@@ -165,7 +165,9 @@ def test_export_rejects_fps_and_frames_together(tmp_path: Path) -> None:
     ("option_kwargs", "message"),
     [
         ({"fps": 0.0}, "FPS must be greater than 0."),
+        ({"fps": -1.0}, "FPS must be greater than 0."),
         ({"frames": 0}, "Frames must be greater than 0."),
+        ({"frames": -1}, "Frames must be greater than 0."),
     ],
 )
 def test_export_rejects_non_positive_sampling_values(
@@ -208,6 +210,37 @@ def test_export_rejects_frames_mode_without_positive_duration(
         )
 
     assert exc_info.value.exit_code == 1
+    assert backend.commands == []
+    assert not (tmp_path / "demo_frames").exists()
+
+
+@pytest.mark.parametrize("duration_seconds", [None, 0.0])
+def test_export_keeps_existing_frames_when_duration_unavailable_with_overwrite(
+    tmp_path: Path,
+    duration_seconds: float | None,
+) -> None:
+    video_path = create_video(tmp_path / "demo.mp4")
+    output_dir = tmp_path / "frames"
+    output_dir.mkdir()
+    existing_frame = output_dir / "demo_000001.png"
+    existing_frame.write_bytes(b"old frame")
+    backend = FakeBackend(duration_seconds=duration_seconds)
+
+    with pytest.raises(
+        VideoFrameError,
+        match="Unable to determine video duration for --frames mode.",
+    ):
+        export_video_frames(
+            VideoFrameOptions(
+                input_path=video_path,
+                output_dir=output_dir,
+                frames=120,
+                overwrite=True,
+            ),
+            backend,
+        )
+
+    assert existing_frame.exists()
     assert backend.commands == []
 
 

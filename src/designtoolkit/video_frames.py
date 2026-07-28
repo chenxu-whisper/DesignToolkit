@@ -78,6 +78,7 @@ def export_video_frames(
 
     image_format = _normalize_image_format(options.image_format)
     _validate_sampling_options(options)
+    effective_fps = _effective_fps(options, backend=backend, input_path=input_path)
     output_dir = options.output_dir or default_output_dir(input_path)
     _prepare_output_dir(output_dir, overwrite=options.overwrite)
 
@@ -93,10 +94,10 @@ def export_video_frames(
 
     command = _build_ffmpeg_command(
         ffmpeg_exe=backend.get_ffmpeg_exe(),
-        backend=backend,
         options=options,
         input_path=input_path,
         output_pattern=output_pattern,
+        effective_fps=effective_fps,
     )
 
     result = backend.run(command)
@@ -170,10 +171,10 @@ def _remove_existing_output_frames(
 def _build_ffmpeg_command(
     *,
     ffmpeg_exe: str,
-    backend: FrameExportBackend,
     options: VideoFrameOptions,
     input_path: Path,
     output_pattern: Path,
+    effective_fps: float | None,
 ) -> list[str]:
     command = [
         ffmpeg_exe,
@@ -183,7 +184,7 @@ def _build_ffmpeg_command(
         str(input_path),
     ]
 
-    filters = _video_filters(options, backend=backend, input_path=input_path)
+    filters = _video_filters(options, effective_fps=effective_fps)
     if filters:
         command.extend(["-vf", ",".join(filters)])
 
@@ -194,13 +195,11 @@ def _build_ffmpeg_command(
 def _video_filters(
     options: VideoFrameOptions,
     *,
-    backend: FrameExportBackend,
-    input_path: Path,
+    effective_fps: float | None,
 ) -> list[str]:
     filters: list[str] = []
-    fps = _effective_fps(options, backend=backend, input_path=input_path)
-    if fps is not None:
-        filters.append(f"fps={fps:g}")
+    if effective_fps is not None:
+        filters.append(f"fps={effective_fps:g}")
     if options.size is not None:
         width, height = options.size
         filters.append(f"scale={width}:{height}")
