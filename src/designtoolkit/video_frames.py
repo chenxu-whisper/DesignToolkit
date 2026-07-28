@@ -77,6 +77,13 @@ def export_video_frames(
     _prepare_output_dir(output_dir, overwrite=options.overwrite)
 
     output_pattern = output_dir / f"{input_path.stem}_%06d.{image_format}"
+    if options.overwrite:
+        _remove_existing_output_frames(
+            output_dir,
+            input_stem=input_path.stem,
+            image_format=image_format,
+        )
+
     command = _build_ffmpeg_command(
         ffmpeg_exe=backend.get_ffmpeg_exe(),
         options=options,
@@ -111,7 +118,7 @@ def _normalize_image_format(image_format: str) -> str:
     if normalized not in SUPPORTED_FORMATS:
         supported = ", ".join(sorted(SUPPORTED_FORMATS))
         raise VideoFrameError(
-            f"Unsupported image format '{image_format}'. "
+            f"Unsupported output format '{image_format}'. "
             f"Supported formats: {supported}."
         )
     return normalized
@@ -127,6 +134,20 @@ def _prepare_output_dir(output_dir: Path, *, overwrite: bool) -> None:
         raise VideoFrameError(
             f"Output directory is not empty: {output_dir}. Use overwrite to continue."
         )
+
+
+def _remove_existing_output_frames(
+    output_dir: Path,
+    *,
+    input_stem: str,
+    image_format: str,
+) -> None:
+    output_name_pattern = re.compile(
+        rf"{re.escape(input_stem)}_\d{{6}}\.{re.escape(image_format)}"
+    )
+    for path in output_dir.iterdir():
+        if path.is_file() and output_name_pattern.fullmatch(path.name):
+            path.unlink()
 
 
 def _build_ffmpeg_command(

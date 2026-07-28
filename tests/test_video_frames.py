@@ -16,8 +16,13 @@ from designtoolkit.video_frames import (
 
 
 class FakeBackend:
-    def __init__(self, duration_seconds: float | None = 10.0) -> None:
+    def __init__(
+        self,
+        duration_seconds: float | None = 10.0,
+        run_result: BackendResult | None = None,
+    ) -> None:
         self.duration_seconds = duration_seconds
+        self.run_result = run_result or BackendResult(returncode=0)
         self.commands: list[list[str]] = []
 
     def get_ffmpeg_exe(self) -> str:
@@ -28,7 +33,7 @@ class FakeBackend:
 
     def run(self, command: Sequence[str]) -> BackendResult:
         self.commands.append(list(command))
-        return BackendResult(returncode=0)
+        return self.run_result
 
 
 def create_video(path: Path) -> Path:
@@ -131,6 +136,35 @@ def test_export_uses_custom_output_dir_and_overwrite_flag(tmp_path: Path) -> Non
     assert backend.commands[0][2] == "-y"
 
 
+def test_export_removes_matching_frames_when_overwriting(tmp_path: Path) -> None:
+    video_path = create_video(tmp_path / "demo.mp4")
+    output_dir = tmp_path / "frames"
+    output_dir.mkdir()
+    matching_frame = output_dir / "demo_000123.png"
+    unrelated_files = [
+        output_dir / "demo_000123.jpg",
+        output_dir / "demo_123.png",
+        output_dir / "other_000123.png",
+        output_dir / "notes.txt",
+    ]
+    matching_frame.write_bytes(b"old frame")
+    for path in unrelated_files:
+        path.write_bytes(b"keep")
+    backend = FakeBackend()
+
+    export_video_frames(
+        VideoFrameOptions(
+            input_path=video_path,
+            output_dir=output_dir,
+            overwrite=True,
+        ),
+        backend,
+    )
+
+    assert not matching_frame.exists()
+    assert all(path.exists() for path in unrelated_files)
+
+
 def test_export_rejects_missing_input_video(tmp_path: Path) -> None:
     backend = FakeBackend()
 
@@ -157,5 +191,48 @@ def test_export_rejects_non_empty_output_dir_without_overwrite(tmp_path: Path) -
     with pytest.raises(VideoFrameError, match="Output directory is not empty"):
         export_video_frames(
             VideoFrameOptions(input_path=video_path, output_dir=output_dir),
+            backend,
+        )
+
+
+def test_export_maps_backend_failure_to_exit_code_one_with_stderr(
+    tmp_path: Path,
+) -> None:
+    video_path = create_video(tmp_path / "demo.mp4")
+    backend = FakeBackend(
+        run_result=BackendResult(
+            returncode=7,
+            stderr="encoder failed while writing frames\n",
+        )
+    )
+
+    with pytest.raises(VideoFrameError, match="encoder failed") as exc_info:
+        export_video_frames(VideoFrameOptions(input_path=video_path), backend)
+
+    assert exc_info.value.exit_code == 1
+    assert "FFmpeg failed with exit code 7" in str(exc_info.value)
+    assert "encoder failed while writing frames" in str(exc_info.value)
+
+
+def test_export_rejects_unsupported_image_format(tmp_path: Path) -> None:
+    video_path = create_video(tmp_path / "demo.mp4")
+    backend = FakeBackend()
+
+    with pytest.raises(VideoFrameError, match="Unsupported output format"):
+        export_video_frames(
+            VideoFrameOptions(input_path=video_path, image_format="gif"),
+            backend,
+        )
+
+
+def test_export_rejects_output_path_that_is_not_directory(tmp_path: Path) -> None:
+    video_path = create_video(tmp_path / "demo.mp4")
+    output_path = tmp_path / "frames"
+    output_path.write_text("not a directory")
+    backend = FakeBackend()
+
+    with pytest.raises(VideoFrameError, match="Output path is not a directory"):
+        export_video_frames(
+            VideoFrameOptions(input_path=video_path, output_dir=output_path),
             backend,
         )
