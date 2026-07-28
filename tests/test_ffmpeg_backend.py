@@ -14,12 +14,14 @@ from designtoolkit.video_frames import BackendResult
 def test_get_ffmpeg_exe_uses_imageio_ffmpeg(monkeypatch, tmp_path: Path) -> None:
     bundled_dir = tmp_path / "imageio_ffmpeg" / "binaries"
     bundled_dir.mkdir(parents=True)
-    expected_path = str(bundled_dir / "ffmpeg.exe")
+    exe = bundled_dir / "ffmpeg.exe"
+    exe.write_bytes(b"fake bundled ffmpeg")
+    expected_path = str(exe.resolve())
     calls: list[None] = []
 
     def fake_get_ffmpeg_exe() -> str:
         calls.append(None)
-        return expected_path
+        return str(exe)
 
     monkeypatch.setattr(imageio_ffmpeg, "get_ffmpeg_exe", fake_get_ffmpeg_exe)
     monkeypatch.setattr(
@@ -31,6 +33,26 @@ def test_get_ffmpeg_exe_uses_imageio_ffmpeg(monkeypatch, tmp_path: Path) -> None
 
     assert FfmpegBackend().get_ffmpeg_exe() == expected_path
     assert calls == [None]
+
+
+def test_get_ffmpeg_exe_rejects_relative_name_even_from_bundled_cwd(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    bundled_dir = tmp_path / "imageio_ffmpeg" / "binaries"
+    bundled_dir.mkdir(parents=True)
+
+    monkeypatch.chdir(bundled_dir)
+    monkeypatch.setattr(imageio_ffmpeg, "get_ffmpeg_exe", lambda: "ffmpeg")
+    monkeypatch.setattr(
+        ffmpeg_backend,
+        "_bundled_binary_dir",
+        lambda: bundled_dir,
+        raising=False,
+    )
+
+    with pytest.raises(RuntimeError, match="Bundled FFmpeg"):
+        FfmpegBackend().get_ffmpeg_exe()
 
 
 @pytest.mark.parametrize(
