@@ -19,6 +19,45 @@ def test_main_without_subcommand_reports_ready(capsys) -> None:
     assert captured.err == ""
 
 
+def test_main_help_returns_zero(capsys) -> None:
+    exit_code = main(["--help"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "usage:" in captured.out
+    assert captured.err == ""
+
+
+def test_video_to_frames_help_returns_zero_without_backend(capsys) -> None:
+    def unavailable_exporter(
+        options: VideoFrameOptions,
+        backend: DummyBackend,
+    ) -> ExportResult:
+        raise AssertionError("exporter should not be called for help")
+
+    def unavailable_backend_factory() -> DummyBackend:
+        raise AssertionError("backend should not be created for help")
+
+    exit_code = main(
+        ["video-to-frames", "--help"],
+        exporter=unavailable_exporter,
+        backend_factory=unavailable_backend_factory,
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    for option in (
+        "--format",
+        "--output-dir",
+        "--size",
+        "--fps",
+        "--frames",
+        "--overwrite",
+    ):
+        assert option in captured.out
+    assert captured.err == ""
+
+
 def test_video_to_frames_passes_complete_options_to_exporter(
     tmp_path: Path,
     capsys,
