@@ -128,6 +128,89 @@ def test_export_uses_fps_and_size_filters(tmp_path: Path) -> None:
     assert video_filter(backend.commands[0]) == "fps=12,scale=1920:1080"
 
 
+def test_export_converts_total_frames_to_effective_fps(tmp_path: Path) -> None:
+    video_path = create_video(tmp_path / "demo.mp4")
+    backend = FakeBackend(duration_seconds=10.0)
+
+    export_video_frames(
+        VideoFrameOptions(
+            input_path=video_path,
+            frames=120,
+        ),
+        backend,
+    )
+
+    assert video_filter(backend.commands[0]) == "fps=12"
+
+
+def test_export_rejects_fps_and_frames_together(tmp_path: Path) -> None:
+    video_path = create_video(tmp_path / "demo.mp4")
+    backend = FakeBackend()
+
+    with pytest.raises(VideoFrameError, match="cannot be used together") as exc_info:
+        export_video_frames(
+            VideoFrameOptions(
+                input_path=video_path,
+                fps=12.0,
+                frames=120,
+            ),
+            backend,
+        )
+
+    assert exc_info.value.exit_code == 2
+    assert backend.commands == []
+
+
+@pytest.mark.parametrize(
+    ("option_kwargs", "message"),
+    [
+        ({"fps": 0.0}, "FPS must be greater than 0."),
+        ({"frames": 0}, "Frames must be greater than 0."),
+    ],
+)
+def test_export_rejects_non_positive_sampling_values(
+    tmp_path: Path,
+    option_kwargs: dict[str, float | int],
+    message: str,
+) -> None:
+    video_path = create_video(tmp_path / "demo.mp4")
+    backend = FakeBackend()
+
+    with pytest.raises(VideoFrameError) as exc_info:
+        export_video_frames(
+            VideoFrameOptions(input_path=video_path, **option_kwargs),
+            backend,
+        )
+
+    assert str(exc_info.value) == message
+    assert exc_info.value.exit_code == 2
+    assert backend.commands == []
+
+
+@pytest.mark.parametrize("duration_seconds", [None, 0.0])
+def test_export_rejects_frames_mode_without_positive_duration(
+    tmp_path: Path,
+    duration_seconds: float | None,
+) -> None:
+    video_path = create_video(tmp_path / "demo.mp4")
+    backend = FakeBackend(duration_seconds=duration_seconds)
+
+    with pytest.raises(
+        VideoFrameError,
+        match="Unable to determine video duration for --frames mode.",
+    ) as exc_info:
+        export_video_frames(
+            VideoFrameOptions(
+                input_path=video_path,
+                frames=120,
+            ),
+            backend,
+        )
+
+    assert exc_info.value.exit_code == 1
+    assert backend.commands == []
+
+
 def test_export_uses_custom_output_dir_and_overwrite_flag(tmp_path: Path) -> None:
     video_path = create_video(tmp_path / "demo.mp4")
     output_dir = tmp_path / "frames"

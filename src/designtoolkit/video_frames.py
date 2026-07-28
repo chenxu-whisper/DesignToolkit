@@ -77,6 +77,7 @@ def export_video_frames(
     _validate_input_path(input_path)
 
     image_format = _normalize_image_format(options.image_format)
+    _validate_sampling_options(options)
     output_dir = options.output_dir or default_output_dir(input_path)
     _prepare_output_dir(output_dir, overwrite=options.overwrite)
 
@@ -92,6 +93,7 @@ def export_video_frames(
 
     command = _build_ffmpeg_command(
         ffmpeg_exe=backend.get_ffmpeg_exe(),
+        backend=backend,
         options=options,
         input_path=input_path,
         output_pattern=output_pattern,
@@ -130,6 +132,15 @@ def _normalize_image_format(image_format: str) -> str:
     return normalized
 
 
+def _validate_sampling_options(options: VideoFrameOptions) -> None:
+    if options.fps is not None and options.frames is not None:
+        raise VideoFrameError("--fps and --frames cannot be used together.")
+    if options.fps is not None and options.fps <= 0:
+        raise VideoFrameError("FPS must be greater than 0.")
+    if options.frames is not None and options.frames <= 0:
+        raise VideoFrameError("Frames must be greater than 0.")
+
+
 def _prepare_output_dir(output_dir: Path, *, overwrite: bool) -> None:
     if output_dir.exists() and not output_dir.is_dir():
         raise VideoFrameError(f"Output path is not a directory: {output_dir}")
@@ -159,6 +170,7 @@ def _remove_existing_output_frames(
 def _build_ffmpeg_command(
     *,
     ffmpeg_exe: str,
+    backend: FrameExportBackend,
     options: VideoFrameOptions,
     input_path: Path,
     output_pattern: Path,
@@ -171,7 +183,7 @@ def _build_ffmpeg_command(
         str(input_path),
     ]
 
-    filters = _video_filters(options)
+    filters = _video_filters(options, backend=backend, input_path=input_path)
     if filters:
         command.extend(["-vf", ",".join(filters)])
 
@@ -179,9 +191,14 @@ def _build_ffmpeg_command(
     return command
 
 
-def _video_filters(options: VideoFrameOptions) -> list[str]:
+def _video_filters(
+    options: VideoFrameOptions,
+    *,
+    backend: FrameExportBackend,
+    input_path: Path,
+) -> list[str]:
     filters: list[str] = []
-    fps = _effective_fps(options)
+    fps = _effective_fps(options, backend=backend, input_path=input_path)
     if fps is not None:
         filters.append(f"fps={fps:g}")
     if options.size is not None:
@@ -190,5 +207,18 @@ def _video_filters(options: VideoFrameOptions) -> list[str]:
     return filters
 
 
-def _effective_fps(options: VideoFrameOptions) -> float | None:
+def _effective_fps(
+    options: VideoFrameOptions,
+    *,
+    backend: FrameExportBackend,
+    input_path: Path,
+) -> float | None:
+    if options.frames is not None:
+        duration_seconds = backend.get_duration_seconds(input_path)
+        if duration_seconds is None or duration_seconds <= 0:
+            raise VideoFrameError(
+                "Unable to determine video duration for --frames mode.",
+                exit_code=1,
+            )
+        return options.frames / duration_seconds
     return options.fps
