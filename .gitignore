@@ -17,6 +17,7 @@ Desktop.ini
 .venv/
 venv/
 env/
+.worktrees/
 
 # Caches
 .cache/
