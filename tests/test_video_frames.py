@@ -89,6 +89,17 @@ def test_export_uses_default_format_dir_size_and_frame_rate(tmp_path: Path) -> N
     assert "-vf" not in backend.commands[0]
 
 
+def test_export_escapes_percent_in_ffmpeg_output_pattern(tmp_path: Path) -> None:
+    video_path = create_video(tmp_path / "clip%done.mp4")
+    backend = FakeBackend()
+
+    result = export_video_frames(VideoFrameOptions(input_path=video_path), backend)
+
+    output_pattern = tmp_path / "clip%done_frames" / "clip%%done_%06d.png"
+    assert result.output_pattern == output_pattern
+    assert backend.commands[0][-1] == str(output_pattern)
+
+
 def test_export_uses_requested_format(tmp_path: Path) -> None:
     video_path = create_video(tmp_path / "demo.mov")
     backend = FakeBackend()
@@ -163,6 +174,62 @@ def test_export_removes_matching_frames_when_overwriting(tmp_path: Path) -> None
 
     assert not matching_frame.exists()
     assert all(path.exists() for path in unrelated_files)
+
+
+def test_export_removes_percent_stem_frames_when_overwriting(
+    tmp_path: Path,
+) -> None:
+    video_path = create_video(tmp_path / "clip%done.mp4")
+    output_dir = tmp_path / "frames"
+    output_dir.mkdir()
+    matching_frame = output_dir / "clip%done_000001.png"
+    unrelated_files = [
+        output_dir / "clip%%done_000001.png",
+        output_dir / "clip%done_000001.jpg",
+        output_dir / "clip%done_123.png",
+        output_dir / "other_000001.png",
+    ]
+    matching_frame.write_bytes(b"old frame")
+    for path in unrelated_files:
+        path.write_bytes(b"keep")
+    backend = FakeBackend()
+
+    result = export_video_frames(
+        VideoFrameOptions(
+            input_path=video_path,
+            output_dir=output_dir,
+            overwrite=True,
+        ),
+        backend,
+    )
+
+    output_pattern = output_dir / "clip%%done_%06d.png"
+    assert result.output_pattern == output_pattern
+    assert backend.commands[0][-1] == str(output_pattern)
+    assert not matching_frame.exists()
+    assert all(path.exists() for path in unrelated_files)
+
+
+def test_export_keeps_non_ascii_digit_frames_when_overwriting(
+    tmp_path: Path,
+) -> None:
+    video_path = create_video(tmp_path / "demo.mp4")
+    output_dir = tmp_path / "frames"
+    output_dir.mkdir()
+    fullwidth_digits_frame = output_dir / "demo_１２３４５６.png"
+    fullwidth_digits_frame.write_bytes(b"keep")
+    backend = FakeBackend()
+
+    export_video_frames(
+        VideoFrameOptions(
+            input_path=video_path,
+            output_dir=output_dir,
+            overwrite=True,
+        ),
+        backend,
+    )
+
+    assert fullwidth_digits_frame.exists()
 
 
 def test_export_rejects_missing_input_video(tmp_path: Path) -> None:

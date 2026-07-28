@@ -65,6 +65,10 @@ def default_output_dir(video_path: Path) -> Path:
     return video_path.parent / f"{video_path.stem}_frames"
 
 
+def _ffmpeg_output_stem(input_stem: str) -> str:
+    return input_stem.replace("%", "%%")
+
+
 def export_video_frames(
     options: VideoFrameOptions,
     backend: FrameExportBackend,
@@ -76,7 +80,9 @@ def export_video_frames(
     output_dir = options.output_dir or default_output_dir(input_path)
     _prepare_output_dir(output_dir, overwrite=options.overwrite)
 
-    output_pattern = output_dir / f"{input_path.stem}_%06d.{image_format}"
+    output_pattern = (
+        output_dir / f"{_ffmpeg_output_stem(input_path.stem)}_%06d.{image_format}"
+    )
     if options.overwrite:
         _remove_existing_output_frames(
             output_dir,
@@ -143,7 +149,7 @@ def _remove_existing_output_frames(
     image_format: str,
 ) -> None:
     output_name_pattern = re.compile(
-        rf"{re.escape(input_stem)}_\d{{6}}\.{re.escape(image_format)}"
+        rf"{re.escape(input_stem)}_[0-9]{{6}}\.{re.escape(image_format)}"
     )
     for path in output_dir.iterdir():
         if path.is_file() and output_name_pattern.fullmatch(path.name):
