@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from designtoolkit.ffmpeg_backend import FfmpegBackend
 from designtoolkit.main import main
 from designtoolkit.video_frames import ExportResult, VideoFrameError, VideoFrameOptions
 
@@ -140,6 +141,36 @@ def test_video_to_frames_sets_frame_count(tmp_path: Path, capsys) -> None:
     assert exit_code == 0
     assert captured.err == ""
     assert observed_options[0].frames == 120
+
+
+def test_video_to_frames_uses_ffmpeg_backend_by_default(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    video_path = tmp_path / "input.mp4"
+    output_dir = tmp_path / "frames"
+    received_backends: list[FfmpegBackend] = []
+
+    def fake_exporter(
+        options: VideoFrameOptions,
+        backend: FfmpegBackend,
+    ) -> ExportResult:
+        assert options.input_path == video_path
+        assert isinstance(backend, FfmpegBackend)
+        received_backends.append(backend)
+        return ExportResult(
+            output_dir=output_dir,
+            output_pattern=output_dir / "frame_%06d.png",
+            command=("ffmpeg",),
+        )
+
+    exit_code = main(["video-to-frames", str(video_path)], exporter=fake_exporter)
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert captured.out == f"Exported frames to {output_dir}\n"
+    assert captured.err == ""
+    assert len(received_backends) == 1
 
 
 def test_video_to_frames_returns_video_frame_error_exit_code(
