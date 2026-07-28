@@ -63,3 +63,105 @@ def parse_size(value: str) -> tuple[int, int]:
 
 def default_output_dir(video_path: Path) -> Path:
     return video_path.parent / f"{video_path.stem}_frames"
+
+
+def export_video_frames(
+    options: VideoFrameOptions,
+    backend: FrameExportBackend,
+) -> ExportResult:
+    input_path = options.input_path
+    _validate_input_path(input_path)
+
+    image_format = _normalize_image_format(options.image_format)
+    output_dir = options.output_dir or default_output_dir(input_path)
+    _prepare_output_dir(output_dir, overwrite=options.overwrite)
+
+    output_pattern = output_dir / f"{input_path.stem}_%06d.{image_format}"
+    command = _build_ffmpeg_command(
+        ffmpeg_exe=backend.get_ffmpeg_exe(),
+        options=options,
+        input_path=input_path,
+        output_pattern=output_pattern,
+    )
+
+    result = backend.run(command)
+    if result.returncode != 0:
+        detail = f": {result.stderr.strip()}" if result.stderr.strip() else ""
+        raise VideoFrameError(
+            f"FFmpeg failed with exit code {result.returncode}{detail}",
+            exit_code=1,
+        )
+
+    return ExportResult(
+        output_dir=output_dir,
+        output_pattern=output_pattern,
+        command=tuple(command),
+    )
+
+
+def _validate_input_path(input_path: Path) -> None:
+    if not input_path.exists():
+        raise VideoFrameError(f"Input video does not exist: {input_path}")
+    if not input_path.is_file():
+        raise VideoFrameError(f"Input path is not a file: {input_path}")
+
+
+def _normalize_image_format(image_format: str) -> str:
+    normalized = image_format.strip().lower().lstrip(".")
+    if normalized not in SUPPORTED_FORMATS:
+        supported = ", ".join(sorted(SUPPORTED_FORMATS))
+        raise VideoFrameError(
+            f"Unsupported image format '{image_format}'. "
+            f"Supported formats: {supported}."
+        )
+    return normalized
+
+
+def _prepare_output_dir(output_dir: Path, *, overwrite: bool) -> None:
+    if output_dir.exists() and not output_dir.is_dir():
+        raise VideoFrameError(f"Output path is not a directory: {output_dir}")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if not overwrite and any(output_dir.iterdir()):
+        raise VideoFrameError(
+            f"Output directory is not empty: {output_dir}. Use overwrite to continue."
+        )
+
+
+def _build_ffmpeg_command(
+    *,
+    ffmpeg_exe: str,
+    options: VideoFrameOptions,
+    input_path: Path,
+    output_pattern: Path,
+) -> list[str]:
+    command = [
+        ffmpeg_exe,
+        "-hide_banner",
+        "-y" if options.overwrite else "-n",
+        "-i",
+        str(input_path),
+    ]
+
+    filters = _video_filters(options)
+    if filters:
+        command.extend(["-vf", ",".join(filters)])
+
+    command.append(str(output_pattern))
+    return command
+
+
+def _video_filters(options: VideoFrameOptions) -> list[str]:
+    filters: list[str] = []
+    fps = _effective_fps(options)
+    if fps is not None:
+        filters.append(f"fps={fps:g}")
+    if options.size is not None:
+        width, height = options.size
+        filters.append(f"scale={width}:{height}")
+    return filters
+
+
+def _effective_fps(options: VideoFrameOptions) -> float | None:
+    return options.fps
