@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -15,6 +16,10 @@ class VideoFrameError(Exception):
     def __init__(self, message: str, exit_code: int = 2) -> None:
         super().__init__(message)
         self.exit_code = exit_code
+
+
+class BackendUnavailableError(RuntimeError):
+    """Expected backend availability failure before export can start."""
 
 
 @dataclass(frozen=True)
@@ -69,6 +74,19 @@ def _ffmpeg_output_stem(input_stem: str) -> str:
     return input_stem.replace("%", "%%")
 
 
+def _ffmpeg_output_pattern(
+    output_dir: Path,
+    *,
+    input_stem: str,
+    image_format: str,
+) -> Path:
+    escaped_output_dir = str(output_dir).replace("%", "%%")
+    return (
+        Path(escaped_output_dir)
+        / f"{_ffmpeg_output_stem(input_stem)}_%06d.{image_format}"
+    )
+
+
 def export_video_frames(
     options: VideoFrameOptions,
     backend: FrameExportBackend,
@@ -78,12 +96,19 @@ def export_video_frames(
 
     image_format = _normalize_image_format(options.image_format)
     _validate_sampling_options(options)
+    try:
+        ffmpeg_exe = backend.get_ffmpeg_exe()
+    except BackendUnavailableError as exc:
+        raise VideoFrameError(str(exc), exit_code=1) from exc
+
     effective_fps = _effective_fps(options, backend=backend, input_path=input_path)
     output_dir = options.output_dir or default_output_dir(input_path)
     _prepare_output_dir(output_dir, overwrite=options.overwrite)
 
-    output_pattern = (
-        output_dir / f"{_ffmpeg_output_stem(input_path.stem)}_%06d.{image_format}"
+    output_pattern = _ffmpeg_output_pattern(
+        output_dir,
+        input_stem=input_path.stem,
+        image_format=image_format,
     )
     if options.overwrite:
         _remove_existing_output_frames(
@@ -93,7 +118,7 @@ def export_video_frames(
         )
 
     command = _build_ffmpeg_command(
-        ffmpeg_exe=backend.get_ffmpeg_exe(),
+        ffmpeg_exe=ffmpeg_exe,
         options=options,
         input_path=input_path,
         output_pattern=output_pattern,
@@ -136,7 +161,7 @@ def _normalize_image_format(image_format: str) -> str:
 def _validate_sampling_options(options: VideoFrameOptions) -> None:
     if options.fps is not None and options.frames is not None:
         raise VideoFrameError("--fps and --frames cannot be used together.")
-    if options.fps is not None and options.fps <= 0:
+    if options.fps is not None and not (math.isfinite(options.fps) and options.fps > 0):
         raise VideoFrameError("FPS must be greater than 0.")
     if options.frames is not None and options.frames <= 0:
         raise VideoFrameError("Frames must be greater than 0.")
@@ -214,7 +239,9 @@ def _effective_fps(
 ) -> float | None:
     if options.frames is not None:
         duration_seconds = backend.get_duration_seconds(input_path)
-        if duration_seconds is None or duration_seconds <= 0:
+        if duration_seconds is None or not (
+            math.isfinite(duration_seconds) and duration_seconds > 0
+        ):
             raise VideoFrameError(
                 "Unable to determine video duration for --frames mode.",
                 exit_code=1,

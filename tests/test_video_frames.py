@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
 
+import designtoolkit.video_frames as video_frames
 from designtoolkit.video_frames import (
     BackendResult,
     VideoFrameError,
@@ -20,12 +22,16 @@ class FakeBackend:
         self,
         duration_seconds: float | None = 10.0,
         run_result: BackendResult | None = None,
+        ffmpeg_error: Exception | None = None,
     ) -> None:
         self.duration_seconds = duration_seconds
         self.run_result = run_result or BackendResult(returncode=0)
+        self.ffmpeg_error = ffmpeg_error
         self.commands: list[list[str]] = []
 
     def get_ffmpeg_exe(self) -> str:
+        if self.ffmpeg_error is not None:
+            raise self.ffmpeg_error
         return "ffmpeg"
 
     def get_duration_seconds(self, video_path: Path) -> float | None:
@@ -43,6 +49,13 @@ def create_video(path: Path) -> Path:
 
 def video_filter(command: list[str]) -> str:
     return command[command.index("-vf") + 1]
+
+
+def backend_unavailable_error_type() -> type[Exception]:
+    error_type = getattr(video_frames, "BackendUnavailableError", None)
+    assert error_type is not None, "BackendUnavailableError should be defined"
+    assert issubclass(error_type, RuntimeError)
+    return error_type
 
 
 def test_parse_size_accepts_width_x_height() -> None:
@@ -95,8 +108,28 @@ def test_export_escapes_percent_in_ffmpeg_output_pattern(tmp_path: Path) -> None
 
     result = export_video_frames(VideoFrameOptions(input_path=video_path), backend)
 
-    output_pattern = tmp_path / "clip%done_frames" / "clip%%done_%06d.png"
+    output_dir = tmp_path / "clip%done_frames"
+    output_pattern = Path(str(output_dir).replace("%", "%%")) / "clip%%done_%06d.png"
+    assert result.output_dir == output_dir
     assert result.output_pattern == output_pattern
+    assert output_dir.is_dir()
+    assert backend.commands[0][-1] == str(output_pattern)
+
+
+def test_export_escapes_percent_in_custom_output_dir_pattern(tmp_path: Path) -> None:
+    video_path = create_video(tmp_path / "demo.mp4")
+    output_dir = tmp_path / "custom%frames"
+    backend = FakeBackend()
+
+    result = export_video_frames(
+        VideoFrameOptions(input_path=video_path, output_dir=output_dir),
+        backend,
+    )
+
+    output_pattern = Path(str(output_dir).replace("%", "%%")) / "demo_%06d.png"
+    assert result.output_dir == output_dir
+    assert result.output_pattern == output_pattern
+    assert output_dir.is_dir()
     assert backend.commands[0][-1] == str(output_pattern)
 
 
@@ -189,7 +222,24 @@ def test_export_rejects_non_positive_sampling_values(
     assert backend.commands == []
 
 
-@pytest.mark.parametrize("duration_seconds", [None, 0.0])
+@pytest.mark.parametrize("fps", [math.nan, math.inf])
+def test_export_rejects_non_finite_fps_before_running_backend(
+    tmp_path: Path,
+    fps: float,
+) -> None:
+    video_path = create_video(tmp_path / "demo.mp4")
+    backend = FakeBackend()
+
+    with pytest.raises(VideoFrameError) as exc_info:
+        export_video_frames(VideoFrameOptions(input_path=video_path, fps=fps), backend)
+
+    assert str(exc_info.value) == "FPS must be greater than 0."
+    assert exc_info.value.exit_code == 2
+    assert backend.commands == []
+    assert not (tmp_path / "demo_frames").exists()
+
+
+@pytest.mark.parametrize("duration_seconds", [None, 0.0, math.nan, math.inf])
 def test_export_rejects_frames_mode_without_positive_duration(
     tmp_path: Path,
     duration_seconds: float | None,
@@ -214,7 +264,7 @@ def test_export_rejects_frames_mode_without_positive_duration(
     assert not (tmp_path / "demo_frames").exists()
 
 
-@pytest.mark.parametrize("duration_seconds", [None, 0.0])
+@pytest.mark.parametrize("duration_seconds", [None, 0.0, math.nan, math.inf])
 def test_export_keeps_existing_frames_when_duration_unavailable_with_overwrite(
     tmp_path: Path,
     duration_seconds: float | None,
@@ -242,6 +292,22 @@ def test_export_keeps_existing_frames_when_duration_unavailable_with_overwrite(
 
     assert existing_frame.exists()
     assert backend.commands == []
+
+
+def test_export_maps_backend_unavailable_before_output_side_effects(
+    tmp_path: Path,
+) -> None:
+    video_path = create_video(tmp_path / "demo.mp4")
+    backend = FakeBackend(
+        ffmpeg_error=backend_unavailable_error_type()("Bundled FFmpeg unavailable")
+    )
+
+    with pytest.raises(VideoFrameError, match="Bundled FFmpeg unavailable") as exc_info:
+        export_video_frames(VideoFrameOptions(input_path=video_path), backend)
+
+    assert exc_info.value.exit_code == 1
+    assert backend.commands == []
+    assert not (tmp_path / "demo_frames").exists()
 
 
 def test_export_uses_custom_output_dir_and_overwrite_flag(tmp_path: Path) -> None:

@@ -7,7 +7,7 @@ from pathlib import Path
 
 import imageio_ffmpeg
 
-from designtoolkit.video_frames import BackendResult
+from designtoolkit.video_frames import BackendResult, BackendUnavailableError
 
 
 def _bundled_binary_dir() -> Path:
@@ -27,11 +27,13 @@ class FfmpegBackend:
         try:
             ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
         except Exception as exc:
-            raise RuntimeError("Bundled FFmpeg could not be located.") from exc
+            raise BackendUnavailableError(
+                "Bundled FFmpeg could not be located."
+            ) from exc
 
         ffmpeg_path = Path(ffmpeg_exe)
         if not ffmpeg_path.is_absolute():
-            raise RuntimeError(
+            raise BackendUnavailableError(
                 "Bundled FFmpeg is required, but imageio_ffmpeg returned "
                 f"a non-absolute executable path: {ffmpeg_exe}"
             )
@@ -40,16 +42,18 @@ class FfmpegBackend:
             resolved_ffmpeg_exe = ffmpeg_path.resolve()
             bundled_dir = _bundled_binary_dir().resolve()
         except Exception as exc:
-            raise RuntimeError("Bundled FFmpeg could not be located.") from exc
+            raise BackendUnavailableError(
+                "Bundled FFmpeg could not be located."
+            ) from exc
 
         if not resolved_ffmpeg_exe.is_file():
-            raise RuntimeError(
+            raise BackendUnavailableError(
                 "Bundled FFmpeg is required, but imageio_ffmpeg returned "
                 f"a missing executable: {ffmpeg_exe}"
             )
 
         if not _is_relative_to(resolved_ffmpeg_exe, bundled_dir):
-            raise RuntimeError(
+            raise BackendUnavailableError(
                 "Bundled FFmpeg is required, but imageio_ffmpeg returned "
                 f"an external executable: {ffmpeg_exe}"
             )

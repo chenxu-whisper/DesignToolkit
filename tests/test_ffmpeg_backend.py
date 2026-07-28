@@ -6,9 +6,17 @@ from pathlib import Path
 import imageio_ffmpeg
 import pytest
 
+import designtoolkit.video_frames as video_frames
 from designtoolkit import ffmpeg_backend
 from designtoolkit.ffmpeg_backend import FfmpegBackend
 from designtoolkit.video_frames import BackendResult
+
+
+def backend_unavailable_error_type() -> type[Exception]:
+    error_type = getattr(video_frames, "BackendUnavailableError", None)
+    assert error_type is not None, "BackendUnavailableError should be defined"
+    assert issubclass(error_type, RuntimeError)
+    return error_type
 
 
 def test_get_ffmpeg_exe_uses_imageio_ffmpeg(monkeypatch, tmp_path: Path) -> None:
@@ -51,7 +59,17 @@ def test_get_ffmpeg_exe_rejects_relative_name_even_from_bundled_cwd(
         raising=False,
     )
 
-    with pytest.raises(RuntimeError, match="Bundled FFmpeg"):
+    with pytest.raises(backend_unavailable_error_type(), match="Bundled FFmpeg"):
+        FfmpegBackend().get_ffmpeg_exe()
+
+
+def test_get_ffmpeg_exe_maps_imageio_lookup_failure(monkeypatch) -> None:
+    def fake_get_ffmpeg_exe() -> str:
+        raise RuntimeError("lookup failed")
+
+    monkeypatch.setattr(imageio_ffmpeg, "get_ffmpeg_exe", fake_get_ffmpeg_exe)
+
+    with pytest.raises(backend_unavailable_error_type(), match="Bundled FFmpeg"):
         FfmpegBackend().get_ffmpeg_exe()
 
 
@@ -80,7 +98,7 @@ def test_get_ffmpeg_exe_rejects_external_ffmpeg(
         raising=False,
     )
 
-    with pytest.raises(RuntimeError, match="Bundled FFmpeg"):
+    with pytest.raises(backend_unavailable_error_type(), match="Bundled FFmpeg"):
         FfmpegBackend().get_ffmpeg_exe()
 
 
@@ -152,7 +170,7 @@ def test_get_duration_seconds_returns_none_without_probe_for_external_ffmpeg(
     calls: list[str] = []
 
     def fake_get_ffmpeg_exe(backend: FfmpegBackend) -> str:
-        raise RuntimeError("Bundled FFmpeg is unavailable")
+        raise backend_unavailable_error_type()("Bundled FFmpeg is unavailable")
 
     def fake_count_frames_and_secs(path: str) -> tuple[int, float]:
         calls.append(path)

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import imageio_ffmpeg
+
 from designtoolkit.ffmpeg_backend import FfmpegBackend
 from designtoolkit.main import main
 from designtoolkit.video_frames import ExportResult, VideoFrameError, VideoFrameOptions
@@ -171,6 +173,29 @@ def test_video_to_frames_uses_ffmpeg_backend_by_default(
     assert captured.out == f"Exported frames to {output_dir}\n"
     assert captured.err == ""
     assert len(received_backends) == 1
+
+
+def test_video_to_frames_default_backend_reports_bundled_ffmpeg_unavailable(
+    monkeypatch,
+    tmp_path: Path,
+    capsys,
+) -> None:
+    video_path = tmp_path / "input.mp4"
+    video_path.write_bytes(b"video")
+
+    def fake_get_ffmpeg_exe() -> str:
+        raise RuntimeError("lookup failed")
+
+    monkeypatch.setattr(imageio_ffmpeg, "get_ffmpeg_exe", fake_get_ffmpeg_exe)
+
+    exit_code = main(["video-to-frames", str(video_path)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert captured.out == ""
+    assert "Bundled FFmpeg" in captured.err
+    assert "Traceback" not in captured.err
+    assert not (tmp_path / "input_frames").exists()
 
 
 def test_video_to_frames_returns_video_frame_error_exit_code(
