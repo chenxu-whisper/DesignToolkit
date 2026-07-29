@@ -109,7 +109,8 @@ def _build_ffmpeg_command(
         "-i",
         str(input_path),
         "-vf",
-        f"scale={width}:{height}:force_original_aspect_ratio=decrease",
+        f"scale={width}:{height}:force_original_aspect_ratio=decrease:"
+        "force_divisible_by=2",
         "-map",
         "0",
         "-c:a",

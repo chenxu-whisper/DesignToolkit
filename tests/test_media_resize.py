@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from designtoolkit.media_resize import (
     default_output_path,
     resize_media,
 )
+from designtoolkit.video_frames.ffmpeg_backend import FfmpegBackend
 
 
 class FakeResizeBackend:
@@ -75,7 +77,8 @@ def test_resize_uses_default_output_and_aspect_ratio_scale_filter(
             "-i",
             str(input_path),
             "-vf",
-            "scale=800:600:force_original_aspect_ratio=decrease",
+            "scale=800:600:force_original_aspect_ratio=decrease:"
+            "force_divisible_by=2",
             "-map",
             "0",
             "-c:a",
@@ -101,6 +104,50 @@ def test_resize_uses_explicit_output_path(tmp_path: Path) -> None:
 
     assert result.output_path == output_path
     assert backend.commands[0][-1] == str(output_path)
+
+
+def test_resize_h264_video_with_odd_bounding_box_uses_encoder_safe_dimensions(
+    tmp_path: Path,
+) -> None:
+    backend = FfmpegBackend()
+    ffmpeg_exe = backend.get_ffmpeg_exe()
+    input_path = tmp_path / "source.mp4"
+    output_path = tmp_path / "out.mp4"
+
+    created = subprocess.run(
+        [
+            ffmpeg_exe,
+            "-hide_banner",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=160x90:rate=1",
+            "-t",
+            "1",
+            "-pix_fmt",
+            "yuv420p",
+            str(input_path),
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    assert created.returncode == 0, created.stderr
+
+    result = resize_media(
+        MediaResizeOptions(
+            input_path=input_path,
+            size=(101, 100),
+            output_path=output_path,
+        ),
+        backend,
+    )
+
+    assert result.output_path == output_path
+    assert output_path.is_file()
 
 
 def test_resize_rejects_missing_input(tmp_path: Path) -> None:
