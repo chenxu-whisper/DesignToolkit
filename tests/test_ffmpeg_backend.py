@@ -7,9 +7,8 @@ import imageio_ffmpeg
 import pytest
 
 import designtoolkit.video_frames as video_frames
-from designtoolkit import ffmpeg_backend
-from designtoolkit.ffmpeg_backend import FfmpegBackend
-from designtoolkit.video_frames import BackendResult
+from designtoolkit.video_frames import BackendResult, ffmpeg_backend
+from designtoolkit.video_frames.ffmpeg_backend import FfmpegBackend
 
 
 def backend_unavailable_error_type() -> type[Exception]:

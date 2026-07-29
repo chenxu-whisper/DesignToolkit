@@ -7,7 +7,7 @@ from pathlib import Path
 
 import imageio_ffmpeg
 
-from designtoolkit.video_frames import BackendResult, BackendUnavailableError
+from designtoolkit.video_frames.core import BackendResult, BackendUnavailableError
 
 
 def _bundled_binary_dir() -> Path:

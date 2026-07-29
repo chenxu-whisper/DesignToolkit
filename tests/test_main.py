@@ -4,9 +4,9 @@ from pathlib import Path
 
 import imageio_ffmpeg
 
-from designtoolkit.ffmpeg_backend import FfmpegBackend
 from designtoolkit.main import main
 from designtoolkit.video_frames import ExportResult, VideoFrameError, VideoFrameOptions
+from designtoolkit.video_frames.ffmpeg_backend import FfmpegBackend
 
 
 class DummyBackend:

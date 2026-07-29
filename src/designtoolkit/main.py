@@ -83,7 +83,7 @@ def _create_backend(backend_factory: BackendFactory | None) -> FrameExportBacken
     if backend_factory is not None:
         return backend_factory()
 
-    from designtoolkit.ffmpeg_backend import FfmpegBackend
+    from designtoolkit.video_frames.ffmpeg_backend import FfmpegBackend
 
     return FfmpegBackend()
 
