@@ -27,6 +27,45 @@ uv run designtoolkit
 DesignToolkit is ready.
 ```
 
+## 视频转序列帧
+
+默认导出：
+
+```powershell
+uv run designtoolkit video-to-frames .\demo.mp4
+```
+
+默认行为：
+
+- 输出目录：视频同级目录下的 `demo_frames`
+- 输出格式：`png`
+- 输出尺寸：原视频尺寸
+- 输出帧率：原视频帧率
+
+指定输出参数：
+
+```powershell
+uv run designtoolkit video-to-frames .\demo.mov --format jpg --output-dir .\frames --size 1920x1080 --fps 12
+```
+
+按输出总帧数抽帧：
+
+```powershell
+uv run designtoolkit video-to-frames .\demo.mp4 --frames 120 --overwrite
+```
+
+参数说明：
+
+- `video_path`：输入视频文件路径，支持 FFmpeg 可解码的常见格式，例如 `mp4`、`mov`、`m4v`、`avi`、`mkv`
+- `--output-dir PATH`：序列帧保存目录，默认是 `{视频名}_frames`
+- `--format {png,jpg,jpeg}`：输出图片格式，默认 `png`
+- `--size WIDTHxHEIGHT`：输出尺寸，例如 `1920x1080`
+- `--fps FLOAT`：输出帧率
+- `--frames INT`：输出总帧数，会根据视频时长均匀抽帧
+- `--overwrite`：允许写入已存在的非空输出目录
+
+`--fps` 和 `--frames` 不能同时使用。
+
 ## 验证
 
 ```powershell

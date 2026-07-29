@@ -4,7 +4,9 @@ version = "0.1.0"
 description = "A uv-managed CLI application for design tooling."
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "imageio-ffmpeg>=0.6.0",
+]
 
 [project.scripts]
 designtoolkit = "designtoolkit.main:main"
