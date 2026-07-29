@@ -21,12 +21,6 @@ uv sync --link-mode=copy
 uv run designtoolkit
 ```
 
-预期输出：
-
-```text
-DesignToolkit is ready.
-```
-
 ## 视频转序列帧
 
 默认导出：
