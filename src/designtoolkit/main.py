@@ -5,6 +5,13 @@ import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
+from designtoolkit.media_resize import (
+    MediaResizeError,
+    MediaResizeOptions,
+    MediaResizeResult,
+    ResizeBackend,
+    resize_media,
+)
 from designtoolkit.video_frames import (
     ExportResult,
     FrameExportBackend,
@@ -15,13 +22,15 @@ from designtoolkit.video_frames import (
 )
 
 Exporter = Callable[[VideoFrameOptions, FrameExportBackend], ExportResult]
-BackendFactory = Callable[[], FrameExportBackend]
+MediaResizer = Callable[[MediaResizeOptions, ResizeBackend], MediaResizeResult]
+BackendFactory = Callable[[], FrameExportBackend | ResizeBackend]
 
 
 def main(
     argv: Sequence[str] | None = None,
     *,
     exporter: Exporter = export_video_frames,
+    media_resizer: MediaResizer = resize_media,
     backend_factory: BackendFactory | None = None,
 ) -> int:
     parser = _build_parser()
@@ -43,6 +52,17 @@ def main(
             return exc.exit_code
 
         print(f"Exported frames to {result.output_dir}")
+        return 0
+
+    if args.command == "resize-media":
+        try:
+            backend = _create_backend(backend_factory)
+            result = media_resizer(_media_resize_options(args), backend)
+        except MediaResizeError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return exc.exit_code
+
+        print(f"Resized media to {result.output_path}")
         return 0
 
     raise AssertionError(f"Unhandled command: {args.command}")
@@ -69,6 +89,14 @@ def _build_parser() -> argparse.ArgumentParser:
     video_to_frames.add_argument("--frames", type=int)
     video_to_frames.add_argument("--overwrite", action="store_true")
 
+    resize_media_parser = subparsers.add_parser(
+        "resize-media",
+        help="Resize a media file.",
+    )
+    resize_media_parser.add_argument("input_path", type=Path)
+    resize_media_parser.add_argument("size", type=_parse_size_argument)
+    resize_media_parser.add_argument("output_path", nargs="?", type=Path)
+
     return parser
 
 
@@ -79,7 +107,9 @@ def _parse_size_argument(value: str) -> tuple[int, int]:
         raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
-def _create_backend(backend_factory: BackendFactory | None) -> FrameExportBackend:
+def _create_backend(
+    backend_factory: BackendFactory | None,
+) -> FrameExportBackend | ResizeBackend:
     if backend_factory is not None:
         return backend_factory()
 
@@ -97,6 +127,14 @@ def _video_frame_options(args: argparse.Namespace) -> VideoFrameOptions:
         fps=args.fps,
         frames=args.frames,
         overwrite=args.overwrite,
+    )
+
+
+def _media_resize_options(args: argparse.Namespace) -> MediaResizeOptions:
+    return MediaResizeOptions(
+        input_path=args.input_path,
+        size=args.size,
+        output_path=args.output_path,
     )
 
 
