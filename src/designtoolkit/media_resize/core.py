@@ -7,6 +7,11 @@ from typing import Protocol
 
 from designtoolkit.video_frames import BackendUnavailableError
 
+IMAGE_SUFFIXES = frozenset(
+    {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
+)
+VIDEO_SUFFIXES = frozenset({".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"})
+
 
 class MediaResizeError(Exception):
     """Expected user-facing error while resizing media."""
@@ -92,6 +97,26 @@ def _validate_output_path(*, input_path: Path, output_path: Path) -> None:
         )
     if output_path.exists():
         raise MediaResizeError(f"Output path already exists: {output_path}")
+    input_media_type = _media_type_for_suffix(input_path.suffix)
+    output_media_type = _media_type_for_suffix(output_path.suffix)
+    if (
+        input_media_type is not None
+        and output_media_type is not None
+        and input_media_type != output_media_type
+    ):
+        raise MediaResizeError(
+            "Output media type must match input media type: "
+            f"{input_path.suffix} -> {output_path.suffix}"
+        )
+
+
+def _media_type_for_suffix(suffix: str) -> str | None:
+    normalized_suffix = suffix.lower()
+    if normalized_suffix in IMAGE_SUFFIXES:
+        return "image"
+    if normalized_suffix in VIDEO_SUFFIXES:
+        return "video"
+    return None
 
 
 def _build_ffmpeg_command(

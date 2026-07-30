@@ -106,6 +106,94 @@ def test_resize_uses_explicit_output_path(tmp_path: Path) -> None:
     assert backend.commands[0][-1] == str(output_path)
 
 
+def test_resize_rejects_image_input_with_video_output_suffix(
+    tmp_path: Path,
+) -> None:
+    input_path = create_media(tmp_path / "photo.png")
+    output_path = tmp_path / "photo.mp4"
+    backend = FakeResizeBackend()
+
+    with pytest.raises(
+        MediaResizeError,
+        match="Output media type must match input media type",
+    ) as exc:
+        resize_media(
+            MediaResizeOptions(
+                input_path=input_path,
+                size=(320, 240),
+                output_path=output_path,
+            ),
+            backend,
+        )
+
+    assert exc.value.exit_code == 2
+    assert backend.commands == []
+
+
+def test_resize_rejects_video_input_with_image_output_suffix(
+    tmp_path: Path,
+) -> None:
+    input_path = create_media(tmp_path / "clip.mp4")
+    output_path = tmp_path / "clip.png"
+    backend = FakeResizeBackend()
+
+    with pytest.raises(
+        MediaResizeError,
+        match="Output media type must match input media type",
+    ) as exc:
+        resize_media(
+            MediaResizeOptions(
+                input_path=input_path,
+                size=(320, 240),
+                output_path=output_path,
+            ),
+            backend,
+        )
+
+    assert exc.value.exit_code == 2
+    assert backend.commands == []
+
+
+def test_resize_allows_explicit_image_output_in_different_image_format(
+    tmp_path: Path,
+) -> None:
+    input_path = create_media(tmp_path / "photo.png")
+    output_path = tmp_path / "photo.jpg"
+    backend = FakeResizeBackend()
+
+    result = resize_media(
+        MediaResizeOptions(
+            input_path=input_path,
+            size=(320, 240),
+            output_path=output_path,
+        ),
+        backend,
+    )
+
+    assert result.output_path == output_path
+    assert backend.commands[0][-1] == str(output_path)
+
+
+def test_resize_allows_explicit_video_output_in_different_video_format(
+    tmp_path: Path,
+) -> None:
+    input_path = create_media(tmp_path / "clip.mp4")
+    output_path = tmp_path / "clip.mov"
+    backend = FakeResizeBackend()
+
+    result = resize_media(
+        MediaResizeOptions(
+            input_path=input_path,
+            size=(320, 240),
+            output_path=output_path,
+        ),
+        backend,
+    )
+
+    assert result.output_path == output_path
+    assert backend.commands[0][-1] == str(output_path)
+
+
 def test_resize_h264_video_with_odd_bounding_box_uses_encoder_safe_dimensions(
     tmp_path: Path,
 ) -> None:
