@@ -60,6 +60,36 @@ uv run designtoolkit video-to-frames .\demo.mp4 --frames 120 --overwrite
 
 `--fps` 和 `--frames` 不能同时使用。
 
+## 修改视频或图片尺寸
+
+默认导出到源文件同级目录：
+
+```powershell
+uv run designtoolkit resize-media .\demo.mp4 800x600
+uv run designtoolkit resize-media .\photo.png 800x600
+```
+
+默认行为：
+
+- 输出路径：源文件同级目录下的 `{原文件名}_resized.{原扩展名}`
+- 输出尺寸：保持原始宽高比，并放入指定最大边界内
+- 覆盖策略：默认不覆盖已有输出文件
+
+指定输出路径：
+
+```powershell
+uv run designtoolkit resize-media .\demo.mp4 1280x720 .\output.mp4
+uv run designtoolkit resize-media .\photo.jpg 800x600 .\small.jpg
+```
+
+参数说明：
+
+- `input_path`：输入视频或图片文件路径，支持 FFmpeg 可解码的主流格式
+- `size`：最大输出尺寸，例如 `800x600`
+- `output_path`：可选，生成文件保存路径
+
+`800x600` 表示输出宽度不超过 `800` 且输出高度不超过 `600`。工具不会强制拉伸图片或视频到固定宽高。
+
 ## 验证
 
 ```powershell
