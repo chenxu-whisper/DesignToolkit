@@ -123,6 +123,7 @@ def export_video_frames(
         input_path=input_path,
         output_pattern=output_pattern,
         effective_fps=effective_fps,
+        image_format=image_format,
     )
 
     result = backend.run(command)
@@ -193,6 +194,12 @@ def _remove_existing_output_frames(
             path.unlink()
 
 
+def _input_decoder_args(*, input_path: Path, image_format: str) -> list[str]:
+    if input_path.suffix.lower() == ".webm" and image_format == "png":
+        return ["-c:v", "libvpx-vp9"]
+    return []
+
+
 def _build_ffmpeg_command(
     *,
     ffmpeg_exe: str,
@@ -200,14 +207,22 @@ def _build_ffmpeg_command(
     input_path: Path,
     output_pattern: Path,
     effective_fps: float | None,
+    image_format: str,
 ) -> list[str]:
     command = [
         ffmpeg_exe,
         "-hide_banner",
         "-y" if options.overwrite else "-n",
-        "-i",
-        str(input_path),
     ]
+    command.extend(
+        _input_decoder_args(input_path=input_path, image_format=image_format)
+    )
+    command.extend(
+        [
+            "-i",
+            str(input_path),
+        ]
+    )
 
     filters = _video_filters(options, effective_fps=effective_fps)
     if filters:

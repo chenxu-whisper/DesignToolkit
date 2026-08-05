@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import subprocess
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from designtoolkit.video_frames import (
     export_video_frames,
     parse_size,
 )
+from designtoolkit.video_frames.ffmpeg_backend import FfmpegBackend
 
 
 class FakeBackend:
@@ -49,6 +51,28 @@ def create_video(path: Path) -> Path:
 
 def video_filter(command: list[str]) -> str:
     return command[command.index("-vf") + 1]
+
+
+def png_alpha_extrema(ffmpeg_exe: str, image_path: Path) -> tuple[int, int]:
+    decoded = subprocess.run(
+        [
+            ffmpeg_exe,
+            "-hide_banner",
+            "-i",
+            str(image_path),
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgba",
+            "-",
+        ],
+        capture_output=True,
+        check=False,
+    )
+    assert decoded.returncode == 0, decoded.stderr.decode("utf-8", errors="replace")
+    alpha_values = decoded.stdout[3::4]
+    assert alpha_values
+    return min(alpha_values), max(alpha_values)
 
 
 def backend_unavailable_error_type() -> type[Exception]:
@@ -143,6 +167,53 @@ def test_export_uses_requested_format(tmp_path: Path) -> None:
     )
 
     assert result.output_pattern == tmp_path / "demo_frames" / "demo_%06d.jpg"
+
+
+def test_export_webm_to_png_uses_vp9_alpha_decoder_before_input(
+    tmp_path: Path,
+) -> None:
+    video_path = create_video(tmp_path / "transparent.webm")
+    backend = FakeBackend()
+
+    export_video_frames(VideoFrameOptions(input_path=video_path), backend)
+
+    command = backend.commands[0]
+    assert command[3:7] == ["-c:v", "libvpx-vp9", "-i", str(video_path)]
+
+
+def test_export_webm_to_jpg_does_not_use_alpha_decoder(tmp_path: Path) -> None:
+    video_path = create_video(tmp_path / "transparent.webm")
+    backend = FakeBackend()
+
+    export_video_frames(
+        VideoFrameOptions(input_path=video_path, image_format="jpg"),
+        backend,
+    )
+
+    command = backend.commands[0]
+    assert "-c:v" not in command
+    assert "libvpx-vp9" not in command
+
+
+def test_export_transparent_webm_to_png_preserves_alpha(tmp_path: Path) -> None:
+    video_path = Path("assets/video/test.webm")
+    assert video_path.is_file()
+    output_dir = tmp_path / "frames"
+    backend = FfmpegBackend()
+    ffmpeg_exe = backend.get_ffmpeg_exe()
+
+    export_video_frames(
+        VideoFrameOptions(
+            input_path=video_path,
+            output_dir=output_dir,
+            fps=1.0,
+        ),
+        backend,
+    )
+
+    frame_path = output_dir / "test_000001.png"
+    assert frame_path.is_file()
+    assert png_alpha_extrema(ffmpeg_exe, frame_path) == (0, 255)
 
 
 def test_export_uses_fps_and_size_filters(tmp_path: Path) -> None:

@@ -33,6 +33,7 @@ uv run designtoolkit video-to-frames .\demo.mp4
 
 - 输出目录：视频同级目录下的 `demo_frames`
 - 输出格式：`png`
+- 透明支持：带透明通道的 WebM 导出为 PNG 序列时，会默认保留 alpha 通道；导出为 JPG/JPEG 时不保留透明信息
 - 输出尺寸：原视频尺寸
 - 输出帧率：原视频帧率
 
@@ -50,7 +51,7 @@ uv run designtoolkit video-to-frames .\demo.mp4 --frames 120 --overwrite
 
 参数说明：
 
-- `video_path`：输入视频文件路径，支持 FFmpeg 可解码的常见格式，例如 `mp4`、`mov`、`m4v`、`avi`、`mkv`
+- `video_path`：输入视频文件路径，支持 FFmpeg 可解码的常见格式，例如 `mp4`、`mov`、`m4v`、`avi`、`mkv`、`webm`
 - `--output-dir PATH`：序列帧保存目录，默认是 `{视频名}_frames`
 - `--format {png,jpg,jpeg}`：输出图片格式，默认 `png`
 - `--size WIDTHxHEIGHT`：输出尺寸，例如 `1920x1080`
