@@ -127,6 +127,23 @@ def export_video_frames(
     )
 
     result = backend.run(command)
+    if result.returncode != 0 and _should_retry_with_automatic_decoder(
+        input_path=input_path,
+        image_format=image_format,
+        result=result,
+    ):
+        fallback_command = _build_ffmpeg_command(
+            ffmpeg_exe=ffmpeg_exe,
+            options=options,
+            input_path=input_path,
+            output_pattern=output_pattern,
+            effective_fps=effective_fps,
+            image_format=image_format,
+            use_input_decoder_args=False,
+        )
+        result = backend.run(fallback_command)
+        command = fallback_command
+
     if result.returncode != 0:
         detail = f": {result.stderr.strip()}" if result.stderr.strip() else ""
         raise VideoFrameError(
@@ -200,6 +217,22 @@ def _input_decoder_args(*, input_path: Path, image_format: str) -> list[str]:
     return []
 
 
+def _should_retry_with_automatic_decoder(
+    *,
+    input_path: Path,
+    image_format: str,
+    result: BackendResult,
+) -> bool:
+    if not _input_decoder_args(input_path=input_path, image_format=image_format):
+        return False
+
+    stderr = result.stderr.lower()
+    return (
+        "libvpx-vp9" in stderr
+        and "bitstream not supported by this decoder" in stderr
+    )
+
+
 def _build_ffmpeg_command(
     *,
     ffmpeg_exe: str,
@@ -208,15 +241,17 @@ def _build_ffmpeg_command(
     output_pattern: Path,
     effective_fps: float | None,
     image_format: str,
+    use_input_decoder_args: bool = True,
 ) -> list[str]:
     command = [
         ffmpeg_exe,
         "-hide_banner",
         "-y" if options.overwrite else "-n",
     ]
-    command.extend(
-        _input_decoder_args(input_path=input_path, image_format=image_format)
-    )
+    if use_input_decoder_args:
+        command.extend(
+            _input_decoder_args(input_path=input_path, image_format=image_format)
+        )
     command.extend(
         [
             "-i",

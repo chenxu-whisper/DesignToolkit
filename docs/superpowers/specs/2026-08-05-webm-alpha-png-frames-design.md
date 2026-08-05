@@ -24,19 +24,20 @@ Current `video-to-frames` can export `assets/video/test.webm`, but the first exp
 
 Keep the CLI and public Python dataclasses stable. Adjust only FFmpeg command construction in `src/designtoolkit/video_frames/core.py`.
 
-When `image_format == "png"` and `input_path.suffix.lower() == ".webm"`, insert these input decoder arguments before `-i`:
+When `image_format == "png"` and `input_path.suffix.lower() == ".webm"`, first try these input decoder arguments before `-i`:
 
 ```text
 -c:v libvpx-vp9
 ```
 
-This makes FFmpeg use the WebM VP9 decoder path that exposes the alpha layer before PNG encoding. Non-PNG exports and non-WebM inputs use the existing command shape.
+This makes FFmpeg use the WebM VP9 decoder path that exposes the alpha layer before PNG encoding. If FFmpeg reports that `libvpx-vp9` does not support the bitstream, retry once without explicit input decoder arguments so non-VP9 WebM files continue to use FFmpeg's automatic decoder selection. Non-PNG exports and non-WebM inputs use the existing command shape.
 
 ## Components
 
 - `src/designtoolkit/video_frames/core.py`
   - Add a small helper that returns extra input decoder arguments for alpha-capable WebM-to-PNG export.
   - Call the helper while building the FFmpeg command, before `-i`.
+  - Retry with automatic decoder selection only when `libvpx-vp9` reports that the bitstream is unsupported.
   - Keep filter composition behavior unchanged.
 
 - `tests/test_video_frames.py`
@@ -54,12 +55,14 @@ This makes FFmpeg use the WebM VP9 decoder path that exposes the alpha layer bef
 2. `export_video_frames` normalizes the image format and prepares the output directory.
 3. `_build_ffmpeg_command` adds WebM alpha decoder arguments only for PNG output.
 4. FFmpeg decodes the WebM alpha layer and writes PNG frames.
-5. Tests decode an exported PNG frame as RGBA raw video and assert alpha includes transparent and opaque values.
+5. If `libvpx-vp9` explicitly rejects the bitstream, `export_video_frames` rebuilds the command without decoder arguments and runs it once with automatic decoder selection.
+6. Tests decode an exported PNG frame as RGBA raw video and assert alpha includes transparent and opaque values.
 
 ## Error Handling
 
 - If bundled FFmpeg lacks `libvpx-vp9`, the existing backend failure path returns a `VideoFrameError` with exit code `1`.
-- If the input WebM is not compatible with the decoder, FFmpeg returns a non-zero code and the existing `FFmpeg failed with exit code ...` message is preserved.
+- If the input WebM is not compatible with `libvpx-vp9`, and stderr says the bitstream is not supported by that decoder, retry with FFmpeg's automatic decoder selection.
+- If the retry fails, or the first failure is unrelated to `libvpx-vp9` bitstream support, the existing `FFmpeg failed with exit code ...` message is preserved.
 - No new CLI validation errors are added.
 
 ## Testing Strategy
@@ -67,13 +70,14 @@ This makes FFmpeg use the WebM VP9 decoder path that exposes the alpha layer bef
 - Unit test: `.webm` input plus PNG output includes `-c:v libvpx-vp9` before `-i`.
 - Unit test: `.webm` input plus JPG output does not include `-c:v libvpx-vp9`.
 - Integration test: export one frame from `assets/video/test.webm` to PNG with real bundled FFmpeg and verify decoded alpha extrema are `(0, 255)`.
+- Integration regression test: generate a tiny VP8 WebM with bundled FFmpeg and verify PNG frame export succeeds by retrying with automatic decoder selection.
 - Regression commands:
 
 ```powershell
-uv run python -m pytest tests/test_video_frames.py
-uv run python -m pytest
-uv run python -m ruff check .
-uv run python -m compileall src tests
+.\.venv\Scripts\python.exe -m pytest tests/test_video_frames.py
+.\.venv\Scripts\python.exe -m pytest
+.\.venv\Scripts\ruff.exe check .
+.\.venv\Scripts\python.exe -m compileall src tests
 ```
 
 ## Non-Goals

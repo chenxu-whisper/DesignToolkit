@@ -216,6 +216,53 @@ def test_export_transparent_webm_to_png_preserves_alpha(tmp_path: Path) -> None:
     assert png_alpha_extrema(ffmpeg_exe, frame_path) == (0, 255)
 
 
+def test_export_vp8_webm_to_png_falls_back_to_automatic_decoder(
+    tmp_path: Path,
+) -> None:
+    backend = FfmpegBackend()
+    ffmpeg_exe = backend.get_ffmpeg_exe()
+    video_path = tmp_path / "vp8.webm"
+    output_dir = tmp_path / "frames"
+
+    created = subprocess.run(
+        [
+            ffmpeg_exe,
+            "-hide_banner",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=16x16:rate=1",
+            "-t",
+            "1",
+            "-c:v",
+            "libvpx",
+            "-pix_fmt",
+            "yuv420p",
+            str(video_path),
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    assert created.returncode == 0, created.stderr
+
+    result = export_video_frames(
+        VideoFrameOptions(
+            input_path=video_path,
+            output_dir=output_dir,
+            fps=1.0,
+        ),
+        backend,
+    )
+
+    assert (output_dir / "vp8_000001.png").is_file()
+    assert "-c:v" not in result.command
+    assert "libvpx-vp9" not in result.command
+
+
 def test_export_uses_fps_and_size_filters(tmp_path: Path) -> None:
     video_path = create_video(tmp_path / "demo.mp4")
     backend = FakeBackend()
