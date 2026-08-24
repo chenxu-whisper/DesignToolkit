@@ -24,6 +24,7 @@ from designtoolkit.video_frames import (
 Exporter = Callable[[VideoFrameOptions, FrameExportBackend], ExportResult]
 MediaResizer = Callable[[MediaResizeOptions, ResizeBackend], MediaResizeResult]
 BackendFactory = Callable[[], FrameExportBackend | ResizeBackend]
+WebRunner = Callable[[str, int], int]
 
 
 def main(
@@ -32,6 +33,7 @@ def main(
     exporter: Exporter = export_video_frames,
     media_resizer: MediaResizer = resize_media,
     backend_factory: BackendFactory | None = None,
+    web_runner: WebRunner | None = None,
 ) -> int:
     parser = _build_parser()
     try:
@@ -65,6 +67,14 @@ def main(
         print(f"Resized media to {result.output_path}")
         return 0
 
+    if args.command == "web":
+        runner = web_runner
+        if runner is None:
+            from designtoolkit.web.server import run_web_server
+
+            runner = run_web_server
+        return runner(args.host, args.port)
+
     raise AssertionError(f"Unhandled command: {args.command}")
 
 
@@ -96,6 +106,13 @@ def _build_parser() -> argparse.ArgumentParser:
     resize_media_parser.add_argument("input_path", type=Path)
     resize_media_parser.add_argument("size", type=_parse_size_argument)
     resize_media_parser.add_argument("output_path", nargs="?", type=Path)
+
+    web_parser = subparsers.add_parser(
+        "web",
+        help="Start the local Web GUI.",
+    )
+    web_parser.add_argument("--host", default="127.0.0.1")
+    web_parser.add_argument("--port", default=8765, type=int)
 
     return parser
 

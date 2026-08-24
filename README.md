@@ -21,7 +21,7 @@ uv sync --link-mode=copy
 uv run designtoolkit
 ```
 
-## 视频转序列帧
+### 视频转序列帧
 
 默认导出：
 
@@ -61,7 +61,7 @@ uv run designtoolkit video-to-frames .\demo.mp4 --frames 120 --overwrite
 
 `--fps` 和 `--frames` 不能同时使用。
 
-## 修改视频或图片尺寸
+### 修改视频或图片尺寸
 
 默认导出到源文件同级目录：
 
@@ -90,6 +90,33 @@ uv run designtoolkit resize-media .\photo.jpg 800x600 .\small.jpg
 - `output_path`：可选，生成文件保存路径
 
 `800x600` 表示输出宽度不超过 `800` 且输出高度不超过 `600`。工具不会强制拉伸图片或视频到固定宽高。
+
+## Web GUI
+
+启动 Web 图形界面：
+
+```powershell
+uv run designtoolkit web
+```
+
+默认访问地址：http://127.0.0.1:8765
+
+支持功能：
+
+- 视频转 PNG/JPG/JPEG 序列帧
+- 路径字段支持通过文件夹按钮唤起本机文件/目录选择器，并会记住上一次选择目录；不可用时会回退到内联编辑器手动填写本地路径
+- 视频转帧支持在输入路径中按行填写多个视频，任务会按顺序逐个处理；填写输出目录时会作为批量输出根目录使用
+- 视频或图片尺寸修改；输入路径支持按行填写多个媒体文件，批量任务会逐个处理并自动生成 `_resized` 输出路径
+- 实时任务状态追踪
+- 任务执行日志实时查看（SSE 推送），包含单个素材和任务总耗时
+
+前端开发（热重载模式，端口 5173）：
+
+```powershell
+cd web/frontend
+npm install
+npm run dev
+```
 
 ## 验证
 

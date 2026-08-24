@@ -28,6 +28,11 @@ __pycache__/
 *.py[cod]
 node_modules/
 
+# Playwright
+web/frontend/test-results/
+web/frontend/playwright-report/
+web/frontend/playwright/.cache/
+
 # Build outputs
 build/
 dist/

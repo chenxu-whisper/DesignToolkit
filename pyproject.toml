@@ -5,7 +5,9 @@ description = "A uv-managed CLI application for design tooling."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "fastapi>=0.116.0",
     "imageio-ffmpeg>=0.6.0",
+    "uvicorn>=0.35.0",
 ]
 
 [project.scripts]
@@ -13,6 +15,7 @@ designtoolkit = "designtoolkit.main:main"
 
 [dependency-groups]
 dev = [
+  "httpx>=0.28.0",
   "pytest>=8.4.1",
   "ruff>=0.12.0",
 ]
