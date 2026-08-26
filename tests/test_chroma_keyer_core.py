@@ -115,6 +115,7 @@ def test_read_rgb_image_accepts_supported_suffixes_case_insensitively(
         ("source.jpeg", "JPEG"),
         ("upper.PNG", "PNG"),
         ("upper.JPG", "JPEG"),
+        ("upper.JPEG", "JPEG"),
     ):
         path = tmp_path / filename
         Image.new("RGB", (1, 1), (12, 34, 56)).save(path, format=image_format)
