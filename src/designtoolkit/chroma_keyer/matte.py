@@ -23,9 +23,11 @@ def generate_alpha(
 ) -> np.ndarray:
     """Generate an opaque-foreground alpha matte from RGB distance."""
     rgb = _validate_rgb(rgb)
-    normalized_rgb = rgb.astype(np.float32) / 255.0
-    mean_rgb = np.asarray(model.mean_rgb, dtype=np.float32) / 255.0
-    distance = np.linalg.norm(normalized_rgb - mean_rgb, axis=2)
+    rgb_float = rgb.astype(np.float32)
+    mean_rgb = np.asarray(model.mean_rgb, dtype=np.float32)
+    distance = np.linalg.norm(rgb_float - mean_rgb, axis=2) / (
+        255.0 * np.sqrt(3.0)
+    )
 
     variance = float(np.mean(model.stddev_rgb)) / 255.0
     lower = float(np.clip(params.tolerance + variance, 0.0, 1.0))

@@ -33,6 +33,21 @@ def test_generate_alpha_softness_produces_intermediate_alpha() -> None:
     assert 0 < alpha[0, 0] < 255
 
 
+def test_generate_alpha_normalizes_rgb_distance_to_a_maximum_of_one() -> None:
+    rgb = np.array([[[133, 0, 0]]], dtype=np.uint8)
+    model = ScreenColorModel(
+        mean_rgb=(0.0, 0.0, 0.0),
+        stddev_rgb=(0.0, 0.0, 0.0),
+        samples=((0, 0, 0),),
+    )
+
+    alpha = generate_alpha(
+        rgb, model, KeyerParams(tolerance=0.25, softness=0.15)
+    )
+
+    assert alpha[0, 0] == 69
+
+
 @mark.parametrize(
     "rgb",
     [

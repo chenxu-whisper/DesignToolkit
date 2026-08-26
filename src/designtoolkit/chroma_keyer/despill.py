@@ -39,7 +39,7 @@ def _dominant_screen_channel(model: ScreenColorModel) -> int | None:
     for channel in range(3):
         others = np.delete(mean_rgb, channel)
         if mean_rgb[channel] - np.max(others) >= threshold:
-            return channel
+            return channel if channel in (1, 2) else None
     return None
 
 
@@ -58,12 +58,8 @@ def despill(
 
     dominant_channel = _dominant_screen_channel(model)
     if dominant_channel is None:
-        luminance = (
-            0.299 * rgb_float[..., 0]
-            + 0.587 * rgb_float[..., 1]
-            + 0.114 * rgb_float[..., 2]
-        )
-        result += effect[..., None] * (luminance[..., None] - result)
+        neutral_luminance = float(np.mean(model.mean_rgb))
+        result += effect[..., None] * (neutral_luminance - result)
     else:
         other_channels = [
             channel for channel in range(3) if channel != dominant_channel
