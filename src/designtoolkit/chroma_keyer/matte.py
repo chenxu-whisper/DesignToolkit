@@ -15,6 +15,8 @@ def _validate_rgb(rgb: object) -> np.ndarray:
 def _validate_alpha(alpha: object) -> np.ndarray:
     if not isinstance(alpha, np.ndarray) or alpha.dtype != np.uint8 or alpha.ndim != 2:
         raise KeyerError("alpha must be a uint8 HxW array")
+    if alpha.size == 0:
+        raise KeyerError("alpha must be a non-empty uint8 HxW array")
     return alpha
 
 

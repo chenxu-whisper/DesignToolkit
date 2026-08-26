@@ -81,6 +81,17 @@ def test_refine_alpha_rejects_invalid_alpha_shape_or_dtype(alpha: np.ndarray) ->
         refine_alpha(alpha, KeyerParams())
 
 
+def test_refine_alpha_rejects_empty_alpha_for_morphology_and_feather() -> None:
+    with raises(KeyerError):
+        refine_alpha(np.empty((0, 0), dtype=np.uint8), KeyerParams(shrink_grow=1))
+
+    with raises(KeyerError):
+        refine_alpha(np.empty((0, 0), dtype=np.uint8), KeyerParams(shrink_grow=-1))
+
+    with raises(KeyerError):
+        refine_alpha(np.empty((0, 0), dtype=np.uint8), KeyerParams(feather=1))
+
+
 @mark.parametrize(
     "params",
     [
