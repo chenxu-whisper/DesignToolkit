@@ -16,8 +16,8 @@ def _validate_unit_interval(name: str, value: float) -> None:
 
 
 def _validate_range(name: str, value: int, minimum: int, maximum: int) -> None:
-    if not isinstance(value, Real) or isinstance(value, bool) or not isfinite(value):
-        raise KeyerError(f"{name} must be a finite number")
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise KeyerError(f"{name} must be an integer")
     if not minimum <= value <= maximum:
         raise KeyerError(f"{name} must be between {minimum} and {maximum}")
 

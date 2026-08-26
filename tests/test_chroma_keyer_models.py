@@ -40,6 +40,12 @@ def test_params_accept_default_mvp_values() -> None:
     )
 
 
+@mark.parametrize(("field", "value"), [("shrink_grow", 0.5), ("feather", 0.5)])
+def test_params_reject_fractional_integer_fields(field: str, value: float) -> None:
+    with raises(KeyerError):
+        KeyerParams(**{field: value})
+
+
 @mark.parametrize(
     ("field", "value"),
     [
