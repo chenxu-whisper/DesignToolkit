@@ -1,5 +1,5 @@
 from io import BytesIO
-from os import replace
+from os import link
 from os.path import normcase
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -18,6 +18,8 @@ def _validate_rgb(rgb: object) -> np.ndarray:
         or rgb.dtype != np.uint8
         or rgb.ndim != 3
         or rgb.shape[2] != 3
+        or rgb.shape[0] <= 0
+        or rgb.shape[1] <= 0
     ):
         raise KeyerError("rgb must be a uint8 HxWx3 array")
     return rgb
@@ -95,7 +97,9 @@ def write_rgba_png(output_path: Path, rgb: np.ndarray, alpha: np.ndarray) -> Non
         ) as temporary:
             temporary_path = Path(temporary.name)
             Image.fromarray(rgba, mode="RGBA").save(temporary, format="PNG")
-        replace(temporary_path, output_path)
+        link(temporary_path, output_path)
+    except FileExistsError as error:
+        raise KeyerError("Output path already exists") from error
     except OSError as error:
         raise KeyerError("Output image could not be written") from error
     finally:

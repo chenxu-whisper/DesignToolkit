@@ -172,7 +172,7 @@ def test_make_preview_png_constrains_size_preserves_aspect_and_never_upscales() 
         assert image.size == (400, 100)
 
 
-def test_make_preview_png_rejects_invalid_limits_and_rgb(tmp_path: Path) -> None:
+def test_make_preview_png_rejects_invalid_limits_and_rgb() -> None:
     rgb = np.zeros((2, 2, 3), dtype=np.uint8)
 
     with raises(KeyerError):
@@ -183,6 +183,15 @@ def test_make_preview_png_rejects_invalid_limits_and_rgb(tmp_path: Path) -> None
         make_preview_png(np.zeros((2, 2, 3), dtype=np.float32))
 
 
+def test_make_preview_png_rejects_empty_rgb_dimensions() -> None:
+    for rgb in (
+        np.zeros((0, 1, 3), dtype=np.uint8),
+        np.zeros((1, 0, 3), dtype=np.uint8),
+    ):
+        with raises(KeyerError, match="^rgb must be a uint8 HxWx3 array$"):
+            make_preview_png(rgb)
+
+
 def test_write_rgba_png_rejects_bad_rgb_or_mismatched_alpha(tmp_path: Path) -> None:
     output_path = tmp_path / "result.png"
     rgb = np.zeros((2, 2, 3), dtype=np.uint8)
@@ -191,6 +200,15 @@ def test_write_rgba_png_rejects_bad_rgb_or_mismatched_alpha(tmp_path: Path) -> N
         write_rgba_png(output_path, rgb.astype(np.float32), np.zeros((2, 2), np.uint8))
     with raises(KeyerError):
         write_rgba_png(output_path, rgb, np.zeros((3, 2), np.uint8))
+
+
+def test_write_rgba_png_rejects_empty_rgb_dimensions(tmp_path: Path) -> None:
+    for rgb, alpha in (
+        (np.zeros((0, 1, 3), dtype=np.uint8), np.zeros((0, 1), dtype=np.uint8)),
+        (np.zeros((1, 0, 3), dtype=np.uint8), np.zeros((1, 0), dtype=np.uint8)),
+    ):
+        with raises(KeyerError, match="^rgb must be a uint8 HxWx3 array$"):
+            write_rgba_png(tmp_path / "result.png", rgb, alpha)
 
 
 def test_write_rgba_png_rejects_existing_output_and_accepts_uppercase_png(
@@ -212,22 +230,25 @@ def test_write_rgba_png_rejects_existing_output_and_accepts_uppercase_png(
         assert image.mode == "RGBA"
 
 
-def test_write_rgba_png_removes_temporary_file_when_replace_fails(
+def test_write_rgba_png_preserves_racing_destination_and_removes_temporary_file(
     tmp_path: Path, monkeypatch
 ) -> None:
     output_path = tmp_path / "result.png"
     rgb = np.zeros((1, 1, 3), dtype=np.uint8)
     alpha = np.full((1, 1), 255, dtype=np.uint8)
+    racing_bytes = b"racing destination bytes"
+    original_link = image_io.link
 
-    def fail_replace(source: Path, destination: Path) -> None:
+    def create_destination_before_link(source: Path, destination: Path) -> None:
         assert source.is_file()
         assert destination == output_path
-        raise OSError("replace failed")
+        destination.write_bytes(racing_bytes)
+        original_link(source, destination)
 
-    monkeypatch.setattr(image_io, "replace", fail_replace)
+    monkeypatch.setattr(image_io, "link", create_destination_before_link)
 
-    with raises(KeyerError, match="^Output image could not be written$"):
+    with raises(KeyerError, match="^Output path already exists$"):
         write_rgba_png(output_path, rgb, alpha)
 
-    assert not output_path.exists()
+    assert output_path.read_bytes() == racing_bytes
     assert not list(tmp_path.glob("tmp*.png"))
