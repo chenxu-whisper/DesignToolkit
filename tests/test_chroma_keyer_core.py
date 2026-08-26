@@ -5,6 +5,7 @@ import numpy as np
 from PIL import Image
 from pytest import raises
 
+from designtoolkit.chroma_keyer import image_io
 from designtoolkit.chroma_keyer.core import key_image
 from designtoolkit.chroma_keyer.image_io import (
     default_output_path,
@@ -105,6 +106,45 @@ def test_read_rgb_image_rejects_unsupported_and_normalizes_rgba(tmp_path: Path) 
     assert rgb.tolist() == [[[12, 34, 56]]]
 
 
+def test_read_rgb_image_accepts_supported_suffixes_case_insensitively(
+    tmp_path: Path,
+) -> None:
+    for filename, image_format in (
+        ("source.png", "PNG"),
+        ("source.jpg", "JPEG"),
+        ("source.jpeg", "JPEG"),
+        ("upper.PNG", "PNG"),
+        ("upper.JPG", "JPEG"),
+    ):
+        path = tmp_path / filename
+        Image.new("RGB", (1, 1), (12, 34, 56)).save(path, format=image_format)
+
+        rgb = read_rgb_image(path)
+
+        assert rgb.dtype == np.uint8
+        assert rgb.shape == (1, 1, 3)
+
+
+def test_read_rgb_image_rejects_missing_directory_corrupt_and_gif_paths(
+    tmp_path: Path,
+) -> None:
+    directory_path = tmp_path / "directory.png"
+    directory_path.mkdir()
+    corrupt_path = tmp_path / "corrupt.JPG"
+    corrupt_path.write_bytes(b"not an image")
+    gif_path = tmp_path / "screen.gif"
+    Image.new("RGB", (1, 1), (42, 180, 72)).save(gif_path, format="GIF")
+
+    for path in (
+        tmp_path / "missing.png",
+        directory_path,
+        corrupt_path,
+        gif_path,
+    ):
+        with raises(KeyerError):
+            read_rgb_image(path)
+
+
 def test_output_path_must_be_new_png_in_an_existing_parent(tmp_path: Path) -> None:
     input_path = tmp_path / "screen.png"
     _save_rgb(input_path, np.array([[[42, 180, 72]]], dtype=np.uint8))
@@ -150,3 +190,43 @@ def test_write_rgba_png_rejects_bad_rgb_or_mismatched_alpha(tmp_path: Path) -> N
         write_rgba_png(output_path, rgb.astype(np.float32), np.zeros((2, 2), np.uint8))
     with raises(KeyerError):
         write_rgba_png(output_path, rgb, np.zeros((3, 2), np.uint8))
+
+
+def test_write_rgba_png_rejects_existing_output_and_accepts_uppercase_png(
+    tmp_path: Path,
+) -> None:
+    rgb = np.zeros((1, 1, 3), dtype=np.uint8)
+    alpha = np.full((1, 1), 255, dtype=np.uint8)
+    existing_path = tmp_path / "existing.png"
+    existing_path.write_bytes(b"existing")
+
+    with raises(KeyerError, match="^Output path already exists$"):
+        write_rgba_png(existing_path, rgb, alpha)
+
+    output_path = tmp_path / "result.PNG"
+    write_rgba_png(output_path, rgb, alpha)
+
+    assert output_path.is_file()
+    with Image.open(output_path) as image:
+        assert image.mode == "RGBA"
+
+
+def test_write_rgba_png_removes_temporary_file_when_replace_fails(
+    tmp_path: Path, monkeypatch
+) -> None:
+    output_path = tmp_path / "result.png"
+    rgb = np.zeros((1, 1, 3), dtype=np.uint8)
+    alpha = np.full((1, 1), 255, dtype=np.uint8)
+
+    def fail_replace(source: Path, destination: Path) -> None:
+        assert source.is_file()
+        assert destination == output_path
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(image_io, "replace", fail_replace)
+
+    with raises(KeyerError, match="^Output image could not be written$"):
+        write_rgba_png(output_path, rgb, alpha)
+
+    assert not output_path.exists()
+    assert not list(tmp_path.glob("tmp*.png"))
