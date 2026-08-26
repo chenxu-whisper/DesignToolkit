@@ -51,7 +51,7 @@ def screen_model_from_samples(samples: object) -> ScreenColorModel:
         stddev_rgb=(0.0, 0.0, 0.0),
         samples=samples,  # type: ignore[arg-type]
     )
-    rgb_samples = np.asarray(validated_model.samples, dtype=np.float64)
+    rgb_samples = np.asarray(validated_model.samples, dtype=np.float32)
     mean_rgb = tuple(float(value) for value in rgb_samples.mean(axis=0))
     stddev_rgb = tuple(float(value) for value in rgb_samples.std(axis=0))
 

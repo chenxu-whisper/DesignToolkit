@@ -1,7 +1,9 @@
 from math import inf, nan
 
+import numpy as np
 from pytest import mark, raises
 
+from designtoolkit.chroma_keyer import sampling
 from designtoolkit.chroma_keyer.models import KeyerError
 from designtoolkit.chroma_keyer.sampling import (
     map_preview_point,
@@ -49,6 +51,21 @@ def test_screen_model_from_samples_calculates_two_sample_statistics() -> None:
     assert model.mean_rgb == (20.0, 30.0, 40.0)
     assert model.stddev_rgb == (10.0, 10.0, 10.0)
     assert model.samples == ((10, 20, 30), (30, 40, 50))
+
+
+def test_screen_model_from_samples_aggregates_as_float32(monkeypatch: object) -> None:
+    observed_dtypes: list[object] = []
+    original_asarray = np.asarray
+
+    def observe_asarray(*args: object, **kwargs: object) -> np.ndarray:
+        observed_dtypes.append(kwargs["dtype"])
+        return original_asarray(*args, **kwargs)
+
+    monkeypatch.setattr(sampling.np, "asarray", observe_asarray)  # type: ignore[attr-defined]
+
+    screen_model_from_samples(((10, 20, 30),))
+
+    assert observed_dtypes == [np.float32]
 
 
 @mark.parametrize("samples", [(), ((0, 0),), ((0, 0, 256),)])
