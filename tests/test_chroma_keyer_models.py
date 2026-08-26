@@ -12,9 +12,20 @@ from designtoolkit.chroma_keyer.models import (
 )
 
 
-def test_params_reject_clip_black_not_below_clip_white() -> None:
-    with raises(KeyerError, match="clip_black must be less than clip_white"):
-        KeyerParams(clip_black=0.8, clip_white=0.8)
+@mark.parametrize(
+    ("clip_black", "clip_white"),
+    [
+        (0.8, 0.7),
+        (0.8, 0.8),
+    ],
+)
+def test_params_reject_clip_black_not_less_than_clip_white(
+    clip_black: float, clip_white: float
+) -> None:
+    with raises(KeyerError) as error:
+        KeyerParams(clip_black=clip_black, clip_white=clip_white)
+
+    assert str(error.value) == "clip_black must be less than clip_white"
 
 
 def test_params_accept_default_mvp_values() -> None:
@@ -78,12 +89,40 @@ def test_params_accept_mandated_range_boundaries() -> None:
 
 
 @mark.parametrize(
+    ("field", "value", "other_values"),
+    [
+        ("tolerance", 0.0, {}),
+        ("tolerance", 1.0, {}),
+        ("softness", 0.0, {}),
+        ("softness", 1.0, {}),
+        ("clip_black", 0.0, {"clip_white": 1.0}),
+        ("clip_white", 1.0, {"clip_black": 0.0}),
+        ("despill_amount", 0.0, {}),
+        ("despill_amount", 1.0, {}),
+        ("shrink_grow", -10, {}),
+        ("shrink_grow", 10, {}),
+        ("feather", 0, {}),
+        ("feather", 10, {}),
+    ],
+)
+def test_params_accept_each_feasible_mandated_boundary(
+    field: str, value: float, other_values: dict[str, float]
+) -> None:
+    params = KeyerParams(**other_values, **{field: value})
+
+    assert getattr(params, field) == value
+
+
+@mark.parametrize(
     ("mean_rgb", "stddev_rgb", "samples"),
     [
         ((0.0, 0.0), (0.0, 0.0, 0.0), ((0, 0, 0),)),
         ((0.0, 0.0, 0.0), (0.0, 0.0), ((0, 0, 0),)),
         ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0), ()),
         ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0), ((0, 0),)),
+        ((0.0, 0.0, 0.0, 0.0), (0.0, 0.0, 0.0), ((0, 0, 0),)),
+        ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 0.0), ((0, 0, 0),)),
+        ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0), ((0, 0, 0, 0),)),
     ],
 )
 def test_screen_color_model_rejects_invalid_channel_structure(
@@ -120,6 +159,16 @@ def test_screen_color_model_rejects_non_finite_statistics(value: float) -> None:
         ScreenColorModel(
             mean_rgb=(value, 0.0, 0.0),
             stddev_rgb=(0.0, 0.0, 0.0),
+            samples=((0, 0, 0),),
+        )
+
+
+@mark.parametrize("value", [nan, inf, -inf])
+def test_screen_color_model_rejects_non_finite_stddev_rgb(value: float) -> None:
+    with raises(KeyerError):
+        ScreenColorModel(
+            mean_rgb=(0.0, 0.0, 0.0),
+            stddev_rgb=(value, 0.0, 0.0),
             samples=((0, 0, 0),),
         )
 
