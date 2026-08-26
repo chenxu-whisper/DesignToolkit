@@ -187,6 +187,44 @@ def test_screen_color_model_accepts_valid_rgb_data() -> None:
     ).samples == ((0, 128, 255),)
 
 
+def test_screen_color_model_normalizes_mutable_sequences() -> None:
+    mean_rgb = [0.1, 0.2, 0.3]
+    stddev_rgb = [0.01, 0.02, 0.03]
+    samples = [[0, 128, 255]]
+
+    model = ScreenColorModel(
+        mean_rgb=mean_rgb,
+        stddev_rgb=stddev_rgb,
+        samples=samples,
+    )
+    mean_rgb[0] = 1.0
+    stddev_rgb[0] = 1.0
+    samples[0][0] = 255
+
+    assert model.mean_rgb == (0.1, 0.2, 0.3)
+    assert model.stddev_rgb == (0.01, 0.02, 0.03)
+    assert model.samples == ((0, 128, 255),)
+    assert hash(model)
+
+
+@mark.parametrize("field", ["mean_rgb", "stddev_rgb"])
+@mark.parametrize("value", [None, []])
+def test_screen_color_model_rejects_invalid_statistic_outer_containers(
+    field: str, value: object
+) -> None:
+    arguments: dict[str, object] = {
+        "mean_rgb": (0.0, 0.0, 0.0),
+        "stddev_rgb": (0.0, 0.0, 0.0),
+        "samples": ((0, 0, 0),),
+    }
+    arguments[field] = value
+
+    with raises(KeyerError) as error:
+        ScreenColorModel(**arguments)
+
+    assert str(error.value) == f"{field} must be a sequence of three values"
+
+
 def test_key_image_contracts_preserve_paths() -> None:
     input_path = Path("input.png")
     output_path = Path("output.png")

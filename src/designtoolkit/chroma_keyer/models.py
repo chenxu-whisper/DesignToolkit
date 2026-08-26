@@ -1,3 +1,4 @@
+from collections.abc import Sequence
 from dataclasses import dataclass
 from math import isfinite
 from numbers import Real
@@ -22,9 +23,13 @@ def _validate_range(name: str, value: int, minimum: int, maximum: int) -> None:
         raise KeyerError(f"{name} must be between {minimum} and {maximum}")
 
 
-def _validate_rgb_statistics(name: str, values: tuple[float, float, float]) -> None:
+def _normalize_rgb_statistics(
+    name: str, values: object
+) -> tuple[float, float, float]:
+    if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
+        raise KeyerError(f"{name} must be a sequence of three values")
     if len(values) != 3:
-        raise KeyerError(f"{name} must contain exactly three values")
+        raise KeyerError(f"{name} must be a sequence of three values")
     for value in values:
         if (
             not isinstance(value, Real)
@@ -32,6 +37,32 @@ def _validate_rgb_statistics(name: str, values: tuple[float, float, float]) -> N
             or not isfinite(value)
         ):
             raise KeyerError(f"{name} values must be finite numbers")
+    return tuple(float(value) for value in values)  # type: ignore[return-value]
+
+
+def _normalize_samples(values: object) -> tuple[tuple[int, int, int], ...]:
+    if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
+        raise KeyerError("samples must be a sequence of samples")
+    if not values:
+        raise KeyerError("samples must not be empty")
+
+    samples = []
+    for sample in values:
+        if not isinstance(sample, Sequence) or isinstance(sample, (str, bytes)):
+            raise KeyerError("each sample must contain exactly three channels")
+        if len(sample) != 3:
+            raise KeyerError("each sample must contain exactly three channels")
+        for channel in sample:
+            if (
+                not isinstance(channel, int)
+                or isinstance(channel, bool)
+                or not 0 <= channel <= 255
+            ):
+                raise KeyerError(
+                    "sample channels must be integers between 0 and 255"
+                )
+        samples.append(tuple(sample))
+    return tuple(samples)  # type: ignore[return-value]
 
 
 @dataclass(frozen=True)
@@ -63,22 +94,15 @@ class ScreenColorModel:
     samples: tuple[tuple[int, int, int], ...]
 
     def __post_init__(self) -> None:
-        _validate_rgb_statistics("mean_rgb", self.mean_rgb)
-        _validate_rgb_statistics("stddev_rgb", self.stddev_rgb)
-        if not self.samples:
-            raise KeyerError("samples must not be empty")
-        for sample in self.samples:
-            if len(sample) != 3:
-                raise KeyerError("each sample must contain exactly three channels")
-            for channel in sample:
-                if (
-                    not isinstance(channel, int)
-                    or isinstance(channel, bool)
-                    or not 0 <= channel <= 255
-                ):
-                    raise KeyerError(
-                        "sample channels must be integers between 0 and 255"
-                    )
+        object.__setattr__(
+            self, "mean_rgb", _normalize_rgb_statistics("mean_rgb", self.mean_rgb)
+        )
+        object.__setattr__(
+            self,
+            "stddev_rgb",
+            _normalize_rgb_statistics("stddev_rgb", self.stddev_rgb),
+        )
+        object.__setattr__(self, "samples", _normalize_samples(self.samples))
 
 
 @dataclass(frozen=True)
