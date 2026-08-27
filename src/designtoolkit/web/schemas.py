@@ -142,7 +142,7 @@ class ChromaKeyerTaskRequest(BaseModel):
 
 class ChromaPreviewRequest(BaseModel):
     input_path: str
-    samples: list[list[RgbChannel]]
+    samples: list[list[RgbChannel]] = Field(default_factory=list)
     params: ChromaKeyerParams = Field(default_factory=ChromaKeyerParams)
     view_mode: ChromaViewMode = ChromaViewMode.FINAL
 

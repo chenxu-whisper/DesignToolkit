@@ -320,6 +320,7 @@ def create_router(
 
         try:
             input_path = Path(request.input_path)
+            rgb = read_rgb_image(input_path)
             params_data = request.params.model_dump(mode="json")
             cache_key = _chroma_preview_cache_key(
                 "generated",
@@ -330,7 +331,6 @@ def create_router(
             )
 
             def create_preview_png() -> bytes:
-                rgb = read_rgb_image(input_path)
                 params = KeyerParams(**params_data)
                 alpha = refine_alpha(generate_alpha(rgb, model, params), params)
                 if request.view_mode is ChromaViewMode.FINAL:

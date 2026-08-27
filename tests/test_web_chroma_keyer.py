@@ -119,17 +119,20 @@ def test_inspect_succeeds_when_eviction_interleaves_after_cache_insertion(
 ) -> None:
     input_path = tmp_path / "input.png"
     _write_input_image(input_path)
-    original_get_or_put = ChromaPreviewStore.get_or_put
+    original_get_or_put_entry = ChromaPreviewStore.get_or_put_entry
+    calls = 0
 
     def evict_after_cache_insertion(store, cache_key, create_png_bytes):
-        preview_id = original_get_or_put(store, cache_key, create_png_bytes)
+        nonlocal calls
+        calls += 1
+        preview_entry = original_get_or_put_entry(store, cache_key, create_png_bytes)
         for index in range(32):
             store.put(f"eviction-{index}".encode())
-        return preview_id
+        return preview_entry
 
     monkeypatch.setattr(
         ChromaPreviewStore,
-        "get_or_put",
+        "get_or_put_entry",
         evict_after_cache_insertion,
     )
     client = TestClient(
@@ -143,6 +146,7 @@ def test_inspect_succeeds_when_eviction_interleaves_after_cache_insertion(
     )
 
     assert response.status_code == 200
+    assert calls == 1
 
 
 def test_inspect_preview_reuses_file_fingerprint_and_changes_after_source_update(
@@ -333,25 +337,33 @@ def test_singular_and_plural_preview_routes_share_the_request_cache(
     )
 
 
-def test_preview_rejects_empty_samples_for_a_valid_image(tmp_path: Path) -> None:
+@mark.parametrize("url", ["/api/chroma-keyer/preview", "/api/chroma-keyer/previews"])
+@mark.parametrize("samples", [None, []])
+def test_preview_rejects_missing_or_empty_samples_for_a_valid_image(
+    tmp_path: Path,
+    url: str,
+    samples: list[list[int]] | None,
+) -> None:
     input_path = tmp_path / "input.png"
     _write_input_image(input_path)
+    payload: dict[str, object] = {
+        "input_path": str(input_path),
+        "params": {
+            "tolerance": 0.25,
+            "softness": 0.15,
+            "clip_black": 0.0,
+            "clip_white": 1.0,
+            "shrink_grow": 0,
+            "feather": 0,
+            "despill_amount": 0.5,
+        },
+    }
+    if samples is not None:
+        payload["samples"] = samples
 
     response = _client(tmp_path).post(
-        "/api/chroma-keyer/previews",
-        json={
-            "input_path": str(input_path),
-            "samples": [],
-            "params": {
-                "tolerance": 0.25,
-                "softness": 0.15,
-                "clip_black": 0.0,
-                "clip_white": 1.0,
-                "shrink_grow": 0,
-                "feather": 0,
-                "despill_amount": 0.5,
-            },
-        },
+        url,
+        json=payload,
     )
 
     assert response.status_code == 400
@@ -442,6 +454,50 @@ def test_chroma_decoder_failures_return_invalid_image(
 @mark.parametrize(
     ("url", "payload"),
     [
+        ("/api/chroma-keyer/images/inspect", {}),
+        (
+            "/api/chroma-keyer/images/sample",
+            {
+                "x": 0,
+                "y": 0,
+                "preview_width": 1,
+                "preview_height": 1,
+            },
+        ),
+        (
+            "/api/chroma-keyer/preview",
+            {
+                "samples": [[42, 180, 72]],
+            },
+        ),
+        (
+            "/api/chroma-keyer/previews",
+            {
+                "samples": [[42, 180, 72]],
+            },
+        ),
+    ],
+)
+def test_missing_chroma_source_returns_invalid_request(
+    tmp_path: Path,
+    url: str,
+    payload: dict[str, object],
+) -> None:
+    response = _client(tmp_path).post(
+        url,
+        json={
+            "input_path": str(tmp_path / "missing.png"),
+            **payload,
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_request"
+
+
+@mark.parametrize(
+    ("url", "payload"),
+    [
         ("/api/chroma-keyer/images/inspect", {"input_path": "   "}),
         (
             "/api/chroma-keyer/images/sample",
@@ -453,7 +509,13 @@ def test_chroma_decoder_failures_return_invalid_image(
                 "preview_height": 1,
             },
         ),
-        ("/api/chroma-keyer/previews", {"input_path": "missing.png"}),
+        (
+            "/api/chroma-keyer/previews",
+            {
+                "input_path": "missing.png",
+                "samples": [[42, 180, 72]],
+            },
+        ),
     ],
 )
 def test_invalid_chroma_requests_return_structured_bad_request(
