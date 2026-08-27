@@ -59,6 +59,10 @@ _INVALID_REQUEST_ERRORS = (ValueError, VideoFrameError, MediaResizeError)
 _TERMINAL_STATUSES = (TaskStatus.SUCCEEDED, TaskStatus.FAILED)
 _TERMINAL_LEVELS = (LogLevel.SUCCESS, LogLevel.ERROR)
 _TERMINAL_PHASES = (LogPhase.COMPLETED, LogPhase.FAILED)
+_KEYER_ERROR_CODES = {
+    "Input image could not be read": "invalid_image",
+    "samples must not be empty": "missing_samples",
+}
 
 
 class ApiError(Exception):
@@ -75,6 +79,14 @@ def error_response(exc: ApiError) -> JSONResponse:
         content=ErrorResponse(
             error={"code": exc.code, "message": exc.message},
         ).model_dump(mode="json"),
+    )
+
+
+def _chroma_keyer_error_response(exc: KeyerError) -> ApiError:
+    return ApiError(
+        _KEYER_ERROR_CODES.get(str(exc), "invalid_request"),
+        str(exc),
+        400,
     )
 
 
@@ -251,7 +263,7 @@ def create_router(
                 lambda: make_preview_png(rgb),
             )
         except KeyerError as exc:
-            raise ApiError("invalid_request", str(exc), 400) from exc
+            raise _chroma_keyer_error_response(exc) from exc
 
         preview_png = chroma_preview_store.get(preview_id)
         if preview_png is None:
@@ -275,6 +287,10 @@ def create_router(
     def sample_chroma_image(request: ChromaSampleRequest) -> ChromaSampleResponse:
         try:
             rgb = read_rgb_image(Path(request.input_path))
+        except KeyerError as exc:
+            raise _chroma_keyer_error_response(exc) from exc
+
+        try:
             height, width = rgb.shape[:2]
             source_x, source_y = map_preview_point(
                 request.x,
@@ -285,7 +301,7 @@ def create_router(
                 height,
             )
         except KeyerError as exc:
-            raise ApiError("invalid_request", str(exc), 400) from exc
+            raise ApiError("invalid_sample_coordinates", str(exc), 400) from exc
 
         sampled_rgb = [int(channel) for channel in rgb[source_y, source_x]]
         return ChromaSampleResponse(
@@ -301,6 +317,11 @@ def create_router(
         request: ChromaPreviewRequest,
     ) -> ChromaPreviewResponse:
         try:
+            model = screen_model_from_samples(request.samples)
+        except KeyerError as exc:
+            raise _chroma_keyer_error_response(exc) from exc
+
+        try:
             input_path = Path(request.input_path)
             params_data = request.params.model_dump(mode="json")
             cache_key = _chroma_preview_cache_key(
@@ -313,7 +334,6 @@ def create_router(
 
             def create_preview_png() -> bytes:
                 rgb = read_rgb_image(input_path)
-                model = screen_model_from_samples(request.samples)
                 params = KeyerParams(**params_data)
                 alpha = refine_alpha(generate_alpha(rgb, model, params), params)
                 if request.view_mode is ChromaViewMode.FINAL:
@@ -324,7 +344,7 @@ def create_router(
 
             preview_id = chroma_preview_store.get_or_put(cache_key, create_preview_png)
         except KeyerError as exc:
-            raise ApiError("invalid_request", str(exc), 400) from exc
+            raise _chroma_keyer_error_response(exc) from exc
 
         return ChromaPreviewResponse(preview_url=_chroma_preview_url(preview_id))
 

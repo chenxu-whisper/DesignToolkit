@@ -323,7 +323,7 @@ def test_preview_rejects_empty_samples_for_a_valid_image(tmp_path: Path) -> None
     )
 
     assert response.status_code == 400
-    assert response.json()["error"]["code"] == "invalid_request"
+    assert response.json()["error"]["code"] == "missing_samples"
 
 
 def test_unknown_preview_returns_structured_not_found(tmp_path: Path) -> None:
@@ -333,8 +333,26 @@ def test_unknown_preview_returns_structured_not_found(tmp_path: Path) -> None:
     assert response.json()["error"]["code"] == "preview_not_found"
 
 
-def test_out_of_bounds_sample_coordinates_return_structured_bad_request(
+@mark.parametrize(
+    "payload",
+    [
+        {
+            "x": 2,
+            "y": 0,
+            "preview_width": 2,
+            "preview_height": 1,
+        },
+        {
+            "x": 0,
+            "y": 0,
+            "preview_width": 0,
+            "preview_height": 1,
+        },
+    ],
+)
+def test_invalid_sample_coordinates_return_structured_bad_request(
     tmp_path: Path,
+    payload: dict[str, int],
 ) -> None:
     input_path = tmp_path / "input.png"
     _write_input_image(input_path)
@@ -343,15 +361,50 @@ def test_out_of_bounds_sample_coordinates_return_structured_bad_request(
         "/api/chroma-keyer/images/sample",
         json={
             "input_path": str(input_path),
-            "x": 2,
-            "y": 0,
-            "preview_width": 2,
-            "preview_height": 1,
+            **payload,
         },
     )
 
     assert response.status_code == 400
-    assert response.json()["error"]["code"] == "invalid_request"
+    assert response.json()["error"]["code"] == "invalid_sample_coordinates"
+
+
+@mark.parametrize(
+    ("url", "payload"),
+    [
+        ("/api/chroma-keyer/images/inspect", {}),
+        (
+            "/api/chroma-keyer/images/sample",
+            {
+                "x": 0,
+                "y": 0,
+                "preview_width": 1,
+                "preview_height": 1,
+            },
+        ),
+        (
+            "/api/chroma-keyer/previews",
+            {
+                "samples": [[42, 180, 72]],
+            },
+        ),
+    ],
+)
+def test_chroma_decoder_failures_return_invalid_image(
+    tmp_path: Path,
+    url: str,
+    payload: dict[str, object],
+) -> None:
+    input_path = tmp_path / "corrupt.png"
+    input_path.write_bytes(b"not an image")
+
+    response = _client(tmp_path).post(
+        url,
+        json={"input_path": str(input_path), **payload},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_image"
 
 
 @mark.parametrize(
