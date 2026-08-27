@@ -400,6 +400,83 @@ def test_chroma_keyer_task_endpoint_returns_conflict_until_blocked_task_succeeds
     assert task_manager.get_task(first_task_id).status is TaskStatus.SUCCEEDED
 
 
+def test_chroma_keyer_terminal_event_observes_finished_task_and_free_slot(
+    tmp_path: Path,
+) -> None:
+    input_path = tmp_path / "screen.png"
+    _write_input_image(input_path)
+    keyer_started = Event()
+    release_keyer = Event()
+    log_store = LogStore()
+
+    def blocking_keyer(options, _model, _params) -> KeyImageResult:
+        keyer_started.set()
+        assert release_keyer.wait(timeout=1)
+        return KeyImageResult(output_path=tmp_path / "screen_keyed.png")
+
+    task_manager = TaskManager(
+        log_store=log_store,
+        keyer=blocking_keyer,
+        run_async=True,
+    )
+    first_task = task_manager.create_chroma_keyer_task(
+        ChromaKeyerTaskRequest(
+            input_path=str(input_path),
+            samples=[[42, 180, 72]],
+            params={},
+        )
+    )
+    assert keyer_started.wait(timeout=1)
+
+    class TerminalEventProbe:
+        def __init__(self) -> None:
+            self.delivered = Event()
+            self.status: TaskStatus | None = None
+            self.output_path: str | None = None
+            self.finished_at = None
+            self.error: str | None = None
+            self.event = None
+            self.reserved_task_id: str | None = None
+            self.reservation_error: Exception | None = None
+
+        def put(self, event) -> None:
+            if event.phase is not LogPhase.COMPLETED:
+                return
+            task = task_manager.get_task(first_task.task_id)
+            assert task is not None
+            self.status = task.status
+            self.output_path = task.output_path
+            self.finished_at = task.finished_at
+            self.error = task.error
+            self.event = event
+            try:
+                reserved_task = task_manager.reserve_task(
+                    kind=TaskKind.CHROMA_KEYER,
+                    input_path=str(input_path),
+                    output_path=str(tmp_path / "next_keyed.png"),
+                )
+            except Exception as exc:
+                self.reservation_error = exc
+            else:
+                self.reserved_task_id = reserved_task.task_id
+            self.delivered.set()
+
+    probe = TerminalEventProbe()
+    with log_store._lock:
+        log_store._subscribers[first_task.task_id].append(probe)
+
+    release_keyer.set()
+
+    assert probe.delivered.wait(timeout=1)
+    assert probe.status is TaskStatus.SUCCEEDED
+    assert probe.output_path == str(tmp_path / "screen_keyed.png")
+    assert probe.finished_at is not None
+    assert probe.error is None
+    assert probe.event.details["elapsed_seconds"] >= 0
+    assert probe.reservation_error is None
+    assert probe.reserved_task_id is not None
+
+
 def test_inspect_returns_dimensions_and_a_retrievable_preview(tmp_path: Path) -> None:
     input_path = tmp_path / "input.png"
     _write_input_image(input_path)

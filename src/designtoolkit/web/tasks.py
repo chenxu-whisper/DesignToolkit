@@ -393,6 +393,11 @@ class TaskManager:
         details: dict[str, object] = {"output_path": output_path}
         if elapsed_seconds is not None:
             details["elapsed_seconds"] = elapsed_seconds
+        self.mark_finished(
+            task_id,
+            status=TaskStatus.SUCCEEDED,
+            output_path=output_path,
+        )
         self.log_store.append(
             task_id=task_id,
             level=LogLevel.SUCCESS,
@@ -400,26 +405,21 @@ class TaskManager:
             message=f"Task completed: {output_path}",
             details=details,
         )
-        self.mark_finished(
-            task_id,
-            status=TaskStatus.SUCCEEDED,
-            output_path=output_path,
-        )
 
     def _elapsed_seconds(self, started_at: float) -> float:
         return round(self._clock() - started_at, 3)
 
     def _mark_failed(self, task_id: str, message: str) -> None:
+        self.mark_finished(
+            task_id,
+            status=TaskStatus.FAILED,
+            error=message,
+        )
         self.log_store.append(
             task_id=task_id,
             level=LogLevel.ERROR,
             phase=LogPhase.FAILED,
             message=message,
-        )
-        self.mark_finished(
-            task_id,
-            status=TaskStatus.FAILED,
-            error=message,
         )
 
     @staticmethod
