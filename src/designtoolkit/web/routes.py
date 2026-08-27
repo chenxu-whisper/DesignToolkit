@@ -258,18 +258,15 @@ def create_router(
                 "inspect",
                 _source_fingerprint(input_path),
             )
-            preview_id = chroma_preview_store.get_or_put(
+            preview_entry = chroma_preview_store.get_or_put_entry(
                 cache_key,
                 lambda: make_preview_png(rgb),
             )
         except KeyerError as exc:
             raise _chroma_keyer_error_response(exc) from exc
 
-        preview_png = chroma_preview_store.get(preview_id)
-        if preview_png is None:
-            raise RuntimeError("Preview was evicted before it could be inspected")
         height, width = rgb.shape[:2]
-        with Image.open(BytesIO(preview_png)) as preview_image:
+        with Image.open(BytesIO(preview_entry.png_bytes)) as preview_image:
             preview_width, preview_height = preview_image.size
         return ChromaImageInspectResponse(
             input_path=request.input_path,
@@ -277,7 +274,7 @@ def create_router(
             height=int(height),
             preview_width=int(preview_width),
             preview_height=int(preview_height),
-            preview_url=_chroma_preview_url(preview_id),
+            preview_url=_chroma_preview_url(preview_entry.preview_id),
         )
 
     @router.post(

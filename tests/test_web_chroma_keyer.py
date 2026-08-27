@@ -113,6 +113,38 @@ def test_inspect_returns_dimensions_and_a_retrievable_preview(tmp_path: Path) ->
     assert preview.content.startswith(b"\x89PNG\r\n\x1a\n")
 
 
+def test_inspect_succeeds_when_eviction_interleaves_after_cache_insertion(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    input_path = tmp_path / "input.png"
+    _write_input_image(input_path)
+    original_get_or_put = ChromaPreviewStore.get_or_put
+
+    def evict_after_cache_insertion(store, cache_key, create_png_bytes):
+        preview_id = original_get_or_put(store, cache_key, create_png_bytes)
+        for index in range(32):
+            store.put(f"eviction-{index}".encode())
+        return preview_id
+
+    monkeypatch.setattr(
+        ChromaPreviewStore,
+        "get_or_put",
+        evict_after_cache_insertion,
+    )
+    client = TestClient(
+        create_app(local_path_roots=[tmp_path]),
+        raise_server_exceptions=False,
+    )
+
+    response = client.post(
+        "/api/chroma-keyer/images/inspect",
+        json={"input_path": str(input_path)},
+    )
+
+    assert response.status_code == 200
+
+
 def test_inspect_preview_reuses_file_fingerprint_and_changes_after_source_update(
     tmp_path: Path,
 ) -> None:
@@ -459,6 +491,21 @@ def test_preview_store_evicts_reverse_cache_key_mapping() -> None:
     assert store.get(first_id) is None
     assert replacement_id != first_id
     assert store.get(replacement_id) == b"replacement"
+
+
+def test_preview_store_returns_immutable_entry_across_eviction() -> None:
+    store = ChromaPreviewStore(max_entries=1)
+
+    def create_unexpected_preview() -> bytes:
+        raise AssertionError("cache hit must not create a preview")
+
+    inserted_entry = store.get_or_put_entry("request", lambda: b"first")
+    cached_entry = store.get_or_put_entry("request", create_unexpected_preview)
+    store.put(b"second")
+
+    assert cached_entry == inserted_entry
+    assert store.get(inserted_entry.preview_id) is None
+    assert inserted_entry.png_bytes == b"first"
 
 
 @mark.parametrize("max_entries", [0, -1, True, 1.5])
