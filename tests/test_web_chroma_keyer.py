@@ -7,6 +7,11 @@ from fastapi.testclient import TestClient
 from PIL import Image
 from pytest import mark, raises
 
+from designtoolkit.chroma_keyer.despill import despill
+from designtoolkit.chroma_keyer.image_io import make_preview_png, read_rgb_image
+from designtoolkit.chroma_keyer.matte import generate_alpha, refine_alpha
+from designtoolkit.chroma_keyer.models import KeyerParams
+from designtoolkit.chroma_keyer.sampling import screen_model_from_samples
 from designtoolkit.web.app import create_app
 from designtoolkit.web.chroma_previews import ChromaPreviewStore
 
@@ -25,6 +30,11 @@ def _write_input_image(path: Path) -> np.ndarray:
 
 def _client(tmp_path: Path) -> TestClient:
     return TestClient(create_app(local_path_roots=[tmp_path]))
+
+
+def _decode_rgb_png(png_bytes: bytes) -> np.ndarray:
+    with Image.open(BytesIO(png_bytes)) as image:
+        return np.asarray(image.convert("RGB")).copy()
 
 
 def test_inspect_returns_dimensions_and_a_retrievable_preview(tmp_path: Path) -> None:
@@ -79,7 +89,9 @@ def test_sample_maps_preview_coordinates_to_source_pixel(tmp_path: Path) -> None
     }
 
 
-def test_final_and_alpha_previews_return_distinct_pngs(tmp_path: Path) -> None:
+def test_final_and_alpha_previews_match_the_public_keying_pipeline(
+    tmp_path: Path,
+) -> None:
     input_path = tmp_path / "input.png"
     _write_input_image(input_path)
     client = _client(tmp_path)
@@ -111,10 +123,47 @@ def test_final_and_alpha_previews_return_distinct_pngs(tmp_path: Path) -> None:
     assert alpha_png.headers["content-type"] == "image/png"
     assert final_png.content.startswith(b"\x89PNG\r\n\x1a\n")
     assert alpha_png.content.startswith(b"\x89PNG\r\n\x1a\n")
-    assert final_png.content != alpha_png.content
-    with Image.open(BytesIO(final_png.content)) as final_image:
-        with Image.open(BytesIO(alpha_png.content)) as alpha_image:
-            assert final_image.tobytes() != alpha_image.tobytes()
+
+    source_rgb = read_rgb_image(input_path)
+    model = screen_model_from_samples(payload["samples"])
+    params = KeyerParams(**payload["params"])
+    refined_alpha = refine_alpha(generate_alpha(source_rgb, model, params), params)
+    expected_final = _decode_rgb_png(
+        make_preview_png(
+            despill(source_rgb, refined_alpha, model, params.despill_amount)
+        )
+    )
+    expected_alpha = _decode_rgb_png(
+        make_preview_png(np.repeat(refined_alpha[..., np.newaxis], 3, axis=2))
+    )
+
+    assert np.array_equal(_decode_rgb_png(final_png.content), expected_final)
+    assert np.array_equal(_decode_rgb_png(alpha_png.content), expected_alpha)
+
+
+def test_preview_rejects_empty_samples_for_a_valid_image(tmp_path: Path) -> None:
+    input_path = tmp_path / "input.png"
+    _write_input_image(input_path)
+
+    response = _client(tmp_path).post(
+        "/api/chroma-keyer/previews",
+        json={
+            "input_path": str(input_path),
+            "samples": [],
+            "params": {
+                "tolerance": 0.25,
+                "softness": 0.15,
+                "clip_black": 0.0,
+                "clip_white": 1.0,
+                "shrink_grow": 0,
+                "feather": 0,
+                "despill_amount": 0.5,
+            },
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_request"
 
 
 def test_unknown_preview_returns_structured_not_found(tmp_path: Path) -> None:
