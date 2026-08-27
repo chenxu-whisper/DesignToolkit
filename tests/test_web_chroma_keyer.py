@@ -46,6 +46,19 @@ def _generated_alpha_preview(rgb: np.ndarray) -> bytes:
     return make_preview_png(np.repeat(alpha[..., np.newaxis], 3, axis=2))
 
 
+def _replace_image_preserving_metadata(path: Path, rgb: np.ndarray) -> None:
+    source_stat = path.stat()
+    buffer = BytesIO()
+    Image.fromarray(rgb, mode="RGB").save(buffer, format="PNG")
+    image_bytes = buffer.getvalue()
+    assert len(image_bytes) <= source_stat.st_size
+    path.write_bytes(image_bytes.ljust(source_stat.st_size, b"\0"))
+    utime(
+        path,
+        ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns),
+    )
+
+
 def test_chroma_keyer_task_request_accepts_the_default_export_contract() -> None:
     request = ChromaKeyerTaskRequest(
         input_path="input.png",
@@ -202,6 +215,53 @@ def test_inspect_preview_reuses_file_fingerprint_and_changes_after_source_update
         ),
     ],
 )
+def test_preview_cache_distinguishes_content_with_identical_source_metadata(
+    tmp_path: Path,
+    url: str,
+    payload: dict[str, object],
+    make_expected_preview,
+) -> None:
+    input_path = tmp_path / "input.png"
+    pixels = _write_input_image(input_path)
+    input_path.write_bytes(input_path.read_bytes() + (b"\0" * 2_048))
+    replacement_pixels = pixels.copy()
+    replacement_pixels[0, 0] = [220, 40, 40]
+    client = _client(tmp_path)
+
+    first_response = client.post(url, json={"input_path": str(input_path), **payload})
+    source_stat = input_path.stat()
+    _replace_image_preserving_metadata(input_path, replacement_pixels)
+    replacement_stat = input_path.stat()
+    replacement_response = client.post(
+        url,
+        json={"input_path": str(input_path), **payload},
+    )
+
+    assert first_response.status_code == 200
+    assert replacement_response.status_code == 200
+    assert replacement_stat.st_size == source_stat.st_size
+    assert replacement_stat.st_mtime_ns == source_stat.st_mtime_ns
+    assert replacement_response.json()["preview_url"] != first_response.json()[
+        "preview_url"
+    ]
+    preview = client.get(replacement_response.json()["preview_url"])
+    assert np.array_equal(
+        _decode_rgb_png(preview.content),
+        _decode_rgb_png(make_expected_preview(replacement_pixels)),
+    )
+
+
+@mark.parametrize(
+    ("url", "payload", "make_expected_preview"),
+    [
+        ("/api/chroma-keyer/images/inspect", {}, make_preview_png),
+        (
+            "/api/chroma-keyer/previews",
+            {"samples": [[42, 180, 72]], "view_mode": "alpha"},
+            _generated_alpha_preview,
+        ),
+    ],
+)
 def test_preview_retries_decode_when_source_changes_during_snapshot(
     tmp_path: Path,
     monkeypatch,
@@ -237,6 +297,72 @@ def test_preview_retries_decode_when_source_changes_during_snapshot(
         return rgb
 
     monkeypatch.setattr(web_routes, "read_rgb_image", overwrite_after_first_decode)
+    client = _client(tmp_path)
+
+    response = client.post(url, json={"input_path": str(input_path), **payload})
+
+    assert response.status_code == 200
+    assert decode_calls == 2
+    preview = client.get(response.json()["preview_url"])
+    assert np.array_equal(
+        _decode_rgb_png(preview.content),
+        _decode_rgb_png(make_expected_preview(replacement_pixels)),
+    )
+
+
+@mark.parametrize(
+    ("url", "payload", "make_expected_preview"),
+    [
+        ("/api/chroma-keyer/images/inspect", {}, make_preview_png),
+        (
+            "/api/chroma-keyer/previews",
+            {"samples": [[42, 180, 72]], "view_mode": "alpha"},
+            _generated_alpha_preview,
+        ),
+    ],
+)
+def test_preview_retries_failed_decode_after_source_update(
+    tmp_path: Path,
+    monkeypatch,
+    url: str,
+    payload: dict[str, object],
+    make_expected_preview,
+) -> None:
+    input_path = tmp_path / "input.png"
+    _write_input_image(input_path)
+    replacement_pixels = np.array(
+        [
+            [[220, 40, 40], [220, 40, 40], [220, 40, 40]],
+        ],
+        dtype=np.uint8,
+    )
+    original_read_rgb_image = web_routes.read_rgb_image
+    decode_calls = 0
+
+    def corrupt_then_replace_during_first_decode(path: Path) -> np.ndarray:
+        nonlocal decode_calls
+        decode_calls += 1
+        if decode_calls == 1:
+            source_stat = path.stat()
+            path.write_bytes(b"not an image")
+            try:
+                return original_read_rgb_image(path)
+            finally:
+                Image.fromarray(replacement_pixels, mode="RGB").save(path)
+                utime(
+                    path,
+                    ns=(
+                        source_stat.st_atime_ns,
+                        source_stat.st_mtime_ns + 1_000_000_000,
+                    ),
+                )
+        return original_read_rgb_image(path)
+
+    monkeypatch.setattr(
+        web_routes,
+        "read_rgb_image",
+        corrupt_then_replace_during_first_decode,
+    )
     client = _client(tmp_path)
 
     response = client.post(url, json={"input_path": str(input_path), **payload})

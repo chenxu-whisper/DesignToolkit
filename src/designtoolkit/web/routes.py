@@ -99,14 +99,21 @@ def _source_fingerprint(input_path: Path) -> dict[str, str | int]:
     try:
         resolved_path = input_path.resolve(strict=True)
         source_stat = resolved_path.stat()
+        content_digest = sha256()
+        with resolved_path.open("rb") as source_file:
+            for chunk in iter(lambda: source_file.read(1_048_576), b""):
+                content_digest.update(chunk)
     except FileNotFoundError as exc:
         raise KeyerError("Input path does not exist") from exc
+    except IsADirectoryError as exc:
+        raise KeyerError("Input path must be a file") from exc
     except OSError as exc:
         raise KeyerError("Input image could not be read") from exc
     return {
         "path": str(resolved_path),
         "mtime_ns": source_stat.st_mtime_ns,
         "size": source_stat.st_size,
+        "content_sha256": content_digest.hexdigest(),
     }
 
 
@@ -114,7 +121,12 @@ def _read_rgb_snapshot(input_path: Path) -> tuple[np.ndarray, dict[str, str | in
     """Read RGB pixels paired with the unchanged source version used to decode them."""
     for _ in range(_CHROMA_SNAPSHOT_READ_ATTEMPTS):
         before_decode = _source_fingerprint(input_path)
-        rgb = read_rgb_image(input_path)
+        try:
+            rgb = read_rgb_image(input_path)
+        except KeyerError:
+            if before_decode != _source_fingerprint(input_path):
+                continue
+            raise
         after_decode = _source_fingerprint(input_path)
         if before_decode == after_decode:
             return rgb, after_decode
