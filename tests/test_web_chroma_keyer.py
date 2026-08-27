@@ -14,6 +14,7 @@ from designtoolkit.chroma_keyer.models import KeyerParams
 from designtoolkit.chroma_keyer.sampling import screen_model_from_samples
 from designtoolkit.web.app import create_app
 from designtoolkit.web.chroma_previews import ChromaPreviewStore
+from designtoolkit.web.schemas import ChromaKeyerTaskRequest
 
 
 def _write_input_image(path: Path) -> np.ndarray:
@@ -35,6 +36,51 @@ def _client(tmp_path: Path) -> TestClient:
 def _decode_rgb_png(png_bytes: bytes) -> np.ndarray:
     with Image.open(BytesIO(png_bytes)) as image:
         return np.asarray(image.convert("RGB")).copy()
+
+
+def test_chroma_keyer_task_request_accepts_the_default_export_contract() -> None:
+    request = ChromaKeyerTaskRequest(
+        input_path="input.png",
+        samples=[[42, 180, 72]],
+    )
+
+    assert request.model_dump() == {
+        "input_path": "input.png",
+        "samples": [[42, 180, 72]],
+        "tolerance": 0.25,
+        "softness": 0.15,
+        "clip_black": 0.0,
+        "clip_white": 1.0,
+        "shrink_grow": 0,
+        "feather": 0,
+        "despill_amount": 0.5,
+        "output_path": None,
+    }
+
+
+@mark.parametrize(
+    "changes",
+    [
+        {"samples": []},
+        {"samples": [[42, 180]]},
+        {"samples": [[-1, 180, 72]]},
+        {"samples": [[42, 180, 256]]},
+        {"samples": [[True, 180, 72]]},
+        {"clip_black": 0.5, "clip_white": 0.5},
+        {"output_path": "   "},
+    ],
+)
+def test_chroma_keyer_task_request_rejects_invalid_export_contract(
+    changes: dict[str, object],
+) -> None:
+    with raises(ValueError):
+        ChromaKeyerTaskRequest.model_validate(
+            {
+                "input_path": "input.png",
+                "samples": [[42, 180, 72]],
+                **changes,
+            }
+        )
 
 
 def test_inspect_returns_dimensions_and_a_retrievable_preview(tmp_path: Path) -> None:

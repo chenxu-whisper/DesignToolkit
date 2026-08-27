@@ -105,6 +105,39 @@ class ChromaKeyerParams(BaseModel):
         return self
 
 
+class ChromaKeyerTaskRequest(BaseModel):
+    input_path: str
+    samples: list[list[RgbChannel]] = Field(min_length=1)
+    tolerance: UnitIntervalFloat = 0.25
+    softness: UnitIntervalFloat = 0.15
+    clip_black: UnitIntervalFloat = 0.0
+    clip_white: UnitIntervalFloat = 1.0
+    shrink_grow: Annotated[int, Field(strict=True, ge=-10, le=10)] = 0
+    feather: Annotated[int, Field(strict=True, ge=0, le=10)] = 0
+    despill_amount: UnitIntervalFloat = 0.5
+    output_path: str | None = None
+
+    @field_validator("input_path", "output_path")
+    @classmethod
+    def validate_paths(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("path must not be blank")
+        return value
+
+    @field_validator("samples")
+    @classmethod
+    def validate_samples(cls, value: list[list[int]]) -> list[list[int]]:
+        if any(len(sample) != 3 for sample in value):
+            raise ValueError("each sample must contain exactly three channels")
+        return value
+
+    @model_validator(mode="after")
+    def validate_clip_range(self) -> ChromaKeyerTaskRequest:
+        if self.clip_black >= self.clip_white:
+            raise ValueError("clip_black must be less than clip_white")
+        return self
+
+
 class ChromaPreviewRequest(BaseModel):
     input_path: str
     samples: list[list[RgbChannel]] = Field(min_length=1)
