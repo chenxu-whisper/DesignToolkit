@@ -2,14 +2,26 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterator
+from io import BytesIO
 from pathlib import Path
 from queue import Empty
 
+import numpy as np
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
+from PIL import Image
 
+from designtoolkit.chroma_keyer.despill import despill
+from designtoolkit.chroma_keyer.image_io import make_preview_png, read_rgb_image
+from designtoolkit.chroma_keyer.matte import generate_alpha, refine_alpha
+from designtoolkit.chroma_keyer.models import KeyerError, KeyerParams
+from designtoolkit.chroma_keyer.sampling import (
+    map_preview_point,
+    screen_model_from_samples,
+)
 from designtoolkit.media_resize import MediaResizeError
 from designtoolkit.video_frames import VideoFrameError
+from designtoolkit.web.chroma_previews import ChromaPreviewStore
 from designtoolkit.web.local_paths import resolve_dropped_file_paths
 from designtoolkit.web.native_picker import (
     LocalPathPicker,
@@ -17,6 +29,13 @@ from designtoolkit.web.native_picker import (
     TkinterLocalPathPicker,
 )
 from designtoolkit.web.schemas import (
+    ChromaImageInspectRequest,
+    ChromaImageInspectResponse,
+    ChromaPreviewRequest,
+    ChromaPreviewResponse,
+    ChromaSampleRequest,
+    ChromaSampleResponse,
+    ChromaViewMode,
     DroppedFilePathResolveRequest,
     DroppedFilePathResolveResponse,
     ErrorResponse,
@@ -58,6 +77,10 @@ def error_response(exc: ApiError) -> JSONResponse:
     )
 
 
+def _chroma_preview_url(preview_id: str) -> str:
+    return f"/api/chroma-keyer/previews/{preview_id}"
+
+
 def _sse_line(event) -> str:
     payload = json.dumps(
         event.model_dump(mode="json"),
@@ -79,6 +102,7 @@ def create_router(
 ) -> APIRouter:
     router = APIRouter(prefix="/api")
     picker = local_path_picker or TkinterLocalPathPicker()
+    chroma_preview_store = ChromaPreviewStore()
 
     @router.get("/health")
     def health() -> dict[str, str]:
@@ -166,6 +190,84 @@ def create_router(
         except _INVALID_REQUEST_ERRORS as exc:
             raise ApiError("invalid_request", str(exc), 400) from exc
         return TaskCreateResponse(task_id=task.task_id, status=task.status)
+
+    @router.post(
+        "/chroma-keyer/images/inspect",
+        response_model=ChromaImageInspectResponse,
+    )
+    def inspect_chroma_image(
+        request: ChromaImageInspectRequest,
+    ) -> ChromaImageInspectResponse:
+        try:
+            rgb = read_rgb_image(Path(request.input_path))
+            preview_png = make_preview_png(rgb)
+        except KeyerError as exc:
+            raise ApiError("invalid_request", str(exc), 400) from exc
+
+        preview_id = chroma_preview_store.put(preview_png)
+        height, width = rgb.shape[:2]
+        with Image.open(BytesIO(preview_png)) as preview_image:
+            preview_width, preview_height = preview_image.size
+        return ChromaImageInspectResponse(
+            input_path=request.input_path,
+            width=int(width),
+            height=int(height),
+            preview_width=int(preview_width),
+            preview_height=int(preview_height),
+            preview_url=_chroma_preview_url(preview_id),
+        )
+
+    @router.post(
+        "/chroma-keyer/images/sample",
+        response_model=ChromaSampleResponse,
+    )
+    def sample_chroma_image(request: ChromaSampleRequest) -> ChromaSampleResponse:
+        try:
+            rgb = read_rgb_image(Path(request.input_path))
+            height, width = rgb.shape[:2]
+            source_x, source_y = map_preview_point(
+                request.x,
+                request.y,
+                request.preview_width,
+                request.preview_height,
+                width,
+                height,
+            )
+        except KeyerError as exc:
+            raise ApiError("invalid_request", str(exc), 400) from exc
+
+        return ChromaSampleResponse(
+            rgb=[int(channel) for channel in rgb[source_y, source_x]],
+            source_x=source_x,
+            source_y=source_y,
+        )
+
+    @router.post("/chroma-keyer/previews", response_model=ChromaPreviewResponse)
+    def create_chroma_preview(
+        request: ChromaPreviewRequest,
+    ) -> ChromaPreviewResponse:
+        try:
+            rgb = read_rgb_image(Path(request.input_path))
+            model = screen_model_from_samples(request.samples)
+            params = KeyerParams(**request.params.model_dump())
+            alpha = refine_alpha(generate_alpha(rgb, model, params), params)
+            if request.view_mode is ChromaViewMode.FINAL:
+                preview_rgb = despill(rgb, alpha, model, params.despill_amount)
+            else:
+                preview_rgb = np.repeat(alpha[..., np.newaxis], 3, axis=2)
+            preview_png = make_preview_png(preview_rgb)
+        except KeyerError as exc:
+            raise ApiError("invalid_request", str(exc), 400) from exc
+
+        preview_id = chroma_preview_store.put(preview_png)
+        return ChromaPreviewResponse(preview_url=_chroma_preview_url(preview_id))
+
+    @router.get("/chroma-keyer/previews/{preview_id}")
+    def get_chroma_preview(preview_id: str) -> Response:
+        preview_png = chroma_preview_store.get(preview_id)
+        if preview_png is None:
+            raise ApiError("preview_not_found", "Preview not found", 404)
+        return Response(content=preview_png, media_type="image/png")
 
     @router.get("/tasks/{task_id}", response_model=TaskResponse)
     def get_task(task_id: str) -> TaskResponse:

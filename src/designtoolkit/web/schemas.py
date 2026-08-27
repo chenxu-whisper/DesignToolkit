@@ -2,9 +2,16 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import StrEnum
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
+
+PositiveInt = Annotated[int, Field(strict=True, gt=0)]
+RgbChannel = Annotated[int, Field(strict=True, ge=0, le=255)]
+UnitIntervalFloat = Annotated[
+    float,
+    Field(strict=True, ge=0, le=1, allow_inf_nan=False),
+]
 
 
 class TaskKind(StrEnum):
@@ -34,6 +41,93 @@ class LogPhase(StrEnum):
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
+
+
+class ChromaViewMode(StrEnum):
+    FINAL = "final"
+    ALPHA = "alpha"
+
+
+class ChromaImageInspectRequest(BaseModel):
+    input_path: str
+
+    @field_validator("input_path")
+    @classmethod
+    def validate_input_path(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("input_path must not be blank")
+        return value
+
+
+class ChromaImageInspectResponse(BaseModel):
+    input_path: str
+    width: PositiveInt
+    height: PositiveInt
+    preview_width: PositiveInt
+    preview_height: PositiveInt
+    preview_url: str
+
+
+class ChromaSampleRequest(BaseModel):
+    input_path: str
+    x: float = Field(strict=True, allow_inf_nan=False)
+    y: float = Field(strict=True, allow_inf_nan=False)
+    preview_width: PositiveInt
+    preview_height: PositiveInt
+
+    @field_validator("input_path")
+    @classmethod
+    def validate_input_path(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("input_path must not be blank")
+        return value
+
+
+class ChromaSampleResponse(BaseModel):
+    rgb: list[RgbChannel] = Field(min_length=3, max_length=3)
+    source_x: Annotated[int, Field(strict=True, ge=0)]
+    source_y: Annotated[int, Field(strict=True, ge=0)]
+
+
+class ChromaKeyerParams(BaseModel):
+    tolerance: UnitIntervalFloat = 0.25
+    softness: UnitIntervalFloat = 0.15
+    clip_black: UnitIntervalFloat = 0.0
+    clip_white: UnitIntervalFloat = 1.0
+    shrink_grow: Annotated[int, Field(strict=True, ge=-10, le=10)] = 0
+    feather: Annotated[int, Field(strict=True, ge=0, le=10)] = 0
+    despill_amount: UnitIntervalFloat = 0.5
+
+    @model_validator(mode="after")
+    def validate_clip_range(self) -> ChromaKeyerParams:
+        if self.clip_black >= self.clip_white:
+            raise ValueError("clip_black must be less than clip_white")
+        return self
+
+
+class ChromaPreviewRequest(BaseModel):
+    input_path: str
+    samples: list[list[RgbChannel]] = Field(min_length=1)
+    params: ChromaKeyerParams = Field(default_factory=ChromaKeyerParams)
+    view_mode: ChromaViewMode = ChromaViewMode.FINAL
+
+    @field_validator("input_path")
+    @classmethod
+    def validate_input_path(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("input_path must not be blank")
+        return value
+
+    @field_validator("samples")
+    @classmethod
+    def validate_samples(cls, value: list[list[int]]) -> list[list[int]]:
+        if any(len(sample) != 3 for sample in value):
+            raise ValueError("each sample must contain exactly three channels")
+        return value
+
+
+class ChromaPreviewResponse(BaseModel):
+    preview_url: str
 
 
 class VideoFramesTaskRequest(BaseModel):

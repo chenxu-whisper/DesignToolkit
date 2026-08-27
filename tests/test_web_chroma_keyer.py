@@ -1,0 +1,198 @@
+from io import BytesIO
+from pathlib import Path
+from uuid import UUID
+
+import numpy as np
+from fastapi.testclient import TestClient
+from PIL import Image
+from pytest import mark, raises
+
+from designtoolkit.web.app import create_app
+from designtoolkit.web.chroma_previews import ChromaPreviewStore
+
+
+def _write_input_image(path: Path) -> np.ndarray:
+    pixels = np.array(
+        [
+            [[42, 180, 72], [220, 40, 40], [30, 50, 200], [10, 20, 30]],
+            [[20, 30, 40], [50, 60, 70], [80, 90, 100], [110, 120, 130]],
+        ],
+        dtype=np.uint8,
+    )
+    Image.fromarray(pixels, mode="RGB").save(path)
+    return pixels
+
+
+def _client(tmp_path: Path) -> TestClient:
+    return TestClient(create_app(local_path_roots=[tmp_path]))
+
+
+def test_inspect_returns_dimensions_and_a_retrievable_preview(tmp_path: Path) -> None:
+    input_path = tmp_path / "input.png"
+    _write_input_image(input_path)
+    client = _client(tmp_path)
+
+    response = client.post(
+        "/api/chroma-keyer/images/inspect",
+        json={"input_path": str(input_path)},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body == {
+        "input_path": str(input_path),
+        "width": 4,
+        "height": 2,
+        "preview_width": 4,
+        "preview_height": 2,
+        "preview_url": body["preview_url"],
+    }
+    assert body["preview_url"].startswith("/api/chroma-keyer/previews/")
+
+    preview = client.get(body["preview_url"])
+
+    assert preview.status_code == 200
+    assert preview.headers["content-type"] == "image/png"
+    assert preview.content.startswith(b"\x89PNG\r\n\x1a\n")
+
+
+def test_sample_maps_preview_coordinates_to_source_pixel(tmp_path: Path) -> None:
+    input_path = tmp_path / "input.png"
+    pixels = _write_input_image(input_path)
+
+    response = _client(tmp_path).post(
+        "/api/chroma-keyer/images/sample",
+        json={
+            "input_path": str(input_path),
+            "x": 1.9,
+            "y": 0.9,
+            "preview_width": 2,
+            "preview_height": 1,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "rgb": pixels[1, 3].tolist(),
+        "source_x": 3,
+        "source_y": 1,
+    }
+
+
+def test_final_and_alpha_previews_return_distinct_pngs(tmp_path: Path) -> None:
+    input_path = tmp_path / "input.png"
+    _write_input_image(input_path)
+    client = _client(tmp_path)
+    payload = {
+        "input_path": str(input_path),
+        "samples": [[42, 180, 72]],
+        "params": {
+            "tolerance": 0.25,
+            "softness": 0.15,
+            "clip_black": 0.0,
+            "clip_white": 1.0,
+            "shrink_grow": 0,
+            "feather": 0,
+            "despill_amount": 0.5,
+        },
+    }
+
+    final_response = client.post("/api/chroma-keyer/previews", json=payload)
+    alpha_response = client.post(
+        "/api/chroma-keyer/previews",
+        json={**payload, "view_mode": "alpha"},
+    )
+
+    assert final_response.status_code == 200
+    assert alpha_response.status_code == 200
+    final_png = client.get(final_response.json()["preview_url"])
+    alpha_png = client.get(alpha_response.json()["preview_url"])
+    assert final_png.headers["content-type"] == "image/png"
+    assert alpha_png.headers["content-type"] == "image/png"
+    assert final_png.content.startswith(b"\x89PNG\r\n\x1a\n")
+    assert alpha_png.content.startswith(b"\x89PNG\r\n\x1a\n")
+    assert final_png.content != alpha_png.content
+    with Image.open(BytesIO(final_png.content)) as final_image:
+        with Image.open(BytesIO(alpha_png.content)) as alpha_image:
+            assert final_image.tobytes() != alpha_image.tobytes()
+
+
+def test_unknown_preview_returns_structured_not_found(tmp_path: Path) -> None:
+    response = _client(tmp_path).get("/api/chroma-keyer/previews/not-a-preview")
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "preview_not_found"
+
+
+def test_out_of_bounds_sample_coordinates_return_structured_bad_request(
+    tmp_path: Path,
+) -> None:
+    input_path = tmp_path / "input.png"
+    _write_input_image(input_path)
+
+    response = _client(tmp_path).post(
+        "/api/chroma-keyer/images/sample",
+        json={
+            "input_path": str(input_path),
+            "x": 2,
+            "y": 0,
+            "preview_width": 2,
+            "preview_height": 1,
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_request"
+
+
+@mark.parametrize(
+    ("url", "payload"),
+    [
+        ("/api/chroma-keyer/images/inspect", {"input_path": "   "}),
+        (
+            "/api/chroma-keyer/images/sample",
+            {
+                "input_path": "missing.png",
+                "x": 2,
+                "y": 0,
+                "preview_width": 2,
+                "preview_height": 1,
+            },
+        ),
+        ("/api/chroma-keyer/previews", {"input_path": "missing.png"}),
+    ],
+)
+def test_invalid_chroma_requests_return_structured_bad_request(
+    tmp_path: Path,
+    url: str,
+    payload: dict[str, object],
+) -> None:
+    response = _client(tmp_path).post(url, json=payload)
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_request"
+
+
+def test_preview_store_evicts_oldest_entry_at_capacity() -> None:
+    store = ChromaPreviewStore(max_entries=2)
+
+    first_id = store.put(b"first")
+    second_id = store.put(b"second")
+    third_id = store.put(b"third")
+
+    UUID(first_id)
+    assert store.get(first_id) is None
+    assert store.get(second_id) == b"second"
+    assert store.get(third_id) == b"third"
+
+
+@mark.parametrize("max_entries", [0, -1, True, 1.5])
+def test_preview_store_rejects_invalid_capacity(max_entries: object) -> None:
+    with raises(ValueError):
+        ChromaPreviewStore(max_entries=max_entries)  # type: ignore[arg-type]
+
+
+@mark.parametrize("png_bytes", [b"", "not-bytes", bytearray(b"bytes")])
+def test_preview_store_rejects_empty_or_non_bytes_values(png_bytes: object) -> None:
+    with raises(ValueError):
+        ChromaPreviewStore().put(png_bytes)  # type: ignore[arg-type]
