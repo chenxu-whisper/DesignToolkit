@@ -1,4 +1,5 @@
 from io import BytesIO
+from os import utime
 from pathlib import Path
 from uuid import UUID
 
@@ -112,6 +113,41 @@ def test_inspect_returns_dimensions_and_a_retrievable_preview(tmp_path: Path) ->
     assert preview.content.startswith(b"\x89PNG\r\n\x1a\n")
 
 
+def test_inspect_preview_reuses_file_fingerprint_and_changes_after_source_update(
+    tmp_path: Path,
+) -> None:
+    input_path = tmp_path / "input.png"
+    pixels = _write_input_image(input_path)
+    client = _client(tmp_path)
+    payload = {"input_path": str(input_path)}
+
+    first_response = client.post("/api/chroma-keyer/images/inspect", json=payload)
+    duplicate_response = client.post(
+        "/api/chroma-keyer/images/inspect",
+        json=payload,
+    )
+
+    first_url = first_response.json()["preview_url"]
+    assert first_response.status_code == 200
+    assert duplicate_response.status_code == 200
+    assert duplicate_response.json()["preview_url"] == first_url
+    UUID(first_url.rsplit("/", maxsplit=1)[1])
+    assert str(input_path) not in first_url
+
+    source_stat = input_path.stat()
+    pixels[0, 0] = [1, 2, 3]
+    Image.fromarray(pixels, mode="RGB").save(input_path)
+    utime(
+        input_path,
+        ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns + 1_000_000_000),
+    )
+
+    updated_response = client.post("/api/chroma-keyer/images/inspect", json=payload)
+
+    assert updated_response.status_code == 200
+    assert updated_response.json()["preview_url"] != first_url
+
+
 def test_sample_maps_preview_coordinates_to_source_pixel(tmp_path: Path) -> None:
     input_path = tmp_path / "input.png"
     pixels = _write_input_image(input_path)
@@ -185,6 +221,59 @@ def test_final_and_alpha_previews_match_the_public_keying_pipeline(
 
     assert np.array_equal(_decode_rgb_png(final_png.content), expected_final)
     assert np.array_equal(_decode_rgb_png(alpha_png.content), expected_alpha)
+
+
+def test_generated_preview_reuses_request_state_and_varies_by_view_and_params(
+    tmp_path: Path,
+) -> None:
+    input_path = tmp_path / "input.png"
+    _write_input_image(input_path)
+    client = _client(tmp_path)
+    payload = {
+        "input_path": str(input_path),
+        "samples": [[42, 180, 72]],
+        "params": {
+            "tolerance": 0.25,
+            "softness": 0.15,
+            "clip_black": 0.0,
+            "clip_white": 1.0,
+            "shrink_grow": 0,
+            "feather": 0,
+            "despill_amount": 0.5,
+        },
+    }
+
+    first_response = client.post("/api/chroma-keyer/previews", json=payload)
+    duplicate_response = client.post("/api/chroma-keyer/previews", json=payload)
+    alpha_response = client.post(
+        "/api/chroma-keyer/previews",
+        json={**payload, "view_mode": "alpha"},
+    )
+    tolerance_response = client.post(
+        "/api/chroma-keyer/previews",
+        json={
+            **payload,
+            "params": {**payload["params"], "tolerance": 0.3},
+        },
+    )
+
+    first_url = first_response.json()["preview_url"]
+    assert first_response.status_code == 200
+    assert duplicate_response.status_code == 200
+    assert alpha_response.status_code == 200
+    assert tolerance_response.status_code == 200
+    assert duplicate_response.json()["preview_url"] == first_url
+    assert alpha_response.json()["preview_url"] != first_url
+    assert tolerance_response.json()["preview_url"] != first_url
+    for response in (
+        first_response,
+        duplicate_response,
+        alpha_response,
+        tolerance_response,
+    ):
+        preview_url = response.json()["preview_url"]
+        UUID(preview_url.rsplit("/", maxsplit=1)[1])
+        assert str(input_path) not in preview_url
 
 
 def test_preview_rejects_empty_samples_for_a_valid_image(tmp_path: Path) -> None:
@@ -279,6 +368,19 @@ def test_preview_store_evicts_oldest_entry_at_capacity() -> None:
     assert store.get(first_id) is None
     assert store.get(second_id) == b"second"
     assert store.get(third_id) == b"third"
+
+
+def test_preview_store_evicts_reverse_cache_key_mapping() -> None:
+    store = ChromaPreviewStore(max_entries=2)
+
+    first_id = store.put(b"first", cache_key="first-request")
+    store.put(b"second", cache_key="second-request")
+    store.put(b"third", cache_key="third-request")
+    replacement_id = store.put(b"replacement", cache_key="first-request")
+
+    assert store.get(first_id) is None
+    assert replacement_id != first_id
+    assert store.get(replacement_id) == b"replacement"
 
 
 @mark.parametrize("max_entries", [0, -1, True, 1.5])

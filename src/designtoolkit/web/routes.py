@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterator
+from hashlib import sha256
 from io import BytesIO
 from pathlib import Path
 from queue import Empty
@@ -79,6 +80,46 @@ def error_response(exc: ApiError) -> JSONResponse:
 
 def _chroma_preview_url(preview_id: str) -> str:
     return f"/api/chroma-keyer/previews/{preview_id}"
+
+
+def _source_fingerprint(input_path: Path) -> dict[str, str | int]:
+    try:
+        resolved_path = input_path.resolve(strict=True)
+        source_stat = resolved_path.stat()
+    except OSError as exc:
+        raise KeyerError("Input image could not be read") from exc
+    return {
+        "path": str(resolved_path),
+        "mtime_ns": source_stat.st_mtime_ns,
+        "size": source_stat.st_size,
+    }
+
+
+def _chroma_preview_cache_key(
+    preview_kind: str,
+    source_fingerprint: dict[str, str | int],
+    *,
+    samples: list[list[int]] | None = None,
+    params: dict[str, float | int] | None = None,
+    view_mode: ChromaViewMode | None = None,
+) -> str:
+    request_state: dict[str, object] = {
+        "preview_kind": preview_kind,
+        "source": source_fingerprint,
+    }
+    if samples is not None:
+        request_state["samples"] = samples
+    if params is not None:
+        request_state["params"] = params
+    if view_mode is not None:
+        request_state["view_mode"] = view_mode.value
+    serialized_state = json.dumps(
+        request_state,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    return sha256(serialized_state.encode("utf-8")).hexdigest()
 
 
 def _sse_line(event) -> str:
@@ -199,12 +240,22 @@ def create_router(
         request: ChromaImageInspectRequest,
     ) -> ChromaImageInspectResponse:
         try:
-            rgb = read_rgb_image(Path(request.input_path))
-            preview_png = make_preview_png(rgb)
+            input_path = Path(request.input_path)
+            rgb = read_rgb_image(input_path)
+            cache_key = _chroma_preview_cache_key(
+                "inspect",
+                _source_fingerprint(input_path),
+            )
+            preview_id = chroma_preview_store.get_or_put(
+                cache_key,
+                lambda: make_preview_png(rgb),
+            )
         except KeyerError as exc:
             raise ApiError("invalid_request", str(exc), 400) from exc
 
-        preview_id = chroma_preview_store.put(preview_png)
+        preview_png = chroma_preview_store.get(preview_id)
+        if preview_png is None:
+            raise RuntimeError("Preview was evicted before it could be inspected")
         height, width = rgb.shape[:2]
         with Image.open(BytesIO(preview_png)) as preview_image:
             preview_width, preview_height = preview_image.size
@@ -247,19 +298,31 @@ def create_router(
         request: ChromaPreviewRequest,
     ) -> ChromaPreviewResponse:
         try:
-            rgb = read_rgb_image(Path(request.input_path))
-            model = screen_model_from_samples(request.samples)
-            params = KeyerParams(**request.params.model_dump())
-            alpha = refine_alpha(generate_alpha(rgb, model, params), params)
-            if request.view_mode is ChromaViewMode.FINAL:
-                preview_rgb = despill(rgb, alpha, model, params.despill_amount)
-            else:
-                preview_rgb = np.repeat(alpha[..., np.newaxis], 3, axis=2)
-            preview_png = make_preview_png(preview_rgb)
+            input_path = Path(request.input_path)
+            params_data = request.params.model_dump(mode="json")
+            cache_key = _chroma_preview_cache_key(
+                "generated",
+                _source_fingerprint(input_path),
+                samples=request.samples,
+                params=params_data,
+                view_mode=request.view_mode,
+            )
+
+            def create_preview_png() -> bytes:
+                rgb = read_rgb_image(input_path)
+                model = screen_model_from_samples(request.samples)
+                params = KeyerParams(**params_data)
+                alpha = refine_alpha(generate_alpha(rgb, model, params), params)
+                if request.view_mode is ChromaViewMode.FINAL:
+                    preview_rgb = despill(rgb, alpha, model, params.despill_amount)
+                else:
+                    preview_rgb = np.repeat(alpha[..., np.newaxis], 3, axis=2)
+                return make_preview_png(preview_rgb)
+
+            preview_id = chroma_preview_store.get_or_put(cache_key, create_preview_png)
         except KeyerError as exc:
             raise ApiError("invalid_request", str(exc), 400) from exc
 
-        preview_id = chroma_preview_store.put(preview_png)
         return ChromaPreviewResponse(preview_url=_chroma_preview_url(preview_id))
 
     @router.get("/chroma-keyer/previews/{preview_id}")
