@@ -6,6 +6,7 @@ from hashlib import sha256
 from io import BytesIO
 from pathlib import Path
 from queue import Empty
+from stat import S_ISREG
 
 import numpy as np
 from fastapi import APIRouter, Request
@@ -13,7 +14,11 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from PIL import Image
 
 from designtoolkit.chroma_keyer.despill import despill
-from designtoolkit.chroma_keyer.image_io import make_preview_png, read_rgb_image
+from designtoolkit.chroma_keyer.image_io import (
+    make_preview_png,
+    read_rgb_image,
+    read_rgb_image_bytes,
+)
 from designtoolkit.chroma_keyer.matte import generate_alpha, refine_alpha
 from designtoolkit.chroma_keyer.models import KeyerError, KeyerParams
 from designtoolkit.chroma_keyer.sampling import (
@@ -95,41 +100,55 @@ def _chroma_preview_url(preview_id: str) -> str:
     return f"/api/chroma-keyer/previews/{preview_id}"
 
 
-def _source_fingerprint(input_path: Path) -> dict[str, str | int]:
+def _source_stat(input_path: Path):
     try:
-        resolved_path = input_path.resolve(strict=True)
-        source_stat = resolved_path.stat()
-        content_digest = sha256()
-        with resolved_path.open("rb") as source_file:
-            for chunk in iter(lambda: source_file.read(1_048_576), b""):
-                content_digest.update(chunk)
+        source_stat = input_path.stat()
     except FileNotFoundError as exc:
         raise KeyerError("Input path does not exist") from exc
-    except IsADirectoryError as exc:
-        raise KeyerError("Input path must be a file") from exc
     except OSError as exc:
         raise KeyerError("Input image could not be read") from exc
-    return {
-        "path": str(resolved_path),
-        "mtime_ns": source_stat.st_mtime_ns,
-        "size": source_stat.st_size,
-        "content_sha256": content_digest.hexdigest(),
-    }
+    if not S_ISREG(source_stat.st_mode):
+        raise KeyerError("Input path must be a file")
+    return source_stat
+
+
+def _source_version(source_stat) -> tuple[int, int]:
+    return source_stat.st_mtime_ns, source_stat.st_size
 
 
 def _read_rgb_snapshot(input_path: Path) -> tuple[np.ndarray, dict[str, str | int]]:
-    """Read RGB pixels paired with the unchanged source version used to decode them."""
+    """Read RGB pixels and a fingerprint from one immutable source-byte snapshot."""
+    try:
+        resolved_path = input_path.resolve(strict=True)
+    except FileNotFoundError as exc:
+        raise KeyerError("Input path does not exist") from exc
+    except OSError as exc:
+        raise KeyerError("Input image could not be read") from exc
+
     for _ in range(_CHROMA_SNAPSHOT_READ_ATTEMPTS):
-        before_decode = _source_fingerprint(input_path)
+        before_decode = _source_stat(resolved_path)
         try:
-            rgb = read_rgb_image(input_path)
+            try:
+                source_bytes = resolved_path.read_bytes()
+            except FileNotFoundError as exc:
+                raise KeyerError("Input path does not exist") from exc
+            except OSError as exc:
+                raise KeyerError("Input image could not be read") from exc
+            rgb = read_rgb_image_bytes(source_bytes, resolved_path.suffix)
         except KeyerError:
-            if before_decode != _source_fingerprint(input_path):
+            if _source_version(before_decode) != _source_version(
+                _source_stat(resolved_path)
+            ):
                 continue
             raise
-        after_decode = _source_fingerprint(input_path)
-        if before_decode == after_decode:
-            return rgb, after_decode
+        after_decode = _source_stat(resolved_path)
+        if _source_version(before_decode) == _source_version(after_decode):
+            return rgb, {
+                "path": str(resolved_path),
+                "mtime_ns": after_decode.st_mtime_ns,
+                "size": len(source_bytes),
+                "content_sha256": sha256(source_bytes).hexdigest(),
+            }
     raise KeyerError("Input image changed while it was being read")
 
 

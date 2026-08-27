@@ -61,11 +61,22 @@ def read_rgb_image(path: Path) -> np.ndarray:
         raise KeyerError("Input path does not exist")
     if not path.is_file():
         raise KeyerError("Input path must be a file")
-    if path.suffix.lower() not in _INPUT_SUFFIXES:
-        raise KeyerError("Input path must have a supported image suffix")
 
     try:
-        with Image.open(path) as image:
+        return read_rgb_image_bytes(path.read_bytes(), path.suffix)
+    except OSError as error:
+        raise KeyerError("Input image could not be read") from error
+
+
+def read_rgb_image_bytes(source_bytes: bytes, source_suffix: str) -> np.ndarray:
+    """Decode supported image bytes into an RGB uint8 pixel array."""
+    if source_suffix.lower() not in _INPUT_SUFFIXES:
+        raise KeyerError("Input path must have a supported image suffix")
+    if not isinstance(source_bytes, bytes):
+        raise KeyerError("Input image could not be read")
+
+    try:
+        with Image.open(BytesIO(source_bytes)) as image:
             return np.asarray(image.convert("RGB"), dtype=np.uint8)
     except (OSError, UnidentifiedImageError) as error:
         raise KeyerError("Input image could not be read") from error

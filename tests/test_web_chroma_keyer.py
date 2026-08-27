@@ -1,6 +1,7 @@
 from io import BytesIO
 from os import utime
 from pathlib import Path
+from threading import Event, Thread
 from uuid import UUID
 
 import numpy as np
@@ -262,6 +263,73 @@ def test_preview_cache_distinguishes_content_with_identical_source_metadata(
         ),
     ],
 )
+def test_preview_snapshot_never_caches_aba_decoded_bytes_under_restored_source(
+    tmp_path: Path,
+    monkeypatch,
+    url: str,
+    payload: dict[str, object],
+    make_expected_preview,
+) -> None:
+    input_path = tmp_path / "input.png"
+    original_pixels = _write_input_image(input_path)
+    input_path.write_bytes(input_path.read_bytes() + (b"\0" * 2_048))
+    replacement_pixels = original_pixels.copy()
+    replacement_pixels[0, 0] = [220, 40, 40]
+    original_read_rgb_image = web_routes.read_rgb_image
+
+    def read_replacement_then_restore(path: Path) -> np.ndarray:
+        _replace_image_preserving_metadata(input_path, replacement_pixels)
+        try:
+            return original_read_rgb_image(path)
+        finally:
+            _replace_image_preserving_metadata(input_path, original_pixels)
+
+    def decode_snapshot_during_aba(
+        source_bytes: bytes,
+        source_suffix: str,
+    ) -> np.ndarray:
+        assert source_suffix == ".png"
+        _replace_image_preserving_metadata(input_path, replacement_pixels)
+        _replace_image_preserving_metadata(input_path, original_pixels)
+        with Image.open(BytesIO(source_bytes)) as image:
+            return np.asarray(image.convert("RGB"), dtype=np.uint8)
+
+    monkeypatch.setattr(web_routes, "read_rgb_image", read_replacement_then_restore)
+    monkeypatch.setattr(
+        web_routes,
+        "read_rgb_image_bytes",
+        decode_snapshot_during_aba,
+        raising=False,
+    )
+    client = _client(tmp_path)
+    request_body = {"input_path": str(input_path), **payload}
+
+    first_response = client.post(url, json=request_body)
+    second_response = client.post(url, json=request_body)
+
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+    assert second_response.json()["preview_url"] == first_response.json()[
+        "preview_url"
+    ]
+    preview = client.get(first_response.json()["preview_url"])
+    assert np.array_equal(
+        _decode_rgb_png(preview.content),
+        _decode_rgb_png(make_expected_preview(original_pixels)),
+    )
+
+
+@mark.parametrize(
+    ("url", "payload", "make_expected_preview"),
+    [
+        ("/api/chroma-keyer/images/inspect", {}, make_preview_png),
+        (
+            "/api/chroma-keyer/previews",
+            {"samples": [[42, 180, 72]], "view_mode": "alpha"},
+            _generated_alpha_preview,
+        ),
+    ],
+)
 def test_preview_retries_decode_when_source_changes_during_snapshot(
     tmp_path: Path,
     monkeypatch,
@@ -277,18 +345,26 @@ def test_preview_retries_decode_when_source_changes_during_snapshot(
         ],
         dtype=np.uint8,
     )
-    original_read_rgb_image = web_routes.read_rgb_image
+    original_read_rgb_image_bytes = getattr(
+        web_routes,
+        "read_rgb_image_bytes",
+        None,
+    )
     decode_calls = 0
 
-    def overwrite_after_first_decode(path: Path) -> np.ndarray:
+    def overwrite_after_first_decode(
+        source_bytes: bytes,
+        source_suffix: str,
+    ) -> np.ndarray:
         nonlocal decode_calls
-        rgb = original_read_rgb_image(path)
+        assert original_read_rgb_image_bytes is not None
+        rgb = original_read_rgb_image_bytes(source_bytes, source_suffix)
         decode_calls += 1
         if decode_calls == 1:
-            original_stat = path.stat()
-            Image.fromarray(replacement_pixels, mode="RGB").save(path)
+            original_stat = input_path.stat()
+            Image.fromarray(replacement_pixels, mode="RGB").save(input_path)
             utime(
-                path,
+                input_path,
                 ns=(
                     original_stat.st_atime_ns,
                     original_stat.st_mtime_ns + 1_000_000_000,
@@ -296,7 +372,12 @@ def test_preview_retries_decode_when_source_changes_during_snapshot(
             )
         return rgb
 
-    monkeypatch.setattr(web_routes, "read_rgb_image", overwrite_after_first_decode)
+    monkeypatch.setattr(
+        web_routes,
+        "read_rgb_image_bytes",
+        overwrite_after_first_decode,
+        raising=False,
+    )
     client = _client(tmp_path)
 
     response = client.post(url, json={"input_path": str(input_path), **payload})
@@ -336,32 +417,42 @@ def test_preview_retries_failed_decode_after_source_update(
         ],
         dtype=np.uint8,
     )
-    original_read_rgb_image = web_routes.read_rgb_image
+    original_read_rgb_image_bytes = getattr(
+        web_routes,
+        "read_rgb_image_bytes",
+        None,
+    )
     decode_calls = 0
 
-    def corrupt_then_replace_during_first_decode(path: Path) -> np.ndarray:
+    def corrupt_then_replace_during_first_decode(
+        source_bytes: bytes,
+        source_suffix: str,
+    ) -> np.ndarray:
         nonlocal decode_calls
         decode_calls += 1
         if decode_calls == 1:
-            source_stat = path.stat()
-            path.write_bytes(b"not an image")
+            source_stat = input_path.stat()
+            input_path.write_bytes(b"not an image")
             try:
-                return original_read_rgb_image(path)
+                assert original_read_rgb_image_bytes is not None
+                return original_read_rgb_image_bytes(source_bytes, source_suffix)
             finally:
-                Image.fromarray(replacement_pixels, mode="RGB").save(path)
+                Image.fromarray(replacement_pixels, mode="RGB").save(input_path)
                 utime(
-                    path,
+                    input_path,
                     ns=(
                         source_stat.st_atime_ns,
                         source_stat.st_mtime_ns + 1_000_000_000,
                     ),
                 )
-        return original_read_rgb_image(path)
+        assert original_read_rgb_image_bytes is not None
+        return original_read_rgb_image_bytes(source_bytes, source_suffix)
 
     monkeypatch.setattr(
         web_routes,
-        "read_rgb_image",
+        "read_rgb_image_bytes",
         corrupt_then_replace_during_first_decode,
+        raising=False,
     )
     client = _client(tmp_path)
 
@@ -760,6 +851,171 @@ def test_preview_store_returns_immutable_entry_across_eviction() -> None:
     assert cached_entry == inserted_entry
     assert store.get(inserted_entry.preview_id) is None
     assert inserted_entry.png_bytes == b"first"
+
+
+def test_preview_store_releases_global_lock_while_generating_preview() -> None:
+    store = ChromaPreviewStore()
+    generation_started = Event()
+    release_generation = Event()
+    blocked_result: list[str] = []
+    independent_result: list[tuple[str, bytes | None, str]] = []
+    blocked_error: list[BaseException] = []
+    independent_complete = Event()
+
+    def create_blocked_preview() -> bytes:
+        generation_started.set()
+        assert release_generation.wait(timeout=5)
+        return b"blocked"
+
+    def request_blocked_preview() -> None:
+        try:
+            blocked_result.append(
+                store.get_or_put("blocked-request", create_blocked_preview)
+            )
+        except BaseException as exc:
+            blocked_error.append(exc)
+
+    def access_independent_cache_entries() -> None:
+        try:
+            preview_id = store.put(b"independent")
+            other_preview_id = store.get_or_put(
+                "other-request",
+                lambda: b"other",
+            )
+            independent_result.append(
+                (preview_id, store.get(preview_id), other_preview_id)
+            )
+        finally:
+            independent_complete.set()
+
+    blocked_thread = Thread(target=request_blocked_preview)
+    blocked_thread.start()
+    assert generation_started.wait(timeout=1)
+    independent_thread = Thread(target=access_independent_cache_entries)
+    independent_thread.start()
+    try:
+        assert independent_complete.wait(timeout=1)
+    finally:
+        release_generation.set()
+        blocked_thread.join(timeout=5)
+        independent_thread.join(timeout=5)
+
+    assert not blocked_thread.is_alive()
+    assert not independent_thread.is_alive()
+    assert blocked_error == []
+    assert len(blocked_result) == 1
+    assert len(independent_result) == 1
+    assert independent_result[0][1] == b"independent"
+
+
+def test_preview_store_deduplicates_concurrent_generation_for_the_same_key() -> None:
+    store = ChromaPreviewStore()
+    generation_started = Event()
+    release_generation = Event()
+    first_result: list[str] = []
+    second_result: list[str] = []
+    errors: list[BaseException] = []
+    generation_calls = 0
+
+    def create_preview() -> bytes:
+        nonlocal generation_calls
+        generation_calls += 1
+        generation_started.set()
+        assert release_generation.wait(timeout=5)
+        return b"shared"
+
+    def request_first_preview() -> None:
+        try:
+            first_result.append(store.get_or_put("shared-request", create_preview))
+        except BaseException as exc:
+            errors.append(exc)
+
+    def request_second_preview() -> None:
+        try:
+            second_result.append(
+                store.get_or_put(
+                    "shared-request",
+                    lambda: (_ for _ in ()).throw(
+                        AssertionError("duplicate generator must not run")
+                    ),
+                )
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    first_thread = Thread(target=request_first_preview)
+    first_thread.start()
+    assert generation_started.wait(timeout=1)
+    second_thread = Thread(target=request_second_preview)
+    second_thread.start()
+    release_generation.set()
+    first_thread.join(timeout=5)
+    second_thread.join(timeout=5)
+
+    assert not first_thread.is_alive()
+    assert not second_thread.is_alive()
+    assert errors == []
+    assert generation_calls == 1
+    assert first_result == second_result
+
+
+def test_preview_store_releases_same_key_waiters_after_generator_failure() -> None:
+    store = ChromaPreviewStore()
+    generation_started = Event()
+    release_generation = Event()
+    second_waiter_seen = Event()
+    first_error: list[BaseException] = []
+    second_error: list[BaseException] = []
+    second_complete = Event()
+
+    class TrackingInFlightDict(dict):
+        def get(self, key, default=None):
+            in_flight = super().get(key, default)
+            if key == "failing-request" and in_flight is not None:
+                second_waiter_seen.set()
+            return in_flight
+
+    store._in_flight_by_cache_key = TrackingInFlightDict()
+
+    def failing_generator() -> bytes:
+        generation_started.set()
+        assert release_generation.wait(timeout=5)
+        raise RuntimeError("generation failed")
+
+    def request_first_preview() -> None:
+        try:
+            store.get_or_put("failing-request", failing_generator)
+        except BaseException as exc:
+            first_error.append(exc)
+
+    def request_second_preview() -> None:
+        try:
+            store.get_or_put(
+                "failing-request",
+                lambda: (_ for _ in ()).throw(
+                    AssertionError("duplicate generator must not run")
+                ),
+            )
+        except BaseException as exc:
+            second_error.append(exc)
+        finally:
+            second_complete.set()
+
+    first_thread = Thread(target=request_first_preview)
+    first_thread.start()
+    assert generation_started.wait(timeout=1)
+    second_thread = Thread(target=request_second_preview)
+    second_thread.start()
+    assert second_waiter_seen.wait(timeout=1)
+    release_generation.set()
+    assert second_complete.wait(timeout=1)
+    first_thread.join(timeout=5)
+    second_thread.join(timeout=5)
+
+    assert not first_thread.is_alive()
+    assert not second_thread.is_alive()
+    assert [str(error) for error in first_error] == ["generation failed"]
+    assert [str(error) for error in second_error] == ["generation failed"]
 
 
 @mark.parametrize("max_entries", [0, -1, True, 1.5])

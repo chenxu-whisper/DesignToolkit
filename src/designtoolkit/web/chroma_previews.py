@@ -1,6 +1,6 @@
 from collections import OrderedDict
 from dataclasses import dataclass
-from threading import Lock
+from threading import Event, Lock
 from uuid import uuid4
 
 
@@ -10,6 +10,13 @@ class ChromaPreviewEntry:
 
     preview_id: str
     png_bytes: bytes
+
+
+@dataclass(slots=True)
+class _InFlightPreview:
+    completed: Event
+    entry: ChromaPreviewEntry | None = None
+    error: BaseException | None = None
 
 
 class ChromaPreviewStore:
@@ -25,6 +32,7 @@ class ChromaPreviewStore:
         self._max_entries = max_entries
         self._previews: OrderedDict[str, ChromaPreviewEntry] = OrderedDict()
         self._preview_ids_by_cache_key: dict[str, str] = {}
+        self._in_flight_by_cache_key: dict[str, _InFlightPreview] = {}
         self._lock = Lock()
 
     def put(self, png_bytes: bytes, *, cache_key: str | None = None) -> str:
@@ -37,10 +45,9 @@ class ChromaPreviewStore:
 
         with self._lock:
             if cache_key is not None:
-                existing_preview_id = self._preview_ids_by_cache_key.get(cache_key)
-                if existing_preview_id in self._previews:
-                    return existing_preview_id
-                self._preview_ids_by_cache_key.pop(cache_key, None)
+                existing_entry = self._entry_for_cache_key_locked(cache_key)
+                if existing_entry is not None:
+                    return existing_entry.preview_id
 
             return self._insert_locked(png_bytes, cache_key=cache_key).preview_id
 
@@ -56,22 +63,68 @@ class ChromaPreviewStore:
             raise ValueError("cache_key must be a non-empty string")
 
         with self._lock:
-            existing_preview_id = self._preview_ids_by_cache_key.get(cache_key)
-            existing_entry = self._previews.get(existing_preview_id)
+            existing_entry = self._entry_for_cache_key_locked(cache_key)
             if existing_entry is not None:
                 return existing_entry
-            self._preview_ids_by_cache_key.pop(cache_key, None)
 
+            in_flight = self._in_flight_by_cache_key.get(cache_key)
+            if in_flight is None:
+                in_flight = _InFlightPreview(completed=Event())
+                self._in_flight_by_cache_key[cache_key] = in_flight
+                owns_generation = True
+            else:
+                owns_generation = False
+
+        if not owns_generation:
+            in_flight.completed.wait()
+            if in_flight.error is not None:
+                raise in_flight.error
+            if in_flight.entry is not None:
+                return in_flight.entry
+            raise RuntimeError("preview generation completed without an entry")
+
+        try:
             png_bytes = create_png_bytes()
             if not isinstance(png_bytes, bytes) or not png_bytes:
                 raise ValueError("png_bytes must be non-empty bytes")
 
-            return self._insert_locked(png_bytes, cache_key=cache_key)
+            with self._lock:
+                existing_entry = self._entry_for_cache_key_locked(cache_key)
+                in_flight.entry = (
+                    existing_entry
+                    if existing_entry is not None
+                    else self._insert_locked(png_bytes, cache_key=cache_key)
+                )
+        except BaseException as exc:
+            with self._lock:
+                if self._in_flight_by_cache_key.get(cache_key) is in_flight:
+                    del self._in_flight_by_cache_key[cache_key]
+                in_flight.error = exc
+                in_flight.completed.set()
+            raise
+
+        with self._lock:
+            if self._in_flight_by_cache_key.get(cache_key) is in_flight:
+                del self._in_flight_by_cache_key[cache_key]
+            in_flight.completed.set()
+        if in_flight.entry is None:
+            raise RuntimeError("preview generation completed without an entry")
+        return in_flight.entry
 
     def get(self, preview_id: str) -> bytes | None:
         with self._lock:
             entry = self._previews.get(preview_id)
             return None if entry is None else entry.png_bytes
+
+    def _entry_for_cache_key_locked(
+        self,
+        cache_key: str,
+    ) -> ChromaPreviewEntry | None:
+        preview_id = self._preview_ids_by_cache_key.get(cache_key)
+        entry = self._previews.get(preview_id)
+        if entry is None:
+            self._preview_ids_by_cache_key.pop(cache_key, None)
+        return entry
 
     def _insert_locked(
         self,
