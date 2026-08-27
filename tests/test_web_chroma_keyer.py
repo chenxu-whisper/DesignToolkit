@@ -13,6 +13,7 @@ from designtoolkit.chroma_keyer.image_io import make_preview_png, read_rgb_image
 from designtoolkit.chroma_keyer.matte import generate_alpha, refine_alpha
 from designtoolkit.chroma_keyer.models import KeyerParams
 from designtoolkit.chroma_keyer.sampling import screen_model_from_samples
+from designtoolkit.web import routes as web_routes
 from designtoolkit.web.app import create_app
 from designtoolkit.web.chroma_previews import ChromaPreviewStore
 from designtoolkit.web.schemas import ChromaKeyerTaskRequest
@@ -37,6 +38,12 @@ def _client(tmp_path: Path) -> TestClient:
 def _decode_rgb_png(png_bytes: bytes) -> np.ndarray:
     with Image.open(BytesIO(png_bytes)) as image:
         return np.asarray(image.convert("RGB")).copy()
+
+
+def _generated_alpha_preview(rgb: np.ndarray) -> bytes:
+    model = screen_model_from_samples([[42, 180, 72]])
+    alpha = refine_alpha(generate_alpha(rgb, model, KeyerParams()), KeyerParams())
+    return make_preview_png(np.repeat(alpha[..., np.newaxis], 3, axis=2))
 
 
 def test_chroma_keyer_task_request_accepts_the_default_export_contract() -> None:
@@ -182,6 +189,65 @@ def test_inspect_preview_reuses_file_fingerprint_and_changes_after_source_update
 
     assert updated_response.status_code == 200
     assert updated_response.json()["preview_url"] != first_url
+
+
+@mark.parametrize(
+    ("url", "payload", "make_expected_preview"),
+    [
+        ("/api/chroma-keyer/images/inspect", {}, make_preview_png),
+        (
+            "/api/chroma-keyer/previews",
+            {"samples": [[42, 180, 72]], "view_mode": "alpha"},
+            _generated_alpha_preview,
+        ),
+    ],
+)
+def test_preview_retries_decode_when_source_changes_during_snapshot(
+    tmp_path: Path,
+    monkeypatch,
+    url: str,
+    payload: dict[str, object],
+    make_expected_preview,
+) -> None:
+    input_path = tmp_path / "input.png"
+    _write_input_image(input_path)
+    replacement_pixels = np.array(
+        [
+            [[220, 40, 40], [220, 40, 40], [220, 40, 40]],
+        ],
+        dtype=np.uint8,
+    )
+    original_read_rgb_image = web_routes.read_rgb_image
+    decode_calls = 0
+
+    def overwrite_after_first_decode(path: Path) -> np.ndarray:
+        nonlocal decode_calls
+        rgb = original_read_rgb_image(path)
+        decode_calls += 1
+        if decode_calls == 1:
+            original_stat = path.stat()
+            Image.fromarray(replacement_pixels, mode="RGB").save(path)
+            utime(
+                path,
+                ns=(
+                    original_stat.st_atime_ns,
+                    original_stat.st_mtime_ns + 1_000_000_000,
+                ),
+            )
+        return rgb
+
+    monkeypatch.setattr(web_routes, "read_rgb_image", overwrite_after_first_decode)
+    client = _client(tmp_path)
+
+    response = client.post(url, json={"input_path": str(input_path), **payload})
+
+    assert response.status_code == 200
+    assert decode_calls == 2
+    preview = client.get(response.json()["preview_url"])
+    assert np.array_equal(
+        _decode_rgb_png(preview.content),
+        _decode_rgb_png(make_expected_preview(replacement_pixels)),
+    )
 
 
 def test_sample_maps_preview_coordinates_to_source_pixel_with_uppercase_hex(
