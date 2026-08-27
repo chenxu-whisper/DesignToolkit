@@ -912,10 +912,20 @@ def test_preview_store_deduplicates_concurrent_generation_for_the_same_key() -> 
     store = ChromaPreviewStore()
     generation_started = Event()
     release_generation = Event()
+    second_waiter_seen = Event()
     first_result: list[str] = []
     second_result: list[str] = []
     errors: list[BaseException] = []
     generation_calls = 0
+
+    class TrackingInFlightDict(dict):
+        def get(self, key, default=None):
+            in_flight = super().get(key, default)
+            if key == "shared-request" and in_flight is not None:
+                second_waiter_seen.set()
+            return in_flight
+
+    store._in_flight_by_cache_key = TrackingInFlightDict()
 
     def create_preview() -> bytes:
         nonlocal generation_calls
@@ -948,6 +958,7 @@ def test_preview_store_deduplicates_concurrent_generation_for_the_same_key() -> 
     assert generation_started.wait(timeout=1)
     second_thread = Thread(target=request_second_preview)
     second_thread.start()
+    assert second_waiter_seen.wait(timeout=1)
     release_generation.set()
     first_thread.join(timeout=5)
     second_thread.join(timeout=5)
