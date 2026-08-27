@@ -287,12 +287,15 @@ def create_router(
         except KeyerError as exc:
             raise ApiError("invalid_request", str(exc), 400) from exc
 
+        sampled_rgb = [int(channel) for channel in rgb[source_y, source_x]]
         return ChromaSampleResponse(
-            rgb=[int(channel) for channel in rgb[source_y, source_x]],
+            rgb=sampled_rgb,
+            hex=f"#{sampled_rgb[0]:02X}{sampled_rgb[1]:02X}{sampled_rgb[2]:02X}",
             source_x=source_x,
             source_y=source_y,
         )
 
+    @router.post("/chroma-keyer/preview", response_model=ChromaPreviewResponse)
     @router.post("/chroma-keyer/previews", response_model=ChromaPreviewResponse)
     def create_chroma_preview(
         request: ChromaPreviewRequest,

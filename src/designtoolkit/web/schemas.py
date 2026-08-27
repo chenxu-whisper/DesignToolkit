@@ -85,6 +85,7 @@ class ChromaSampleRequest(BaseModel):
 
 class ChromaSampleResponse(BaseModel):
     rgb: list[RgbChannel] = Field(min_length=3, max_length=3)
+    hex: str
     source_x: Annotated[int, Field(strict=True, ge=0)]
     source_y: Annotated[int, Field(strict=True, ge=0)]
 

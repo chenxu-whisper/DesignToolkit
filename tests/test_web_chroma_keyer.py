@@ -148,16 +148,18 @@ def test_inspect_preview_reuses_file_fingerprint_and_changes_after_source_update
     assert updated_response.json()["preview_url"] != first_url
 
 
-def test_sample_maps_preview_coordinates_to_source_pixel(tmp_path: Path) -> None:
+def test_sample_maps_preview_coordinates_to_source_pixel_with_uppercase_hex(
+    tmp_path: Path,
+) -> None:
     input_path = tmp_path / "input.png"
-    pixels = _write_input_image(input_path)
+    _write_input_image(input_path)
 
     response = _client(tmp_path).post(
         "/api/chroma-keyer/images/sample",
         json={
             "input_path": str(input_path),
-            "x": 1.9,
-            "y": 0.9,
+            "x": 0.9,
+            "y": 0.1,
             "preview_width": 2,
             "preview_height": 1,
         },
@@ -165,9 +167,10 @@ def test_sample_maps_preview_coordinates_to_source_pixel(tmp_path: Path) -> None
 
     assert response.status_code == 200
     assert response.json() == {
-        "rgb": pixels[1, 3].tolist(),
-        "source_x": 3,
-        "source_y": 1,
+        "rgb": [220, 40, 40],
+        "hex": "#DC2828",
+        "source_x": 1,
+        "source_y": 0,
     }
 
 
@@ -274,6 +277,28 @@ def test_generated_preview_reuses_request_state_and_varies_by_view_and_params(
         preview_url = response.json()["preview_url"]
         UUID(preview_url.rsplit("/", maxsplit=1)[1])
         assert str(input_path) not in preview_url
+
+
+def test_singular_and_plural_preview_routes_share_the_request_cache(
+    tmp_path: Path,
+) -> None:
+    input_path = tmp_path / "input.png"
+    _write_input_image(input_path)
+    client = _client(tmp_path)
+    payload = {
+        "input_path": str(input_path),
+        "samples": [[42, 180, 72]],
+    }
+
+    plural_response = client.post("/api/chroma-keyer/previews", json=payload)
+    singular_response = client.post("/api/chroma-keyer/preview", json=payload)
+
+    assert plural_response.status_code == 200
+    assert singular_response.status_code == 200
+    assert (
+        singular_response.json()["preview_url"]
+        == plural_response.json()["preview_url"]
+    )
 
 
 def test_preview_rejects_empty_samples_for_a_valid_image(tmp_path: Path) -> None:
