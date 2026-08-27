@@ -12,7 +12,7 @@ from pytest import mark, raises
 from designtoolkit.chroma_keyer.despill import despill
 from designtoolkit.chroma_keyer.image_io import make_preview_png, read_rgb_image
 from designtoolkit.chroma_keyer.matte import generate_alpha, refine_alpha
-from designtoolkit.chroma_keyer.models import KeyerParams
+from designtoolkit.chroma_keyer.models import KeyerParams, KeyImageResult
 from designtoolkit.chroma_keyer.sampling import screen_model_from_samples
 from designtoolkit.web import routes as web_routes
 from designtoolkit.web.adapters import chroma_keyer_options_from_request
@@ -73,18 +73,21 @@ def test_chroma_keyer_task_request_accepts_the_default_export_contract() -> None
     request = ChromaKeyerTaskRequest(
         input_path="input.png",
         samples=[[42, 180, 72]],
+        params={},
     )
 
     assert request.model_dump() == {
         "input_path": "input.png",
         "samples": [[42, 180, 72]],
-        "tolerance": 0.25,
-        "softness": 0.15,
-        "clip_black": 0.0,
-        "clip_white": 1.0,
-        "shrink_grow": 0,
-        "feather": 0,
-        "despill_amount": 0.5,
+        "params": {
+            "tolerance": 0.25,
+            "softness": 0.15,
+            "clip_black": 0.0,
+            "clip_white": 1.0,
+            "shrink_grow": 0,
+            "feather": 0,
+            "despill_amount": 0.5,
+        },
         "output_path": None,
     }
 
@@ -97,7 +100,8 @@ def test_chroma_keyer_task_request_accepts_the_default_export_contract() -> None
         {"samples": [[-1, 180, 72]]},
         {"samples": [[42, 180, 256]]},
         {"samples": [[True, 180, 72]]},
-        {"clip_black": 0.5, "clip_white": 0.5},
+        {"params": {"clip_black": 0.5, "clip_white": 0.5}},
+        {"params": {"tolerance": 1.1}},
         {"output_path": "   "},
     ],
 )
@@ -109,7 +113,45 @@ def test_chroma_keyer_task_request_rejects_invalid_export_contract(
             {
                 "input_path": "input.png",
                 "samples": [[42, 180, 72]],
+                "params": {},
                 **changes,
+            }
+        )
+
+
+def test_chroma_keyer_task_request_requires_nested_params() -> None:
+    with raises(ValueError):
+        ChromaKeyerTaskRequest.model_validate(
+            {
+                "input_path": "input.png",
+                "samples": [[42, 180, 72]],
+            }
+        )
+
+
+@mark.parametrize(
+    ("legacy_field", "legacy_value"),
+    [
+        ("tolerance", 0.4),
+        ("softness", 0.2),
+        ("clip_black", 0.1),
+        ("clip_white", 0.9),
+        ("shrink_grow", -1),
+        ("feather", 1),
+        ("despill_amount", 0.75),
+    ],
+)
+def test_chroma_keyer_task_request_rejects_legacy_flattened_params(
+    legacy_field: str,
+    legacy_value: float | int,
+) -> None:
+    with raises(ValueError):
+        ChromaKeyerTaskRequest.model_validate(
+            {
+                "input_path": "input.png",
+                "samples": [[42, 180, 72]],
+                "params": {},
+                legacy_field: legacy_value,
             }
         )
 
@@ -120,13 +162,15 @@ def test_chroma_keyer_adapter_converts_request_to_core_keying_arguments() -> Non
             input_path="screen.png",
             output_path="keyed.png",
             samples=[[42, 180, 72], [40, 182, 74]],
-            tolerance=0.4,
-            softness=0.2,
-            clip_black=0.1,
-            clip_white=0.9,
-            shrink_grow=-2,
-            feather=3,
-            despill_amount=0.75,
+            params={
+                "tolerance": 0.4,
+                "softness": 0.2,
+                "clip_black": 0.1,
+                "clip_white": 0.9,
+                "shrink_grow": -2,
+                "feather": 3,
+                "despill_amount": 0.75,
+            },
         )
     )
     options, model, params = arguments
@@ -157,6 +201,7 @@ def test_chroma_keyer_task_manager_exports_default_source_sized_rgba_png(
         ChromaKeyerTaskRequest(
             input_path=str(input_path),
             samples=[[42, 180, 72]],
+            params={},
         )
     )
 
@@ -195,6 +240,7 @@ def test_chroma_keyer_task_endpoint_creates_and_reports_completed_task(
         json={
             "input_path": str(input_path),
             "samples": [[42, 180, 72]],
+            "params": {},
         },
     )
 
@@ -227,6 +273,7 @@ def test_chroma_keyer_task_endpoint_rejects_existing_output_without_overwrite(
         json={
             "input_path": str(input_path),
             "samples": [[42, 180, 72]],
+            "params": {},
         },
     )
 
@@ -238,6 +285,119 @@ def test_chroma_keyer_task_endpoint_rejects_existing_output_without_overwrite(
         }
     }
     assert output_path.read_bytes() == original_bytes
+
+
+def test_chroma_keyer_task_endpoint_rejects_invalid_nested_and_flattened_params(
+    tmp_path: Path,
+) -> None:
+    input_path = tmp_path / "screen.png"
+    _write_input_image(input_path)
+    client = TestClient(
+        create_app(
+            task_manager=TaskManager(log_store=LogStore(), run_async=False),
+            local_path_roots=[tmp_path],
+        )
+    )
+    valid_request = {
+        "input_path": str(input_path),
+        "samples": [[42, 180, 72]],
+        "params": {},
+    }
+
+    invalid_nested_response = client.post(
+        "/api/tasks/chroma-keyer",
+        json={
+            **valid_request,
+            "params": {"clip_black": 0.5, "clip_white": 0.5},
+        },
+    )
+    flattened_response = client.post(
+        "/api/tasks/chroma-keyer",
+        json={**valid_request, "tolerance": 0.4},
+    )
+
+    assert invalid_nested_response.status_code == 400
+    assert invalid_nested_response.json()["error"]["code"] == "invalid_request"
+    assert flattened_response.status_code == 400
+    assert flattened_response.json()["error"]["code"] == "invalid_request"
+
+
+def test_chroma_keyer_task_endpoint_returns_conflict_until_blocked_task_succeeds(
+    tmp_path: Path,
+) -> None:
+    input_path = tmp_path / "screen.png"
+    _write_input_image(input_path)
+    keyer_started = Event()
+    release_keyer = Event()
+    task_finished = Event()
+    log_store = LogStore()
+
+    def blocking_keyer(options, _model, _params) -> KeyImageResult:
+        keyer_started.set()
+        assert release_keyer.wait(timeout=1)
+        return KeyImageResult(output_path=tmp_path / "screen_keyed.png")
+
+    class SignallingTaskManager(TaskManager):
+        def mark_finished(
+            self,
+            task_id: str,
+            *,
+            status: TaskStatus,
+            output_path: str | None = None,
+            error: str | None = None,
+        ):
+            task = super().mark_finished(
+                task_id,
+                status=status,
+                output_path=output_path,
+                error=error,
+            )
+            task_finished.set()
+            return task
+
+    task_manager = SignallingTaskManager(
+        log_store=log_store,
+        keyer=blocking_keyer,
+        run_async=True,
+    )
+    client = TestClient(
+        create_app(task_manager=task_manager, local_path_roots=[tmp_path])
+    )
+    request_body = {
+        "input_path": str(input_path),
+        "samples": [[42, 180, 72]],
+        "params": {},
+    }
+
+    first_response = client.post("/api/tasks/chroma-keyer", json=request_body)
+
+    assert first_response.status_code == 200
+    first_task_id = first_response.json()["task_id"]
+    assert keyer_started.wait(timeout=1)
+    assert [
+        (event.level, event.phase)
+        for event in log_store.history(first_task_id)
+    ] == [
+        (LogLevel.INFO, LogPhase.CREATED),
+        (LogLevel.PROGRESS, LogPhase.RUNNING),
+    ]
+
+    second_response = client.post("/api/tasks/chroma-keyer", json=request_body)
+
+    assert second_response.status_code == 409
+    assert second_response.json() == {
+        "error": {
+            "code": "task_conflict",
+            "message": "A task is already running",
+        }
+    }
+
+    completion_events = log_store.subscribe(first_task_id)
+    release_keyer.set()
+    assert completion_events.get(timeout=1).phase is LogPhase.RUNNING
+    assert completion_events.get(timeout=1).phase is LogPhase.COMPLETED
+    assert task_finished.wait(timeout=1)
+    assert task_manager.get_task(first_task_id).status is TaskStatus.SUCCEEDED
 
 
 def test_inspect_returns_dimensions_and_a_retrievable_preview(tmp_path: Path) -> None:

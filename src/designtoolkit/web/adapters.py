@@ -32,6 +32,7 @@ def _parse_request_size(value: str) -> tuple[int, int]:
 def chroma_keyer_options_from_request(
     request: ChromaKeyerTaskRequest,
 ) -> tuple[KeyImageOptions, ScreenColorModel, KeyerParams]:
+    params = request.params
     return (
         KeyImageOptions(
             input_path=Path(request.input_path),
@@ -39,13 +40,13 @@ def chroma_keyer_options_from_request(
         ),
         screen_model_from_samples(request.samples),
         KeyerParams(
-            tolerance=request.tolerance,
-            softness=request.softness,
-            clip_black=request.clip_black,
-            clip_white=request.clip_white,
-            shrink_grow=request.shrink_grow,
-            feather=request.feather,
-            despill_amount=request.despill_amount,
+            tolerance=params.tolerance,
+            softness=params.softness,
+            clip_black=params.clip_black,
+            clip_white=params.clip_white,
+            shrink_grow=params.shrink_grow,
+            feather=params.feather,
+            despill_amount=params.despill_amount,
         ),
     )
 
