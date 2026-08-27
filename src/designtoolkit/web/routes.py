@@ -37,6 +37,7 @@ from designtoolkit.web.native_picker import (
 from designtoolkit.web.schemas import (
     ChromaImageInspectRequest,
     ChromaImageInspectResponse,
+    ChromaKeyerTaskRequest,
     ChromaPreviewRequest,
     ChromaPreviewResponse,
     ChromaSampleRequest,
@@ -68,6 +69,7 @@ _CHROMA_SNAPSHOT_READ_ATTEMPTS = 3
 _KEYER_ERROR_CODES = {
     "Input image could not be read": "invalid_image",
     "samples must not be empty": "missing_samples",
+    "Output path already exists": "output_exists",
 }
 
 
@@ -89,10 +91,11 @@ def error_response(exc: ApiError) -> JSONResponse:
 
 
 def _chroma_keyer_error_response(exc: KeyerError) -> ApiError:
+    code = _KEYER_ERROR_CODES.get(str(exc), "invalid_request")
     return ApiError(
-        _KEYER_ERROR_CODES.get(str(exc), "invalid_request"),
+        code,
         str(exc),
-        400,
+        409 if code == "output_exists" else 400,
     )
 
 
@@ -287,6 +290,16 @@ def create_router(
             raise ApiError("task_conflict", str(exc), 409) from exc
         except _INVALID_REQUEST_ERRORS as exc:
             raise ApiError("invalid_request", str(exc), 400) from exc
+        return TaskCreateResponse(task_id=task.task_id, status=task.status)
+
+    @router.post("/tasks/chroma-keyer", response_model=TaskCreateResponse)
+    def create_chroma_keyer(request: ChromaKeyerTaskRequest) -> TaskCreateResponse:
+        try:
+            task = task_manager.create_chroma_keyer_task(request)
+        except TaskConflictError as exc:
+            raise ApiError("task_conflict", str(exc), 409) from exc
+        except KeyerError as exc:
+            raise _chroma_keyer_error_response(exc) from exc
         return TaskCreateResponse(task_id=task.task_id, status=task.status)
 
     @router.post(

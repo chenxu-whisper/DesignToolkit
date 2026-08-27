@@ -18,6 +18,7 @@ UnitIntervalFloat = Annotated[
 class TaskKind(StrEnum):
     VIDEO_FRAMES = "video_frames"
     MEDIA_RESIZE = "media_resize"
+    CHROMA_KEYER = "chroma_keyer"
 
 
 class TaskStatus(StrEnum):

@@ -2,6 +2,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from designtoolkit.chroma_keyer.models import (
+    KeyerParams,
+    KeyImageOptions,
+    ScreenColorModel,
+)
+from designtoolkit.chroma_keyer.sampling import screen_model_from_samples
 from designtoolkit.media_resize import MediaResizeOptions
 from designtoolkit.video_frames import (
     VideoFrameError,
@@ -9,7 +15,11 @@ from designtoolkit.video_frames import (
     default_output_dir,
     parse_size,
 )
-from designtoolkit.web.schemas import MediaResizeTaskRequest, VideoFramesTaskRequest
+from designtoolkit.web.schemas import (
+    ChromaKeyerTaskRequest,
+    MediaResizeTaskRequest,
+    VideoFramesTaskRequest,
+)
 
 
 def _parse_request_size(value: str) -> tuple[int, int]:
@@ -17,6 +27,27 @@ def _parse_request_size(value: str) -> tuple[int, int]:
         return parse_size(value)
     except VideoFrameError as exc:
         raise ValueError(str(exc)) from exc
+
+
+def chroma_keyer_options_from_request(
+    request: ChromaKeyerTaskRequest,
+) -> tuple[KeyImageOptions, ScreenColorModel, KeyerParams]:
+    return (
+        KeyImageOptions(
+            input_path=Path(request.input_path),
+            output_path=Path(request.output_path) if request.output_path else None,
+        ),
+        screen_model_from_samples(request.samples),
+        KeyerParams(
+            tolerance=request.tolerance,
+            softness=request.softness,
+            clip_black=request.clip_black,
+            clip_white=request.clip_white,
+            shrink_grow=request.shrink_grow,
+            feather=request.feather,
+            despill_amount=request.despill_amount,
+        ),
+    )
 
 
 def video_frame_options_from_request(

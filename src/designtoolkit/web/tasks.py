@@ -7,6 +7,17 @@ from threading import Lock, Thread
 from time import perf_counter
 from uuid import uuid4
 
+from designtoolkit.chroma_keyer.core import key_image
+from designtoolkit.chroma_keyer.image_io import (
+    default_output_path,
+    validate_output_path,
+)
+from designtoolkit.chroma_keyer.models import (
+    KeyerParams,
+    KeyImageOptions,
+    KeyImageResult,
+    ScreenColorModel,
+)
 from designtoolkit.media_resize import (
     MediaResizeOptions,
     MediaResizeResult,
@@ -20,11 +31,13 @@ from designtoolkit.video_frames import (
     export_video_frames,
 )
 from designtoolkit.web.adapters import (
+    chroma_keyer_options_from_request,
     media_resize_options_list_from_request,
     video_frame_options_list_from_request,
 )
 from designtoolkit.web.logs import LogStore
 from designtoolkit.web.schemas import (
+    ChromaKeyerTaskRequest,
     LogLevel,
     LogPhase,
     MediaResizeTaskRequest,
@@ -36,6 +49,7 @@ from designtoolkit.web.schemas import (
 
 Exporter = Callable[[VideoFrameOptions, FrameExportBackend], ExportResult]
 MediaResizer = Callable[[MediaResizeOptions, ResizeBackend], MediaResizeResult]
+Keyer = Callable[[KeyImageOptions, ScreenColorModel, KeyerParams], KeyImageResult]
 BackendFactory = Callable[[], FrameExportBackend | ResizeBackend]
 Clock = Callable[[], float]
 
@@ -77,6 +91,7 @@ class TaskManager:
         log_store: LogStore,
         exporter: Exporter | None = export_video_frames,
         media_resizer: MediaResizer | None = resize_media,
+        keyer: Keyer | None = key_image,
         backend_factory: BackendFactory | None = None,
         clock: Clock = perf_counter,
         run_async: bool = True,
@@ -84,6 +99,7 @@ class TaskManager:
         self.log_store = log_store
         self._exporter = exporter
         self._media_resizer = media_resizer
+        self._keyer = keyer
         self._backend_factory = backend_factory or self._default_backend
         self._clock = clock
         self._run_async = run_async
@@ -175,6 +191,27 @@ class TaskManager:
         )
         try:
             self._start(task, lambda: self._run_media_resize(task, options_list))
+        except Exception as exc:
+            self._mark_failed(task.task_id, str(exc))
+        return self.get_task(task.task_id) or task
+
+    def create_chroma_keyer_task(
+        self,
+        request: ChromaKeyerTaskRequest,
+    ) -> TaskRecord:
+        options, model, params = chroma_keyer_options_from_request(request)
+        output_path = options.output_path or default_output_path(options.input_path)
+        validate_output_path(options.input_path, output_path)
+        task = self.reserve_task(
+            kind=TaskKind.CHROMA_KEYER,
+            input_path=str(options.input_path),
+            output_path=str(output_path),
+        )
+        try:
+            self._start(
+                task,
+                lambda: self._run_chroma_keyer(task, options, model, params),
+            )
         except Exception as exc:
             self._mark_failed(task.task_id, str(exc))
         return self.get_task(task.task_id) or task
@@ -297,6 +334,40 @@ class TaskManager:
         self._mark_succeeded(
             task.task_id,
             "; ".join(str(result.output_path) for result in results),
+            elapsed_seconds=self._elapsed_seconds(task_started_at),
+        )
+
+    def _run_chroma_keyer(
+        self,
+        task: TaskRecord,
+        options: KeyImageOptions,
+        model: ScreenColorModel,
+        params: KeyerParams,
+    ) -> None:
+        self._mark_running(task.task_id)
+        task_started_at = self._clock()
+        try:
+            if self._keyer is None:
+                raise RuntimeError("chroma keyer is not configured")
+            result = self._keyer(options, model, params)
+            elapsed_seconds = self._elapsed_seconds(task_started_at)
+            self.log_store.append(
+                task_id=task.task_id,
+                level=LogLevel.SUCCESS,
+                phase=LogPhase.RUNNING,
+                message=f"Completed chroma key: {options.input_path}",
+                details={
+                    "input_path": str(options.input_path),
+                    "output_path": str(result.output_path),
+                    "elapsed_seconds": elapsed_seconds,
+                },
+            )
+        except Exception as exc:
+            self._mark_failed(task.task_id, str(exc))
+            return
+        self._mark_succeeded(
+            task.task_id,
+            str(result.output_path),
             elapsed_seconds=self._elapsed_seconds(task_started_at),
         )
 

@@ -15,9 +15,18 @@ from designtoolkit.chroma_keyer.matte import generate_alpha, refine_alpha
 from designtoolkit.chroma_keyer.models import KeyerParams
 from designtoolkit.chroma_keyer.sampling import screen_model_from_samples
 from designtoolkit.web import routes as web_routes
+from designtoolkit.web.adapters import chroma_keyer_options_from_request
 from designtoolkit.web.app import create_app
 from designtoolkit.web.chroma_previews import ChromaPreviewStore
-from designtoolkit.web.schemas import ChromaKeyerTaskRequest
+from designtoolkit.web.logs import LogStore
+from designtoolkit.web.schemas import (
+    ChromaKeyerTaskRequest,
+    LogLevel,
+    LogPhase,
+    TaskKind,
+    TaskStatus,
+)
+from designtoolkit.web.tasks import TaskManager
 
 
 def _write_input_image(path: Path) -> np.ndarray:
@@ -103,6 +112,132 @@ def test_chroma_keyer_task_request_rejects_invalid_export_contract(
                 **changes,
             }
         )
+
+
+def test_chroma_keyer_adapter_converts_request_to_core_keying_arguments() -> None:
+    arguments = chroma_keyer_options_from_request(
+        ChromaKeyerTaskRequest(
+            input_path="screen.png",
+            output_path="keyed.png",
+            samples=[[42, 180, 72], [40, 182, 74]],
+            tolerance=0.4,
+            softness=0.2,
+            clip_black=0.1,
+            clip_white=0.9,
+            shrink_grow=-2,
+            feather=3,
+            despill_amount=0.75,
+        )
+    )
+    options, model, params = arguments
+
+    assert options.input_path == Path("screen.png")
+    assert options.output_path == Path("keyed.png")
+    assert model.samples == ((42, 180, 72), (40, 182, 74))
+    assert params == KeyerParams(
+        tolerance=0.4,
+        softness=0.2,
+        clip_black=0.1,
+        clip_white=0.9,
+        shrink_grow=-2,
+        feather=3,
+        despill_amount=0.75,
+    )
+
+
+def test_chroma_keyer_task_manager_exports_default_source_sized_rgba_png(
+    tmp_path: Path,
+) -> None:
+    input_path = tmp_path / "screen.png"
+    _write_input_image(input_path)
+    log_store = LogStore()
+    task_manager = TaskManager(log_store=log_store, run_async=False)
+
+    task = task_manager.create_chroma_keyer_task(
+        ChromaKeyerTaskRequest(
+            input_path=str(input_path),
+            samples=[[42, 180, 72]],
+        )
+    )
+
+    output_path = tmp_path / "screen_keyed.png"
+    assert task.kind is TaskKind.CHROMA_KEYER
+    assert task.status is TaskStatus.SUCCEEDED
+    assert task.output_path == str(output_path)
+    with Image.open(output_path) as image:
+        assert image.mode == "RGBA"
+        assert image.size == (4, 2)
+        assert image.getpixel((0, 0))[3] == 0
+        assert image.getpixel((1, 0))[3] > 0
+
+    events = log_store.history(task.task_id)
+    assert [(event.level, event.phase) for event in events] == [
+        (LogLevel.INFO, LogPhase.CREATED),
+        (LogLevel.PROGRESS, LogPhase.RUNNING),
+        (LogLevel.SUCCESS, LogPhase.RUNNING),
+        (LogLevel.SUCCESS, LogPhase.COMPLETED),
+    ]
+    assert events[-1].details["elapsed_seconds"] >= 0
+
+
+def test_chroma_keyer_task_endpoint_creates_and_reports_completed_task(
+    tmp_path: Path,
+) -> None:
+    input_path = tmp_path / "screen.png"
+    _write_input_image(input_path)
+    task_manager = TaskManager(log_store=LogStore(), run_async=False)
+    client = TestClient(
+        create_app(task_manager=task_manager, local_path_roots=[tmp_path])
+    )
+
+    response = client.post(
+        "/api/tasks/chroma-keyer",
+        json={
+            "input_path": str(input_path),
+            "samples": [[42, 180, 72]],
+        },
+    )
+
+    assert response.status_code == 200
+    created_task = response.json()
+    assert created_task["status"] == "succeeded"
+    status = client.get(f"/api/tasks/{created_task['task_id']}")
+    assert status.status_code == 200
+    assert status.json()["kind"] == "chroma_keyer"
+    assert status.json()["status"] == "succeeded"
+
+
+def test_chroma_keyer_task_endpoint_rejects_existing_output_without_overwrite(
+    tmp_path: Path,
+) -> None:
+    input_path = tmp_path / "screen.png"
+    _write_input_image(input_path)
+    output_path = tmp_path / "screen_keyed.png"
+    original_bytes = b"existing keyed image"
+    output_path.write_bytes(original_bytes)
+    client = TestClient(
+        create_app(
+            task_manager=TaskManager(log_store=LogStore(), run_async=False),
+            local_path_roots=[tmp_path],
+        )
+    )
+
+    response = client.post(
+        "/api/tasks/chroma-keyer",
+        json={
+            "input_path": str(input_path),
+            "samples": [[42, 180, 72]],
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "error": {
+            "code": "output_exists",
+            "message": "Output path already exists",
+        }
+    }
+    assert output_path.read_bytes() == original_bytes
 
 
 def test_inspect_returns_dimensions_and_a_retrievable_preview(tmp_path: Path) -> None:
