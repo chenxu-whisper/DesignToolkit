@@ -1,0 +1,142 @@
+import type { FormEvent } from 'react'
+import { ImageUp, SlidersHorizontal } from 'lucide-react'
+import { FieldError } from '../../components/FieldError'
+import { PathInput } from '../../components/PathInput'
+import { pickLocalFiles, resolveDroppedFilePaths } from '../../services/apiClient'
+import type { ChromaKeyerErrors, ChromaKeyerValues } from './chromaKeyerValidation'
+
+type ChromaKeyerFormProps = {
+  disabled: boolean
+  errors: ChromaKeyerErrors
+  onChange: (values: ChromaKeyerValues) => void
+  onInspect: () => void
+  onSubmit: () => void
+  values: ChromaKeyerValues
+}
+
+const parameterFields = [
+  { id: 'tolerance', label: 'Tolerance', max: 1, min: 0, step: 0.01 },
+  { id: 'softness', label: 'Softness', max: 1, min: 0, step: 0.01 },
+  { id: 'clipBlack', label: 'Clip Black', max: 1, min: 0, step: 0.01 },
+  { id: 'clipWhite', label: 'Clip White', max: 1, min: 0, step: 0.01 },
+  { id: 'shrinkGrow', label: 'Shrink/Grow', max: 10, min: -10, step: 1 },
+  { id: 'feather', label: 'Feather', max: 10, min: 0, step: 1 },
+  { id: 'despillAmount', label: 'Despill Amount', max: 1, min: 0, step: 0.01 },
+] as const
+
+export function ChromaKeyerForm({ disabled, errors, onChange, onInspect, onSubmit, values }: ChromaKeyerFormProps) {
+  const updateValue = <Key extends keyof ChromaKeyerValues>(key: Key, value: ChromaKeyerValues[Key]) => {
+    onChange({ ...values, [key]: value })
+  }
+
+  const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    onSubmit()
+  }
+
+  return (
+    <form className="chroma-keyer-form" onSubmit={handleSubmit}>
+      <div className="chroma-form-section">
+        <h2 className="chroma-section-title">
+          <ImageUp aria-hidden="true" size={17} />
+          图片
+        </h2>
+        <PathInput
+          disabled={disabled}
+          error={errors.inputPath}
+          id="chroma-keyer-input-path"
+          label="输入图片路径"
+          onChange={(value) => updateValue('inputPath', value)}
+          pickPaths={async () => {
+            const response = await pickLocalFiles({
+              fileKind: 'image',
+              multiple: false,
+              title: '选择图片文件',
+            })
+            return response.paths
+          }}
+          placeholder="PNG、JPG 或 JPEG 本地路径"
+          required
+          resolveDroppedFilePaths={async (names) => {
+            const response = await resolveDroppedFilePaths(names)
+            return response.paths
+          }}
+          value={values.inputPath}
+        />
+        <button
+          className="secondary-action-button"
+          disabled={disabled || !values.inputPath.trim()}
+          onClick={onInspect}
+          type="button"
+        >
+          加载图片
+        </button>
+      </div>
+
+      <div className="chroma-form-section">
+        <h2 className="chroma-section-title">
+          <SlidersHorizontal aria-hidden="true" size={17} />
+          抠像参数
+        </h2>
+        <div className="chroma-parameter-grid">
+          {parameterFields.map((field) => (
+            <div className="field" key={field.id}>
+              <label className="field-label" htmlFor={`chroma-keyer-${field.id}`}>
+                {field.label}
+              </label>
+              <input
+                aria-describedby={errors[field.id] ? `chroma-keyer-${field.id}-error` : undefined}
+                aria-invalid={errors[field.id] ? 'true' : undefined}
+                className="text-input"
+                disabled={disabled}
+                id={`chroma-keyer-${field.id}`}
+                max={field.max}
+                min={field.min}
+                onChange={(event) => updateValue(field.id, event.target.value === '' ? Number.NaN : Number(event.target.value))}
+                step={field.step}
+                type="number"
+                value={Number.isNaN(values[field.id]) ? '' : values[field.id]}
+              />
+              <FieldError id={`chroma-keyer-${field.id}-error`} message={errors[field.id]} />
+            </div>
+          ))}
+        </div>
+        <fieldset className="chroma-view-mode" disabled={disabled}>
+          <legend>预览</legend>
+          <label className="choice">
+            <input
+              checked={values.viewMode === 'final'}
+              name="chroma-keyer-view-mode"
+              onChange={() => updateValue('viewMode', 'final')}
+              type="radio"
+              value="final"
+            />
+            Final
+          </label>
+          <label className="choice">
+            <input
+              checked={values.viewMode === 'alpha'}
+              name="chroma-keyer-view-mode"
+              onChange={() => updateValue('viewMode', 'alpha')}
+              type="radio"
+              value="alpha"
+            />
+            Alpha
+          </label>
+        </fieldset>
+      </div>
+
+      <PathInput
+        disabled={disabled}
+        id="chroma-keyer-output-path"
+        label="输出路径（可选）"
+        onChange={(value) => updateValue('outputPath', value)}
+        placeholder="留空时自动生成 _keyed.png"
+        value={values.outputPath}
+      />
+      <button className="submit-button" disabled={disabled || values.samples.length === 0} type="submit">
+        导出 PNG
+      </button>
+    </form>
+  )
+}

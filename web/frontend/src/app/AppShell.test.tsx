@@ -104,6 +104,16 @@ describe('AppShell', () => {
     expect(screen.getByRole('region', { name: '任务日志' })).toBeInTheDocument()
   })
 
+  it('opens Studio Chroma Keyer from the navigation', async () => {
+    const user = userEvent.setup()
+
+    render(<AppShell />)
+
+    await user.click(screen.getByRole('button', { name: 'Studio Chroma Keyer' }))
+
+    expect(screen.getByRole('heading', { name: 'Studio Chroma Keyer' })).toBeInTheDocument()
+  })
+
   it('marks the selected tool as current in the navigation', async () => {
     const user = userEvent.setup()
 
