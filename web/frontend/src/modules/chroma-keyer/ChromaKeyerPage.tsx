@@ -76,6 +76,7 @@ export function ChromaKeyerPage() {
   const showOutcome = kind === 'chroma_keyer' || kind === null
 
   useEffect(() => {
+    mountedRef.current = true
     return () => {
       mountedRef.current = false
     }

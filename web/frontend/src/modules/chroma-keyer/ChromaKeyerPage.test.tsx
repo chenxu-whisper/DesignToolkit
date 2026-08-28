@@ -1,3 +1,4 @@
+import { StrictMode } from 'react'
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
@@ -162,6 +163,43 @@ describe('ChromaKeyerPage', () => {
 
     expect(screen.getByRole('button', { name: '加载图片' })).toBeDisabled()
     expect(screen.getByRole('button', { name: '导出 PNG' })).toBeDisabled()
+  })
+
+  it('processes deferred inspect and task creation responses after StrictMode effect replay', async () => {
+    const user = userEvent.setup()
+    const inspectRequest = createDeferred<typeof inspectResponse>()
+    const createRequest = createDeferred<{ status: 'queued'; task_id: string }>()
+    pageMocks.inspectChromaImage.mockReturnValue(inspectRequest.promise)
+    pageMocks.createChromaKeyerTask.mockReturnValue(createRequest.promise)
+
+    render(
+      <StrictMode>
+        <ChromaKeyerPage />
+      </StrictMode>,
+    )
+
+    await user.type(screen.getByLabelText('输入图片路径'), 'E:\\media\\screen.png')
+    await user.click(screen.getByRole('button', { name: '加载图片' }))
+    await act(async () => {
+      inspectRequest.resolve(inspectResponse)
+    })
+
+    expect(await screen.findByRole('button', { name: '抠像预览' })).toBeInTheDocument()
+
+    await sampleImage()
+    await waitFor(() => expect(screen.getByRole('button', { name: '导出 PNG' })).toBeEnabled())
+    await user.click(screen.getByRole('button', { name: '导出 PNG' }))
+    await act(async () => {
+      createRequest.resolve({ status: 'queued', task_id: 'strict-mode-task' })
+    })
+
+    await waitFor(() =>
+      expect(useTaskStore.getState()).toMatchObject({
+        currentTaskId: 'strict-mode-task',
+        kind: 'chroma_keyer',
+        status: 'queued',
+      }),
+    )
   })
 
   it('deletes one sample and clears all samples', async () => {
