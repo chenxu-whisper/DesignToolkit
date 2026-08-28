@@ -393,9 +393,10 @@ def create_router(
                 alpha = refine_alpha(generate_alpha(rgb, model, params), params)
                 if request.view_mode is ChromaViewMode.FINAL:
                     preview_rgb = despill(rgb, alpha, model, params.despill_amount)
+                    return make_preview_png(preview_rgb, alpha=alpha)
                 else:
                     preview_rgb = np.repeat(alpha[..., np.newaxis], 3, axis=2)
-                return make_preview_png(preview_rgb)
+                    return make_preview_png(preview_rgb)
 
             preview_id = chroma_preview_store.get_or_put(cache_key, create_preview_png)
         except KeyerError as exc:

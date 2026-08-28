@@ -21,6 +21,7 @@ from designtoolkit.web.chroma_previews import ChromaPreviewStore
 from designtoolkit.web.logs import LogStore
 from designtoolkit.web.schemas import (
     ChromaKeyerTaskRequest,
+    ChromaPreviewRequest,
     LogLevel,
     LogPhase,
     TaskKind,
@@ -48,6 +49,12 @@ def _client(tmp_path: Path) -> TestClient:
 def _decode_rgb_png(png_bytes: bytes) -> np.ndarray:
     with Image.open(BytesIO(png_bytes)) as image:
         return np.asarray(image.convert("RGB")).copy()
+
+
+def _decode_rgba_png(png_bytes: bytes) -> np.ndarray:
+    with Image.open(BytesIO(png_bytes)) as image:
+        assert image.mode == "RGBA"
+        return np.asarray(image).copy()
 
 
 def _generated_alpha_preview(rgb: np.ndarray) -> bytes:
@@ -129,6 +136,16 @@ def test_chroma_keyer_task_request_requires_nested_params() -> None:
         )
 
 
+def test_chroma_preview_request_requires_nested_params() -> None:
+    with raises(ValueError):
+        ChromaPreviewRequest.model_validate(
+            {
+                "input_path": "input.png",
+                "samples": [[42, 180, 72]],
+            }
+        )
+
+
 @mark.parametrize(
     ("legacy_field", "legacy_value"),
     [
@@ -147,6 +164,33 @@ def test_chroma_keyer_task_request_rejects_legacy_flattened_params(
 ) -> None:
     with raises(ValueError):
         ChromaKeyerTaskRequest.model_validate(
+            {
+                "input_path": "input.png",
+                "samples": [[42, 180, 72]],
+                "params": {},
+                legacy_field: legacy_value,
+            }
+        )
+
+
+@mark.parametrize(
+    ("legacy_field", "legacy_value"),
+    [
+        ("tolerance", 0.4),
+        ("softness", 0.2),
+        ("clip_black", 0.1),
+        ("clip_white", 0.9),
+        ("shrink_grow", -1),
+        ("feather", 1),
+        ("despill_amount", 0.75),
+    ],
+)
+def test_chroma_preview_request_rejects_legacy_flattened_params(
+    legacy_field: str,
+    legacy_value: float | int,
+) -> None:
+    with raises(ValueError):
+        ChromaPreviewRequest.model_validate(
             {
                 "input_path": "input.png",
                 "samples": [[42, 180, 72]],
@@ -583,7 +627,7 @@ def test_inspect_preview_reuses_file_fingerprint_and_changes_after_source_update
         ("/api/chroma-keyer/images/inspect", {}, make_preview_png),
         (
             "/api/chroma-keyer/previews",
-            {"samples": [[42, 180, 72]], "view_mode": "alpha"},
+            {"samples": [[42, 180, 72]], "params": {}, "view_mode": "alpha"},
             _generated_alpha_preview,
         ),
     ],
@@ -630,7 +674,7 @@ def test_preview_cache_distinguishes_content_with_identical_source_metadata(
         ("/api/chroma-keyer/images/inspect", {}, make_preview_png),
         (
             "/api/chroma-keyer/previews",
-            {"samples": [[42, 180, 72]], "view_mode": "alpha"},
+            {"samples": [[42, 180, 72]], "params": {}, "view_mode": "alpha"},
             _generated_alpha_preview,
         ),
     ],
@@ -697,7 +741,7 @@ def test_preview_snapshot_never_caches_aba_decoded_bytes_under_restored_source(
         ("/api/chroma-keyer/images/inspect", {}, make_preview_png),
         (
             "/api/chroma-keyer/previews",
-            {"samples": [[42, 180, 72]], "view_mode": "alpha"},
+            {"samples": [[42, 180, 72]], "params": {}, "view_mode": "alpha"},
             _generated_alpha_preview,
         ),
     ],
@@ -769,7 +813,7 @@ def test_preview_retries_decode_when_source_changes_during_snapshot(
         ("/api/chroma-keyer/images/inspect", {}, make_preview_png),
         (
             "/api/chroma-keyer/previews",
-            {"samples": [[42, 180, 72]], "view_mode": "alpha"},
+            {"samples": [[42, 180, 72]], "params": {}, "view_mode": "alpha"},
             _generated_alpha_preview,
         ),
     ],
@@ -926,6 +970,12 @@ def test_final_and_alpha_previews_match_the_public_keying_pipeline(
     assert final_png.content.startswith(b"\x89PNG\r\n\x1a\n")
     assert alpha_png.content.startswith(b"\x89PNG\r\n\x1a\n")
 
+    final_rgba = _decode_rgba_png(final_png.content)
+    with Image.open(BytesIO(alpha_png.content)) as alpha_image:
+        assert alpha_image.mode == "RGB"
+        assert "transparency" not in alpha_image.info
+        alpha_preview = np.asarray(alpha_image).copy()
+
     source_rgb = read_rgb_image(input_path)
     model = screen_model_from_samples(payload["samples"])
     params = KeyerParams(**payload["params"])
@@ -939,8 +989,10 @@ def test_final_and_alpha_previews_match_the_public_keying_pipeline(
         make_preview_png(np.repeat(refined_alpha[..., np.newaxis], 3, axis=2))
     )
 
-    assert np.array_equal(_decode_rgb_png(final_png.content), expected_final)
-    assert np.array_equal(_decode_rgb_png(alpha_png.content), expected_alpha)
+    assert np.array_equal(final_rgba[..., :3], expected_final)
+    assert np.array_equal(final_rgba[..., 3], refined_alpha)
+    assert final_rgba[0, 0, 3] == 0
+    assert np.array_equal(alpha_preview, expected_alpha)
 
 
 def test_generated_preview_reuses_request_state_and_varies_by_view_and_params(
@@ -1005,6 +1057,7 @@ def test_singular_and_plural_preview_routes_share_the_request_cache(
     payload = {
         "input_path": str(input_path),
         "samples": [[42, 180, 72]],
+        "params": {},
     }
 
     plural_response = client.post("/api/chroma-keyer/previews", json=payload)
@@ -1016,6 +1069,44 @@ def test_singular_and_plural_preview_routes_share_the_request_cache(
         singular_response.json()["preview_url"]
         == plural_response.json()["preview_url"]
     )
+
+
+@mark.parametrize("url", ["/api/chroma-keyer/preview", "/api/chroma-keyer/previews"])
+@mark.parametrize(
+    "changes",
+    [
+        {},
+        {"tolerance": 0.4},
+        {"softness": 0.2},
+        {"clip_black": 0.1},
+        {"clip_white": 0.9},
+        {"shrink_grow": -1},
+        {"feather": 1},
+        {"despill_amount": 0.75},
+    ],
+)
+def test_preview_routes_require_nested_params_and_reject_flattened_params(
+    tmp_path: Path,
+    url: str,
+    changes: dict[str, float | int],
+) -> None:
+    input_path = tmp_path / "input.png"
+    _write_input_image(input_path)
+    payload: dict[str, object] = {
+        "input_path": str(input_path),
+        "samples": [[42, 180, 72]],
+        **changes,
+    }
+    if changes:
+        payload["params"] = {}
+
+    response = _client(tmp_path).post(
+        url,
+        json=payload,
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_request"
 
 
 @mark.parametrize("url", ["/api/chroma-keyer/preview", "/api/chroma-keyer/previews"])
@@ -1153,6 +1244,7 @@ def test_sample_rejects_invalid_finite_preview_dimensions_and_bounds(
             "/api/chroma-keyer/previews",
             {
                 "samples": [[42, 180, 72]],
+                "params": {},
             },
         ),
     ],
@@ -1191,12 +1283,14 @@ def test_chroma_decoder_failures_return_invalid_image(
             "/api/chroma-keyer/preview",
             {
                 "samples": [[42, 180, 72]],
+                "params": {},
             },
         ),
         (
             "/api/chroma-keyer/previews",
             {
                 "samples": [[42, 180, 72]],
+                "params": {},
             },
         ),
     ],
@@ -1237,6 +1331,7 @@ def test_missing_chroma_source_returns_invalid_request(
             {
                 "input_path": "missing.png",
                 "samples": [[42, 180, 72]],
+                "params": {},
             },
         ),
     ],

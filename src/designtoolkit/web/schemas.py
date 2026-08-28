@@ -133,9 +133,11 @@ class ChromaKeyerTaskRequest(BaseModel):
 
 
 class ChromaPreviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     input_path: str
     samples: list[list[RgbChannel]] = Field(default_factory=list)
-    params: ChromaKeyerParams = Field(default_factory=ChromaKeyerParams)
+    params: ChromaKeyerParams
     view_mode: ChromaViewMode = ChromaViewMode.FINAL
 
     @field_validator("input_path")

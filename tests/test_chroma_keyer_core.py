@@ -172,6 +172,28 @@ def test_make_preview_png_constrains_size_preserves_aspect_and_never_upscales() 
         assert image.size == (400, 100)
 
 
+def test_make_preview_png_resizes_and_preserves_alpha_from_rgb_or_rgba() -> None:
+    rgb = np.zeros((100, 400, 3), dtype=np.uint8)
+    alpha = np.zeros((100, 400), dtype=np.uint8)
+    alpha[:, 200:] = 255
+    rgba = np.dstack((rgb, alpha))
+
+    for pixels, supplied_alpha in ((rgb, alpha), (rgba, None)):
+        preview = make_preview_png(
+            pixels,
+            alpha=supplied_alpha,
+            max_width=100,
+            max_height=100,
+        )
+
+        with Image.open(BytesIO(preview)) as image:
+            assert image.format == "PNG"
+            assert image.mode == "RGBA"
+            assert image.size == (100, 25)
+            assert image.getpixel((0, 0))[3] == 0
+            assert image.getpixel((99, 0))[3] == 255
+
+
 def test_make_preview_png_rejects_invalid_limits_and_rgb() -> None:
     rgb = np.zeros((2, 2, 3), dtype=np.uint8)
 
@@ -181,6 +203,8 @@ def test_make_preview_png_rejects_invalid_limits_and_rgb() -> None:
         make_preview_png(rgb, max_height=0)
     with raises(KeyerError):
         make_preview_png(np.zeros((2, 2, 3), dtype=np.float32))
+    with raises(KeyerError):
+        make_preview_png(rgb, alpha=np.zeros((3, 2), dtype=np.uint8))
 
 
 def test_make_preview_png_rejects_empty_rgb_dimensions() -> None:

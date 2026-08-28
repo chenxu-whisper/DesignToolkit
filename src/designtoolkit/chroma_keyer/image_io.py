@@ -39,6 +39,25 @@ def _validate_preview_limit(name: str, value: object) -> int:
     return value
 
 
+def _preview_pixels(rgb: object, alpha: object | None) -> tuple[np.ndarray, str]:
+    if (
+        isinstance(rgb, np.ndarray)
+        and rgb.dtype == np.uint8
+        and rgb.ndim == 3
+        and rgb.shape[2] == 4
+        and rgb.shape[0] > 0
+        and rgb.shape[1] > 0
+    ):
+        if alpha is not None:
+            raise KeyerError("alpha must not be provided with RGBA pixels")
+        return rgb, "RGBA"
+
+    rgb = _validate_rgb(rgb)
+    if alpha is None:
+        return rgb, "RGB"
+    return np.dstack((rgb, _validate_alpha(alpha, rgb))), "RGBA"
+
+
 def _resolved_path(path: Path) -> str:
     try:
         return normcase(str(path.resolve(strict=False)))
@@ -119,17 +138,21 @@ def write_rgba_png(output_path: Path, rgb: np.ndarray, alpha: np.ndarray) -> Non
 
 
 def make_preview_png(
-    rgb: np.ndarray, max_width: int = 1280, max_height: int = 720
+    rgb: np.ndarray,
+    max_width: int = 1280,
+    max_height: int = 720,
+    *,
+    alpha: np.ndarray | None = None,
 ) -> bytes:
-    """Encode a bounded, aspect-preserving RGB PNG preview."""
-    rgb = _validate_rgb(rgb)
+    """Encode a bounded, aspect-preserving RGB or RGBA PNG preview."""
+    pixels, mode = _preview_pixels(rgb, alpha)
     max_width = _validate_preview_limit("max_width", max_width)
     max_height = _validate_preview_limit("max_height", max_height)
-    height, width = rgb.shape[:2]
+    height, width = pixels.shape[:2]
     scale = min(max_width / width, max_height / height, 1.0)
     target_size = (max(1, int(width * scale)), max(1, int(height * scale)))
 
-    image = Image.fromarray(rgb, mode="RGB")
+    image = Image.fromarray(pixels, mode=mode)
     if target_size != image.size:
         image = image.resize(target_size, Image.Resampling.LANCZOS)
 
