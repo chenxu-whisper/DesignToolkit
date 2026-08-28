@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, expectTypeOf, it, vi } from 'vitest'
 import {
   createChromaKeyerTask,
   createChromaPreview,
@@ -321,6 +321,13 @@ describe('apiClient', () => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ file_kind: 'media', title: '选择输出路径' }),
     })
+  })
+
+  it('accepts only backend-supported save-file kinds', () => {
+    type SaveFilePickerOptions = Parameters<typeof pickLocalSaveFile>[0]
+
+    expectTypeOf<{ fileKind: 'image'; title: string }>().not.toMatchTypeOf<SaveFilePickerOptions>()
+    expectTypeOf<{ fileKind: 'video'; title: string }>().not.toMatchTypeOf<SaveFilePickerOptions>()
   })
 
   it('fetches task status by id', async () => {
