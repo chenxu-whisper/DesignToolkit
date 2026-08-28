@@ -40,7 +40,7 @@ async function inspectImage() {
 }
 
 async function sampleImage() {
-  const image = await screen.findByRole('img', { name: '抠像预览' })
+  const image = await screen.findByRole('button', { name: '抠像预览' })
   vi.spyOn(image, 'getBoundingClientRect').mockReturnValue({
     bottom: 220,
     height: 200,
@@ -210,6 +210,40 @@ describe('ChromaKeyerPage', () => {
       kind: 'chroma_keyer',
       status: 'queued',
     })
+  })
+
+  it('shows create rejection locally without changing the active task or logs', async () => {
+    const user = renderWithUser()
+    pageMocks.createChromaKeyerTask.mockRejectedValue(new Error('输出路径已存在'))
+
+    await inspectImage()
+    await sampleImage()
+    await waitFor(() => expect(screen.getByRole('button', { name: '导出 PNG' })).toBeEnabled())
+
+    act(() => {
+      useTaskStore.getState().startTask({ kind: 'video_frames', taskId: 'completed-task' })
+      useTaskStore.getState().completeTask({ resultPath: 'E:\\media\\frames', taskId: 'completed-task' })
+      useLogStore.getState().appendEvent({
+        details: {},
+        level: 'success',
+        message: '已有日志',
+        phase: 'completed',
+        task_id: 'completed-task',
+        timestamp: '2026-08-28T00:00:00.000Z',
+      })
+    })
+
+    await user.click(screen.getByRole('button', { name: '导出 PNG' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('输出路径已存在')
+    expect(useTaskStore.getState()).toMatchObject({
+      currentTaskId: 'completed-task',
+      kind: 'video_frames',
+      resultPath: 'E:\\media\\frames',
+      status: 'succeeded',
+    })
+    expect(useLogStore.getState().events).toHaveLength(1)
+    expect(useLogStore.getState().events[0]?.message).toBe('已有日志')
   })
 })
 

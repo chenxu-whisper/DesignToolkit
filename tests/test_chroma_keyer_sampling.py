@@ -22,11 +22,15 @@ def test_map_preview_point_clamps_preview_edge_to_source_edge() -> None:
     )
 
 
+def test_map_preview_point_scales_fractional_preview_dimensions() -> None:
+    assert map_preview_point(400, 200, 400.5, 200.5, 4, 2) == (3, 1)
+
+
 @mark.parametrize(
     ("arguments", "message"),
     [
-        ((0, 0, 0, 540, 1920, 1080), "preview_width must be a positive integer"),
-        ((0, 0, 960, -1, 1920, 1080), "preview_height must be a positive integer"),
+        ((0, 0, 0, 540, 1920, 1080), "preview_width must be positive"),
+        ((0, 0, 960, -1, 1920, 1080), "preview_height must be positive"),
         ((0, 0, 960, 540, True, 1080), "source_width must be a positive integer"),
         ((0, 0, 960, 540, 1920, 0), "source_height must be a positive integer"),
         ((nan, 0, 960, 540, 1920, 1080), "x must be a finite number"),

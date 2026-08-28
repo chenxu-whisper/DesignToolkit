@@ -865,6 +865,32 @@ def test_sample_maps_preview_coordinates_to_source_pixel_with_uppercase_hex(
     }
 
 
+def test_sample_accepts_fractional_preview_dimensions_at_the_near_edge(
+    tmp_path: Path,
+) -> None:
+    input_path = tmp_path / "input.png"
+    _write_input_image(input_path)
+
+    response = _client(tmp_path).post(
+        "/api/chroma-keyer/images/sample",
+        json={
+            "input_path": str(input_path),
+            "x": 400,
+            "y": 200,
+            "preview_width": 400.5,
+            "preview_height": 200.5,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "rgb": [110, 120, 130],
+        "hex": "#6E7882",
+        "source_x": 3,
+        "source_y": 1,
+    }
+
+
 def test_final_and_alpha_previews_match_the_public_keying_pipeline(
     tmp_path: Path,
 ) -> None:
@@ -1052,6 +1078,48 @@ def test_unknown_preview_returns_structured_not_found(tmp_path: Path) -> None:
 def test_invalid_sample_coordinates_return_structured_bad_request(
     tmp_path: Path,
     payload: dict[str, int],
+) -> None:
+    input_path = tmp_path / "input.png"
+    _write_input_image(input_path)
+
+    response = _client(tmp_path).post(
+        "/api/chroma-keyer/images/sample",
+        json={
+            "input_path": str(input_path),
+            **payload,
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_sample_coordinates"
+
+
+@mark.parametrize(
+    "payload",
+    [
+        {
+            "x": 0,
+            "y": 0,
+            "preview_width": -0.5,
+            "preview_height": 1,
+        },
+        {
+            "x": 400.5,
+            "y": 0,
+            "preview_width": 400.5,
+            "preview_height": 1,
+        },
+        {
+            "x": 0,
+            "y": 200.5,
+            "preview_width": 400.5,
+            "preview_height": 200.5,
+        },
+    ],
+)
+def test_sample_rejects_invalid_finite_preview_dimensions_and_bounds(
+    tmp_path: Path,
+    payload: dict[str, float],
 ) -> None:
     input_path = tmp_path / "input.png"
     _write_input_image(input_path)

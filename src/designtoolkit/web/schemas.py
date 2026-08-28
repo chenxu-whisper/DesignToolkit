@@ -8,7 +8,6 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 PositiveInt = Annotated[int, Field(strict=True, gt=0)]
 RgbChannel = Annotated[int, Field(strict=True, ge=0, le=255)]
-StrictInt = Annotated[int, Field(strict=True)]
 UnitIntervalFloat = Annotated[
     float,
     Field(strict=True, ge=0, le=1, allow_inf_nan=False),
@@ -74,8 +73,8 @@ class ChromaSampleRequest(BaseModel):
     input_path: str
     x: float = Field(strict=True, allow_inf_nan=False)
     y: float = Field(strict=True, allow_inf_nan=False)
-    preview_width: StrictInt
-    preview_height: StrictInt
+    preview_width: float = Field(strict=True, allow_inf_nan=False)
+    preview_height: float = Field(strict=True, allow_inf_nan=False)
 
     @field_validator("input_path")
     @classmethod

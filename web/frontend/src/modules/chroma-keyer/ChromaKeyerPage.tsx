@@ -56,7 +56,6 @@ export function ChromaKeyerPage() {
   const taskError = useTaskStore((state) => state.error)
   const isCreating = useTaskStore((state) => state.isCreating)
   const startTask = useTaskStore((state) => state.startTask)
-  const failTask = useTaskStore((state) => state.failTask)
   const resetTask = useTaskStore((state) => state.resetTask)
   const beginCreate = useTaskStore((state) => state.beginCreate)
   const endCreate = useTaskStore((state) => state.endCreate)
@@ -67,6 +66,7 @@ export function ChromaKeyerPage() {
   const [image, setImage] = useState<InspectedImage | null>(null)
   const [previewUrl, setPreviewUrl] = useState<string | null>(null)
   const [sampleDetails, setSampleDetails] = useState<ChromaCanvasSample[]>([])
+  const [exportError, setExportError] = useState<string | null>(null)
   const [isRequestPending, setIsRequestPending] = useState(false)
   const mountedRef = useRef(true)
   const requestSequenceRef = useRef(0)
@@ -240,7 +240,7 @@ export function ChromaKeyerPage() {
       return
     }
 
-    clearEvents()
+    setExportError(null)
     beginCreate()
     try {
       const response = await createChromaKeyerTask(toPayload(values))
@@ -253,6 +253,7 @@ export function ChromaKeyerPage() {
         return
       }
 
+      clearEvents()
       resetTask()
       startTask({
         kind: 'chroma_keyer',
@@ -271,9 +272,7 @@ export function ChromaKeyerPage() {
       }
 
       const message = createError instanceof Error && createError.message ? createError.message : '任务创建失败'
-      appendEvent(createClientTaskEvent('client', 'error', 'failed', message))
-      resetTask()
-      failTask({ error: message })
+      setExportError(message)
     } finally {
       endCreate()
     }
@@ -290,6 +289,11 @@ export function ChromaKeyerPage() {
         {showOutcome && status === 'failed' && taskError ? (
           <p className="task-error" role="alert">
             失败：{taskError}
+          </p>
+        ) : null}
+        {exportError ? (
+          <p className="task-error" role="alert">
+            导出失败：{exportError}
           </p>
         ) : null}
       </div>

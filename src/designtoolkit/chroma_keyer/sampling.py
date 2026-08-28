@@ -6,7 +6,16 @@ import numpy as np
 from .models import KeyerError, ScreenColorModel
 
 
-def _validate_dimension(name: str, value: object) -> int:
+def _validate_preview_dimension(name: str, value: object) -> float:
+    if not isinstance(value, Real) or isinstance(value, bool) or not isfinite(value):
+        raise KeyerError(f"{name} must be a finite number")
+    dimension = float(value)
+    if dimension <= 0:
+        raise KeyerError(f"{name} must be positive")
+    return dimension
+
+
+def _validate_source_dimension(name: str, value: object) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
         raise KeyerError(f"{name} must be a positive integer")
     return value
@@ -26,16 +35,16 @@ def _validate_coordinate(
 def map_preview_point(
     x: float,
     y: float,
-    preview_width: int,
-    preview_height: int,
+    preview_width: float,
+    preview_height: float,
     source_width: int,
     source_height: int,
 ) -> tuple[int, int]:
     """Map an in-bounds preview coordinate to its source image pixel."""
-    preview_width = _validate_dimension("preview_width", preview_width)
-    preview_height = _validate_dimension("preview_height", preview_height)
-    source_width = _validate_dimension("source_width", source_width)
-    source_height = _validate_dimension("source_height", source_height)
+    preview_width = _validate_preview_dimension("preview_width", preview_width)
+    preview_height = _validate_preview_dimension("preview_height", preview_height)
+    source_width = _validate_source_dimension("source_width", source_width)
+    source_height = _validate_source_dimension("source_height", source_height)
     x = _validate_coordinate("x", x, "preview width", preview_width)
     y = _validate_coordinate("y", y, "preview height", preview_height)
 

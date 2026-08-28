@@ -1,4 +1,4 @@
-import type { MouseEvent } from 'react'
+import type { KeyboardEvent, MouseEvent } from 'react'
 
 export type ChromaCanvasSample = {
   hex: string
@@ -14,20 +14,28 @@ type ChromaKeyerCanvasProps = {
   samples: readonly ChromaCanvasSample[]
 }
 
-const normalizeDimension = (dimension: number) => Math.max(1, Number.isFinite(dimension) ? Math.round(dimension) : 1)
+type ChromaSamplePoint = {
+  x: number
+  y: number
+  previewWidth: number
+  previewHeight: number
+}
 
-const normalizeCoordinate = (
-  coordinate: number,
-  offset: number,
-  renderedDimension: number,
-  normalizedDimension: number,
-) => {
-  const relativeCoordinate = renderedDimension > 0 ? (coordinate - offset) / renderedDimension : 0
-  const normalizedCoordinate = Number.isFinite(relativeCoordinate)
-    ? Math.floor(relativeCoordinate * normalizedDimension)
-    : 0
+export function buildChromaSamplePayload(
+  rect: Pick<DOMRect, 'height' | 'left' | 'top' | 'width'>,
+  clientX: number,
+  clientY: number,
+): ChromaSamplePoint | null {
+  if (![clientX, clientY, rect.height, rect.left, rect.top, rect.width].every(Number.isFinite)) {
+    return null
+  }
 
-  return Math.min(normalizedDimension - 1, Math.max(0, normalizedCoordinate))
+  return {
+    x: Math.floor(clientX - rect.left),
+    y: Math.floor(clientY - rect.top),
+    previewHeight: rect.height,
+    previewWidth: rect.width,
+  }
 }
 
 export function ChromaKeyerCanvas({
@@ -37,37 +45,59 @@ export function ChromaKeyerCanvas({
   previewUrl,
   samples,
 }: ChromaKeyerCanvasProps) {
-  const handleClick = (event: MouseEvent<HTMLImageElement>) => {
-    const rect = event.currentTarget.getBoundingClientRect()
-    const previewWidth = normalizeDimension(rect.width)
-    const previewHeight = normalizeDimension(rect.height)
+  const sampleAt = (element: HTMLImageElement, clientX: number, clientY: number) => {
+    const payload = buildChromaSamplePayload(element.getBoundingClientRect(), clientX, clientY)
+    if (payload) {
+      onSample(payload)
+    }
+  }
 
-    onSample({
-      x: normalizeCoordinate(event.clientX, rect.left, rect.width, previewWidth),
-      y: normalizeCoordinate(event.clientY, rect.top, rect.height, previewHeight),
-      previewHeight,
-      previewWidth,
-    })
+  const handleClick = (event: MouseEvent<HTMLImageElement>) => {
+    sampleAt(event.currentTarget, event.clientX, event.clientY)
+  }
+
+  const handleKeyDown = (event: KeyboardEvent<HTMLImageElement>) => {
+    if (event.key !== 'Enter' && event.key !== ' ') {
+      return
+    }
+
+    event.preventDefault()
+    const rect = event.currentTarget.getBoundingClientRect()
+    sampleAt(event.currentTarget, rect.left + rect.width / 2, rect.top + rect.height / 2)
   }
 
   return (
-    <div className="chroma-preview-canvas">
-      <img alt="抠像预览" className="chroma-preview-image" onClick={handleClick} src={previewUrl} />
-      {originalWidth && originalHeight
-        ? samples.map((sample, index) => (
-            <span
-              aria-label={`采样点 ${index + 1}`}
-              className="chroma-sample-marker"
-              key={`${sample.sourceX}-${sample.sourceY}-${index}`}
-              style={{
-                left: `${(sample.sourceX / originalWidth) * 100}%`,
-                top: `${(sample.sourceY / originalHeight) * 100}%`,
-              }}
-            >
-              {index + 1}
-            </span>
-          ))
-        : null}
-    </div>
+    <>
+      <div className="chroma-preview-canvas">
+        <img
+          alt="抠像预览"
+          aria-describedby="chroma-keyer-preview-sampling-instructions"
+          className="chroma-preview-image"
+          onClick={handleClick}
+          onKeyDown={handleKeyDown}
+          role="button"
+          src={previewUrl}
+          tabIndex={0}
+        />
+        {originalWidth && originalHeight
+          ? samples.map((sample, index) => (
+              <span
+                aria-label={`采样点 ${index + 1}`}
+                className="chroma-sample-marker"
+                key={`${sample.sourceX}-${sample.sourceY}-${index}`}
+                style={{
+                  left: `${(sample.sourceX / originalWidth) * 100}%`,
+                  top: `${(sample.sourceY / originalHeight) * 100}%`,
+                }}
+              >
+                {index + 1}
+              </span>
+            ))
+          : null}
+      </div>
+      <p className="chroma-preview-instructions" id="chroma-keyer-preview-sampling-instructions">
+        点击预览采样，或聚焦后按 Enter 或空格从画面中心采样。
+      </p>
+    </>
   )
 }
