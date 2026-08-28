@@ -14,6 +14,22 @@ type ChromaKeyerCanvasProps = {
   samples: readonly ChromaCanvasSample[]
 }
 
+const normalizeDimension = (dimension: number) => Math.max(1, Number.isFinite(dimension) ? Math.round(dimension) : 1)
+
+const normalizeCoordinate = (
+  coordinate: number,
+  offset: number,
+  renderedDimension: number,
+  normalizedDimension: number,
+) => {
+  const relativeCoordinate = renderedDimension > 0 ? (coordinate - offset) / renderedDimension : 0
+  const normalizedCoordinate = Number.isFinite(relativeCoordinate)
+    ? Math.floor(relativeCoordinate * normalizedDimension)
+    : 0
+
+  return Math.min(normalizedDimension - 1, Math.max(0, normalizedCoordinate))
+}
+
 export function ChromaKeyerCanvas({
   onSample,
   originalHeight,
@@ -23,11 +39,14 @@ export function ChromaKeyerCanvas({
 }: ChromaKeyerCanvasProps) {
   const handleClick = (event: MouseEvent<HTMLImageElement>) => {
     const rect = event.currentTarget.getBoundingClientRect()
+    const previewWidth = normalizeDimension(rect.width)
+    const previewHeight = normalizeDimension(rect.height)
+
     onSample({
-      x: Math.floor(event.clientX - rect.left),
-      y: Math.floor(event.clientY - rect.top),
-      previewHeight: rect.height,
-      previewWidth: rect.width,
+      x: normalizeCoordinate(event.clientX, rect.left, rect.width, previewWidth),
+      y: normalizeCoordinate(event.clientY, rect.top, rect.height, previewHeight),
+      previewHeight,
+      previewWidth,
     })
   }
 
