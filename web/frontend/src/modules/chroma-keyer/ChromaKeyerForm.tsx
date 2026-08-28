@@ -2,7 +2,7 @@ import type { FormEvent } from 'react'
 import { ImageUp, SlidersHorizontal } from 'lucide-react'
 import { FieldError } from '../../components/FieldError'
 import { PathInput } from '../../components/PathInput'
-import { pickLocalFiles, resolveDroppedFilePaths } from '../../services/apiClient'
+import { pickLocalFiles, pickLocalSaveFile, resolveDroppedFilePaths } from '../../services/apiClient'
 import type { ChromaKeyerErrors, ChromaKeyerValues } from './chromaKeyerValidation'
 
 type ChromaKeyerFormProps = {
@@ -131,6 +131,13 @@ export function ChromaKeyerForm({ disabled, errors, onChange, onInspect, onSubmi
         id="chroma-keyer-output-path"
         label="输出路径（可选）"
         onChange={(value) => updateValue('outputPath', value)}
+        pickPaths={async () => {
+          const response = await pickLocalSaveFile({
+            fileKind: 'media',
+            title: '选择 PNG 输出路径',
+          })
+          return response.paths
+        }}
         placeholder="留空时自动生成 _keyed.png"
         value={values.outputPath}
       />

@@ -6,16 +6,19 @@ import { ChromaKeyerForm } from './ChromaKeyerForm'
 
 const apiMocks = vi.hoisted(() => ({
   pickLocalFiles: vi.fn(),
+  pickLocalSaveFile: vi.fn(),
   resolveDroppedFilePaths: vi.fn(),
 }))
 
 vi.mock('../../services/apiClient', () => ({
   pickLocalFiles: apiMocks.pickLocalFiles,
+  pickLocalSaveFile: apiMocks.pickLocalSaveFile,
   resolveDroppedFilePaths: apiMocks.resolveDroppedFilePaths,
 }))
 
 beforeEach(() => {
   apiMocks.pickLocalFiles.mockReset()
+  apiMocks.pickLocalSaveFile.mockReset()
   apiMocks.resolveDroppedFilePaths.mockReset()
 })
 
@@ -43,6 +46,31 @@ describe('ChromaKeyerForm', () => {
       fileKind: 'image',
       multiple: false,
       title: '选择图片文件',
+    })
+  })
+
+  it('uses the native picker for a PNG output path', async () => {
+    const user = userEvent.setup()
+    const onChange = vi.fn()
+    apiMocks.pickLocalSaveFile.mockResolvedValue({ cancelled: false, paths: ['E:\\media\\screen_keyed.png'] })
+
+    render(
+      <ChromaKeyerForm
+        disabled={false}
+        errors={{}}
+        onChange={onChange}
+        onInspect={vi.fn()}
+        onSubmit={vi.fn()}
+        values={createChromaKeyerDefaultValues()}
+      />,
+    )
+
+    await user.click(screen.getByRole('button', { name: '指定输出路径（可选）' }))
+
+    await waitFor(() => expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ outputPath: 'E:\\media\\screen_keyed.png' })))
+    expect(apiMocks.pickLocalSaveFile).toHaveBeenCalledWith({
+      fileKind: 'media',
+      title: '选择 PNG 输出路径',
     })
   })
 
