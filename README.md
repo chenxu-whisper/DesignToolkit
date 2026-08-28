@@ -110,6 +110,15 @@ uv run designtoolkit web
 - 实时任务状态追踪
 - 任务执行日志实时查看（SSE 推送），包含单个素材和任务总耗时
 
+### Studio Chroma Keyer
+
+在以上命令启动的本地 Web GUI 中，点击侧边栏的 `Studio Chroma Keyer`：
+
+- 仅接受一张本地 PNG、JPG 或 JPEG 图片，可通过本地选择器或路径输入
+- 在画布上吸取实际背景色，支持任意颜色，不限定绿幕或蓝幕模式
+- 支持 `Final` 与 `Alpha` 预览，并导出原图尺寸的 RGBA PNG
+- 当前不支持视频和图片序列
+
 前端开发（热重载模式，端口 5173）：
 
 ```powershell
