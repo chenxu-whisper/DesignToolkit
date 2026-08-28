@@ -63,6 +63,7 @@ test('stacks the Chroma editor in the constrained desktop workspace without clip
   await page.getByRole('textbox', { name: '输入图片路径' }).fill('E:\\media\\screen.png')
   await page.getByRole('button', { name: '加载图片' }).click()
   await page.getByRole('button', { name: '抠像预览' }).click({ position: { x: 27, y: 27 } })
+  await expect(page.locator('.chroma-sample-item span', { hasText: /^27, 27$/ })).toBeVisible()
 
   const layout = await page.locator('.chroma-editor').evaluate((editor) => {
     const main = editor.querySelector<HTMLElement>('.chroma-editor-main')
