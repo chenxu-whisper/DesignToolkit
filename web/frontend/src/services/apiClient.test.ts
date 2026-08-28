@@ -1,12 +1,16 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
+  createChromaKeyerTask,
+  createChromaPreview,
   createMediaResizeTask,
   createVideoFramesTask,
   getTask,
+  inspectChromaImage,
   pickLocalDirectory,
   pickLocalFiles,
   pickLocalSaveFile,
   resolveDroppedFilePaths,
+  sampleChromaImage,
 } from './apiClient'
 
 afterEach(() => {
@@ -90,6 +94,133 @@ describe('apiClient', () => {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
+    })
+  })
+
+  it('inspects a chroma keyer image', async () => {
+    const body = {
+      input_path: 'screen.png',
+      width: 1920,
+      height: 1080,
+      preview_width: 1280,
+      preview_height: 720,
+      preview_url: '/api/chroma-keyer/previews/inspect-1',
+    }
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify(body)))
+
+    await expect(inspectChromaImage({ inputPath: 'screen.png' })).resolves.toEqual(body)
+    expect(fetchMock).toHaveBeenCalledWith('/api/chroma-keyer/images/inspect', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ input_path: 'screen.png' }),
+    })
+  })
+
+  it('samples a chroma keyer image at preview coordinates', async () => {
+    const body = { rgb: [42, 180, 72], hex: '#2AB448', source_x: 630, source_y: 405 }
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify(body)))
+
+    await expect(
+      sampleChromaImage({
+        inputPath: 'screen.png',
+        x: 0.5,
+        y: 0.75,
+        previewWidth: 1280,
+        previewHeight: 720,
+      }),
+    ).resolves.toEqual(body)
+    expect(fetchMock).toHaveBeenCalledWith('/api/chroma-keyer/images/sample', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        input_path: 'screen.png',
+        x: 0.5,
+        y: 0.75,
+        preview_width: 1280,
+        preview_height: 720,
+      }),
+    })
+  })
+
+  it('posts canonical chroma preview requests with nested snake case params', async () => {
+    const fetchMock = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(new Response(JSON.stringify({ preview_url: '/api/chroma-keyer/previews/final-1' })))
+    const payload = {
+      inputPath: 'screen.png',
+      samples: [[42, 180, 72]] as const,
+      params: {
+        tolerance: 0.25,
+        softness: 0.15,
+        clipBlack: 0,
+        clipWhite: 1,
+        shrinkGrow: 0,
+        feather: 0,
+        despillAmount: 0.5,
+      },
+      viewMode: 'final' as const,
+    }
+
+    await expect(createChromaPreview(payload)).resolves.toEqual({
+      preview_url: '/api/chroma-keyer/previews/final-1',
+    })
+    expect(fetchMock).toHaveBeenCalledWith('/api/chroma-keyer/preview', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        input_path: 'screen.png',
+        samples: [[42, 180, 72]],
+        params: {
+          tolerance: 0.25,
+          softness: 0.15,
+          clip_black: 0,
+          clip_white: 1,
+          shrink_grow: 0,
+          feather: 0,
+          despill_amount: 0.5,
+        },
+        view_mode: 'final',
+      }),
+    })
+  })
+
+  it('omits blank output paths from chroma keyer task requests', async () => {
+    const fetchMock = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(new Response(JSON.stringify({ task_id: 'task-chroma-1', status: 'queued' })))
+
+    await expect(
+      createChromaKeyerTask({
+        inputPath: 'screen.png',
+        outputPath: '   ',
+        samples: [[42, 180, 72]],
+        params: {
+          tolerance: 0.25,
+          softness: 0.15,
+          clipBlack: 0,
+          clipWhite: 1,
+          shrinkGrow: 0,
+          feather: 0,
+          despillAmount: 0.5,
+        },
+      }),
+    ).resolves.toEqual({ task_id: 'task-chroma-1', status: 'queued' })
+    expect(fetchMock).toHaveBeenCalledWith('/api/tasks/chroma-keyer', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        input_path: 'screen.png',
+        samples: [[42, 180, 72]],
+        params: {
+          tolerance: 0.25,
+          softness: 0.15,
+          clip_black: 0,
+          clip_white: 1,
+          shrink_grow: 0,
+          feather: 0,
+          despill_amount: 0.5,
+        },
+      }),
     })
   })
 

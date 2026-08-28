@@ -63,6 +63,61 @@ export type MediaResizePayload = MediaResizeBasePayload &
       }
   )
 
+export type ChromaKeyerRgbSample = readonly [red: number, green: number, blue: number]
+
+export type ChromaKeyerParams = {
+  tolerance: number
+  softness: number
+  clipBlack: number
+  clipWhite: number
+  shrinkGrow: number
+  feather: number
+  despillAmount: number
+}
+
+export type ChromaKeyerPayload = {
+  inputPath: string
+  samples: readonly [ChromaKeyerRgbSample, ...ChromaKeyerRgbSample[]]
+  params: ChromaKeyerParams
+  outputPath?: string
+}
+
+export type ChromaImageInspectRequest = {
+  inputPath: string
+}
+
+export type ChromaImageInspectResponse = {
+  input_path: string
+  width: number
+  height: number
+  preview_width: number
+  preview_height: number
+  preview_url: string
+}
+
+export type ChromaImageSampleRequest = {
+  inputPath: string
+  x: number
+  y: number
+  previewWidth: number
+  previewHeight: number
+}
+
+export type ChromaImageSampleResponse = {
+  rgb: ChromaKeyerRgbSample
+  hex: string
+  source_x: number
+  source_y: number
+}
+
+export type ChromaPreviewPayload = Omit<ChromaKeyerPayload, 'outputPath'> & {
+  viewMode: 'final' | 'alpha'
+}
+
+export type ChromaPreviewResponse = {
+  preview_url: string
+}
+
 export type DroppedFilePathResolveResponse = {
   paths: string[]
   unresolved: string[]
@@ -73,7 +128,7 @@ export type LocalPathPickResponse = {
   cancelled: boolean
 }
 
-export type LocalFileKind = 'video' | 'media' | 'any'
+export type LocalFileKind = 'video' | 'media' | 'image' | 'any'
 
 async function readJson<T>(response: Response): Promise<ApiErrorResponse | T | null> {
   try {
@@ -122,6 +177,55 @@ export function createVideoFramesTask(payload: VideoFramesPayload): Promise<Task
 
 export function createMediaResizeTask(payload: MediaResizePayload): Promise<TaskCreateResponse> {
   return request<TaskCreateResponse>('/api/tasks/media-resize', payload)
+}
+
+function chromaParamsToWire(params: ChromaKeyerParams) {
+  return {
+    tolerance: params.tolerance,
+    softness: params.softness,
+    clip_black: params.clipBlack,
+    clip_white: params.clipWhite,
+    shrink_grow: params.shrinkGrow,
+    feather: params.feather,
+    despill_amount: params.despillAmount,
+  }
+}
+
+function chromaPayloadToWire(payload: ChromaKeyerPayload) {
+  const outputPath = payload.outputPath?.trim()
+  return {
+    input_path: payload.inputPath,
+    samples: payload.samples,
+    params: chromaParamsToWire(payload.params),
+    ...(outputPath ? { output_path: outputPath } : {}),
+  }
+}
+
+export function inspectChromaImage(payload: ChromaImageInspectRequest): Promise<ChromaImageInspectResponse> {
+  return request<ChromaImageInspectResponse>('/api/chroma-keyer/images/inspect', {
+    input_path: payload.inputPath,
+  })
+}
+
+export function sampleChromaImage(payload: ChromaImageSampleRequest): Promise<ChromaImageSampleResponse> {
+  return request<ChromaImageSampleResponse>('/api/chroma-keyer/images/sample', {
+    input_path: payload.inputPath,
+    x: payload.x,
+    y: payload.y,
+    preview_width: payload.previewWidth,
+    preview_height: payload.previewHeight,
+  })
+}
+
+export function createChromaPreview(payload: ChromaPreviewPayload): Promise<ChromaPreviewResponse> {
+  return request<ChromaPreviewResponse>('/api/chroma-keyer/preview', {
+    ...chromaPayloadToWire(payload),
+    view_mode: payload.viewMode,
+  })
+}
+
+export function createChromaKeyerTask(payload: ChromaKeyerPayload): Promise<TaskCreateResponse> {
+  return request<TaskCreateResponse>('/api/tasks/chroma-keyer', chromaPayloadToWire(payload))
 }
 
 export function getTask(taskId: string): Promise<TaskResponse> {

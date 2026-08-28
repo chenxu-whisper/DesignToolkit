@@ -1,4 +1,4 @@
-export type TaskKind = 'video_frames' | 'media_resize'
+export type TaskKind = 'video_frames' | 'media_resize' | 'chroma_keyer'
 export type TaskStatus = 'idle' | 'queued' | 'running' | 'succeeded' | 'failed'
 export type LogLevel = 'info' | 'progress' | 'success' | 'error'
 export type LogPhase = 'created' | 'validating' | 'preparing' | 'running' | 'completed' | 'failed'
