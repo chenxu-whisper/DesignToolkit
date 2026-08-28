@@ -588,6 +588,19 @@ button {
   padding: 0 4px;
 }
 
+@media (min-width: 761px) and (max-width: 900px) {
+  .chroma-editor {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .chroma-editor-main {
+    border-bottom: 1px solid #d7dce2;
+    border-right: 0;
+    padding-bottom: 18px;
+    padding-right: 0;
+  }
+}
+
 @media (max-width: 760px) {
   .app-shell {
     grid-template-areas:
