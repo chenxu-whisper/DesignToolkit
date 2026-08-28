@@ -71,6 +71,38 @@ describe('validateChromaKeyerValues', () => {
     })
   })
 
+  it.each([
+    ['shrinkGrow', -11, { shrinkGrow: '收缩/扩张必须是 -10 到 10 之间的整数' }],
+    ['shrinkGrow', 11, { shrinkGrow: '收缩/扩张必须是 -10 到 10 之间的整数' }],
+    ['feather', -1, { feather: '羽化必须是 0 到 10 之间的整数' }],
+    ['feather', 11, { feather: '羽化必须是 0 到 10 之间的整数' }],
+  ] as const)('rejects out-of-range %s value %d', (field, value, expectedErrors) => {
+    expect(
+      validateChromaKeyerValues({
+        ...createChromaKeyerDefaultValues(),
+        inputPath: 'screen.png',
+        samples: [[42, 180, 72]],
+        [field]: value,
+      }),
+    ).toEqual(expectedErrors)
+  })
+
+  it.each([
+    ['shrinkGrow', -10],
+    ['shrinkGrow', 10],
+    ['feather', 0],
+    ['feather', 10],
+  ] as const)('accepts boundary %s value %d', (field, value) => {
+    expect(
+      validateChromaKeyerValues({
+        ...createChromaKeyerDefaultValues(),
+        inputPath: 'screen.png',
+        samples: [[42, 180, 72]],
+        [field]: value,
+      }),
+    ).toEqual({})
+  })
+
   it('requires clip black to remain below clip white', () => {
     expect(
       validateChromaKeyerValues({

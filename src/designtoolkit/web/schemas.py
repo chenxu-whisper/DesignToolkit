@@ -241,7 +241,7 @@ class DroppedFilePathResolveResponse(BaseModel):
 
 class LocalFilePickRequest(BaseModel):
     multiple: bool = False
-    file_kind: Literal["video", "media", "any"] = "any"
+    file_kind: Literal["video", "media", "image", "any"] = "any"
     title: str = "Select file"
 
 

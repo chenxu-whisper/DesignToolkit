@@ -45,9 +45,13 @@ export function validateChromaKeyerValues(values: ChromaKeyerValues): ChromaKeye
 
   if (!Number.isFinite(values.shrinkGrow) || !Number.isInteger(values.shrinkGrow)) {
     errors.shrinkGrow = 'Shrink/Grow 必须是有限整数'
+  } else if (values.shrinkGrow < -10 || values.shrinkGrow > 10) {
+    errors.shrinkGrow = '收缩/扩张必须是 -10 到 10 之间的整数'
   }
   if (!Number.isFinite(values.feather) || !Number.isInteger(values.feather)) {
     errors.feather = 'Feather 必须是有限整数'
+  } else if (values.feather < 0 || values.feather > 10) {
+    errors.feather = '羽化必须是 0 到 10 之间的整数'
   }
   if (isUnitInterval(values.clipBlack) && isUnitInterval(values.clipWhite) && values.clipBlack >= values.clipWhite) {
     errors.clipBlack = 'Clip Black 必须小于 Clip White'

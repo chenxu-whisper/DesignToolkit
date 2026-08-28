@@ -5,7 +5,8 @@ from typing import Literal, Protocol
 
 from designtoolkit.web.local_paths import default_local_path_roots
 
-LocalFileKind = Literal["video", "media", "any"]
+LocalFileKind = Literal["video", "media", "image", "any"]
+_IMAGE_FILE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg"})
 
 
 class LocalPathPickerError(RuntimeError):
@@ -56,10 +57,12 @@ class TkinterLocalPathPicker:
             if multiple:
                 selected = filedialog.askopenfilenames(**options)
                 paths = [Path(path) for path in selected]
+                paths = _filter_paths_by_file_kind(paths, file_kind)
                 self._remember_file_directory(paths)
                 return paths
             selected = filedialog.askopenfilename(**options)
             paths = [Path(selected)] if selected else []
+            paths = _filter_paths_by_file_kind(paths, file_kind)
             self._remember_file_directory(paths)
             return paths
         finally:
@@ -138,6 +141,8 @@ def _filetypes(file_kind: str):
     image_types = ("*.png *.jpg *.jpeg *.webp *.bmp *.gif")
     if file_kind == "video":
         return [("Video files", video_types), ("All files", "*.*")]
+    if file_kind == "image":
+        return [("Image files", "*.png *.jpg *.jpeg")]
     if file_kind == "media":
         return [
             ("Media files", f"{video_types} {image_types}"),
@@ -146,6 +151,15 @@ def _filetypes(file_kind: str):
             ("All files", "*.*"),
         ]
     return [("All files", "*.*")]
+
+
+def _filter_paths_by_file_kind(
+    paths: list[Path],
+    file_kind: str,
+) -> list[Path]:
+    if file_kind == "image":
+        return [path for path in paths if path.suffix.lower() in _IMAGE_FILE_SUFFIXES]
+    return paths
 
 
 def _default_initial_directory(file_kind: str) -> str:
