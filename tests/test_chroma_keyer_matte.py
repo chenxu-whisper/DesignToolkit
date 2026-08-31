@@ -65,9 +65,7 @@ def test_generate_alpha_falls_back_for_near_neutral_screen_chroma() -> None:
 
 
 def test_generate_alpha_falls_back_for_low_chroma_sample_model() -> None:
-    model = screen_model_from_samples(
-        ((128, 128, 128),) * 9_999 + ((128, 129, 127),)
-    )
+    model = screen_model_from_samples(((128, 128, 128),) * 9_999 + ((128, 129, 127),))
 
     alpha = generate_alpha(
         np.array([[[128, 128, 128]]], dtype=np.uint8),
@@ -76,6 +74,33 @@ def test_generate_alpha_falls_back_for_low_chroma_sample_model() -> None:
     )
 
     assert alpha[0, 0] == 0
+
+
+def test_generate_alpha_blends_neutral_chroma_projection_confidence() -> None:
+    gray_rgb = np.array([[[128, 128, 128]]], dtype=np.uint8)
+    chroma_levels = (0.039, 0.041)
+    models = []
+    for chroma in chroma_levels:
+        channel_offset = chroma * 255.0 / np.sqrt(2.0)
+        model = ScreenColorModel(
+            mean_rgb=(128.0 - channel_offset, 128.0, 128.0 + channel_offset),
+            stddev_rgb=(0.0, 0.0, 0.0),
+            samples=((128, 128, 128),),
+        )
+        normalized_mean_rgb = np.asarray(model.mean_rgb, dtype=np.float32) / 255.0
+        measured_chroma = np.linalg.norm(
+            normalized_mean_rgb - normalized_mean_rgb.mean(dtype=np.float32)
+        )
+        assert 0.03 < measured_chroma < 0.05
+        models.append(model)
+
+    alpha_values = [
+        generate_alpha(gray_rgb, model, KeyerParams(tolerance=0.0, softness=1.0))[0, 0]
+        for model in models
+    ]
+
+    assert all(0 < alpha < 255 for alpha in alpha_values)
+    assert 0 < abs(int(alpha_values[1]) - int(alpha_values[0])) < 100
 
 
 @mark.parametrize(

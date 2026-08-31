@@ -3,7 +3,8 @@ import numpy as np
 
 from .models import KeyerError, KeyerParams, ScreenColorModel
 
-SCREEN_CHROMA_MINIMUM = 0.05
+SCREEN_CHROMA_BLEND_START = 0.03
+SCREEN_CHROMA_BLEND_END = 0.05
 
 
 def _validate_rgb(rgb: object) -> np.ndarray:
@@ -22,6 +23,10 @@ def _validate_alpha(alpha: object) -> np.ndarray:
     return alpha
 
 
+def _rgb_distance_confidence(rgb_float: np.ndarray, mean_rgb: np.ndarray) -> np.ndarray:
+    return np.linalg.norm(rgb_float - mean_rgb, axis=2) / np.sqrt(np.float32(3.0))
+
+
 def generate_alpha(
     rgb: np.ndarray, model: ScreenColorModel, params: KeyerParams
 ) -> np.ndarray:
@@ -34,8 +39,9 @@ def generate_alpha(
         normalized_mean_rgb, dtype=np.float32
     )
     screen_chroma = np.linalg.norm(centered_screen)
+    rgb_distance_confidence = _rgb_distance_confidence(rgb_float, normalized_mean_rgb)
 
-    if screen_chroma > SCREEN_CHROMA_MINIMUM:
+    if screen_chroma > 0.0:
         screen_direction = centered_screen / screen_chroma
         centered_pixels = rgb_float - np.mean(
             rgb_float, axis=2, keepdims=True, dtype=np.float32
@@ -52,11 +58,24 @@ def generate_alpha(
             np.float32(0.0),
             np.float32(1.0),
         )
-        confidence = np.maximum(1.0 - background_fraction, residual_foreground)
-    else:
-        confidence = np.linalg.norm(rgb_float - normalized_mean_rgb, axis=2) / (
-            np.sqrt(np.float32(3.0))
+        projection_confidence = np.maximum(
+            1.0 - background_fraction, residual_foreground
         )
+        blend_position = np.clip(
+            (screen_chroma - SCREEN_CHROMA_BLEND_START)
+            / (SCREEN_CHROMA_BLEND_END - SCREEN_CHROMA_BLEND_START),
+            0.0,
+            1.0,
+        )
+        projection_weight = (
+            blend_position * blend_position * (3.0 - 2.0 * blend_position)
+        )
+        confidence = (
+            rgb_distance_confidence * (1.0 - projection_weight)
+            + projection_confidence * projection_weight
+        )
+    else:
+        confidence = rgb_distance_confidence
 
     variance = np.mean(np.asarray(model.stddev_rgb, dtype=np.float32)) / np.float32(
         255.0
