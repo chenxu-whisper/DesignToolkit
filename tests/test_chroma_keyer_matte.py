@@ -116,6 +116,21 @@ def test_generate_alpha_blends_neutral_chroma_projection_confidence() -> None:
     assert abs(alpha_values[1] - alpha_values[0]) < 32
 
 
+def test_generate_alpha_stabilizes_low_chroma_perpendicular_residual() -> None:
+    model = ScreenColorModel(
+        mean_rgb=(116.0, 128.0, 140.0),
+        stddev_rgb=(0.0, 0.0, 0.0),
+        samples=((116, 128, 140),),
+    )
+    rgb = np.array([[[128, 156, 152]]], dtype=np.uint8)
+
+    alpha = generate_alpha(
+        rgb, model, KeyerParams(tolerance=0.0, softness=1.0)
+    )
+
+    assert alpha[0, 0] == 72
+
+
 @mark.parametrize(
     "rgb",
     [
