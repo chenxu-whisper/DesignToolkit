@@ -98,6 +98,7 @@ class TkinterLocalPathPicker:
                 **_save_file_options(file_kind),
             )
             paths = [Path(selected)] if selected else []
+            paths = _normalize_save_paths(paths, file_kind)
             self._remember_file_directory(paths)
             return paths
         finally:
@@ -173,6 +174,19 @@ def _filter_paths_by_file_kind(
     if file_kind == "image":
         return [path for path in paths if path.suffix.lower() in _IMAGE_FILE_SUFFIXES]
     return paths
+
+
+def _normalize_save_paths(paths: list[Path], file_kind: str) -> list[Path]:
+    if file_kind != "image":
+        return paths
+
+    normalized_paths = []
+    for path in paths:
+        if not path.suffix:
+            normalized_paths.append(path.with_suffix(".png"))
+        elif path.suffix.lower() == ".png":
+            normalized_paths.append(path)
+    return normalized_paths
 
 
 def _default_initial_directory(file_kind: str) -> str:
