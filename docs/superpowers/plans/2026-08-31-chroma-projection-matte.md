@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Replace RGB-distance chroma keying with a sampled-color projection matte that preserves semi-transparent edges and suppresses background spill.
+**Goal:** Augment RGB-distance chroma keying with a sampled-color projection matte that preserves semi-transparent edges and suppresses background spill.
 
-**Architecture:** Keep the public API and `KeyerParams` unchanged. `matte.py` will calculate continuous foreground confidence from sampled screen chroma projection plus perpendicular residual; `refine_alpha` will keep alpha continuous through morphology; `despill.py` will use a background-contribution mask. `core.py` and preview routes already share the pipeline, so focused unit tests and one route parity regression prove preview/export behavior.
+**Architecture:** Keep the public API field names and validation ranges unchanged, while setting the `KeyerParams`, API-schema, and UI defaults to `tolerance = 0.00` and `softness = 1.00`. `matte.py` will calculate continuous foreground confidence from sampled screen chroma projection plus perpendicular residual; `refine_alpha` will keep alpha continuous through morphology; `despill.py` will use a background-contribution mask. `core.py` and preview routes already share the pipeline, so focused unit tests and one route parity regression prove preview/export behavior. The defaults intentionally span the full continuous opacity range; users raise tolerance and lower softness to tighten the key.
 
 **Tech Stack:** Python 3.12, NumPy float32, OpenCV morphology/Gaussian blur, Pillow, FastAPI, pytest.
 
@@ -66,53 +66,35 @@ uv run pytest tests/test_chroma_keyer_matte.py::test_generate_alpha_preserves_a_
 
 Expected: FAIL because the Euclidean-distance implementation makes the mixed green edge opaque or does not expose the specified projection behavior.
 
-- [ ] **Step 3: Replace Euclidean distance with projection confidence**
+- [ ] **Step 3: Add projection confidence to RGB-distance confidence**
 
-In `generate_alpha`, keep RGB validation and add these helpers in `matte.py`:
+In `generate_alpha`, keep RGB validation and normalize pixels and the sampled
+mean to `[0, 1]`. Retain normalized RGB-distance confidence as the neutral
+fallback. For chromatic sampled colors, center pixels and the sampled mean
+around their per-pixel/channel averages, then calculate:
 
-```python
-def _screen_chroma_direction(mean_rgb: np.ndarray) -> tuple[np.ndarray, float]:
-    centered = mean_rgb / 255.0
-    centered -= float(np.mean(centered))
-    magnitude = float(np.linalg.norm(centered))
-    if magnitude <= np.finfo(np.float32).eps:
-        return np.zeros(3, dtype=np.float32), 0.0
-    return centered / magnitude, magnitude
+- projection-axis confidence as `1 - projection / screen_chroma`;
+- perpendicular residual confidence normalized by pixel and screen chroma;
+- a smooth chroma weight that blends projected alpha with RGB-distance alpha.
 
-
-def _foreground_confidence(
-    rgb_float: np.ndarray, mean_rgb: np.ndarray
-) -> np.ndarray:
-    screen_direction, screen_chroma = _screen_chroma_direction(mean_rgb)
-    if screen_chroma == 0.0:
-        distance = np.linalg.norm(rgb_float - mean_rgb, axis=2) / (255.0 * np.sqrt(3.0))
-        return distance
-
-    pixels = rgb_float / 255.0
-    centered_pixels = pixels - np.mean(pixels, axis=2, keepdims=True)
-    projection = np.sum(centered_pixels * screen_direction, axis=2)
-    background_fraction = np.clip(projection / screen_chroma, 0.0, 1.0)
-    residual = centered_pixels - projection[..., None] * screen_direction
-    residual_foreground = np.clip(
-        np.linalg.norm(residual, axis=2) / screen_chroma, 0.0, 1.0
-    )
-    return np.maximum(1.0 - background_fraction, residual_foreground)
-```
-
-Then map the returned confidence through the existing variance-adjusted
-`tolerance` and `softness` smoothstep:
+Map RGB-distance confidence, projection-axis confidence, and residual
+confidence independently through the same variance-adjusted `tolerance` and
+`softness` smoothstep before combining their alpha values:
 
 ```python
-confidence = _foreground_confidence(rgb_float, mean_rgb)
 variance = float(np.mean(model.stddev_rgb)) / 255.0
 lower = float(np.clip(params.tolerance + variance, 0.0, 1.0))
 upper = max(lower + 0.01, min(1.0, lower + params.softness))
-position = np.clip((confidence - lower) / (upper - lower), 0.0, 1.0)
-return np.rint(position * position * (3.0 - 2.0 * position) * 255.0).astype(np.uint8)
+distance_alpha = remap_confidence(distance_confidence, lower, upper)
+axis_alpha = remap_confidence(axis_confidence, lower, upper)
+residual_alpha = remap_confidence(residual_confidence, lower, upper)
+colored_alpha = np.maximum(axis_alpha, residual_alpha)
+alpha = blend_by_screen_chroma(distance_alpha, colored_alpha)
 ```
 
-Use `np.asarray(..., dtype=np.float32)` for `mean_rgb`; do not change
-`KeyerParams` or any API model.
+Use `np.asarray(..., dtype=np.float32)` for `mean_rgb`. Do not rename API
+fields or change their validation ranges. Set the backend and frontend
+defaults to `tolerance = 0.00` and `softness = 1.00`.
 
 - [ ] **Step 4: Run matte tests to verify projection behavior passes**
 

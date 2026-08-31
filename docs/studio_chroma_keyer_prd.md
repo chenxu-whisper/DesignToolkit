@@ -86,20 +86,25 @@ Despill 仅在半透明边缘生效，并按 `despill_amount` 线性混合，避
 
 ### 7.1 初始 Alpha
 
-算法基于归一化 RGB 色差。色差低于背景阈值的像素趋于透明，高于前景阈值的像素趋于不透明，中间区域采用平滑插值生成连续 Alpha。
+算法以归一化 RGB 色差为基线；对于具有明确主色方向的采样背景，还会计算像素沿背景色度轴的前景置信度和垂直于该轴的残差置信度。色度轴置信度、残差置信度和 RGB 色差置信度均使用同一套 `tolerance` / `softness` 平滑重映射，再按采样色度组合为连续 Alpha。
 
 ```text
 background_threshold = tolerance + sample_variance
 foreground_threshold = background_threshold + softness
-alpha = smoothstep(background_threshold, foreground_threshold, color_distance)
+distance_alpha = smoothstep(background_threshold, foreground_threshold, color_distance)
+axis_alpha = smoothstep(background_threshold, foreground_threshold, axis_confidence)
+residual_alpha = smoothstep(background_threshold, foreground_threshold, residual_confidence)
+alpha = blend(distance_alpha, max(axis_alpha, residual_alpha), screen_chroma)
 ```
+
+默认 `tolerance = 0.00`、`softness = 1.00`，有意覆盖完整的连续不透明度范围，以保留半透明边缘。用户可提高 Tolerance、降低 Softness，使抠像范围更紧、过渡更窄。
 
 ### 7.2 MVP 参数
 
 | 参数 | 范围 | 默认值 | 作用 |
 | --- | --- | --- | --- |
-| Tolerance | 0.00 - 1.00 | 0.25 | 背景颜色容差 |
-| Softness | 0.01 - 1.00 | 0.15 | Alpha 过渡宽度 |
+| Tolerance | 0.00 - 1.00 | 0.00 | 背景颜色容差 |
+| Softness | 0.00 - 1.00 | 1.00 | Alpha 过渡宽度 |
 | Clip Black | 0.00 - 1.00 | 0.00 | 将低 Alpha 压向透明 |
 | Clip White | 0.00 - 1.00 | 1.00 | 将高 Alpha 压向不透明 |
 | Shrink / Grow | -10 - 10 px | 0 | Alpha 收缩或扩张 |

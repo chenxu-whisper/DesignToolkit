@@ -33,9 +33,10 @@ information. Combine:
 - the residual chroma distance from the sampled background; and
 - sampled color variance.
 
-The combined foreground confidence is remapped through the existing
-`tolerance` and `softness` controls with smoothstep. It produces a continuous
-alpha value in `[0, 255]`:
+The background-axis and residual confidences each use the same smoothstep
+remap as RGB-distance confidence, controlled by `tolerance` and `softness`.
+Their combined foreground confidence produces a continuous alpha value in
+`[0, 255]`:
 
 - sampled background approaches `0`;
 - clearly distinct foreground approaches `255`;
@@ -73,9 +74,13 @@ mixed by `despill_amount`. Opaque foreground remains unchanged.
 - Existing API payloads, parameter names, preview modes, and output files stay
   unchanged.
 - Preview and export continue to call the same public keying pipeline.
-- The existing defaults remain valid; their behavior becomes more continuous
-  around screen-contaminated edges.
-- Existing RGB-distance behavior is replaced rather than exposed as a mode.
+- Parameter names and validation ranges stay unchanged. The defaults become
+  `tolerance = 0.00` and `softness = 1.00`, intentionally spanning the full
+  continuous opacity range to preserve screen-contaminated edges. Users raise
+  tolerance and lower softness when they need a tighter key.
+- RGB-distance confidence remains the neutral-color fallback and blends into
+  the projected matte for low-chroma sampled colors; it is not exposed as a
+  separate mode.
 
 ## Tests
 
