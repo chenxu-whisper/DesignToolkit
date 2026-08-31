@@ -22,7 +22,7 @@
 - `tests/test_web_chroma_keyer.py`: schema defaults and preview parity.
 - `web/frontend/src/modules/chroma-keyer/chromaKeyerValidation.test.ts`: frontend default regression.
 - `web/frontend/src/modules/chroma-keyer/ChromaKeyerPage.test.tsx`: default export payload regression.
-- `assets/frame/test_frame_5.png`: existing real green-background asset used read-only by the quantitative regression.
+- `assets/frame/test_frame_2.png`: existing real green-background asset used read-only by the quantitative regression.
 
 ### Task 1: Recover Foreground RGB by Sampled-Background Unmixing
 
@@ -202,19 +202,19 @@ Expected: focused backend and frontend tests pass before the commit.
 **Files:**
 - Modify: `tests/test_chroma_keyer_core.py`
 - Modify: `tests/test_web_chroma_keyer.py`
-- Read fixture: `assets/frame/test_frame_5.png`
+- Read fixture: `assets/frame/test_frame_2.png`
 
 - [ ] **Step 1: Add a quantitative regression for the existing asset**
 
-Add a test that reads `assets/frame/test_frame_5.png`, samples the four
-background corners at `(10, 10)`, `(741, 10)`, `(10, 549)`, and `(741, 549)`,
+Add a test that reads `assets/frame/test_frame_2.png`, samples the four
+background corners at `(10, 10)`, `(3157, 10)`, `(10, 1333)`, and `(3157, 1333)`,
 then runs `key_rgb` with default `KeyerParams`.
 
 ```python
 def test_key_rgb_reduces_sampled_background_contribution_on_real_asset() -> None:
-    asset = Path(__file__).parents[1] / "assets/frame/test_frame_5.png"
+    asset = Path(__file__).parents[1] / "assets/frame/test_frame_2.png"
     rgb = read_rgb_image(asset)
-    sample_xy = ((10, 10), (741, 10), (10, 549), (741, 549))
+    sample_xy = ((10, 10), (3157, 10), (10, 1333), (3157, 1333))
     samples = [[int(channel) for channel in rgb[y, x]] for x, y in sample_xy]
     model = screen_model_from_samples(samples)
 
@@ -314,7 +314,7 @@ Expected: Uvicorn listens on `http://127.0.0.1:8765`.
 - [ ] **Step 4: Verify the browser workflow with the real asset**
 
 Open Studio Chroma Keyer, load the absolute path to
-`assets/frame/test_frame_5.png`, sample the four corner background points,
+`assets/frame/test_frame_2.png`, sample the four corner background points,
 and verify:
 
 1. the initial Despill Amount control reads `1.00`;
