@@ -39,7 +39,7 @@ def _dominant_screen_channel(model: ScreenColorModel) -> int | None:
     for channel in range(3):
         others = np.delete(mean_rgb, channel)
         if mean_rgb[channel] - np.max(others) >= threshold:
-            return channel if channel in (1, 2) else None
+            return channel
     return None
 
 

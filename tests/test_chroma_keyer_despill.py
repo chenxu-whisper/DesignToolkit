@@ -115,7 +115,7 @@ def test_despill_neutral_screen_model_uses_sample_luminance_as_target() -> None:
     assert result[0, 0].tolist() == [151, 101, 101]
 
 
-def test_despill_red_dominant_screen_model_uses_neutral_fallback() -> None:
+def test_despill_suppresses_dominant_red_channel() -> None:
     rgb = np.array([[[200, 100, 100]]], dtype=np.uint8)
 
     result = despill(
@@ -125,7 +125,20 @@ def test_despill_red_dominant_screen_model_uses_neutral_fallback() -> None:
         amount=1.0,
     )
 
-    assert result[0, 0].tolist() == [137, 87, 87]
+    assert result[0, 0].tolist() == [150, 100, 100]
+
+
+def test_despill_does_not_raise_low_dominant_red_channel() -> None:
+    rgb = np.array([[[100, 200, 180]]], dtype=np.uint8)
+
+    result = despill(
+        rgb,
+        np.array([[128]], dtype=np.uint8),
+        _model((200.0, 10.0, 10.0)),
+        amount=1.0,
+    )
+
+    assert result[0, 0].tolist() == [100, 200, 180]
 
 
 @mark.parametrize(
