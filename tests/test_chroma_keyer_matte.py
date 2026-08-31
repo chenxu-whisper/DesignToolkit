@@ -13,27 +13,31 @@ def _green_screen_model() -> ScreenColorModel:
     )
 
 
-def test_generate_alpha_makes_screen_transparent_and_foreground_opaque() -> None:
-    rgb = np.array([[[0, 255, 0], [255, 0, 0]]], dtype=np.uint8)
-
-    alpha = generate_alpha(rgb, _green_screen_model(), KeyerParams(softness=0.1))
-
-    assert alpha.dtype == np.uint8
-    assert alpha.shape == (1, 2)
-    assert alpha.tolist() == [[0, 255]]
-
-
-def test_generate_alpha_softness_produces_intermediate_alpha() -> None:
-    rgb = np.array([[[0, 192, 0]]], dtype=np.uint8)
+def test_generate_alpha_projects_sampled_green_chroma() -> None:
+    rgb = np.array([[[0, 255, 0], [128, 255, 128], [255, 0, 0]]], dtype=np.uint8)
 
     alpha = generate_alpha(
-        rgb, _green_screen_model(), KeyerParams(tolerance=0.0, softness=0.5)
+        rgb, _green_screen_model(), KeyerParams(tolerance=0.0, softness=1.0)
     )
 
-    assert 0 < alpha[0, 0] < 255
+    assert alpha.dtype == np.uint8
+    assert alpha.shape == (1, 3)
+    assert alpha[0, 0] == 0
+    assert 0 < alpha[0, 1] < 255
+    assert alpha[0, 2] == 255
 
 
-def test_generate_alpha_normalizes_rgb_distance_to_a_maximum_of_one() -> None:
+def test_generate_alpha_keeps_perpendicular_chroma_as_foreground() -> None:
+    rgb = np.array([[[0, 220, 255]]], dtype=np.uint8)
+
+    alpha = generate_alpha(
+        rgb, _green_screen_model(), KeyerParams(tolerance=0.0, softness=1.0)
+    )
+
+    assert alpha[0, 0] > 200
+
+
+def test_generate_alpha_falls_back_to_normalized_rgb_distance_for_gray_screen() -> None:
     rgb = np.array([[[133, 0, 0]]], dtype=np.uint8)
     model = ScreenColorModel(
         mean_rgb=(0.0, 0.0, 0.0),
@@ -41,9 +45,7 @@ def test_generate_alpha_normalizes_rgb_distance_to_a_maximum_of_one() -> None:
         samples=((0, 0, 0),),
     )
 
-    alpha = generate_alpha(
-        rgb, model, KeyerParams(tolerance=0.25, softness=0.15)
-    )
+    alpha = generate_alpha(rgb, model, KeyerParams(tolerance=0.25, softness=0.15))
 
     assert alpha[0, 0] == 69
 
