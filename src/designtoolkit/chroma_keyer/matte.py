@@ -27,7 +27,7 @@ def _rgb_distance_confidence(rgb_float: np.ndarray, mean_rgb: np.ndarray) -> np.
     return np.linalg.norm(rgb_float - mean_rgb, axis=2) / np.sqrt(np.float32(3.0))
 
 
-def _smoothstep(
+def _remap_confidence(
     confidence: np.ndarray, lower: np.float32, upper: np.float32
 ) -> np.ndarray:
     position = np.clip(
@@ -67,7 +67,7 @@ def generate_alpha(
             min(np.float32(1.0), lower + np.float32(params.softness)),
         )
     )
-    distance_alpha = _smoothstep(rgb_distance_confidence, lower, upper)
+    distance_alpha = _remap_confidence(rgb_distance_confidence, lower, upper)
 
     if screen_chroma > SCREEN_CHROMA_BLEND_START:
         screen_direction = centered_screen / screen_chroma
@@ -77,19 +77,24 @@ def generate_alpha(
         projection = np.sum(
             centered_pixels * screen_direction, axis=2, dtype=np.float32
         )
-        axis_alpha = np.clip(
+        axis_confidence = np.clip(
             np.float32(1.0) - projection / screen_chroma,
             np.float32(0.0),
             np.float32(1.0),
         )
+        axis_alpha = _remap_confidence(axis_confidence, lower, upper)
         residual = centered_pixels - projection[..., np.newaxis] * screen_direction
+        pixel_chroma = np.linalg.norm(centered_pixels, axis=2)
         residual_confidence = np.clip(
             np.linalg.norm(residual, axis=2)
-            / max(screen_chroma, np.float32(0.10)),
+            / np.maximum(
+                pixel_chroma,
+                max(screen_chroma, np.float32(0.10)),
+            ),
             np.float32(0.0),
             np.float32(1.0),
         )
-        residual_alpha = _smoothstep(residual_confidence, lower, upper)
+        residual_alpha = _remap_confidence(residual_confidence, lower, upper)
         colored_alpha = np.maximum(axis_alpha, residual_alpha)
         blend_position = np.clip(
             (screen_chroma - SCREEN_CHROMA_BLEND_START)

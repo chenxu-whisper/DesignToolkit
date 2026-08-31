@@ -30,8 +30,8 @@ def test_params_reject_clip_black_not_less_than_clip_white(
 
 def test_params_accept_default_mvp_values() -> None:
     assert KeyerParams() == KeyerParams(
-        tolerance=0.25,
-        softness=0.15,
+        tolerance=0.0,
+        softness=1.0,
         clip_black=0.0,
         clip_white=1.0,
         shrink_grow=0,

@@ -239,7 +239,7 @@ describe('ChromaKeyerPage', () => {
         despillAmount: 0.5,
         feather: 0,
         shrinkGrow: 0,
-        softness: 0.15,
+        softness: 1,
         tolerance: 0.4,
       },
       samples: [[42, 180, 72]],

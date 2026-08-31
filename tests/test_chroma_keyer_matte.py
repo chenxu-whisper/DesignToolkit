@@ -28,7 +28,7 @@ def test_generate_alpha_projects_sampled_green_chroma() -> None:
     assert alpha[0, 2] == 255
 
 
-def test_generate_alpha_preserves_default_green_composite_opacity() -> None:
+def test_generate_alpha_smoothly_remaps_default_green_projection() -> None:
     rgb = np.array(
         [
             [
@@ -44,8 +44,30 @@ def test_generate_alpha_preserves_default_green_composite_opacity() -> None:
 
     alpha = generate_alpha(rgb, _green_screen_model(), KeyerParams())
 
-    np.testing.assert_allclose(alpha[0], [0, 64, 128, 191, 255], atol=2)
+    np.testing.assert_array_equal(alpha[0], [0, 40, 128, 215, 255])
     assert np.all(np.diff(alpha[0].astype(np.int16)) > 0)
+
+
+def test_generate_alpha_applies_tolerance_and_softness_to_green_projection() -> None:
+    rgb = np.array([[[128, 255, 128]]], dtype=np.uint8)
+
+    default_alpha = int(generate_alpha(rgb, _green_screen_model(), KeyerParams())[0, 0])
+    tolerant_alpha = int(
+        generate_alpha(
+            rgb,
+            _green_screen_model(),
+            KeyerParams(tolerance=0.25, softness=1.0),
+        )[0, 0]
+    )
+    firm_alpha = int(
+        generate_alpha(
+            rgb,
+            _green_screen_model(),
+            KeyerParams(tolerance=0.0, softness=0.25),
+        )[0, 0]
+    )
+
+    assert tolerant_alpha < default_alpha < firm_alpha
 
 
 def test_generate_alpha_keeps_perpendicular_chroma_as_foreground() -> None:
@@ -113,6 +135,25 @@ def test_generate_alpha_blends_neutral_chroma_projection_confidence() -> None:
     ]
 
     assert all(0 < alpha < 128 for alpha in alpha_values)
+    assert abs(alpha_values[1] - alpha_values[0]) < 32
+
+
+def test_generate_alpha_avoids_adjacent_low_chroma_default_cliff() -> None:
+    rgb = np.array([[[16, 0, 224]]], dtype=np.uint8)
+    models = [
+        ScreenColorModel(
+            mean_rgb=mean_rgb,
+            stddev_rgb=(0.0, 0.0, 0.0),
+            samples=(tuple(int(channel) for channel in mean_rgb),),
+        )
+        for mean_rgb in ((112.0, 112.0, 144.0), (113.0, 112.0, 144.0))
+    ]
+
+    alpha_values = [
+        int(generate_alpha(rgb, model, KeyerParams())[0, 0]) for model in models
+    ]
+
+    assert all(0 < alpha < 255 for alpha in alpha_values)
     assert abs(alpha_values[1] - alpha_values[0]) < 32
 
 

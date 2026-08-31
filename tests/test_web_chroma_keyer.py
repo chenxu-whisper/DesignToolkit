@@ -90,8 +90,8 @@ def test_chroma_keyer_task_request_accepts_the_default_export_contract() -> None
         "input_path": "input.png",
         "samples": [[42, 180, 72]],
         "params": {
-            "tolerance": 0.25,
-            "softness": 0.15,
+            "tolerance": 0.0,
+            "softness": 1.0,
             "clip_black": 0.0,
             "clip_white": 1.0,
             "shrink_grow": 0,

@@ -67,8 +67,8 @@ def _normalize_samples(values: object) -> tuple[tuple[int, int, int], ...]:
 
 @dataclass(frozen=True)
 class KeyerParams:
-    tolerance: float = 0.25
-    softness: float = 0.15
+    tolerance: float = 0.0
+    softness: float = 1.0
     clip_black: float = 0.0
     clip_white: float = 1.0
     shrink_grow: int = 0

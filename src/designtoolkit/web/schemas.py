@@ -94,8 +94,8 @@ class ChromaSampleResponse(BaseModel):
 class ChromaKeyerParams(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    tolerance: UnitIntervalFloat = 0.25
-    softness: UnitIntervalFloat = 0.15
+    tolerance: UnitIntervalFloat = 0.0
+    softness: UnitIntervalFloat = 1.0
     clip_black: UnitIntervalFloat = 0.0
     clip_white: UnitIntervalFloat = 1.0
     shrink_grow: Annotated[int, Field(strict=True, ge=-10, le=10)] = 0

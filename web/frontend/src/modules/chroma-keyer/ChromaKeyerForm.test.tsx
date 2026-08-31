@@ -86,8 +86,8 @@ describe('ChromaKeyerForm', () => {
       />,
     )
 
-    expect(screen.getByLabelText('Tolerance')).toHaveValue(0.25)
-    expect(screen.getByLabelText('Softness')).toHaveValue(0.15)
+    expect(screen.getByLabelText('Tolerance')).toHaveValue(0)
+    expect(screen.getByLabelText('Softness')).toHaveValue(1)
     expect(screen.getByLabelText('Clip Black')).toHaveValue(0)
     expect(screen.getByLabelText('Clip White')).toHaveValue(1)
     expect(screen.getByLabelText('Shrink/Grow')).toHaveValue(0)
