@@ -124,6 +124,19 @@ def test_refine_alpha_remaps_clip_black_and_clip_white_endpoints() -> None:
     assert result.tolist() == [[1, 129, 255]]
 
 
+@mark.parametrize("shrink_grow", [-1, 1])
+def test_refine_alpha_preserves_fractional_values_during_morphology(
+    shrink_grow: int,
+) -> None:
+    alpha = np.array([[0, 0, 0], [0, 128, 255], [0, 0, 0]], dtype=np.uint8)
+
+    result = refine_alpha(alpha, KeyerParams(shrink_grow=shrink_grow))
+
+    assert 0 < result[1, 1] < 255
+    if shrink_grow > 0:
+        assert result[0, 1] == 64
+
+
 @mark.parametrize(
     "alpha",
     [

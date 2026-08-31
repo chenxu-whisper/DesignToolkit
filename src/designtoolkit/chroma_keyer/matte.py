@@ -90,7 +90,7 @@ def generate_alpha(
 
 
 def refine_alpha(alpha: np.ndarray, params: KeyerParams) -> np.ndarray:
-    """Apply clip remapping, binary morphology, and feathering to an alpha matte."""
+    """Apply clip remapping, morphology, and feathering to an alpha matte."""
     alpha = _validate_alpha(alpha)
     refined = alpha.astype(np.float32) / 255.0
     refined = np.clip(
@@ -104,9 +104,8 @@ def refine_alpha(alpha: np.ndarray, params: KeyerParams) -> np.ndarray:
         kernel = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE, (kernel_size, kernel_size)
         )
-        binary = (refined >= 0.5).astype(np.uint8) * 255
         operation = cv2.dilate if params.shrink_grow > 0 else cv2.erode
-        transformed = operation(binary, kernel).astype(np.float32) / 255.0
+        transformed = operation(refined, kernel)
         refined = (refined + transformed) / 2.0
 
     if params.feather:
