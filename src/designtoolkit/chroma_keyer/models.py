@@ -73,7 +73,7 @@ class KeyerParams:
     clip_white: float = 1.0
     shrink_grow: int = 0
     feather: int = 0
-    despill_amount: float = 0.5
+    despill_amount: float = 1.0
 
     def __post_init__(self) -> None:
         _validate_unit_interval("tolerance", self.tolerance)

@@ -92,7 +92,7 @@ describe('ChromaKeyerForm', () => {
     expect(screen.getByLabelText('Clip White')).toHaveValue(1)
     expect(screen.getByLabelText('Shrink/Grow')).toHaveValue(0)
     expect(screen.getByLabelText('Feather')).toHaveValue(0)
-    expect(screen.getByLabelText('Despill Amount')).toHaveValue(0.5)
+    expect(screen.getByLabelText('Despill Amount')).toHaveValue(1)
     expect(screen.getByRole('radio', { name: 'Final' })).toBeChecked()
     expect(screen.getByRole('radio', { name: 'Alpha' })).not.toBeChecked()
   })

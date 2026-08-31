@@ -277,7 +277,7 @@ describe('ChromaKeyerPage', () => {
       params: {
         clipBlack: 0,
         clipWhite: 1,
-        despillAmount: 0.5,
+        despillAmount: 1,
         feather: 0,
         shrinkGrow: 0,
         softness: 1,

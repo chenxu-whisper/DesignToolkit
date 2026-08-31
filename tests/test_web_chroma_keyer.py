@@ -96,7 +96,7 @@ def test_chroma_keyer_task_request_accepts_the_default_export_contract() -> None
             "clip_white": 1.0,
             "shrink_grow": 0,
             "feather": 0,
-            "despill_amount": 0.5,
+            "despill_amount": 1.0,
         },
         "output_path": None,
     }

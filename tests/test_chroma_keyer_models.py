@@ -36,7 +36,7 @@ def test_params_accept_default_mvp_values() -> None:
         clip_white=1.0,
         shrink_grow=0,
         feather=0,
-        despill_amount=0.5,
+        despill_amount=1.0,
     )
 
 

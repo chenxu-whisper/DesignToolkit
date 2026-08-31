@@ -11,7 +11,7 @@ export function createChromaKeyerDefaultValues(): ChromaKeyerValues {
     clipWhite: 1,
     shrinkGrow: 0,
     feather: 0,
-    despillAmount: 0.5,
+    despillAmount: 1,
     viewMode: 'final',
   }
 }

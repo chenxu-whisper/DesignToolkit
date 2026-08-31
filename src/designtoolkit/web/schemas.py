@@ -100,7 +100,7 @@ class ChromaKeyerParams(BaseModel):
     clip_white: UnitIntervalFloat = 1.0
     shrink_grow: Annotated[int, Field(strict=True, ge=-10, le=10)] = 0
     feather: Annotated[int, Field(strict=True, ge=0, le=10)] = 0
-    despill_amount: UnitIntervalFloat = 0.5
+    despill_amount: UnitIntervalFloat = 1.0
 
     @model_validator(mode="after")
     def validate_clip_range(self) -> ChromaKeyerParams:
