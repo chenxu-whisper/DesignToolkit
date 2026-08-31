@@ -56,6 +56,36 @@ def test_key_image_writes_source_sized_rgba_png(tmp_path: Path) -> None:
         assert image.getpixel((1, 0))[3] > 0
 
 
+def test_key_image_preserves_fractional_edge_alpha_and_despills_green(
+    tmp_path: Path,
+) -> None:
+    input_path = tmp_path / "screen.png"
+    output_path = tmp_path / "result.png"
+    _save_rgb(
+        input_path,
+        np.array([[[0, 255, 0], [180, 235, 180], [255, 0, 0]]], dtype=np.uint8),
+    )
+    model = ScreenColorModel(
+        mean_rgb=(0.0, 255.0, 0.0),
+        stddev_rgb=(0.0, 0.0, 0.0),
+        samples=((0, 255, 0),),
+    )
+
+    key_image(
+        KeyImageOptions(input_path=input_path, output_path=output_path),
+        model,
+        KeyerParams(tolerance=0.0, softness=1.0, despill_amount=1.0),
+    )
+
+    with Image.open(output_path) as image:
+        pixels = np.asarray(image.convert("RGBA"))
+
+    assert pixels[0, 0, 3] == 0
+    assert 0 < pixels[0, 1, 3] < 255
+    assert pixels[0, 1, 1] < 235
+    assert pixels[0, 2, 3] == 255
+
+
 def test_default_output_path_and_key_image_omitted_output_use_keyed_suffix(
     tmp_path: Path,
 ) -> None:

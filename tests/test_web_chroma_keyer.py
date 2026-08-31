@@ -1091,19 +1091,23 @@ def test_final_and_alpha_previews_match_the_public_keying_pipeline(
     tmp_path: Path,
 ) -> None:
     input_path = tmp_path / "input.png"
-    _write_input_image(input_path)
+    source_rgb = np.array(
+        [[[0, 255, 0], [180, 235, 180], [255, 0, 0]]],
+        dtype=np.uint8,
+    )
+    Image.fromarray(source_rgb, mode="RGB").save(input_path)
     client = _client(tmp_path)
     payload = {
         "input_path": str(input_path),
-        "samples": [[42, 180, 72]],
+        "samples": [[0, 255, 0]],
         "params": {
-            "tolerance": 0.25,
-            "softness": 0.15,
+            "tolerance": 0.0,
+            "softness": 1.0,
             "clip_black": 0.0,
             "clip_white": 1.0,
             "shrink_grow": 0,
             "feather": 0,
-            "despill_amount": 0.5,
+            "despill_amount": 1.0,
         },
     }
 
@@ -1144,6 +1148,8 @@ def test_final_and_alpha_previews_match_the_public_keying_pipeline(
     assert np.array_equal(final_rgba[..., :3], expected_final)
     assert np.array_equal(final_rgba[..., 3], refined_alpha)
     assert final_rgba[0, 0, 3] == 0
+    assert 0 < final_rgba[0, 1, 3] < 255
+    assert final_rgba[0, 1, 1] < source_rgb[0, 1, 1]
     assert np.array_equal(alpha_preview, expected_alpha)
 
 
