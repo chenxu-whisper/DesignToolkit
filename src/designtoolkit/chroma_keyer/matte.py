@@ -33,7 +33,7 @@ def generate_alpha(
     )
     screen_chroma = np.linalg.norm(centered_screen)
 
-    if screen_chroma > 0.0:
+    if screen_chroma > np.finfo(np.float32).eps:
         screen_direction = centered_screen / screen_chroma
         centered_pixels = rgb_float - np.mean(
             rgb_float, axis=2, keepdims=True, dtype=np.float32

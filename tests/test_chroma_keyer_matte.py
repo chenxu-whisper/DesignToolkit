@@ -50,6 +50,19 @@ def test_generate_alpha_falls_back_to_normalized_rgb_distance_for_gray_screen() 
     assert alpha[0, 0] == 69
 
 
+def test_generate_alpha_falls_back_for_near_neutral_screen_chroma() -> None:
+    rgb = np.array([[[128, 128, 128]]], dtype=np.uint8)
+    model = ScreenColorModel(
+        mean_rgb=(128.0, 128.0 + 1e-5, 128.0 - 1e-5),
+        stddev_rgb=(0.0, 0.0, 0.0),
+        samples=((128, 128, 128),),
+    )
+
+    alpha = generate_alpha(rgb, model, KeyerParams(tolerance=0.0, softness=0.15))
+
+    assert alpha[0, 0] == 0
+
+
 @mark.parametrize(
     "rgb",
     [
