@@ -13,13 +13,12 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from PIL import Image
 
-from designtoolkit.chroma_keyer.despill import despill
+from designtoolkit.chroma_keyer.core import key_rgb
 from designtoolkit.chroma_keyer.image_io import (
     make_preview_png,
     read_rgb_image,
     read_rgb_image_bytes,
 )
-from designtoolkit.chroma_keyer.matte import generate_alpha, refine_alpha
 from designtoolkit.chroma_keyer.models import KeyerError, KeyerParams
 from designtoolkit.chroma_keyer.sampling import (
     map_preview_point,
@@ -386,9 +385,8 @@ def create_router(
 
             def create_preview_png() -> bytes:
                 params = KeyerParams(**params_data)
-                alpha = refine_alpha(generate_alpha(rgb, model, params), params)
+                preview_rgb, alpha = key_rgb(rgb, model, params)
                 if request.view_mode is ChromaViewMode.FINAL:
-                    preview_rgb = despill(rgb, alpha, model, params.despill_amount)
                     return make_preview_png(preview_rgb, alpha=alpha)
                 else:
                     preview_rgb = np.repeat(alpha[..., np.newaxis], 3, axis=2)

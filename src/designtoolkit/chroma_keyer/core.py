@@ -1,3 +1,5 @@
+import numpy as np
+
 from .despill import despill
 from .image_io import (
     default_output_path,
@@ -9,6 +11,16 @@ from .matte import generate_alpha, refine_alpha
 from .models import KeyerParams, KeyImageOptions, KeyImageResult, ScreenColorModel
 
 
+def key_rgb(
+    rgb: np.ndarray,
+    model: ScreenColorModel,
+    params: KeyerParams,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return despilled RGB pixels and the refined alpha matte."""
+    alpha = refine_alpha(generate_alpha(rgb, model, params), params)
+    return despill(rgb, alpha, model, params.despill_amount), alpha
+
+
 def key_image(
     options: KeyImageOptions, model: ScreenColorModel, params: KeyerParams
 ) -> KeyImageResult:
@@ -16,7 +28,6 @@ def key_image(
     rgb = read_rgb_image(options.input_path)
     output_path = options.output_path or default_output_path(options.input_path)
     validate_output_path(options.input_path, output_path)
-    alpha = refine_alpha(generate_alpha(rgb, model, params), params)
-    keyed_rgb = despill(rgb, alpha, model, params.despill_amount)
+    keyed_rgb, alpha = key_rgb(rgb, model, params)
     write_rgba_png(output_path, keyed_rgb, alpha)
     return KeyImageResult(output_path=output_path)

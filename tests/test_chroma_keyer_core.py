@@ -5,6 +5,7 @@ import numpy as np
 from PIL import Image
 from pytest import raises
 
+from designtoolkit.chroma_keyer import core as chroma_keyer_core
 from designtoolkit.chroma_keyer import image_io
 from designtoolkit.chroma_keyer.core import key_image
 from designtoolkit.chroma_keyer.image_io import (
@@ -32,6 +33,28 @@ def _green_screen_model() -> ScreenColorModel:
         stddev_rgb=(0.0, 0.0, 0.0),
         samples=((42, 180, 72),),
     )
+
+
+def test_key_rgb_returns_refined_alpha_and_despilled_rgb() -> None:
+    source_rgb = np.array(
+        [[[0, 255, 0], [180, 235, 180], [255, 0, 0]]],
+        dtype=np.uint8,
+    )
+    params = KeyerParams(tolerance=0.0, softness=1.0, despill_amount=1.0)
+    model = ScreenColorModel(
+        mean_rgb=(0.0, 255.0, 0.0),
+        stddev_rgb=(0.0, 0.0, 0.0),
+        samples=((0, 255, 0),),
+    )
+
+    assert hasattr(chroma_keyer_core, "key_rgb")
+    keyed_rgb, alpha = chroma_keyer_core.key_rgb(source_rgb, model, params)
+
+    assert keyed_rgb.dtype == np.uint8
+    assert np.array_equal(keyed_rgb[0, 0], source_rgb[0, 0])
+    assert keyed_rgb[0, 1, 1] < source_rgb[0, 1, 1]
+    assert alpha.tolist() == [[0, alpha[0, 1], 255]]
+    assert 0 < alpha[0, 1] < 255
 
 
 def test_key_image_writes_source_sized_rgba_png(tmp_path: Path) -> None:

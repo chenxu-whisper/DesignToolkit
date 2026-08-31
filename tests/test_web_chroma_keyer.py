@@ -1153,6 +1153,67 @@ def test_final_and_alpha_previews_match_the_public_keying_pipeline(
     assert np.array_equal(alpha_preview, expected_alpha)
 
 
+def test_final_and_alpha_previews_use_shared_key_rgb_pipeline(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    input_path = tmp_path / "input.png"
+    source_rgb = _write_input_image(input_path)
+    expected_keyed_rgb = np.array(
+        [
+            [[10, 20, 30], [40, 50, 60], [70, 80, 90], [100, 110, 120]],
+            [
+                [130, 140, 150],
+                [160, 170, 180],
+                [190, 200, 210],
+                [220, 230, 240],
+            ],
+        ],
+        dtype=np.uint8,
+    )
+    expected_alpha = np.array(
+        [[0, 32, 96, 255], [255, 192, 128, 64]],
+        dtype=np.uint8,
+    )
+    pipeline_calls: list[tuple[np.ndarray, KeyerParams]] = []
+
+    def key_rgb(
+        rgb: np.ndarray,
+        _model,
+        params: KeyerParams,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        pipeline_calls.append((rgb.copy(), params))
+        return expected_keyed_rgb, expected_alpha
+
+    monkeypatch.setattr(web_routes, "key_rgb", key_rgb, raising=False)
+    client = _client(tmp_path)
+    payload = {
+        "input_path": str(input_path),
+        "samples": [[42, 180, 72]],
+        "params": {},
+    }
+
+    final_response = client.post("/api/chroma-keyer/previews", json=payload)
+    alpha_response = client.post(
+        "/api/chroma-keyer/previews",
+        json={**payload, "view_mode": "alpha"},
+    )
+
+    assert final_response.status_code == 200
+    assert alpha_response.status_code == 200
+    assert len(pipeline_calls) == 2
+    assert all(np.array_equal(rgb, source_rgb) for rgb, _ in pipeline_calls)
+    assert all(params == KeyerParams() for _, params in pipeline_calls)
+    assert np.array_equal(
+        _decode_rgba_png(client.get(final_response.json()["preview_url"]).content),
+        np.dstack((expected_keyed_rgb, expected_alpha)),
+    )
+    assert np.array_equal(
+        _decode_rgb_png(client.get(alpha_response.json()["preview_url"]).content),
+        np.repeat(expected_alpha[..., np.newaxis], 3, axis=2),
+    )
+
+
 def test_generated_preview_reuses_request_state_and_varies_by_view_and_params(
     tmp_path: Path,
 ) -> None:
