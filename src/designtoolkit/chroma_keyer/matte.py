@@ -3,6 +3,8 @@ import numpy as np
 
 from .models import KeyerError, KeyerParams, ScreenColorModel
 
+SCREEN_CHROMA_MINIMUM = 0.05
+
 
 def _validate_rgb(rgb: object) -> np.ndarray:
     if not isinstance(rgb, np.ndarray) or rgb.dtype != np.uint8 or rgb.ndim != 3:
@@ -33,7 +35,7 @@ def generate_alpha(
     )
     screen_chroma = np.linalg.norm(centered_screen)
 
-    if screen_chroma > np.finfo(np.float32).eps:
+    if screen_chroma > SCREEN_CHROMA_MINIMUM:
         screen_direction = centered_screen / screen_chroma
         centered_pixels = rgb_float - np.mean(
             rgb_float, axis=2, keepdims=True, dtype=np.float32

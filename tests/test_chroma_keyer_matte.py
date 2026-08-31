@@ -3,6 +3,7 @@ from pytest import mark, raises
 
 from designtoolkit.chroma_keyer.matte import generate_alpha, refine_alpha
 from designtoolkit.chroma_keyer.models import KeyerError, KeyerParams, ScreenColorModel
+from designtoolkit.chroma_keyer.sampling import screen_model_from_samples
 
 
 def _green_screen_model() -> ScreenColorModel:
@@ -59,6 +60,20 @@ def test_generate_alpha_falls_back_for_near_neutral_screen_chroma() -> None:
     )
 
     alpha = generate_alpha(rgb, model, KeyerParams(tolerance=0.0, softness=0.15))
+
+    assert alpha[0, 0] == 0
+
+
+def test_generate_alpha_falls_back_for_low_chroma_sample_model() -> None:
+    model = screen_model_from_samples(
+        ((128, 128, 128),) * 9_999 + ((128, 129, 127),)
+    )
+
+    alpha = generate_alpha(
+        np.array([[[128, 128, 128]]], dtype=np.uint8),
+        model,
+        KeyerParams(tolerance=0.0, softness=1.0),
+    )
 
     assert alpha[0, 0] == 0
 
