@@ -54,7 +54,7 @@ def despill(
     rgb_float = rgb.astype(np.float32)
     alpha_float = alpha.astype(np.float32) / 255.0
     edge = (alpha > 0) & (alpha < 255)
-    background_contribution = np.clip((1.0 - alpha_float) * 1.2, 0.0, 1.0)
+    background_contribution = 1.0 - alpha_float
     effect = np.where(edge, background_contribution * amount, 0.0)
     result = rgb_float.copy()
 
