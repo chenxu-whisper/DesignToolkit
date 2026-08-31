@@ -67,8 +67,7 @@ def despill(
             channel for channel in range(3) if channel != dominant_channel
         ]
         target = np.max(rgb_float[..., other_channels], axis=2)
-        result[..., dominant_channel] += effect * (
-            target - result[..., dominant_channel]
-        )
+        spill = np.maximum(rgb_float[..., dominant_channel] - target, 0.0)
+        result[..., dominant_channel] -= effect * spill
 
     return np.rint(np.clip(result, 0.0, 255.0)).astype(np.uint8)

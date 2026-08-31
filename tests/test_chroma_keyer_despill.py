@@ -26,6 +26,15 @@ def test_despill_suppresses_green_on_fractional_alpha_edge() -> None:
     assert result[0, 0, 2] == 120
 
 
+def test_despill_does_not_raise_low_dominant_green_channel() -> None:
+    rgb = np.array([[[235, 100, 180]]], dtype=np.uint8)
+    alpha = np.array([[48]], dtype=np.uint8)
+
+    result = despill(rgb, alpha, _model((10.0, 200.0, 10.0)), amount=1.0)
+
+    assert result[0, 0].tolist() == [235, 100, 180]
+
+
 @mark.parametrize(
     ("amount", "expected_green"),
     [
