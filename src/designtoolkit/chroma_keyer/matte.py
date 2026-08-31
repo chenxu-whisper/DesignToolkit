@@ -3,8 +3,8 @@ import numpy as np
 
 from .models import KeyerError, KeyerParams, ScreenColorModel
 
-SCREEN_CHROMA_BLEND_START = 0.03
-SCREEN_CHROMA_BLEND_END = 0.05
+SCREEN_CHROMA_BLEND_START = np.float32(0.03)
+SCREEN_CHROMA_BLEND_END = np.float32(0.10)
 
 
 def _validate_rgb(rgb: object) -> np.ndarray:
@@ -27,6 +27,17 @@ def _rgb_distance_confidence(rgb_float: np.ndarray, mean_rgb: np.ndarray) -> np.
     return np.linalg.norm(rgb_float - mean_rgb, axis=2) / np.sqrt(np.float32(3.0))
 
 
+def _smoothstep(
+    confidence: np.ndarray, lower: np.float32, upper: np.float32
+) -> np.ndarray:
+    position = np.clip(
+        (confidence - lower) / (upper - lower), np.float32(0.0), np.float32(1.0)
+    )
+    return position * position * (
+        np.float32(3.0) - np.float32(2.0) * position
+    )
+
+
 def generate_alpha(
     rgb: np.ndarray, model: ScreenColorModel, params: KeyerParams
 ) -> np.ndarray:
@@ -40,8 +51,25 @@ def generate_alpha(
     )
     screen_chroma = np.linalg.norm(centered_screen)
     rgb_distance_confidence = _rgb_distance_confidence(rgb_float, normalized_mean_rgb)
+    variance = np.mean(np.asarray(model.stddev_rgb, dtype=np.float32)) / np.float32(
+        255.0
+    )
+    lower = np.float32(
+        np.clip(
+            np.float32(params.tolerance) + variance,
+            np.float32(0.0),
+            np.float32(1.0),
+        )
+    )
+    upper = np.float32(
+        max(
+            lower + np.float32(0.01),
+            min(np.float32(1.0), lower + np.float32(params.softness)),
+        )
+    )
+    distance_alpha = _smoothstep(rgb_distance_confidence, lower, upper)
 
-    if screen_chroma > 0.0:
+    if screen_chroma > SCREEN_CHROMA_BLEND_START:
         screen_direction = centered_screen / screen_chroma
         centered_pixels = rgb_float - np.mean(
             rgb_float, axis=2, keepdims=True, dtype=np.float32
@@ -49,44 +77,39 @@ def generate_alpha(
         projection = np.sum(
             centered_pixels * screen_direction, axis=2, dtype=np.float32
         )
-        background_fraction = np.clip(
-            projection / screen_chroma, np.float32(0.0), np.float32(1.0)
-        )
-        residual = centered_pixels - projection[..., np.newaxis] * screen_direction
-        residual_foreground = np.clip(
-            np.linalg.norm(residual, axis=2) / screen_chroma,
+        axis_alpha = np.clip(
+            np.float32(1.0) - projection / screen_chroma,
             np.float32(0.0),
             np.float32(1.0),
         )
-        projection_confidence = np.maximum(
-            1.0 - background_fraction, residual_foreground
+        residual = centered_pixels - projection[..., np.newaxis] * screen_direction
+        residual_confidence = np.clip(
+            np.linalg.norm(residual, axis=2)
+            / max(screen_chroma, np.float32(0.10)),
+            np.float32(0.0),
+            np.float32(1.0),
         )
+        residual_alpha = _smoothstep(residual_confidence, lower, upper)
+        colored_alpha = np.maximum(axis_alpha, residual_alpha)
         blend_position = np.clip(
             (screen_chroma - SCREEN_CHROMA_BLEND_START)
             / (SCREEN_CHROMA_BLEND_END - SCREEN_CHROMA_BLEND_START),
-            0.0,
-            1.0,
+            np.float32(0.0),
+            np.float32(1.0),
         )
         projection_weight = (
-            blend_position * blend_position * (3.0 - 2.0 * blend_position)
+            blend_position
+            * blend_position
+            * (np.float32(3.0) - np.float32(2.0) * blend_position)
         )
-        confidence = (
-            rgb_distance_confidence * (1.0 - projection_weight)
-            + projection_confidence * projection_weight
+        alpha = (
+            distance_alpha * (np.float32(1.0) - projection_weight)
+            + colored_alpha * projection_weight
         )
     else:
-        confidence = rgb_distance_confidence
+        alpha = distance_alpha
 
-    variance = np.mean(np.asarray(model.stddev_rgb, dtype=np.float32)) / np.float32(
-        255.0
-    )
-    lower = np.clip(
-        np.float32(params.tolerance) + variance, np.float32(0.0), np.float32(1.0)
-    )
-    upper = max(lower + np.float32(0.01), min(np.float32(1.0), lower + params.softness))
-    position = np.clip((confidence - lower) / (upper - lower), 0.0, 1.0)
-    smoothstep = position * position * (3.0 - 2.0 * position)
-    return np.rint(smoothstep * 255.0).astype(np.uint8)
+    return np.rint(alpha * np.float32(255.0)).astype(np.uint8)
 
 
 def refine_alpha(alpha: np.ndarray, params: KeyerParams) -> np.ndarray:
