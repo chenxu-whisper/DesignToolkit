@@ -474,6 +474,17 @@ button {
   position: relative;
 }
 
+.chroma-preview-canvas-final {
+  background-color: #e2e8f0;
+  background-image:
+    linear-gradient(45deg, #cbd5e1 25%, transparent 25%),
+    linear-gradient(-45deg, #cbd5e1 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, #cbd5e1 75%),
+    linear-gradient(-45deg, transparent 75%, #cbd5e1 75%);
+  background-position: 0 0, 0 10px, 10px -10px, -10px 0;
+  background-size: 20px 20px;
+}
+
 .chroma-preview-image {
   cursor: crosshair;
   display: block;
@@ -535,7 +546,7 @@ button {
   display: grid;
   font-size: 13px;
   gap: 8px;
-  grid-template-columns: 18px 28px minmax(72px, 1fr) minmax(70px, 1fr) 40px;
+  grid-template-columns: 18px 28px minmax(112px, 1fr) minmax(72px, 1fr) minmax(70px, 1fr) 40px;
   min-width: 0;
   padding: 6px;
 }

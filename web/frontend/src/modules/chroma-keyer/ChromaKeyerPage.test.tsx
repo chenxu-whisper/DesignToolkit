@@ -95,6 +95,7 @@ describe('ChromaKeyerPage', () => {
       x: 200,
       y: 100,
     })
+    expect(screen.getByText('RGB(42, 180, 72)')).toBeInTheDocument()
     expect(screen.getByText('400, 200')).toBeInTheDocument()
   })
 

@@ -2,6 +2,7 @@ import type { KeyboardEvent, MouseEvent } from 'react'
 
 export type ChromaCanvasSample = {
   hex: string
+  rgb: readonly [red: number, green: number, blue: number]
   sourceX: number
   sourceY: number
 }
@@ -12,6 +13,7 @@ type ChromaKeyerCanvasProps = {
   originalWidth?: number
   previewUrl: string
   samples: readonly ChromaCanvasSample[]
+  viewMode: 'final' | 'alpha'
 }
 
 type ChromaSamplePoint = {
@@ -44,6 +46,7 @@ export function ChromaKeyerCanvas({
   originalWidth,
   previewUrl,
   samples,
+  viewMode,
 }: ChromaKeyerCanvasProps) {
   const sampleAt = (element: HTMLImageElement, clientX: number, clientY: number) => {
     const payload = buildChromaSamplePayload(element.getBoundingClientRect(), clientX, clientY)
@@ -68,7 +71,9 @@ export function ChromaKeyerCanvas({
 
   return (
     <>
-      <div className="chroma-preview-canvas">
+      <div
+        className={`chroma-preview-canvas${viewMode === 'final' ? ' chroma-preview-canvas-final' : ''}`}
+      >
         <img
           alt="抠像预览"
           aria-describedby="chroma-keyer-preview-sampling-instructions"

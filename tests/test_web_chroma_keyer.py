@@ -1,3 +1,4 @@
+import json
 from io import BytesIO
 from os import utime
 from pathlib import Path
@@ -295,6 +296,39 @@ def test_chroma_keyer_task_endpoint_creates_and_reports_completed_task(
     assert status.status_code == 200
     assert status.json()["kind"] == "chroma_keyer"
     assert status.json()["status"] == "succeeded"
+
+
+def test_chroma_task_event_stream_emits_running_success_before_completed(
+    tmp_path: Path,
+) -> None:
+    input_path = tmp_path / "screen.png"
+    _write_input_image(input_path)
+    task_manager = TaskManager(log_store=LogStore(), run_async=False)
+    task = task_manager.create_chroma_keyer_task(
+        ChromaKeyerTaskRequest(
+            input_path=str(input_path),
+            samples=[[42, 180, 72]],
+            params={},
+        )
+    )
+    client = TestClient(
+        create_app(task_manager=task_manager, local_path_roots=[tmp_path])
+    )
+
+    response = client.get(f"/api/tasks/{task.task_id}/events")
+
+    assert response.status_code == 200
+    events = [
+        json.loads(line.removeprefix("data: "))
+        for line in response.text.splitlines()
+        if line.startswith("data: ")
+    ]
+    assert [(event["level"], event["phase"]) for event in events] == [
+        ("info", "created"),
+        ("progress", "running"),
+        ("success", "running"),
+        ("success", "completed"),
+    ]
 
 
 def test_chroma_keyer_task_endpoint_rejects_existing_output_without_overwrite(

@@ -6,7 +6,7 @@ describe('ChromaKeyerCanvas', () => {
   it('submits click coordinates relative to the rendered preview', async () => {
     const onSample = vi.fn()
 
-    render(<ChromaKeyerCanvas previewUrl="/preview.png" onSample={onSample} samples={[]} />)
+    render(<ChromaKeyerCanvas previewUrl="/preview.png" onSample={onSample} samples={[]} viewMode="final" />)
 
     const image = screen.getByRole('button', { name: '抠像预览' })
     vi.spyOn(image, 'getBoundingClientRect').mockReturnValue({
@@ -29,7 +29,7 @@ describe('ChromaKeyerCanvas', () => {
   it('preserves fractional preview dimensions and floors near-edge click coordinates', () => {
     const onSample = vi.fn()
 
-    render(<ChromaKeyerCanvas previewUrl="/preview.png" onSample={onSample} samples={[]} />)
+    render(<ChromaKeyerCanvas previewUrl="/preview.png" onSample={onSample} samples={[]} viewMode="final" />)
 
     const image = screen.getByRole('button', { name: '抠像预览' })
     vi.spyOn(image, 'getBoundingClientRect').mockReturnValue({
@@ -55,7 +55,7 @@ describe('ChromaKeyerCanvas', () => {
   ])('samples the visual center with %s and prevents its default action', (_name, key) => {
     const onSample = vi.fn()
 
-    render(<ChromaKeyerCanvas previewUrl="/preview.png" onSample={onSample} samples={[]} />)
+    render(<ChromaKeyerCanvas previewUrl="/preview.png" onSample={onSample} samples={[]} viewMode="final" />)
 
     const image = screen.getByRole('button', { name: '抠像预览' })
     vi.spyOn(image, 'getBoundingClientRect').mockReturnValue({
@@ -85,10 +85,33 @@ describe('ChromaKeyerCanvas', () => {
         originalHeight={400}
         originalWidth={800}
         previewUrl="/preview.png"
-        samples={[{ hex: '#2AB448', sourceX: 200, sourceY: 100 }]}
+        samples={[{ hex: '#2AB448', rgb: [42, 180, 72], sourceX: 200, sourceY: 100 }]}
+        viewMode="final"
       />,
     )
 
     expect(screen.getByLabelText('采样点 1')).toHaveStyle({ left: '25%', top: '25%' })
+  })
+
+  it.each([
+    ['final', true],
+    ['alpha', false],
+  ] as const)('applies the checkerboard class only for %s previews', (viewMode, hasCheckerboard) => {
+    render(
+      <ChromaKeyerCanvas
+        onSample={vi.fn()}
+        previewUrl="/preview.png"
+        samples={[]}
+        viewMode={viewMode}
+      />,
+    )
+
+    const canvas = screen.getByRole('button', { name: '抠像预览' }).parentElement
+    expect(canvas).toHaveClass('chroma-preview-canvas')
+    if (hasCheckerboard) {
+      expect(canvas).toHaveClass('chroma-preview-canvas-final')
+    } else {
+      expect(canvas).not.toHaveClass('chroma-preview-canvas-final')
+    }
   })
 })

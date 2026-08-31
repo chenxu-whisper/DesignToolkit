@@ -51,7 +51,6 @@ from designtoolkit.web.schemas import (
     LocalPathPickResponse,
     LocalSaveFilePickRequest,
     LogEventResponse,
-    LogLevel,
     LogPhase,
     MediaResizeTaskRequest,
     TaskCreateResponse,
@@ -63,7 +62,6 @@ from designtoolkit.web.tasks import TaskConflictError, TaskManager
 
 _INVALID_REQUEST_ERRORS = (ValueError, VideoFrameError, MediaResizeError)
 _TERMINAL_STATUSES = (TaskStatus.SUCCEEDED, TaskStatus.FAILED)
-_TERMINAL_LEVELS = (LogLevel.SUCCESS, LogLevel.ERROR)
 _TERMINAL_PHASES = (LogPhase.COMPLETED, LogPhase.FAILED)
 _CHROMA_SNAPSHOT_READ_ATTEMPTS = 3
 _KEYER_ERROR_CODES = {
@@ -192,7 +190,7 @@ def _sse_line(event) -> str:
 
 
 def _is_terminal_event(event: LogEventResponse) -> bool:
-    return event.level in _TERMINAL_LEVELS or event.phase in _TERMINAL_PHASES
+    return event.phase in _TERMINAL_PHASES
 
 
 def create_router(

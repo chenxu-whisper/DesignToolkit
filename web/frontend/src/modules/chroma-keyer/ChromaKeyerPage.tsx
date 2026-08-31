@@ -198,7 +198,12 @@ export function ChromaKeyerPage() {
         setValues((current) => ({ ...current, samples: [...current.samples, [...response.rgb]] }))
         setSampleDetails((current) => [
           ...current,
-          { hex: response.hex, sourceX: response.source_x, sourceY: response.source_y },
+          {
+            hex: response.hex,
+            rgb: response.rgb,
+            sourceX: response.source_x,
+            sourceY: response.source_y,
+          },
         ])
         setErrors((current) => ({ ...current, samples: undefined }))
       }
@@ -308,6 +313,7 @@ export function ChromaKeyerPage() {
               originalWidth={image.width}
               previewUrl={previewUrl}
               samples={sampleDetails}
+              viewMode={values.viewMode}
             />
           ) : (
             <div className="chroma-empty-preview">加载一张本地图片后，可在画面中吸取背景颜色。</div>
@@ -331,6 +337,7 @@ export function ChromaKeyerPage() {
               <li className="chroma-sample-item" key={`${sample.sourceX}-${sample.sourceY}-${index}`}>
                 <span aria-hidden="true" className="chroma-swatch" style={{ backgroundColor: sample.hex }} />
                 <span>#{index + 1}</span>
+                <span>{`RGB(${sample.rgb.join(', ')})`}</span>
                 <span>{sample.hex}</span>
                 <span>{sample.sourceX}, {sample.sourceY}</span>
                 <button
