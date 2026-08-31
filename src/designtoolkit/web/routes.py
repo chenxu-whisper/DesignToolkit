@@ -55,13 +55,11 @@ from designtoolkit.web.schemas import (
     MediaResizeTaskRequest,
     TaskCreateResponse,
     TaskResponse,
-    TaskStatus,
     VideoFramesTaskRequest,
 )
 from designtoolkit.web.tasks import TaskConflictError, TaskManager
 
 _INVALID_REQUEST_ERRORS = (ValueError, VideoFrameError, MediaResizeError)
-_TERMINAL_STATUSES = (TaskStatus.SUCCEEDED, TaskStatus.FAILED)
 _TERMINAL_PHASES = (LogPhase.COMPLETED, LogPhase.FAILED)
 _CHROMA_SNAPSHOT_READ_ATTEMPTS = 3
 _KEYER_ERROR_CODES = {
@@ -425,26 +423,21 @@ def create_router(
         def event_stream() -> Iterator[str]:
             history, subscriber = task_manager.log_store.history_and_subscribe(task_id)
             try:
+                terminal_event_seen = False
                 for event in history:
                     yield _sse_line(event)
-                    if _is_terminal_event(event):
-                        return
+                    terminal_event_seen = _is_terminal_event(event)
+                    if terminal_event_seen:
+                        break
 
-                while True:
+                while not terminal_event_seen:
                     try:
                         event = subscriber.get(timeout=0.25)
                     except Empty:
-                        latest_task = task_manager.get_task(task_id)
-                        if (
-                            latest_task is None
-                            or latest_task.status in _TERMINAL_STATUSES
-                        ):
-                            return
                         continue
 
                     yield _sse_line(event)
-                    if _is_terminal_event(event):
-                        return
+                    terminal_event_seen = _is_terminal_event(event)
             finally:
                 task_manager.log_store.unsubscribe(task_id, subscriber)
 

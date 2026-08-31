@@ -1,7 +1,9 @@
+import asyncio
 import json
 from io import BytesIO
 from os import utime
 from pathlib import Path
+from queue import Empty
 from threading import Event, Thread
 from uuid import UUID
 
@@ -329,6 +331,122 @@ def test_chroma_task_event_stream_emits_running_success_before_completed(
         ("success", "running"),
         ("success", "completed"),
     ]
+
+
+@mark.parametrize(
+    ("status", "terminal_phase"),
+    [
+        (TaskStatus.SUCCEEDED, LogPhase.COMPLETED),
+        (TaskStatus.FAILED, LogPhase.FAILED),
+    ],
+)
+def test_task_event_stream_waits_for_terminal_event_after_task_is_finished(
+    monkeypatch,
+    status: TaskStatus,
+    terminal_phase: LogPhase,
+) -> None:
+    log_store = LogStore()
+    task_manager = TaskManager(log_store=log_store)
+    task = task_manager.reserve_task(
+        kind=TaskKind.CHROMA_KEYER,
+        input_path="input.png",
+        output_path="output.png",
+    )
+    terminal_publication_blocked = Event()
+    release_terminal_publication = Event()
+    terminal_status_timeout_seen = Event()
+    stream_closed = Event()
+    stream_chunks: list[bytes] = []
+    original_append = log_store.append
+    original_history_and_subscribe = log_store.history_and_subscribe
+
+    def pause_terminal_append(**kwargs):
+        if kwargs["phase"] is terminal_phase:
+            terminal_publication_blocked.set()
+            assert release_terminal_publication.wait(timeout=1)
+        return original_append(**kwargs)
+
+    def subscribe_with_terminal_gap_timeout(task_id: str):
+        history, subscriber = original_history_and_subscribe(task_id)
+        original_get = subscriber.get
+        timed_out = False
+
+        def get(*, timeout: float):
+            nonlocal timed_out
+            if not timed_out:
+                timed_out = True
+                terminal_status_timeout_seen.set()
+                raise Empty
+            return original_get(timeout=timeout)
+
+        monkeypatch.setattr(subscriber, "get", get)
+        return history, subscriber
+
+    monkeypatch.setattr(log_store, "append", pause_terminal_append)
+    monkeypatch.setattr(
+        log_store,
+        "history_and_subscribe",
+        subscribe_with_terminal_gap_timeout,
+    )
+
+    def finish_task() -> None:
+        if status is TaskStatus.SUCCEEDED:
+            task_manager._mark_succeeded(task.task_id, "output.png")
+        else:
+            task_manager._mark_failed(task.task_id, "keying failed")
+
+    def consume_stream() -> None:
+        app = create_app(task_manager=task_manager)
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0", "spec_version": "2.4"},
+            "http_version": "1.1",
+            "method": "GET",
+            "scheme": "http",
+            "path": f"/api/tasks/{task.task_id}/events",
+            "raw_path": f"/api/tasks/{task.task_id}/events".encode(),
+            "query_string": b"",
+            "root_path": "",
+            "headers": [],
+            "client": ("testclient", 50000),
+            "server": ("testserver", 80),
+        }
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(message):
+            if message["type"] == "http.response.body":
+                stream_chunks.append(message["body"])
+                if not message["more_body"]:
+                    stream_closed.set()
+
+        asyncio.run(app(scope, receive, send))
+
+    finish_thread = Thread(target=finish_task)
+    finish_thread.start()
+    assert terminal_publication_blocked.wait(timeout=1)
+    assert task_manager.get_task(task.task_id).status is status
+
+    stream_thread = Thread(target=consume_stream)
+    stream_thread.start()
+    assert terminal_status_timeout_seen.wait(timeout=1)
+    try:
+        assert not stream_closed.wait(timeout=0.25)
+    finally:
+        release_terminal_publication.set()
+        finish_thread.join(timeout=1)
+        stream_thread.join(timeout=1)
+
+    assert not finish_thread.is_alive()
+    assert not stream_thread.is_alive()
+    events = [
+        json.loads(line.removeprefix("data: "))
+        for line in b"".join(stream_chunks).decode().splitlines()
+        if line.startswith("data: ")
+    ]
+    assert events[-1]["phase"] == terminal_phase.value
+    assert stream_closed.is_set()
 
 
 def test_chroma_keyer_task_endpoint_rejects_existing_output_without_overwrite(
