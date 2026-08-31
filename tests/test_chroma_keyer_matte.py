@@ -125,11 +125,11 @@ def test_refine_alpha_remaps_clip_black_and_clip_white_endpoints() -> None:
 
 
 def test_refine_alpha_negative_shrink_erodes_continuous_center_value() -> None:
-    alpha = np.array([[0, 0, 0], [0, 128, 255], [0, 0, 0]], dtype=np.uint8)
+    alpha = np.array([[64, 64, 64], [64, 128, 255], [64, 64, 64]], dtype=np.uint8)
 
     result = refine_alpha(alpha, KeyerParams(shrink_grow=-1))
 
-    assert result[1, 1] == 64
+    assert result[1, 1] == 96
     assert result[1, 1] < alpha[1, 1]
 
 
@@ -139,6 +139,7 @@ def test_refine_alpha_positive_growth_dilates_continuous_center_value() -> None:
     result = refine_alpha(alpha, KeyerParams(shrink_grow=1))
 
     assert result[1, 1] == 192
+    assert result[0, 1] == 64
     assert result[1, 1] > alpha[1, 1]
 
 
