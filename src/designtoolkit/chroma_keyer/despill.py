@@ -33,41 +33,29 @@ def _validate_amount(amount: object) -> float:
     return float(amount)
 
 
-def _dominant_screen_channel(model: ScreenColorModel) -> int | None:
-    mean_rgb = np.asarray(model.mean_rgb, dtype=np.float32)
-    threshold = 0.05 * 255
-    for channel in range(3):
-        others = np.delete(mean_rgb, channel)
-        if mean_rgb[channel] - np.max(others) >= threshold:
-            return channel
-    return None
-
-
 def despill(
     rgb: np.ndarray, alpha: np.ndarray, model: ScreenColorModel, amount: float
 ) -> np.ndarray:
-    """Suppress sampled screen color only along partially transparent edges."""
+    """Recover foreground RGB from the sampled background on fractional edges."""
     rgb = _validate_rgb(rgb)
     alpha = _validate_alpha(alpha, rgb)
     amount = _validate_amount(amount)
 
     rgb_float = rgb.astype(np.float32)
     alpha_float = alpha.astype(np.float32) / 255.0
-    edge = (alpha > 0) & (alpha < 255)
-    background_contribution = 1.0 - alpha_float
-    effect = np.where(edge, background_contribution * amount, 0.0)
-    result = rgb_float.copy()
-
-    dominant_channel = _dominant_screen_channel(model)
-    if dominant_channel is None:
-        neutral_luminance = float(np.mean(model.mean_rgb))
-        result += effect[..., None] * (neutral_luminance - result)
-    else:
-        other_channels = [
-            channel for channel in range(3) if channel != dominant_channel
-        ]
-        target = np.max(rgb_float[..., other_channels], axis=2)
-        spill = np.maximum(rgb_float[..., dominant_channel] - target, 0.0)
-        result[..., dominant_channel] -= effect * spill
+    alpha_expanded = alpha_float[..., None]
+    background = np.asarray(model.mean_rgb, dtype=np.float32)
+    safe_alpha = np.maximum(alpha_expanded, 1.0 / 255.0)
+    recovered = np.clip(
+        (rgb_float - (1.0 - alpha_expanded) * background) / safe_alpha,
+        0.0,
+        255.0,
+    )
+    edge = ((alpha > 0) & (alpha < 255))[..., None]
+    result = np.where(
+        edge,
+        rgb_float + amount * (recovered - rgb_float),
+        rgb_float,
+    )
 
     return np.rint(np.clip(result, 0.0, 255.0)).astype(np.uint8)

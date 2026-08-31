@@ -15,130 +15,79 @@ def _model(mean_rgb: tuple[float, float, float]) -> ScreenColorModel:
     )
 
 
-def test_despill_suppresses_green_on_fractional_alpha_edge() -> None:
-    rgb = np.array([[[100, 200, 120]]], dtype=np.uint8)
-    alpha = np.array([[128]], dtype=np.uint8)
+def test_despill_recovers_white_foreground_from_green_composites() -> None:
+    rgb = np.array([[[64, 255, 64], [128, 255, 128], [191, 255, 191]]], dtype=np.uint8)
+    alpha = np.array([[64, 128, 191]], dtype=np.uint8)
 
-    result = despill(rgb, alpha, _model((10.0, 200.0, 10.0)), amount=1.0)
+    result = despill(rgb, alpha, _model((0.0, 255.0, 0.0)), amount=1.0)
 
-    assert result[0, 0, 0] == 100
-    assert result[0, 0, 1] < 200
-    assert result[0, 0, 2] == 120
+    assert np.all(np.abs(result.astype(np.int16) - 255) <= 1)
 
 
-def test_despill_does_not_raise_low_dominant_green_channel() -> None:
-    rgb = np.array([[[235, 100, 180]]], dtype=np.uint8)
-    alpha = np.array([[48]], dtype=np.uint8)
+def test_despill_preserves_transparent_and_opaque_rgb_exactly() -> None:
+    rgb = np.array([[[17, 231, 94], [203, 12, 177]]], dtype=np.uint8)
+    alpha = np.array([[0, 255]], dtype=np.uint8)
 
-    result = despill(rgb, alpha, _model((10.0, 200.0, 10.0)), amount=1.0)
+    result = despill(rgb, alpha, _model((31.0, 149.0, 223.0)), amount=1.0)
 
-    assert result[0, 0].tolist() == [235, 100, 180]
+    assert np.array_equal(result, rgb)
+
+
+def test_despill_amount_zero_preserves_entire_image_exactly() -> None:
+    rgb = np.array(
+        [[[17, 231, 94], [128, 255, 128], [203, 12, 177]]], dtype=np.uint8
+    )
+    alpha = np.array([[0, 128, 255]], dtype=np.uint8)
+
+    result = despill(rgb, alpha, _model((0.0, 255.0, 0.0)), amount=0.0)
+
+    assert np.array_equal(result, rgb)
 
 
 @mark.parametrize(
-    ("amount", "expected_green"),
+    ("amount", "expected"),
     [
-        (0.0, 235),
-        (0.5, 213),
+        (0.0, [128, 255, 128]),
+        (0.5, [192, 255, 192]),
+        (1.0, [255, 255, 255]),
     ],
 )
-def test_despill_scales_dominant_channel_linearly_by_amount(
-    amount: float, expected_green: int
+def test_despill_interpolates_toward_recovered_foreground(
+    amount: float, expected: list[int]
 ) -> None:
-    rgb = np.array([[[180, 235, 180]]], dtype=np.uint8)
-    alpha = np.array([[48]], dtype=np.uint8)
+    rgb = np.array([[[128, 255, 128]]], dtype=np.uint8)
+    alpha = np.array([[128]], dtype=np.uint8)
 
-    result = despill(rgb, alpha, _model((10.0, 200.0, 10.0)), amount=amount)
+    result = despill(rgb, alpha, _model((0.0, 255.0, 0.0)), amount=amount)
 
-    assert result[0, 0, 0] == 180
-    assert result[0, 0, 1] == expected_green
-    assert result[0, 0, 2] == 180
+    assert np.all(np.abs(result[0, 0].astype(np.int16) - expected) <= 1)
 
 
-def test_despill_reduces_low_alpha_dominant_green_to_at_most_190() -> None:
-    rgb = np.array([[[180, 235, 180]]], dtype=np.uint8)
-    alpha = np.array([[48]], dtype=np.uint8)
-
-    result = despill(rgb, alpha, _model((10.0, 200.0, 10.0)), amount=1.0)
-
-    assert result[0, 0, 1] <= 190
-
-
-def test_despill_masks_transparent_and_opaque_endpoints() -> None:
-    rgb = np.array(
-        [[[10, 200, 10], [100, 200, 180], [20, 190, 30]]], dtype=np.uint8
-    )
-    alpha = np.array([[0, 48, 255]], dtype=np.uint8)
-
-    result = despill(rgb, alpha, _model((10.0, 200.0, 10.0)), amount=1.0)
-
-    assert np.array_equal(result[:, [0, 2]], rgb[:, [0, 2]])
-
-
-def test_despill_keeps_low_alpha_neutral_red_at_least_120() -> None:
-    rgb = np.array([[[200, 100, 100]]], dtype=np.uint8)
+@mark.parametrize(
+    ("background", "foreground"),
+    [
+        ((20.0, 40.0, 220.0), (240, 180, 100)),
+        ((220.0, 30.0, 10.0), (80, 190, 245)),
+    ],
+)
+def test_despill_recovers_full_rgb_for_arbitrary_sampled_background(
+    background: tuple[float, float, float], foreground: tuple[int, int, int]
+) -> None:
+    alpha_value = 128
+    alpha_fraction = alpha_value / 255.0
+    composite = np.rint(
+        alpha_fraction * np.asarray(foreground)
+        + (1.0 - alpha_fraction) * np.asarray(background)
+    ).astype(np.uint8)
 
     result = despill(
-        rgb,
-        np.array([[48]], dtype=np.uint8),
-        _model((100.0, 105.0, 100.0)),
+        composite.reshape(1, 1, 3),
+        np.array([[alpha_value]], dtype=np.uint8),
+        _model(background),
         amount=1.0,
     )
 
-    assert result[0, 0, 0] >= 120
-
-
-def test_despill_suppresses_dominant_blue_channel() -> None:
-    rgb = np.array([[[100, 120, 200]]], dtype=np.uint8)
-
-    result = despill(
-        rgb,
-        np.array([[128]], dtype=np.uint8),
-        _model((10.0, 10.0, 200.0)),
-        amount=1.0,
-    )
-
-    assert result[0, 0, 2] < rgb[0, 0, 2]
-    assert result[0, 0, :2].tolist() == [100, 120]
-
-
-def test_despill_neutral_screen_model_uses_sample_luminance_as_target() -> None:
-    rgb = np.array([[[200, 100, 100]]], dtype=np.uint8)
-
-    result = despill(
-        rgb,
-        np.array([[128]], dtype=np.uint8),
-        _model((100.0, 105.0, 100.0)),
-        amount=1.0,
-    )
-
-    assert result[0, 0].tolist() == [151, 101, 101]
-
-
-def test_despill_suppresses_dominant_red_channel() -> None:
-    rgb = np.array([[[200, 100, 100]]], dtype=np.uint8)
-
-    result = despill(
-        rgb,
-        np.array([[128]], dtype=np.uint8),
-        _model((200.0, 10.0, 10.0)),
-        amount=1.0,
-    )
-
-    assert result[0, 0].tolist() == [150, 100, 100]
-
-
-def test_despill_does_not_raise_low_dominant_red_channel() -> None:
-    rgb = np.array([[[100, 200, 180]]], dtype=np.uint8)
-
-    result = despill(
-        rgb,
-        np.array([[128]], dtype=np.uint8),
-        _model((200.0, 10.0, 10.0)),
-        amount=1.0,
-    )
-
-    assert result[0, 0].tolist() == [100, 200, 180]
+    assert np.all(np.abs(result[0, 0].astype(np.int16) - foreground) <= 1)
 
 
 @mark.parametrize(
