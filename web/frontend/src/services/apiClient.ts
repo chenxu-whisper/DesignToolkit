@@ -202,6 +202,15 @@ function chromaPayloadToWire(payload: ChromaKeyerPayload) {
   }
 }
 
+function chromaPreviewPayloadToWire(payload: ChromaPreviewPayload) {
+  return {
+    input_path: payload.inputPath,
+    samples: payload.samples,
+    params: chromaParamsToWire(payload.params),
+    view_mode: payload.viewMode,
+  }
+}
+
 export function inspectChromaImage(payload: ChromaImageInspectRequest): Promise<ChromaImageInspectResponse> {
   return request<ChromaImageInspectResponse>('/api/chroma-keyer/images/inspect', {
     input_path: payload.inputPath,
@@ -219,10 +228,7 @@ export function sampleChromaImage(payload: ChromaImageSampleRequest): Promise<Ch
 }
 
 export function createChromaPreview(payload: ChromaPreviewPayload): Promise<ChromaPreviewResponse> {
-  return request<ChromaPreviewResponse>('/api/chroma-keyer/preview', {
-    ...chromaPayloadToWire(payload),
-    view_mode: payload.viewMode,
-  })
+  return request<ChromaPreviewResponse>('/api/chroma-keyer/preview', chromaPreviewPayloadToWire(payload))
 }
 
 export function createChromaKeyerTask(payload: ChromaKeyerPayload): Promise<TaskCreateResponse> {

@@ -139,6 +139,47 @@ describe('ChromaKeyerPage', () => {
     )
   })
 
+  it('keeps the current preview without re-requesting when only the output path changes', async () => {
+    const user = renderWithUser()
+
+    await inspectImage()
+    await sampleImage()
+    await waitFor(() => expect(pageMocks.createChromaPreview).toHaveBeenCalledTimes(1))
+    const preview = screen.getByRole('button', { name: '抠像预览' })
+    await waitFor(() => expect(preview).toHaveAttribute('src', '/api/previews/final.png'))
+
+    await user.type(screen.getByLabelText('输出路径（可选）'), 'E:\\media\\screen_keyed.png')
+    await act(async () => {
+      await new Promise((resolve) => window.setTimeout(resolve, 300))
+    })
+
+    expect(pageMocks.createChromaPreview).toHaveBeenCalledTimes(1)
+    expect(preview).toHaveAttribute('src', '/api/previews/final.png')
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  })
+
+  it('clears a preview error after a later preview request succeeds', async () => {
+    pageMocks.createChromaPreview
+      .mockRejectedValueOnce(new Error('预览请求失败'))
+      .mockResolvedValueOnce({ preview_url: '/api/previews/recovered.png' })
+    render(<ChromaKeyerPage />)
+
+    await inspectImage()
+    await sampleImage()
+    expect(await screen.findByRole('alert')).toHaveTextContent('预览请求失败')
+
+    fireEvent.change(screen.getByLabelText('Tolerance'), { target: { value: '0.4' } })
+
+    await waitFor(() => expect(pageMocks.createChromaPreview).toHaveBeenCalledTimes(2))
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: '抠像预览' })).toHaveAttribute(
+        'src',
+        '/api/previews/recovered.png',
+      ),
+    )
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  })
+
   it('disables export without a sample and while another task is running', async () => {
     render(<ChromaKeyerPage />)
 

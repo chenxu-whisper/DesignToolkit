@@ -115,6 +115,7 @@ export function ChromaKeyerPage() {
       })
       if (mountedRef.current && requestSequence === requestSequenceRef.current) {
         setPreviewUrl(response.preview_url)
+        setErrors((current) => ({ ...current, samples: undefined }))
       }
     } catch (error) {
       if (mountedRef.current && requestSequence === requestSequenceRef.current) {
@@ -146,7 +147,19 @@ export function ChromaKeyerPage() {
       void requestPreview(values)
     }, 250)
     return () => window.clearTimeout(timeout)
-  }, [image, values])
+  }, [
+    image,
+    values.inputPath,
+    values.samples,
+    values.tolerance,
+    values.softness,
+    values.clipBlack,
+    values.clipWhite,
+    values.shrinkGrow,
+    values.feather,
+    values.despillAmount,
+    values.viewMode,
+  ])
 
   const handleInspect = async () => {
     const inputPath = values.inputPath.trim()

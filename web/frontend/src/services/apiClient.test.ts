@@ -11,6 +11,7 @@ import {
   pickLocalSaveFile,
   resolveDroppedFilePaths,
   sampleChromaImage,
+  type ChromaPreviewPayload,
 } from './apiClient'
 
 afterEach(() => {
@@ -164,6 +165,48 @@ describe('apiClient', () => {
     await expect(createChromaPreview(payload)).resolves.toEqual({
       preview_url: '/api/chroma-keyer/previews/final-1',
     })
+    expect(fetchMock).toHaveBeenCalledWith('/api/chroma-keyer/preview', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        input_path: 'screen.png',
+        samples: [[42, 180, 72]],
+        params: {
+          tolerance: 0.25,
+          softness: 0.15,
+          clip_black: 0,
+          clip_white: 1,
+          shrink_grow: 0,
+          feather: 0,
+          despill_amount: 0.5,
+        },
+        view_mode: 'final',
+      }),
+    })
+  })
+
+  it('omits export-only output paths from chroma preview requests', async () => {
+    const fetchMock = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(new Response(JSON.stringify({ preview_url: '/api/chroma-keyer/previews/final-2' })))
+    const payload: ChromaPreviewPayload & { outputPath: string } = {
+      inputPath: 'screen.png',
+      outputPath: 'screen_keyed.png',
+      samples: [[42, 180, 72]],
+      params: {
+        tolerance: 0.25,
+        softness: 0.15,
+        clipBlack: 0,
+        clipWhite: 1,
+        shrinkGrow: 0,
+        feather: 0,
+        despillAmount: 0.5,
+      },
+      viewMode: 'final',
+    }
+
+    await createChromaPreview(payload)
+
     expect(fetchMock).toHaveBeenCalledWith('/api/chroma-keyer/preview', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
