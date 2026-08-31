@@ -60,14 +60,33 @@ matte rather than a thresholded binary mask:
 
 ### Spill Suppression
 
-Despill uses the sampled-background contribution and inverse alpha as the
-effect strength. It remains restricted to non-opaque edge pixels, but does not
-depend on the symmetric `alpha * (1 - alpha)` peak alone.
+Despill treats a fractional-alpha source pixel as a composite over the sampled
+background instead of suppressing one dominant channel. For normalized alpha
+`a` in `(0, 1)`, observed RGB `C`, sampled-background mean `B`, and unknown
+foreground RGB `F`:
 
-For a clear dominant sampled channel, reduce that channel toward the larger of
-the other two channels. For an ambiguous sampled color, move the pixel toward
-the sampled model's neutral luminance. The operation is clamped to uint8 and
-mixed by `despill_amount`. Opaque foreground remains unchanged.
+```text
+C = aF + (1 - a)B
+F = clip((C - (1 - a)B) / max(a, 1/255), 0, 255)
+result = lerp(C, F, despill_amount)
+```
+
+The implementation uses float32 intermediates and rounds and clamps only when
+converting the result to uint8. Pixels whose alpha byte is `0` or `255` bypass
+the calculation and retain their input RGB bytes exactly. An amount of `0`
+also returns RGB byte-identical to the input. For fractional alpha, amounts
+between `0` and `1` interpolate linearly between the observed composite and
+the recovered foreground; amount `1` selects the recovered foreground.
+
+This recovery is driven by the complete sampled RGB mean and therefore works
+for green, blue, red, and non-primary screen colors without dominant-channel
+or neutral-color branches.
+
+The model cannot distinguish a true foreground color close to the sampled
+screen color from screen contribution without a trimap or another foreground
+prior. Such colors may shift after unmixing. Users can reduce
+`despill_amount` when preserving those colors is more important than removing
+edge contamination.
 
 ## Compatibility
 
@@ -78,6 +97,9 @@ mixed by `despill_amount`. Opaque foreground remains unchanged.
   `tolerance = 0.00` and `softness = 1.00`, intentionally spanning the full
   continuous opacity range to preserve screen-contaminated edges. Users raise
   tolerance and lower softness when they need a tighter key.
+- The `despill_amount` default becomes `1.00` in the backend model, API schema,
+  and frontend form so the sampled-background recovery is fully applied by
+  default.
 - RGB-distance confidence remains the neutral-color fallback and blends into
   the projected matte for low-chroma sampled colors; it is not exposed as a
   separate mode.
@@ -90,11 +112,18 @@ Add synthetic pixel and small-image tests that prove:
 2. distant foreground remains opaque;
 3. a pixel mixed between foreground and sampled background has intermediate
    alpha;
-4. a green-contaminated semi-transparent edge retains intermediate alpha and
-   has a reduced green channel after despill;
-5. continuous shrink/grow preserves intermediate alpha rather than replacing
+4. synthetic white composited over sampled green at 25%, 50%, and 75% alpha
+   recovers white within uint8 rounding tolerance at amount `1`;
+5. amount `0`, `0.5`, and `1` prove unchanged input, linear interpolation, and
+   the recovered endpoint;
+6. alpha bytes `0` and `255` preserve all RGB bytes exactly;
+7. a committed real chroma asset has a quantitative regression over its
+   fractional-alpha edge population;
+8. continuous shrink/grow preserves intermediate alpha rather than replacing
    it with a binary value;
-6. preview Alpha and Final RGBA output match the export pipeline.
+9. preview Alpha and Final RGBA output match the export pipeline; and
+10. backend, API-schema, and frontend defaults all use
+    `despill_amount = 1.00`.
 
 Run the existing core, route, frontend, and E2E suites after the focused
 regressions pass.

@@ -11,7 +11,7 @@ Studio Chroma Keyer 是 DesignToolkit 中的本地专业抠像模块。它使用
 1. 从本机绝对路径导入一张 PNG、JPG 或 JPEG 图片。
 2. 展示缩放预览画布，允许用户单点或多点吸取待抠除的背景颜色。
 3. 基于采样颜色生成连续 Alpha Matte，不要求用户预先选择“绿幕”或“蓝幕”。
-4. 支持基础 Matte 调整、边缘羽化及基于采样主色的 Despill。
+4. 支持基础 Matte 调整、边缘羽化及基于采样背景色反混合的 Despill。
 5. 支持 Final 和 Alpha Matte 预览。
 6. 导出原图分辨率的 RGBA PNG。
 
@@ -72,15 +72,26 @@ source_y = floor(y * source_height / preview_height)
 
 多点采样计算 RGB 均值作为 `screen_color`，并计算每通道标准差。标准差用于扩展背景颜色容差，防止光照不均的背景在单点取样后残留。
 
-### 6.4 绿幕与蓝幕 Despill
+### 6.4 基于采样背景色的 Despill
 
-不设置固定的绿幕/蓝幕开关。系统比较采样均值的 RGB 三个通道，主通道即 Despill 候选通道：
+不设置固定的绿幕/蓝幕开关，也不只抑制采样色的主通道。系统将 Alpha
+为 `a` 的半透明像素视为前景 `F` 与采样背景均值 `B` 的合成结果 `C`，并对
+完整 RGB 向量执行颜色反混合：
 
-- G 最大时为绿色背景抑制。
-- B 最大时为蓝色背景抑制。
-- R 最大或通道差距不足时，使用通用采样色向中性色衰减，不假设绿色或蓝色。
+```text
+C = aF + (1 - a)B
+F = clip((C - (1 - a)B) / max(a, 1/255), 0, 255)
+result = lerp(C, F, despill_amount)
+```
 
-Despill 仅在半透明边缘生效，并按 `despill_amount` 线性混合，避免整体人物颜色漂移。
+仅对 Alpha 字节处于 `1..254` 的像素计算恢复色。Alpha 为 `0` 或 `255` 时，
+输出 RGB 必须与输入逐字节一致；`despill_amount = 0` 时整张图 RGB 不变；
+`despill_amount = 1` 时半透明像素使用恢复色，中间值在原始合成色与恢复色
+之间线性插值。
+
+该模型没有 Trimap 或前景颜色先验，无法区分“接近采样背景色的真实前景”与
+“背景颜色混入”。这类真实前景色可能发生偏移，用户可降低 Despill Amount
+以换取更保守的颜色保留。
 
 ## 7. Matte 与预览
 
@@ -109,7 +120,7 @@ alpha = blend(distance_alpha, max(axis_alpha, residual_alpha), screen_chroma)
 | Clip White | 0.00 - 1.00 | 1.00 | 将高 Alpha 压向不透明 |
 | Shrink / Grow | -10 - 10 px | 0 | Alpha 收缩或扩张 |
 | Feather | 0 - 10 px | 0 | Alpha 边缘羽化 |
-| Despill Amount | 0.00 - 1.00 | 0.50 | 边缘溢色抑制强度 |
+| Despill Amount | 0.00 - 1.00 | 1.00 | 采样背景色反混合强度 |
 
 ### 7.3 预览模式
 
@@ -134,6 +145,8 @@ alpha = blend(distance_alpha, max(axis_alpha, residual_alpha), screen_chroma)
 5. Final 与 Alpha Matte 预览随参数变更更新。
 6. 导出的 PNG 与输入尺寸一致，含 Alpha 通道。
 7. 默认输出不覆盖已存在文件。
+8. 对白色前景叠加绿色背景的 25%、50%、75% Alpha 合成像素，默认 Despill
+   可在 uint8 舍入误差内恢复白色；透明和不透明端点的 RGB 保持逐字节不变。
 
 ## 10. 技术约束
 
