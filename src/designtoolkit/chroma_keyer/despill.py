@@ -53,7 +53,9 @@ def despill(
 
     rgb_float = rgb.astype(np.float32)
     alpha_float = alpha.astype(np.float32) / 255.0
-    effect = alpha_float * (1.0 - alpha_float) * amount
+    edge = (alpha > 0) & (alpha < 255)
+    background_contribution = np.clip((1.0 - alpha_float) * 1.2, 0.0, 1.0)
+    effect = np.where(edge, background_contribution * amount, 0.0)
     result = rgb_float.copy()
 
     dominant_channel = _dominant_screen_channel(model)
