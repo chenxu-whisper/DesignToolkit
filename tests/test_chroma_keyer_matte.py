@@ -143,6 +143,36 @@ def test_refine_alpha_positive_growth_dilates_continuous_center_value() -> None:
     assert result[1, 1] > alpha[1, 1]
 
 
+def test_refine_alpha_clips_before_float_morphology_and_feathers_afterward() -> None:
+    alpha = np.array(
+        [
+            [0, 64, 128, 192, 255],
+            [32, 96, 160, 224, 16],
+            [48, 112, 176, 240, 80],
+            [208, 144, 100, 56, 24],
+            [255, 192, 128, 64, 0],
+        ],
+        dtype=np.uint8,
+    )
+    expected = np.array(
+        [
+            [56, 104, 192, 227, 223],
+            [84, 127, 204, 223, 209],
+            [150, 169, 203, 192, 165],
+            [215, 205, 179, 128, 94],
+            [243, 222, 167, 93, 52],
+        ],
+        dtype=np.uint8,
+    )
+
+    result = refine_alpha(
+        alpha,
+        KeyerParams(clip_black=0.25, clip_white=0.75, shrink_grow=1, feather=1),
+    )
+
+    np.testing.assert_array_equal(result, expected)
+
+
 @mark.parametrize(
     "alpha",
     [
