@@ -57,6 +57,48 @@ def test_key_rgb_returns_refined_alpha_and_despilled_rgb() -> None:
     assert 0 < alpha[0, 1] < 255
 
 
+def test_key_image_uses_key_rgb_for_decoded_source(
+    tmp_path: Path, monkeypatch
+) -> None:
+    input_path = tmp_path / "screen.png"
+    output_path = tmp_path / "result.png"
+    source_rgb = np.array(
+        [[[42, 180, 72], [220, 40, 40]]],
+        dtype=np.uint8,
+    )
+    model = _green_screen_model()
+    params = KeyerParams(softness=0.1)
+    calls: list[tuple[np.ndarray, ScreenColorModel, KeyerParams]] = []
+    original_key_rgb = chroma_keyer_core.key_rgb
+    _save_rgb(input_path, source_rgb)
+
+    def spy_key_rgb(
+        rgb: np.ndarray,
+        supplied_model: ScreenColorModel,
+        supplied_params: KeyerParams,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        calls.append((rgb.copy(), supplied_model, supplied_params))
+        return original_key_rgb(rgb, supplied_model, supplied_params)
+
+    monkeypatch.setattr(chroma_keyer_core, "key_rgb", spy_key_rgb)
+
+    result = key_image(
+        KeyImageOptions(input_path=input_path, output_path=output_path),
+        model,
+        params,
+    )
+
+    assert result.output_path == output_path
+    assert len(calls) == 1
+    decoded_rgb, supplied_model, supplied_params = calls[0]
+    assert np.array_equal(decoded_rgb, source_rgb)
+    assert supplied_model is model
+    assert supplied_params is params
+    with Image.open(output_path) as image:
+        assert image.mode == "RGBA"
+        assert image.size == (2, 1)
+
+
 def test_key_image_writes_source_sized_rgba_png(tmp_path: Path) -> None:
     input_path = tmp_path / "screen.png"
     output_path = tmp_path / "result.png"
