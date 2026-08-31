@@ -133,7 +133,7 @@ export function ChromaKeyerForm({ disabled, errors, onChange, onInspect, onSubmi
         onChange={(value) => updateValue('outputPath', value)}
         pickPaths={async () => {
           const response = await pickLocalSaveFile({
-            fileKind: 'media',
+            fileKind: 'image',
             title: '选择 PNG 输出路径',
           })
           return response.paths

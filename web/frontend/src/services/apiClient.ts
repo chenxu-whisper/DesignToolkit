@@ -129,7 +129,7 @@ export type LocalPathPickResponse = {
 }
 
 export type LocalFileKind = 'video' | 'media' | 'image' | 'any'
-type LocalSaveFileKind = 'media' | 'any'
+type LocalSaveFileKind = 'media' | 'image' | 'any'
 
 async function readJson<T>(response: Response): Promise<ApiErrorResponse | T | null> {
   try {

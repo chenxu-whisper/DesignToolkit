@@ -326,7 +326,9 @@ describe('apiClient', () => {
   it('accepts only backend-supported save-file kinds', () => {
     type SaveFilePickerOptions = Parameters<typeof pickLocalSaveFile>[0]
 
-    expectTypeOf<{ fileKind: 'image'; title: string }>().not.toMatchTypeOf<SaveFilePickerOptions>()
+    expectTypeOf<{ fileKind: 'image'; title: string }>().toMatchTypeOf<SaveFilePickerOptions>()
+    expectTypeOf<{ fileKind: 'media'; title: string }>().toMatchTypeOf<SaveFilePickerOptions>()
+    expectTypeOf<{ fileKind: 'any'; title: string }>().toMatchTypeOf<SaveFilePickerOptions>()
     expectTypeOf<{ fileKind: 'video'; title: string }>().not.toMatchTypeOf<SaveFilePickerOptions>()
   })
 

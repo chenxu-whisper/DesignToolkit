@@ -69,7 +69,7 @@ describe('ChromaKeyerForm', () => {
 
     await waitFor(() => expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ outputPath: 'E:\\media\\screen_keyed.png' })))
     expect(apiMocks.pickLocalSaveFile).toHaveBeenCalledWith({
-      fileKind: 'media',
+      fileKind: 'image',
       title: '选择 PNG 输出路径',
     })
   })

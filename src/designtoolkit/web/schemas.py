@@ -251,7 +251,7 @@ class LocalDirectoryPickRequest(BaseModel):
 
 
 class LocalSaveFilePickRequest(BaseModel):
-    file_kind: Literal["media", "any"] = "any"
+    file_kind: Literal["media", "image", "any"] = "any"
     title: str = "Select output path"
 
 

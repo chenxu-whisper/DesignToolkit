@@ -93,8 +93,9 @@ class TkinterLocalPathPicker:
             selected = filedialog.asksaveasfilename(
                 parent=root,
                 title=title,
-                filetypes=_filetypes(file_kind),
+                filetypes=_save_filetypes(file_kind),
                 initialdir=self._initial_directory("any"),
+                **_save_file_options(file_kind),
             )
             paths = [Path(selected)] if selected else []
             self._remember_file_directory(paths)
@@ -151,6 +152,18 @@ def _filetypes(file_kind: str):
             ("All files", "*.*"),
         ]
     return [("All files", "*.*")]
+
+
+def _save_filetypes(file_kind: str):
+    if file_kind == "image":
+        return [("PNG files", "*.png")]
+    return _filetypes(file_kind)
+
+
+def _save_file_options(file_kind: str) -> dict[str, str]:
+    if file_kind == "image":
+        return {"defaultextension": ".png"}
+    return {}
 
 
 def _filter_paths_by_file_kind(
