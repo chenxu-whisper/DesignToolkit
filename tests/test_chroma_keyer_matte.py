@@ -3,7 +3,6 @@ from pytest import mark, raises
 
 from designtoolkit.chroma_keyer.matte import generate_alpha, refine_alpha
 from designtoolkit.chroma_keyer.models import KeyerError, KeyerParams, ScreenColorModel
-from designtoolkit.chroma_keyer.sampling import screen_model_from_samples
 
 
 def _green_screen_model() -> ScreenColorModel:
@@ -93,7 +92,11 @@ def test_generate_alpha_balance_uses_stronger_and_weaker_other_channels() -> Non
 
 
 def test_generate_alpha_rejects_low_saturation_screen_model() -> None:
-    model = screen_model_from_samples(((128, 128, 128),))
+    model = ScreenColorModel(
+        mean_rgb=(128.0, 128.0, 128.0),
+        stddev_rgb=(0.0, 0.0, 0.0),
+        samples=((128, 128, 128),),
+    )
 
     with raises(KeyerError) as error:
         generate_alpha(

@@ -40,7 +40,7 @@ def test_key_rgb_returns_refined_alpha_and_despilled_rgb() -> None:
         [[[0, 255, 0], [180, 235, 180], [255, 0, 0]]],
         dtype=np.uint8,
     )
-    params = KeyerParams(tolerance=0.0, softness=1.0, despill_amount=1.0)
+    params = KeyerParams(despill_amount=1.0)
     model = ScreenColorModel(
         mean_rgb=(0.0, 255.0, 0.0),
         stddev_rgb=(0.0, 0.0, 0.0),
@@ -67,7 +67,7 @@ def test_key_image_uses_key_rgb_for_decoded_source(
         dtype=np.uint8,
     )
     model = _green_screen_model()
-    params = KeyerParams(softness=0.1)
+    params = KeyerParams()
     calls: list[tuple[np.ndarray, ScreenColorModel, KeyerParams]] = []
     original_key_rgb = chroma_keyer_core.key_rgb
     _save_rgb(input_path, source_rgb)
@@ -110,7 +110,7 @@ def test_key_image_writes_source_sized_rgba_png(tmp_path: Path) -> None:
     result = key_image(
         KeyImageOptions(input_path=input_path, output_path=output_path),
         _green_screen_model(),
-        KeyerParams(softness=0.1),
+        KeyerParams(),
     )
 
     assert result.output_path == output_path
@@ -139,7 +139,7 @@ def test_key_image_preserves_fractional_edge_alpha_and_despills_green(
     key_image(
         KeyImageOptions(input_path=input_path, output_path=output_path),
         model,
-        KeyerParams(tolerance=0.0, softness=1.0, despill_amount=1.0),
+        KeyerParams(despill_amount=1.0),
     )
 
     with Image.open(output_path) as image:
