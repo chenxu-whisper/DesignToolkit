@@ -320,4 +320,3 @@ clean green background pixel, and verify:
 4. title and wing edges have substantially less green contamination;
 5. the Alpha view retains gray edge pixels;
 6. export produces a source-sized RGBA PNG.
-
