@@ -86,8 +86,14 @@ describe('ChromaKeyerForm', () => {
       />,
     )
 
-    expect(screen.getByLabelText('Tolerance')).toHaveValue(0)
-    expect(screen.getByLabelText('Softness')).toHaveValue(1)
+    expect(screen.getByLabelText('Screen Gain')).toHaveValue(1)
+    expect(screen.getByLabelText('Screen Gain')).toHaveAttribute('max', '2')
+    expect(screen.getByLabelText('Screen Gain')).toHaveAttribute('step', '0.01')
+    expect(screen.getByLabelText('Screen Balance')).toHaveValue(0.5)
+    expect(screen.getByLabelText('Screen Balance')).toHaveAttribute('max', '1')
+    expect(screen.getByLabelText('Screen Balance')).toHaveAttribute('step', '0.01')
+    expect(screen.queryByLabelText('Tolerance')).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('Softness')).not.toBeInTheDocument()
     expect(screen.getByLabelText('Clip Black')).toHaveValue(0)
     expect(screen.getByLabelText('Clip White')).toHaveValue(1)
     expect(screen.getByLabelText('Shrink/Grow')).toHaveValue(0)
@@ -112,8 +118,8 @@ describe('ChromaKeyerForm', () => {
       />,
     )
 
-    await user.clear(screen.getByLabelText('Tolerance'))
+    await user.clear(screen.getByLabelText('Screen Gain'))
 
-    expect(onChange.mock.lastCall?.[0].tolerance).toBeNaN()
+    expect(onChange.mock.lastCall?.[0].screenGain).toBeNaN()
   })
 })

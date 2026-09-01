@@ -28,10 +28,10 @@ type InspectedImage = {
 }
 
 function toPayload(values: ChromaKeyerValues): ChromaKeyerPayload {
-  const [firstSample, ...remainingSamples] = values.samples
-  if (!firstSample) {
-    throw new Error('至少需要一个背景采样颜色')
+  if (values.samples.length !== 1) {
+    throw new Error('需要且只能保留一个背景采样颜色')
   }
+  const [sample] = values.samples
 
   return {
     inputPath: values.inputPath.trim(),
@@ -42,10 +42,10 @@ function toPayload(values: ChromaKeyerValues): ChromaKeyerPayload {
       despillAmount: values.despillAmount,
       feather: values.feather,
       shrinkGrow: values.shrinkGrow,
-      softness: values.softness,
-      tolerance: values.tolerance,
+      screenBalance: values.screenBalance,
+      screenGain: values.screenGain,
     },
-    samples: [firstSample, ...remainingSamples],
+    samples: [sample],
   }
 }
 
@@ -151,8 +151,8 @@ export function ChromaKeyerPage() {
     image,
     values.inputPath,
     values.samples,
-    values.tolerance,
-    values.softness,
+    values.screenGain,
+    values.screenBalance,
     values.clipBlack,
     values.clipWhite,
     values.shrinkGrow,
@@ -208,9 +208,8 @@ export function ChromaKeyerPage() {
     try {
       const response = await sampleChromaImage({ inputPath: image.inputPath, ...point })
       if (mountedRef.current && requestSequence === requestSequenceRef.current) {
-        setValues((current) => ({ ...current, samples: [...current.samples, [...response.rgb]] }))
-        setSampleDetails((current) => [
-          ...current,
+        setValues((current) => ({ ...current, samples: [[...response.rgb]] }))
+        setSampleDetails([
           {
             hex: response.hex,
             rgb: response.rgb,
@@ -234,10 +233,10 @@ export function ChromaKeyerPage() {
     }
   }
 
-  const removeSample = (index: number) => {
+  const removeSample = () => {
     invalidateRequests()
-    setValues((current) => ({ ...current, samples: current.samples.filter((_, itemIndex) => itemIndex !== index) }))
-    setSampleDetails((current) => current.filter((_, itemIndex) => itemIndex !== index))
+    setValues((current) => ({ ...current, samples: [] }))
+    setSampleDetails([])
     setPreviewUrl(image?.previewUrl ?? null)
   }
 
@@ -346,19 +345,19 @@ export function ChromaKeyerPage() {
           </div>
           <FieldError message={errors.samples} />
           <ol className="chroma-sample-list">
-            {sampleDetails.map((sample, index) => (
-              <li className="chroma-sample-item" key={`${sample.sourceX}-${sample.sourceY}-${index}`}>
+            {sampleDetails.map((sample) => (
+              <li className="chroma-sample-item" key={`${sample.sourceX}-${sample.sourceY}`}>
                 <span aria-hidden="true" className="chroma-swatch" style={{ backgroundColor: sample.hex }} />
-                <span>#{index + 1}</span>
+                <span>Screen Color</span>
                 <span>{`RGB(${sample.rgb.join(', ')})`}</span>
                 <span>{sample.hex}</span>
                 <span>{sample.sourceX}, {sample.sourceY}</span>
                 <button
-                  aria-label={`删除采样点 ${index + 1}`}
+                  aria-label="删除 Screen Color"
                   className="icon-button"
                   disabled={disabled}
-                  onClick={() => removeSample(index)}
-                  title={`删除采样点 ${index + 1}`}
+                  onClick={removeSample}
+                  title="删除 Screen Color"
                   type="button"
                 >
                   <Trash2 aria-hidden="true" size={17} />

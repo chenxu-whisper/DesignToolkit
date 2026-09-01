@@ -8,8 +8,8 @@ describe('chromaKeyerDefaultValues', () => {
       inputPath: '',
       outputPath: '',
       samples: [],
-      tolerance: 0,
-      softness: 1,
+      screenGain: 1,
+      screenBalance: 0.5,
       clipBlack: 0,
       clipWhite: 1,
       shrinkGrow: 0,
@@ -35,25 +35,70 @@ describe('validateChromaKeyerValues', () => {
     })
   })
 
-  it('rejects non-finite and out-of-range normalized values', () => {
+  it('rejects non-finite and out-of-range keylight values', () => {
     const errors = validateChromaKeyerValues({
       ...createChromaKeyerDefaultValues(),
       inputPath: 'screen.png',
       samples: [[42, 180, 72]],
-      tolerance: Number.NaN,
-      softness: Number.POSITIVE_INFINITY,
+      screenGain: Number.NaN,
+      screenBalance: Number.POSITIVE_INFINITY,
       clipBlack: -0.1,
       clipWhite: 1.1,
       despillAmount: 2,
     })
 
     expect(errors).toMatchObject({
-      tolerance: 'Tolerance 必须是 0 到 1 之间的有限数值',
-      softness: 'Softness 必须是 0 到 1 之间的有限数值',
+      screenGain: 'Screen Gain 必须是 0 到 2 之间的有限数值',
+      screenBalance: 'Screen Balance 必须是 0 到 1 之间的有限数值',
       clipBlack: 'Clip Black 必须是 0 到 1 之间的有限数值',
       clipWhite: 'Clip White 必须是 0 到 1 之间的有限数值',
       despillAmount: 'Despill Amount 必须是 0 到 1 之间的有限数值',
     })
+  })
+
+  it.each([
+    ['screenGain', -0.01, { screenGain: 'Screen Gain 必须是 0 到 2 之间的有限数值' }],
+    ['screenGain', 2.01, { screenGain: 'Screen Gain 必须是 0 到 2 之间的有限数值' }],
+    ['screenBalance', -0.01, { screenBalance: 'Screen Balance 必须是 0 到 1 之间的有限数值' }],
+    ['screenBalance', 1.01, { screenBalance: 'Screen Balance 必须是 0 到 1 之间的有限数值' }],
+  ] as const)('rejects out-of-range %s value %d', (field, value, expectedErrors) => {
+    expect(
+      validateChromaKeyerValues({
+        ...createChromaKeyerDefaultValues(),
+        inputPath: 'screen.png',
+        samples: [[42, 180, 72]],
+        [field]: value,
+      }),
+    ).toEqual(expectedErrors)
+  })
+
+  it.each([
+    ['screenGain', 0],
+    ['screenGain', 2],
+    ['screenBalance', 0],
+    ['screenBalance', 1],
+  ] as const)('accepts boundary %s value %d', (field, value) => {
+    expect(
+      validateChromaKeyerValues({
+        ...createChromaKeyerDefaultValues(),
+        inputPath: 'screen.png',
+        samples: [[42, 180, 72]],
+        [field]: value,
+      }),
+    ).toEqual({})
+  })
+
+  it('rejects multiple screen colors', () => {
+    expect(
+      validateChromaKeyerValues({
+        ...createChromaKeyerDefaultValues(),
+        inputPath: 'screen.png',
+        samples: [
+          [42, 180, 72],
+          [30, 50, 200],
+        ],
+      }),
+    ).toEqual({ samples: '只能保留一个背景采样颜色' })
   })
 
   it('requires integer shrink/grow and feather values', () => {

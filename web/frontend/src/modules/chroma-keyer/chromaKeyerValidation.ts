@@ -4,8 +4,8 @@ export type ChromaKeyerValues = {
   inputPath: string
   outputPath: string
   samples: ChromaKeyerRgbSample[]
-  tolerance: number
-  softness: number
+  screenGain: number
+  screenBalance: number
   clipBlack: number
   clipWhite: number
   shrinkGrow: number
@@ -28,11 +28,16 @@ export function validateChromaKeyerValues(values: ChromaKeyerValues): ChromaKeye
   }
   if (values.samples.length === 0) {
     errors.samples = '请先在画布上吸取需要抠除的背景颜色'
+  } else if (values.samples.length !== 1) {
+    errors.samples = '只能保留一个背景采样颜色'
+  }
+
+  if (!Number.isFinite(values.screenGain) || values.screenGain < 0 || values.screenGain > 2) {
+    errors.screenGain = 'Screen Gain 必须是 0 到 2 之间的有限数值'
   }
 
   const unitIntervalFields = [
-    ['tolerance', 'Tolerance'],
-    ['softness', 'Softness'],
+    ['screenBalance', 'Screen Balance'],
     ['clipBlack', 'Clip Black'],
     ['clipWhite', 'Clip White'],
     ['despillAmount', 'Despill Amount'],

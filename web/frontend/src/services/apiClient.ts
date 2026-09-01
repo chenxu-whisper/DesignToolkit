@@ -66,8 +66,8 @@ export type MediaResizePayload = MediaResizeBasePayload &
 export type ChromaKeyerRgbSample = readonly [red: number, green: number, blue: number]
 
 export type ChromaKeyerParams = {
-  tolerance: number
-  softness: number
+  screenGain: number
+  screenBalance: number
   clipBlack: number
   clipWhite: number
   shrinkGrow: number
@@ -77,7 +77,7 @@ export type ChromaKeyerParams = {
 
 export type ChromaKeyerPayload = {
   inputPath: string
-  samples: readonly [ChromaKeyerRgbSample, ...ChromaKeyerRgbSample[]]
+  samples: readonly [ChromaKeyerRgbSample]
   params: ChromaKeyerParams
   outputPath?: string
 }
@@ -182,8 +182,8 @@ export function createMediaResizeTask(payload: MediaResizePayload): Promise<Task
 
 function chromaParamsToWire(params: ChromaKeyerParams) {
   return {
-    tolerance: params.tolerance,
-    softness: params.softness,
+    screen_gain: params.screenGain,
+    screen_balance: params.screenBalance,
     clip_black: params.clipBlack,
     clip_white: params.clipWhite,
     shrink_grow: params.shrinkGrow,

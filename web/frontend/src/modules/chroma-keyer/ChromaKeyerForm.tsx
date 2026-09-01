@@ -15,8 +15,8 @@ type ChromaKeyerFormProps = {
 }
 
 const parameterFields = [
-  { id: 'tolerance', label: 'Tolerance', max: 1, min: 0, step: 0.01 },
-  { id: 'softness', label: 'Softness', max: 1, min: 0, step: 0.01 },
+  { id: 'screenGain', label: 'Screen Gain', max: 2, min: 0, step: 0.01 },
+  { id: 'screenBalance', label: 'Screen Balance', max: 1, min: 0, step: 0.01 },
   { id: 'clipBlack', label: 'Clip Black', max: 1, min: 0, step: 0.01 },
   { id: 'clipWhite', label: 'Clip White', max: 1, min: 0, step: 0.01 },
   { id: 'shrinkGrow', label: 'Shrink/Grow', max: 10, min: -10, step: 1 },

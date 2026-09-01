@@ -11,6 +11,8 @@ import {
   pickLocalSaveFile,
   resolveDroppedFilePaths,
   sampleChromaImage,
+  type ChromaKeyerPayload,
+  type ChromaKeyerRgbSample,
   type ChromaPreviewPayload,
 } from './apiClient'
 
@@ -19,6 +21,10 @@ afterEach(() => {
 })
 
 describe('apiClient', () => {
+  it('models chroma payloads with exactly one RGB sample', () => {
+    expectTypeOf<ChromaKeyerPayload['samples']>().toEqualTypeOf<readonly [ChromaKeyerRgbSample]>()
+  })
+
   it('posts video frame tasks', async () => {
     const fetchMock = vi
       .spyOn(globalThis, 'fetch')
@@ -151,8 +157,8 @@ describe('apiClient', () => {
       inputPath: 'screen.png',
       samples: [[42, 180, 72]] as const,
       params: {
-        tolerance: 0.25,
-        softness: 0.15,
+        screenGain: 1.25,
+        screenBalance: 0.35,
         clipBlack: 0,
         clipWhite: 1,
         shrinkGrow: 0,
@@ -172,8 +178,8 @@ describe('apiClient', () => {
         input_path: 'screen.png',
         samples: [[42, 180, 72]],
         params: {
-          tolerance: 0.25,
-          softness: 0.15,
+          screen_gain: 1.25,
+          screen_balance: 0.35,
           clip_black: 0,
           clip_white: 1,
           shrink_grow: 0,
@@ -194,8 +200,8 @@ describe('apiClient', () => {
       outputPath: 'screen_keyed.png',
       samples: [[42, 180, 72]],
       params: {
-        tolerance: 0.25,
-        softness: 0.15,
+        screenGain: 1.25,
+        screenBalance: 0.35,
         clipBlack: 0,
         clipWhite: 1,
         shrinkGrow: 0,
@@ -214,8 +220,8 @@ describe('apiClient', () => {
         input_path: 'screen.png',
         samples: [[42, 180, 72]],
         params: {
-          tolerance: 0.25,
-          softness: 0.15,
+          screen_gain: 1.25,
+          screen_balance: 0.35,
           clip_black: 0,
           clip_white: 1,
           shrink_grow: 0,
@@ -238,8 +244,8 @@ describe('apiClient', () => {
         outputPath: '   ',
         samples: [[42, 180, 72]],
         params: {
-          tolerance: 0.25,
-          softness: 0.15,
+          screenGain: 1.25,
+          screenBalance: 0.35,
           clipBlack: 0,
           clipWhite: 1,
           shrinkGrow: 0,
@@ -255,8 +261,8 @@ describe('apiClient', () => {
         input_path: 'screen.png',
         samples: [[42, 180, 72]],
         params: {
-          tolerance: 0.25,
-          softness: 0.15,
+          screen_gain: 1.25,
+          screen_balance: 0.35,
           clip_black: 0,
           clip_white: 1,
           shrink_grow: 0,
