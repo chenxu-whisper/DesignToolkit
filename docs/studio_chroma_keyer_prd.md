@@ -9,7 +9,7 @@ Studio Chroma Keyer 是 DesignToolkit 中的本地专业抠像模块。它使用
 ## 2. MVP 目标
 
 1. 从本机绝对路径导入一张 PNG、JPG 或 JPEG 图片。
-2. 展示缩放预览画布，允许用户单点或多点吸取待抠除的背景颜色。
+2. 展示缩放预览画布，允许用户吸取一个待抠除的背景颜色；再次吸取时替换当前颜色。
 3. 基于采样颜色生成连续 Alpha Matte，不要求用户预先选择“绿幕”或“蓝幕”。
 4. 支持基础 Matte 调整、边缘羽化及基于采样背景色反混合的 Despill。
 5. 支持 Final 和 Alpha Matte 预览。
@@ -34,8 +34,8 @@ MVP 不实现以下能力：
 3. 后端读取图片并返回预览图及原图尺寸。
 4. 用户启用取样工具，在预览画布点击背景区域。
 5. 前端将预览坐标和预览尺寸提交给后端；后端换算原图坐标并返回采样颜色。
-6. 用户可继续添加采样点、删除某一采样点或清空全部采样点。
-7. 系统以采样色均值和颜色离散度生成预览，用户调整参数。
+6. 用户可重新取样以替换当前颜色，或清空当前颜色。
+7. 系统以当前采样色生成预览，用户调整参数。
 8. 用户在 Final / Alpha Matte 视图中检查结果。
 9. 用户选择输出路径，导出 RGBA PNG。
 
@@ -53,9 +53,10 @@ MVP 不实现以下能力：
 ### 6.1 颜色吸取
 
 - 用户吸取的是“需要被抠除的实际背景颜色”，可为绿色、蓝色或其他单色背景。
-- 每个点保存原图像素坐标及 RGB 值。
-- UI 显示每个采样色块、RGB 和 HEX，并支持删除和清空。
-- 至少需要一个采样点才可生成预览或导出。
+- 系统只保留一个采样颜色；再次点击画布时，新颜色替换原颜色。
+- UI 显示当前采样色块、RGB 和 HEX，并支持清空。
+- 预览和导出请求必须包含且仅包含一个采样颜色；清空后不可预览或导出。
+- 采样色的最强通道必须比其余通道至少高 `12.75`，否则按低饱和度背景拒绝，并提示用户选择具有明显主色的纯色幕背景。
 
 ### 6.2 坐标契约
 
@@ -68,9 +69,11 @@ source_y = floor(y * source_height / preview_height)
 
 采样必须来自原图，而非浏览器缩放、压缩或叠加后的像素。
 
-### 6.3 多点模型
+### 6.3 单色模型
 
-多点采样计算 RGB 均值作为 `screen_color`，并计算每通道标准差。标准差用于扩展背景颜色容差，防止光照不均的背景在单点取样后残留。
+`screen_model_from_samples` 严格接收一个 RGB 采样值。`mean_rgb` 等于该采样值，
+`stddev_rgb` 固定为零，`samples` 只包含该颜色。空列表、多于一个颜色或低饱和度
+颜色均拒绝，不再通过多点均值或颜色离散度扩展抠除范围。
 
 ### 6.4 基于采样背景色的 Despill
 
@@ -97,25 +100,29 @@ result = lerp(C, F, despill_amount)
 
 ### 7.1 初始 Alpha
 
-算法以归一化 RGB 色差为基线；对于具有明确主色方向的采样背景，还会计算像素沿背景色度轴的前景置信度和垂直于该轴的残差置信度。色度轴置信度、残差置信度和 RGB 色差置信度均使用同一套 `tolerance` / `softness` 平滑重映射，再按采样色度组合为连续 Alpha。
+算法使用 Keylight 风格的主色通道覆盖率。设采样色的最强通道为 `D`，
+`screen_balance` 为 `b`，先在其余两个通道之间计算平衡值，再比较主通道的
+饱和度：
 
 ```text
-background_threshold = tolerance + sample_variance
-foreground_threshold = background_threshold + softness
-distance_alpha = smoothstep(background_threshold, foreground_threshold, color_distance)
-axis_alpha = smoothstep(background_threshold, foreground_threshold, axis_confidence)
-residual_alpha = smoothstep(background_threshold, foreground_threshold, residual_confidence)
-alpha = blend(distance_alpha, max(axis_alpha, residual_alpha), screen_chroma)
+screen_other = (1 - b) * max(screen_other_channels) + b * min(screen_other_channels)
+screen_saturation = screen[D] - screen_other
+pixel_other = (1 - b) * max(pixel_other_channels) + b * min(pixel_other_channels)
+pixel_saturation = pixel[D] - pixel_other
+coverage = clip(screen_gain * pixel_saturation / screen_saturation, 0, 1)
+alpha = 1 - coverage
 ```
 
-默认 `tolerance = 0.00`、`softness = 1.00`，有意覆盖完整的连续不透明度范围，以保留半透明边缘。用户可提高 Tolerance、降低 Softness，使抠像范围更紧、过渡更窄。
+默认 `screen_gain = 1.00`、`screen_balance = 0.50`。提高 Screen Gain 会抠除
+更多与幕布主色方向一致的像素；Screen Balance 决定两个非主通道对覆盖率的
+相对贡献。结果保持连续 Alpha，以保留半透明边缘。
 
 ### 7.2 MVP 参数
 
 | 参数 | 范围 | 默认值 | 作用 |
 | --- | --- | --- | --- |
-| Tolerance | 0.00 - 1.00 | 0.00 | 背景颜色容差 |
-| Softness | 0.00 - 1.00 | 1.00 | Alpha 过渡宽度 |
+| Screen Gain | 0.00 - 2.00 | 1.00 | 调整主色覆盖率和抠除强度 |
+| Screen Balance | 0.00 - 1.00 | 0.50 | 平衡两个非主色通道 |
 | Clip Black | 0.00 - 1.00 | 0.00 | 将低 Alpha 压向透明 |
 | Clip White | 0.00 - 1.00 | 1.00 | 将高 Alpha 压向不透明 |
 | Shrink / Grow | -10 - 10 px | 0 | Alpha 收缩或扩张 |
@@ -140,13 +147,16 @@ alpha = blend(distance_alpha, max(axis_alpha, residual_alpha), screen_chroma)
 
 1. 用户可从本地路径导入 PNG/JPG/JPEG，错误路径或不支持格式有明确提示。
 2. 用户在预览画布点击后，后端返回与原图对应坐标的 RGB/HEX 采样结果。
-3. 用户可添加多个采样点、删除单点、清空采样点；清空后不可预览或导出。
+3. 系统始终只保留一个采样颜色；重新取样会替换当前颜色，清空后不可预览或导出，低饱和度颜色必须拒绝。
 4. 对绿色和蓝色背景测试素材，背景区域基本透明，主体核心区域保持不透明。
 5. Final 与 Alpha Matte 预览随参数变更更新。
 6. 导出的 PNG 与输入尺寸一致，含 Alpha 通道。
 7. 默认输出不覆盖已存在文件。
-8. 对白色前景叠加绿色背景的 25%、50%、75% Alpha 合成像素，默认 Despill
+8. 对白色前景叠加绿色背景的 25%、50%、75% Alpha 合成像素，默认
+   `despill_amount = 1.0` 的 Despill
    可在 uint8 舍入误差内恢复白色；透明和不透明端点的 RGB 保持逐字节不变。
+9. Despill 仅处理 Alpha 为 `1..254` 的像素；由于 MVP 没有 Trimap 或前景颜色
+   先验，接近幕布色的真实前景可能偏色，用户可降低 Despill Amount。
 
 ## 10. 技术约束
 

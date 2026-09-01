@@ -21,6 +21,7 @@ from designtoolkit.chroma_keyer.models import (
     KeyImageOptions,
     ScreenColorModel,
 )
+from designtoolkit.chroma_keyer.sampling import screen_model_from_samples
 
 
 def _save_rgb(path: Path, pixels: np.ndarray) -> None:
@@ -55,6 +56,32 @@ def test_key_rgb_returns_refined_alpha_and_despilled_rgb() -> None:
     assert keyed_rgb[0, 1, 1] < source_rgb[0, 1, 1]
     assert alpha.tolist() == [[0, alpha[0, 1], 255]]
     assert 0 < alpha[0, 1] < 255
+
+
+def test_key_rgb_keys_production_artwork_with_fractional_despilled_edges() -> None:
+    source_path = (
+        Path(__file__).resolve().parents[1] / "assets" / "frame" / "test_frame_2.png"
+    )
+    source_rgb = read_rgb_image(source_path)
+    sample = tuple(int(channel) for channel in source_rgb[10, 10])
+    model = screen_model_from_samples((sample,))
+
+    keyed_rgb, alpha = chroma_keyer_core.key_rgb(
+        source_rgb,
+        model,
+        KeyerParams(),
+    )
+
+    assert source_rgb.shape == (1344, 3168, 3)
+    assert keyed_rgb.shape == source_rgb.shape
+    assert alpha.shape == source_rgb.shape[:2]
+    fractional = (alpha > 0) & (alpha < 255)
+    assert np.count_nonzero(fractional) > 1_000_000
+    green_spill = keyed_rgb[..., 1].astype(np.int16) - np.maximum(
+        keyed_rgb[..., 0],
+        keyed_rgb[..., 2],
+    ).astype(np.int16)
+    assert np.count_nonzero(fractional & (green_spill > 0)) < 50_000
 
 
 def test_key_image_uses_key_rgb_for_decoded_source(
