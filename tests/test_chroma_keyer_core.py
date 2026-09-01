@@ -75,6 +75,20 @@ def test_key_rgb_keys_production_artwork_with_fractional_despilled_edges() -> No
     assert source_rgb.shape == (1344, 3168, 3)
     assert keyed_rgb.shape == source_rgb.shape
     assert alpha.shape == source_rgb.shape[:2]
+    source_channels = source_rgb.astype(np.int16)
+    red, green, blue = np.moveaxis(source_channels, -1, 0)
+    obvious_background = green - np.maximum(red, blue) > 100
+    assert np.count_nonzero(obvious_background) > 2_500_000
+    assert np.percentile(alpha[obvious_background], 95) <= 50
+    assert np.mean(alpha[obvious_background]) <= 10
+
+    green_primary_saturation = green - (red + blue) / 2
+    obvious_foreground = green_primary_saturation <= 0
+    assert np.count_nonzero(obvious_foreground) > 900_000
+    assert np.all(alpha[obvious_foreground] == 255)
+    opaque = alpha == 255
+    assert np.array_equal(keyed_rgb[opaque], source_rgb[opaque])
+
     fractional = (alpha > 0) & (alpha < 255)
     assert np.count_nonzero(fractional) > 1_000_000
     green_spill = keyed_rgb[..., 1].astype(np.int16) - np.maximum(
