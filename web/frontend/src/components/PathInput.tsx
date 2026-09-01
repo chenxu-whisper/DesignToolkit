@@ -12,6 +12,7 @@ type PathInputProps = {
   label: string
   multiline?: boolean
   onChange: (value: string) => void
+  onCommit?: (value: string) => void
   pickPaths?: () => Promise<readonly string[]>
   placeholder?: string
   required?: boolean
@@ -27,6 +28,7 @@ export function PathInput({
   label,
   multiline = false,
   onChange,
+  onCommit,
   pickPaths,
   placeholder,
   required = false,
@@ -60,17 +62,20 @@ export function PathInput({
     setIsEditorOpen(true)
   }
 
-  const applyDraftPath = () => {
-    setDropError(null)
-    setPickerError(null)
-    onChange(draftPath)
-    setIsEditorOpen(false)
-  }
-
   const updateValue = (nextValue: string) => {
     setDropError(null)
     setPickerError(null)
     onChange(nextValue)
+  }
+
+  const commitValue = (nextValue: string) => {
+    updateValue(nextValue)
+    onCommit?.(nextValue)
+  }
+
+  const applyDraftPath = () => {
+    commitValue(draftPath)
+    setIsEditorOpen(false)
   }
 
   const handlePickerClick = async () => {
@@ -88,7 +93,7 @@ export function PathInput({
     try {
       const paths = await pickPaths()
       if (paths.length > 0) {
-        updateValue(valueWithDroppedPaths(value, paths, multiline))
+        commitValue(valueWithDroppedPaths(value, paths, multiline))
         setIsEditorOpen(false)
       }
     } catch {
@@ -121,7 +126,7 @@ export function PathInput({
       if (fileNames.length > 0 && resolveDroppedFilePaths) {
         const resolvedPaths = await resolveDroppedFilePaths(fileNames)
         if (resolvedPaths.length > 0) {
-          updateValue(valueWithDroppedPaths(currentValue, resolvedPaths, multiline))
+          commitValue(valueWithDroppedPaths(currentValue, resolvedPaths, multiline))
           return
         }
       }
@@ -130,7 +135,7 @@ export function PathInput({
       }
       return
     }
-    updateValue(valueWithDroppedPaths(currentValue, paths, multiline))
+    commitValue(valueWithDroppedPaths(currentValue, paths, multiline))
   }
 
   const inputClassName = `text-input${isDragActive ? ' path-drop-active' : ''}`
@@ -180,10 +185,16 @@ export function PathInput({
             className={inputClassName}
             disabled={disabled}
             id={inputId}
+            onBlur={(event) => onCommit?.(event.currentTarget.value)}
             onChange={(event) => updateValue(event.target.value)}
             onDragLeave={() => setIsDragActive(false)}
             onDragOver={handleDragOver}
             onDrop={handleDrop}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter') {
+                onCommit?.(event.currentTarget.value)
+              }
+            }}
             placeholder={placeholder}
             required={required}
             type="text"

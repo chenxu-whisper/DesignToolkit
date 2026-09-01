@@ -64,7 +64,239 @@ function ControlledBatchPathInputWithPicker({
   )
 }
 
+function ControlledCommittedPathInput({
+  initialValue = '',
+  multiline = false,
+  onChange,
+  onCommit,
+  pickPaths,
+  resolveDroppedFilePaths,
+}: {
+  initialValue?: string
+  multiline?: boolean
+  onChange: (value: string) => void
+  onCommit: (value: string) => void
+  pickPaths?: () => Promise<readonly string[]>
+  resolveDroppedFilePaths?: (names: readonly string[]) => Promise<readonly string[]>
+}) {
+  const [value, setValue] = useState(initialValue)
+
+  return (
+    <PathInput
+      label="输入媒体路径"
+      multiline={multiline}
+      onChange={(nextValue) => {
+        onChange(nextValue)
+        setValue(nextValue)
+      }}
+      onCommit={onCommit}
+      pickPaths={pickPaths}
+      resolveDroppedFilePaths={resolveDroppedFilePaths}
+      value={value}
+    />
+  )
+}
+
 describe('PathInput', () => {
+  it('commits a manually typed single-line path on Enter but not on raw changes', async () => {
+    const user = userEvent.setup()
+    const onChange = vi.fn()
+    const onCommit = vi.fn()
+    render(<ControlledCommittedPathInput onChange={onChange} onCommit={onCommit} />)
+    const input = screen.getByLabelText('输入媒体路径')
+
+    await user.type(input, 'D:\\art\\screen.png')
+
+    expect(onChange).toHaveBeenLastCalledWith('D:\\art\\screen.png')
+    expect(onCommit).not.toHaveBeenCalled()
+
+    await user.keyboard('{Enter}')
+
+    expect(onCommit).toHaveBeenCalledOnce()
+    expect(onCommit).toHaveBeenLastCalledWith('D:\\art\\screen.png')
+  })
+
+  it('commits the current single-line path on blur', async () => {
+    const user = userEvent.setup()
+    const onChange = vi.fn()
+    const onCommit = vi.fn()
+    render(<ControlledCommittedPathInput onChange={onChange} onCommit={onCommit} />)
+    const input = screen.getByLabelText('输入媒体路径')
+
+    await user.type(input, 'D:\\art\\screen.png')
+    fireEvent.blur(input)
+
+    expect(onCommit).toHaveBeenCalledOnce()
+    expect(onCommit).toHaveBeenLastCalledWith('D:\\art\\screen.png')
+  })
+
+  it('updates and commits the exact path returned by the native picker', async () => {
+    const user = userEvent.setup()
+    const onChange = vi.fn()
+    const onCommit = vi.fn()
+    const pickPaths = vi.fn().mockResolvedValue(['E:\\media\\screen.png'])
+    render(
+      <ControlledCommittedPathInput
+        multiline
+        onChange={onChange}
+        onCommit={onCommit}
+        pickPaths={pickPaths}
+      />,
+    )
+
+    await user.click(screen.getByRole('button', { name: '指定输入媒体路径' }))
+
+    await waitFor(() => expect(onCommit).toHaveBeenCalledWith('E:\\media\\screen.png'))
+    expect(onChange).toHaveBeenCalledWith('E:\\media\\screen.png')
+    expect(onCommit).toHaveBeenCalledOnce()
+  })
+
+  it('does not commit when the native picker is cancelled', async () => {
+    const user = userEvent.setup()
+    const onChange = vi.fn()
+    const onCommit = vi.fn()
+    const pickPaths = vi.fn().mockResolvedValue([])
+    render(
+      <ControlledCommittedPathInput
+        onChange={onChange}
+        onCommit={onCommit}
+        pickPaths={pickPaths}
+      />,
+    )
+
+    await user.click(screen.getByRole('button', { name: '指定输入媒体路径' }))
+
+    await waitFor(() => expect(pickPaths).toHaveBeenCalledOnce())
+    expect(onChange).not.toHaveBeenCalled()
+    expect(onCommit).not.toHaveBeenCalled()
+  })
+
+  it('does not commit when the native picker fails', async () => {
+    const user = userEvent.setup()
+    const onChange = vi.fn()
+    const onCommit = vi.fn()
+    const pickPaths = vi.fn().mockRejectedValue(new Error('Native picker unavailable'))
+    render(
+      <ControlledCommittedPathInput
+        onChange={onChange}
+        onCommit={onCommit}
+        pickPaths={pickPaths}
+      />,
+    )
+
+    await user.click(screen.getByRole('button', { name: '指定输入媒体路径' }))
+
+    await waitFor(() => expect(screen.getByLabelText('本地路径')).toHaveFocus())
+    expect(onChange).not.toHaveBeenCalled()
+    expect(onCommit).not.toHaveBeenCalled()
+  })
+
+  it('updates and commits the exact directly dropped path', () => {
+    const onChange = vi.fn()
+    const onCommit = vi.fn()
+    render(
+      <ControlledCommittedPathInput multiline onChange={onChange} onCommit={onCommit} />,
+    )
+
+    fireEvent.drop(screen.getByLabelText('输入媒体路径'), {
+      dataTransfer: {
+        files: [],
+        getData: (type: string) => (type === 'text/plain' ? 'D:\\drop\\screen.png' : ''),
+      },
+    })
+
+    expect(onChange).toHaveBeenCalledWith('D:\\drop\\screen.png')
+    expect(onCommit).toHaveBeenCalledOnce()
+    expect(onCommit).toHaveBeenCalledWith('D:\\drop\\screen.png')
+  })
+
+  it('updates and commits the exact resolved dropped path', async () => {
+    const onChange = vi.fn()
+    const onCommit = vi.fn()
+    const resolveDroppedFilePaths = vi.fn().mockResolvedValue(['E:\\resolved\\screen.png'])
+    render(
+      <ControlledCommittedPathInput
+        multiline
+        onChange={onChange}
+        onCommit={onCommit}
+        resolveDroppedFilePaths={resolveDroppedFilePaths}
+      />,
+    )
+
+    fireEvent.drop(screen.getByLabelText('输入媒体路径'), {
+      dataTransfer: {
+        files: [new File(['image'], 'screen.png', { type: 'image/png' })],
+        getData: () => '',
+      },
+    })
+
+    await waitFor(() => expect(onCommit).toHaveBeenCalledWith('E:\\resolved\\screen.png'))
+    expect(onChange).toHaveBeenCalledWith('E:\\resolved\\screen.png')
+    expect(onCommit).toHaveBeenCalledOnce()
+  })
+
+  it('updates and commits the exact path applied from the editor', async () => {
+    const user = userEvent.setup()
+    const onChange = vi.fn()
+    const onCommit = vi.fn()
+    render(
+      <ControlledCommittedPathInput
+        initialValue="C:\\old\\screen.png"
+        multiline
+        onChange={onChange}
+        onCommit={onCommit}
+      />,
+    )
+
+    await user.click(screen.getByRole('button', { name: '指定输入媒体路径' }))
+    const editor = screen.getByLabelText('本地路径')
+    await user.clear(editor)
+    await user.type(editor, 'D:\\edited\\screen.png')
+    await user.click(screen.getByRole('button', { name: '应用路径' }))
+
+    expect(onChange).toHaveBeenCalledWith('D:\\edited\\screen.png')
+    expect(onCommit).toHaveBeenCalledOnce()
+    expect(onCommit).toHaveBeenCalledWith('D:\\edited\\screen.png')
+  })
+
+  it('does not commit when the path editor is cancelled', async () => {
+    const user = userEvent.setup()
+    const onChange = vi.fn()
+    const onCommit = vi.fn()
+    render(
+      <ControlledCommittedPathInput
+        initialValue="C:\\old\\screen.png"
+        onChange={onChange}
+        onCommit={onCommit}
+      />,
+    )
+
+    await user.click(screen.getByRole('button', { name: '指定输入媒体路径' }))
+    const editor = screen.getByLabelText('本地路径')
+    await user.clear(editor)
+    await user.type(editor, 'D:\\edited\\screen.png')
+    await user.click(screen.getByRole('button', { name: '取消' }))
+
+    expect(onChange).not.toHaveBeenCalled()
+    expect(onCommit).not.toHaveBeenCalled()
+  })
+
+  it('does not commit multiline manual changes on Enter or blur', async () => {
+    const user = userEvent.setup()
+    const onChange = vi.fn()
+    const onCommit = vi.fn()
+    render(
+      <ControlledCommittedPathInput multiline onChange={onChange} onCommit={onCommit} />,
+    )
+    const input = screen.getByLabelText('输入媒体路径')
+
+    await user.type(input, 'C:\\art\\one.png{Enter}D:\\art\\two.png')
+    fireEvent.blur(input)
+
+    expect(onChange).toHaveBeenLastCalledWith('C:\\art\\one.png\nD:\\art\\two.png')
+    expect(onCommit).not.toHaveBeenCalled()
+  })
+
   it('lets users specify a path through the folder icon editor', async () => {
     const user = userEvent.setup()
 
