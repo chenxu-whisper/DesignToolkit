@@ -848,10 +848,10 @@ describe('ChromaKeyerPage', () => {
     await sampleImage()
     await waitFor(() => expect(screen.getByRole('button', { name: '导出 PNG' })).toBeEnabled())
     await user.type(screen.getByLabelText('输出路径（可选）'), 'E:\\media\\screen_keyed.png')
-    await user.clear(screen.getByLabelText('Screen Gain'))
-    await user.type(screen.getByLabelText('Screen Gain'), '1.4')
-    await user.clear(screen.getByLabelText('Screen Balance'))
-    await user.type(screen.getByLabelText('Screen Balance'), '0.35')
+    await user.clear(screen.getByRole('spinbutton', { name: 'Screen Gain 数值' }))
+    await user.type(screen.getByRole('spinbutton', { name: 'Screen Gain 数值' }), '1.4')
+    await user.clear(screen.getByRole('spinbutton', { name: 'Screen Balance 数值' }))
+    await user.type(screen.getByRole('spinbutton', { name: 'Screen Balance 数值' }), '0.35')
     await user.click(screen.getByRole('button', { name: '导出 PNG' }))
 
     expect(pageMocks.createChromaKeyerTask).toHaveBeenCalledWith({
