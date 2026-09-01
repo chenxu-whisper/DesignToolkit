@@ -95,6 +95,9 @@ export function PathInput({
   }
 
   const applyDraftPath = () => {
+    if (disabled) {
+      return
+    }
     beginIntent()
     commitValue(draftPath)
     setIsEditorOpen(false)
@@ -312,7 +315,12 @@ export function PathInput({
             />
           )}
           <div className="path-editor-actions">
-            <button className="secondary-action-button" onClick={applyDraftPath} type="button">
+            <button
+              className="secondary-action-button"
+              disabled={disabled}
+              onClick={applyDraftPath}
+              type="button"
+            >
               应用路径
             </button>
             <button className="secondary-action-button" onClick={() => setIsEditorOpen(false)} type="button">

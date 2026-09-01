@@ -626,6 +626,47 @@ describe('PathInput', () => {
     expect(onCommit).not.toHaveBeenCalled()
   })
 
+  it('keeps a pending fallback editor disabled without committing after the prop changes', async () => {
+    const user = userEvent.setup()
+    const onChange = vi.fn()
+    const onCommit = vi.fn()
+    const pickPaths = vi.fn().mockRejectedValue(new Error('Native picker unavailable'))
+    const renderInput = (disabled: boolean) => (
+      <PathInput
+        disabled={disabled}
+        label="输入媒体路径"
+        onChange={onChange}
+        onCommit={onCommit}
+        pickPaths={pickPaths}
+        value="C:\\old\\screen.png"
+      />
+    )
+    const { rerender } = render(renderInput(false))
+
+    await user.click(screen.getByRole('button', { name: '指定输入媒体路径' }))
+    const editor = await screen.findByLabelText('本地路径')
+    await user.clear(editor)
+    await user.type(editor, 'D:\\edited\\screen.png')
+
+    rerender(renderInput(true))
+
+    const apply = screen.getByRole('button', { name: '应用路径' })
+    expect(screen.getByRole('dialog', { name: '指定输入媒体路径' })).toBeInTheDocument()
+    expect(editor).toBeDisabled()
+    expect(editor).toHaveValue('D:\\edited\\screen.png')
+    expect(apply).toBeDisabled()
+
+    fireEvent.change(editor, { target: { value: 'E:\\blocked\\screen.png' } })
+    fireEvent.click(apply)
+
+    expect(onChange).not.toHaveBeenCalled()
+    expect(onCommit).not.toHaveBeenCalled()
+    expect(screen.getByRole('dialog', { name: '指定输入媒体路径' })).toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: '取消' }))
+    expect(screen.queryByRole('dialog', { name: '指定输入媒体路径' })).not.toBeInTheDocument()
+  })
+
   it('does not commit multiline manual changes on Enter or blur', async () => {
     const user = userEvent.setup()
     const onChange = vi.fn()
