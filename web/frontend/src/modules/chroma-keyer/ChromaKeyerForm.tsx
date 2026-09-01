@@ -9,7 +9,7 @@ type ChromaKeyerFormProps = {
   disabled: boolean
   errors: ChromaKeyerErrors
   onChange: (values: ChromaKeyerValues) => void
-  onInspect: () => void
+  onInputPathCommit: (path: string) => void
   onSubmit: () => void
   values: ChromaKeyerValues
 }
@@ -24,7 +24,14 @@ const parameterFields = [
   { id: 'despillAmount', label: 'Despill Amount', max: 1, min: 0, step: 0.01 },
 ] as const
 
-export function ChromaKeyerForm({ disabled, errors, onChange, onInspect, onSubmit, values }: ChromaKeyerFormProps) {
+export function ChromaKeyerForm({
+  disabled,
+  errors,
+  onChange,
+  onInputPathCommit,
+  onSubmit,
+  values,
+}: ChromaKeyerFormProps) {
   const updateValue = <Key extends keyof ChromaKeyerValues>(key: Key, value: ChromaKeyerValues[Key]) => {
     onChange({ ...values, [key]: value })
   }
@@ -47,6 +54,7 @@ export function ChromaKeyerForm({ disabled, errors, onChange, onInspect, onSubmi
           id="chroma-keyer-input-path"
           label="输入图片路径"
           onChange={(value) => updateValue('inputPath', value)}
+          onCommit={onInputPathCommit}
           pickPaths={async () => {
             const response = await pickLocalFiles({
               fileKind: 'image',
@@ -63,14 +71,6 @@ export function ChromaKeyerForm({ disabled, errors, onChange, onInspect, onSubmi
           }}
           value={values.inputPath}
         />
-        <button
-          className="secondary-action-button"
-          disabled={disabled || !values.inputPath.trim()}
-          onClick={onInspect}
-          type="button"
-        >
-          加载图片
-        </button>
       </div>
 
       <div className="chroma-form-section">

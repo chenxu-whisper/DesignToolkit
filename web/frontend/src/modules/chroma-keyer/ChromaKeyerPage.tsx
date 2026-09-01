@@ -69,6 +69,7 @@ export function ChromaKeyerPage() {
   const [exportError, setExportError] = useState<string | null>(null)
   const [isRequestPending, setIsRequestPending] = useState(false)
   const mountedRef = useRef(true)
+  const inspectingPathRef = useRef<string | null>(null)
   const requestSequenceRef = useRef(0)
   const lastViewModeRef = useRef(values.viewMode)
   const disabledByTask = status === 'queued' || status === 'running' || isCreating
@@ -161,14 +162,18 @@ export function ChromaKeyerPage() {
     values.viewMode,
   ])
 
-  const handleInspect = async () => {
-    const inputPath = values.inputPath.trim()
-    if (!inputPath || disabled) {
+  const handleInspect = async (committedPath: string) => {
+    const inputPath = committedPath.trim()
+    if (!inputPath) {
       setErrors((current) => ({ ...current, inputPath: '请输入图片路径' }))
+      return
+    }
+    if (image?.inputPath === inputPath || inspectingPathRef.current === inputPath) {
       return
     }
 
     const requestSequence = ++requestSequenceRef.current
+    inspectingPathRef.current = inputPath
     setIsRequestPending(true)
     setErrors({})
     try {
@@ -192,6 +197,9 @@ export function ChromaKeyerPage() {
         }))
       }
     } finally {
+      if (inspectingPathRef.current === inputPath) {
+        inspectingPathRef.current = null
+      }
       if (mountedRef.current && requestSequence === requestSequenceRef.current) {
         setIsRequestPending(false)
       }
@@ -370,7 +378,7 @@ export function ChromaKeyerPage() {
           disabled={disabled}
           errors={errors}
           onChange={updateValues}
-          onInspect={() => void handleInspect()}
+          onInputPathCommit={(path) => void handleInspect(path)}
           onSubmit={() => void handleSubmit()}
           values={values}
         />

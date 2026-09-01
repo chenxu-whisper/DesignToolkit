@@ -36,7 +36,7 @@ const inspectResponse = {
 async function inspectImage() {
   const user = userEvent.setup()
   await user.type(screen.getByLabelText('输入图片路径'), 'E:\\media\\screen.png')
-  await user.click(screen.getByRole('button', { name: '加载图片' }))
+  await user.keyboard('{Enter}')
   return user
 }
 
@@ -65,6 +65,7 @@ beforeEach(() => {
   pageMocks.pickLocalFiles.mockReset()
   pageMocks.resolveDroppedFilePaths.mockReset()
   pageMocks.sampleChromaImage.mockReset()
+  pageMocks.pickLocalFiles.mockResolvedValue({ cancelled: false, paths: ['E:\\media\\screen.png'] })
   pageMocks.inspectChromaImage.mockResolvedValue(inspectResponse)
   pageMocks.sampleChromaImage.mockResolvedValue({
     hex: '#2AB448',
@@ -79,6 +80,64 @@ beforeEach(() => {
 })
 
 describe('ChromaKeyerPage', () => {
+  it('automatically inspects the exact path selected by the native picker', async () => {
+    const user = renderWithUser()
+
+    expect(screen.queryByRole('button', { name: '加载图片' })).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: '指定输入图片路径' }))
+
+    await waitFor(() =>
+      expect(pageMocks.inspectChromaImage).toHaveBeenCalledWith({
+        inputPath: 'E:\\media\\screen.png',
+      }),
+    )
+    expect(pageMocks.inspectChromaImage).toHaveBeenCalledOnce()
+    expect(screen.getByLabelText('输入图片路径')).toHaveValue('E:\\media\\screen.png')
+    expect(await screen.findByRole('button', { name: '抠像预览' })).toBeInTheDocument()
+  })
+
+  it('does not inspect while typing and commits once on Enter followed by blur', async () => {
+    const user = renderWithUser()
+    const input = screen.getByLabelText('输入图片路径')
+    const inspectRequest = createDeferred<typeof inspectResponse>()
+    pageMocks.inspectChromaImage.mockReturnValueOnce(inspectRequest.promise)
+
+    await user.type(input, 'E:\\media\\screen.png')
+
+    expect(pageMocks.inspectChromaImage).not.toHaveBeenCalled()
+
+    await user.keyboard('{Enter}')
+    fireEvent.blur(input)
+    fireEvent.blur(input)
+
+    await waitFor(() => expect(pageMocks.inspectChromaImage).toHaveBeenCalledOnce())
+    expect(pageMocks.inspectChromaImage).toHaveBeenCalledWith({ inputPath: 'E:\\media\\screen.png' })
+    await act(async () => {
+      inspectRequest.resolve(inspectResponse)
+    })
+  })
+
+  it('commits a manually typed path on blur', async () => {
+    const user = renderWithUser()
+    const input = screen.getByLabelText('输入图片路径')
+
+    await user.type(input, 'E:\\media\\screen.png')
+
+    expect(pageMocks.inspectChromaImage).not.toHaveBeenCalled()
+    fireEvent.blur(input)
+
+    await waitFor(() => expect(pageMocks.inspectChromaImage).toHaveBeenCalledOnce())
+  })
+
+  it('shows an input error for a blank committed path', () => {
+    render(<ChromaKeyerPage />)
+
+    fireEvent.keyDown(screen.getByLabelText('输入图片路径'), { key: 'Enter' })
+
+    expect(screen.getByRole('alert')).toHaveTextContent('请输入图片路径')
+    expect(pageMocks.inspectChromaImage).not.toHaveBeenCalled()
+  })
+
   it('inspects an explicit local image then stores returned Screen Color metadata', async () => {
     render(<ChromaKeyerPage />)
 
@@ -181,6 +240,80 @@ describe('ChromaKeyerPage', () => {
 
     expect(screen.queryByRole('img', { name: '抠像预览' })).not.toBeInTheDocument()
     expect(screen.queryByText('#2AB448')).not.toBeInTheDocument()
+  })
+
+  it('keeps the loaded image and Screen Color when the same path is committed again', async () => {
+    const user = renderWithUser()
+
+    await inspectImage()
+    await sampleImage()
+    await waitFor(() => expect(screen.getByText('#2AB448')).toBeInTheDocument())
+    const input = screen.getByLabelText('输入图片路径')
+
+    await user.click(input)
+    await user.keyboard('{Enter}')
+    fireEvent.blur(input)
+
+    expect(pageMocks.inspectChromaImage).toHaveBeenCalledOnce()
+    expect(screen.getByText('#2AB448')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '抠像预览' })).toBeInTheDocument()
+  })
+
+  it('keeps the new path empty and reports an inspection failure', async () => {
+    const user = renderWithUser()
+    pageMocks.inspectChromaImage.mockRejectedValueOnce(new Error('图片无法读取'))
+
+    await user.type(screen.getByLabelText('输入图片路径'), 'E:\\media\\broken.png')
+    await user.keyboard('{Enter}')
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('图片无法读取')
+    expect(screen.getByLabelText('输入图片路径')).toHaveValue('E:\\media\\broken.png')
+    expect(screen.queryByRole('button', { name: '抠像预览' })).not.toBeInTheDocument()
+    expect(screen.getByText('加载一张本地图片后，可在画面中吸取背景颜色。')).toBeInTheDocument()
+  })
+
+  it('does not let a slower older inspection overwrite a newer committed path', async () => {
+    const oldRequest = createDeferred<typeof inspectResponse>()
+    const newRequest = createDeferred<typeof inspectResponse>()
+    pageMocks.inspectChromaImage
+      .mockReturnValueOnce(oldRequest.promise)
+      .mockReturnValueOnce(newRequest.promise)
+    render(<ChromaKeyerPage />)
+    const input = screen.getByLabelText('输入图片路径')
+
+    fireEvent.change(input, { target: { value: 'E:\\media\\old.png' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    fireEvent.change(input, { target: { value: 'E:\\media\\new.png' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+
+    expect(pageMocks.inspectChromaImage).toHaveBeenNthCalledWith(1, { inputPath: 'E:\\media\\old.png' })
+    expect(pageMocks.inspectChromaImage).toHaveBeenNthCalledWith(2, { inputPath: 'E:\\media\\new.png' })
+
+    await act(async () => {
+      newRequest.resolve({
+        ...inspectResponse,
+        input_path: 'E:\\media\\new.png',
+        preview_url: '/api/previews/new.png',
+      })
+    })
+    expect(await screen.findByRole('button', { name: '抠像预览' })).toHaveAttribute(
+      'src',
+      '/api/previews/new.png',
+    )
+
+    await act(async () => {
+      oldRequest.resolve({
+        ...inspectResponse,
+        input_path: 'E:\\media\\old.png',
+        preview_url: '/api/previews/old.png',
+      })
+    })
+
+    expect(screen.getByLabelText('输入图片路径')).toHaveValue('E:\\media\\new.png')
+    expect(screen.getByRole('button', { name: '抠像预览' })).toHaveAttribute(
+      'src',
+      '/api/previews/new.png',
+    )
   })
 
   it('requests Final and immediately re-requests Alpha previews with complete samples', async () => {
@@ -289,7 +422,8 @@ describe('ChromaKeyerPage', () => {
       useTaskStore.getState().startTask({ kind: 'video_frames', taskId: 'running-task' })
     })
 
-    expect(screen.getByRole('button', { name: '加载图片' })).toBeDisabled()
+    expect(screen.getByLabelText('输入图片路径')).toBeDisabled()
+    expect(screen.getByRole('button', { name: '指定输入图片路径' })).toBeDisabled()
     expect(screen.getByRole('button', { name: '导出 PNG' })).toBeDisabled()
   })
 
@@ -301,9 +435,10 @@ describe('ChromaKeyerPage', () => {
     render(<ChromaKeyerPage />)
 
     await user.type(screen.getByLabelText('输入图片路径'), 'E:\\media\\screen.png')
-    await user.click(screen.getByRole('button', { name: '加载图片' }))
+    await user.keyboard('{Enter}')
 
-    expect(screen.getByRole('button', { name: '加载图片' })).toBeDisabled()
+    expect(screen.getByLabelText('输入图片路径')).toBeDisabled()
+    expect(screen.getByRole('button', { name: '指定输入图片路径' })).toBeDisabled()
     expect(screen.getByRole('button', { name: '导出 PNG' })).toBeDisabled()
   })
 
@@ -321,7 +456,7 @@ describe('ChromaKeyerPage', () => {
     )
 
     await user.type(screen.getByLabelText('输入图片路径'), 'E:\\media\\screen.png')
-    await user.click(screen.getByRole('button', { name: '加载图片' }))
+    await user.keyboard('{Enter}')
     await act(async () => {
       inspectRequest.resolve(inspectResponse)
     })

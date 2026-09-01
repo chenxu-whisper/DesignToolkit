@@ -26,6 +26,7 @@ describe('ChromaKeyerForm', () => {
   it('uses the native picker for one local image path', async () => {
     const user = userEvent.setup()
     const onChange = vi.fn()
+    const onInputPathCommit = vi.fn()
     apiMocks.pickLocalFiles.mockResolvedValue({ cancelled: false, paths: ['E:\\media\\screen.png'] })
 
     render(
@@ -33,15 +34,18 @@ describe('ChromaKeyerForm', () => {
         disabled={false}
         errors={{}}
         onChange={onChange}
-        onInspect={vi.fn()}
+        onInputPathCommit={onInputPathCommit}
         onSubmit={vi.fn()}
         values={createChromaKeyerDefaultValues()}
       />,
     )
 
+    expect(screen.queryByRole('button', { name: '加载图片' })).not.toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: '指定输入图片路径' }))
 
     await waitFor(() => expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ inputPath: 'E:\\media\\screen.png' })))
+    expect(onInputPathCommit).toHaveBeenCalledOnce()
+    expect(onInputPathCommit).toHaveBeenCalledWith('E:\\media\\screen.png')
     expect(apiMocks.pickLocalFiles).toHaveBeenCalledWith({
       fileKind: 'image',
       multiple: false,
@@ -59,7 +63,7 @@ describe('ChromaKeyerForm', () => {
         disabled={false}
         errors={{}}
         onChange={onChange}
-        onInspect={vi.fn()}
+        onInputPathCommit={vi.fn()}
         onSubmit={vi.fn()}
         values={createChromaKeyerDefaultValues()}
       />,
@@ -80,7 +84,7 @@ describe('ChromaKeyerForm', () => {
         disabled={false}
         errors={{}}
         onChange={vi.fn()}
-        onInspect={vi.fn()}
+        onInputPathCommit={vi.fn()}
         onSubmit={vi.fn()}
         values={createChromaKeyerDefaultValues()}
       />,
@@ -112,7 +116,7 @@ describe('ChromaKeyerForm', () => {
         disabled={false}
         errors={{}}
         onChange={onChange}
-        onInspect={vi.fn()}
+        onInputPathCommit={vi.fn()}
         onSubmit={vi.fn()}
         values={createChromaKeyerDefaultValues()}
       />,
