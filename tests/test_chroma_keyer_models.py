@@ -30,8 +30,8 @@ def test_params_reject_clip_black_not_less_than_clip_white(
 
 def test_params_accept_default_mvp_values() -> None:
     assert KeyerParams() == KeyerParams(
-        tolerance=0.0,
-        softness=1.0,
+        screen_gain=1.0,
+        screen_balance=0.5,
         clip_black=0.0,
         clip_white=1.0,
         shrink_grow=0,
@@ -49,10 +49,10 @@ def test_params_reject_fractional_integer_fields(field: str, value: float) -> No
 @mark.parametrize(
     ("field", "value"),
     [
-        ("tolerance", -0.01),
-        ("tolerance", 1.01),
-        ("softness", -0.01),
-        ("softness", 1.01),
+        ("screen_gain", -0.01),
+        ("screen_gain", 2.01),
+        ("screen_balance", -0.01),
+        ("screen_balance", 1.01),
         ("clip_black", -0.01),
         ("clip_black", 1.01),
         ("clip_white", -0.01),
@@ -74,7 +74,13 @@ def test_params_reject_values_outside_mandated_ranges(
 
 @mark.parametrize(
     "field",
-    ["tolerance", "softness", "clip_black", "clip_white", "despill_amount"],
+    [
+        "screen_gain",
+        "screen_balance",
+        "clip_black",
+        "clip_white",
+        "despill_amount",
+    ],
 )
 @mark.parametrize("value", [nan, inf, -inf])
 def test_params_reject_non_finite_values(field: str, value: float) -> None:
@@ -84,8 +90,8 @@ def test_params_reject_non_finite_values(field: str, value: float) -> None:
 
 def test_params_accept_mandated_range_boundaries() -> None:
     assert KeyerParams(
-        tolerance=0.0,
-        softness=1.0,
+        screen_gain=2.0,
+        screen_balance=1.0,
         clip_black=0.0,
         clip_white=1.0,
         shrink_grow=-10,
@@ -97,10 +103,10 @@ def test_params_accept_mandated_range_boundaries() -> None:
 @mark.parametrize(
     ("field", "value", "other_values"),
     [
-        ("tolerance", 0.0, {}),
-        ("tolerance", 1.0, {}),
-        ("softness", 0.0, {}),
-        ("softness", 1.0, {}),
+        ("screen_gain", 0.0, {}),
+        ("screen_gain", 2.0, {}),
+        ("screen_balance", 0.0, {}),
+        ("screen_balance", 1.0, {}),
         ("clip_black", 0.0, {"clip_white": 1.0}),
         ("clip_white", 1.0, {"clip_black": 0.0}),
         ("despill_amount", 0.0, {}),

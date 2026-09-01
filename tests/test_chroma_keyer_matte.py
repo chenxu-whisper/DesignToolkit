@@ -14,21 +14,7 @@ def _green_screen_model() -> ScreenColorModel:
     )
 
 
-def test_generate_alpha_projects_sampled_green_chroma() -> None:
-    rgb = np.array([[[0, 255, 0], [128, 255, 128], [255, 0, 0]]], dtype=np.uint8)
-
-    alpha = generate_alpha(
-        rgb, _green_screen_model(), KeyerParams(tolerance=0.0, softness=1.0)
-    )
-
-    assert alpha.dtype == np.uint8
-    assert alpha.shape == (1, 3)
-    assert alpha[0, 0] == 0
-    assert 0 < alpha[0, 1] < 255
-    assert alpha[0, 2] == 255
-
-
-def test_generate_alpha_smoothly_remaps_default_green_projection() -> None:
+def test_generate_alpha_maps_default_green_saturation_ramp() -> None:
     rgb = np.array(
         [
             [
@@ -44,132 +30,79 @@ def test_generate_alpha_smoothly_remaps_default_green_projection() -> None:
 
     alpha = generate_alpha(rgb, _green_screen_model(), KeyerParams())
 
-    np.testing.assert_array_equal(alpha[0], [0, 40, 128, 215, 255])
-    assert np.all(np.diff(alpha[0].astype(np.int16)) > 0)
+    assert alpha.dtype == np.uint8
+    assert alpha.shape == (1, 5)
+    np.testing.assert_array_equal(alpha[0], [0, 64, 128, 191, 255])
 
 
-def test_generate_alpha_applies_tolerance_and_softness_to_green_projection() -> None:
+@mark.parametrize(
+    ("screen_rgb", "ramp"),
+    [
+        ((0, 255, 0), [[0, 255, 0], [128, 255, 128], [255, 255, 255]]),
+        ((0, 0, 255), [[0, 0, 255], [128, 128, 255], [255, 255, 255]]),
+        ((255, 0, 0), [[255, 0, 0], [255, 128, 128], [255, 255, 255]]),
+    ],
+)
+def test_generate_alpha_supports_each_primary_screen(
+    screen_rgb: tuple[int, int, int], ramp: list[list[int]]
+) -> None:
+    model = ScreenColorModel(
+        mean_rgb=screen_rgb,
+        stddev_rgb=(0.0, 0.0, 0.0),
+        samples=(screen_rgb,),
+    )
+
+    alpha = generate_alpha(
+        np.array([ramp], dtype=np.uint8),
+        model,
+        KeyerParams(),
+    )
+
+    np.testing.assert_array_equal(alpha[0], [0, 128, 255])
+
+
+def test_generate_alpha_screen_gain_two_keys_more() -> None:
     rgb = np.array([[[128, 255, 128]]], dtype=np.uint8)
 
-    default_alpha = int(generate_alpha(rgb, _green_screen_model(), KeyerParams())[0, 0])
-    tolerant_alpha = int(
+    default_alpha = generate_alpha(rgb, _green_screen_model(), KeyerParams())
+    gain_two_alpha = generate_alpha(
+        rgb,
+        _green_screen_model(),
+        KeyerParams(screen_gain=2.0),
+    )
+
+    assert gain_two_alpha[0, 0] < default_alpha[0, 0]
+
+
+def test_generate_alpha_balance_uses_stronger_and_weaker_other_channels() -> None:
+    rgb = np.array([[[128, 255, 64]]], dtype=np.uint8)
+
+    stronger_other_alpha = generate_alpha(
+        rgb,
+        _green_screen_model(),
+        KeyerParams(screen_balance=0.0),
+    )
+    weaker_other_alpha = generate_alpha(
+        rgb,
+        _green_screen_model(),
+        KeyerParams(screen_balance=1.0),
+    )
+
+    assert stronger_other_alpha[0, 0] == 128
+    assert weaker_other_alpha[0, 0] == 64
+
+
+def test_generate_alpha_rejects_low_saturation_screen_model() -> None:
+    model = screen_model_from_samples(((128, 128, 128),))
+
+    with raises(KeyerError) as error:
         generate_alpha(
-            rgb,
-            _green_screen_model(),
-            KeyerParams(tolerance=0.25, softness=1.0),
-        )[0, 0]
-    )
-    firm_alpha = int(
-        generate_alpha(
-            rgb,
-            _green_screen_model(),
-            KeyerParams(tolerance=0.0, softness=0.25),
-        )[0, 0]
-    )
-
-    assert tolerant_alpha < default_alpha < firm_alpha
-
-
-def test_generate_alpha_keeps_perpendicular_chroma_as_foreground() -> None:
-    rgb = np.array([[[0, 220, 255]]], dtype=np.uint8)
-
-    alpha = generate_alpha(
-        rgb, _green_screen_model(), KeyerParams(tolerance=0.0, softness=1.0)
-    )
-
-    assert alpha[0, 0] > 200
-
-
-def test_generate_alpha_falls_back_to_normalized_rgb_distance_for_gray_screen() -> None:
-    rgb = np.array([[[133, 0, 0]]], dtype=np.uint8)
-    model = ScreenColorModel(
-        mean_rgb=(0.0, 0.0, 0.0),
-        stddev_rgb=(0.0, 0.0, 0.0),
-        samples=((0, 0, 0),),
-    )
-
-    alpha = generate_alpha(rgb, model, KeyerParams(tolerance=0.25, softness=0.15))
-
-    assert alpha[0, 0] == 69
-
-
-def test_generate_alpha_falls_back_for_near_neutral_screen_chroma() -> None:
-    rgb = np.array([[[128, 128, 128]]], dtype=np.uint8)
-    model = ScreenColorModel(
-        mean_rgb=(128.0, 128.0 + 1e-5, 128.0 - 1e-5),
-        stddev_rgb=(0.0, 0.0, 0.0),
-        samples=((128, 128, 128),),
-    )
-
-    alpha = generate_alpha(rgb, model, KeyerParams(tolerance=0.0, softness=0.15))
-
-    assert alpha[0, 0] == 0
-
-
-def test_generate_alpha_falls_back_for_low_chroma_sample_model() -> None:
-    model = screen_model_from_samples(((128, 128, 128),) * 9_999 + ((128, 129, 127),))
-
-    alpha = generate_alpha(
-        np.array([[[128, 128, 128]]], dtype=np.uint8),
-        model,
-        KeyerParams(tolerance=0.0, softness=1.0),
-    )
-
-    assert alpha[0, 0] == 0
-
-
-def test_generate_alpha_blends_neutral_chroma_projection_confidence() -> None:
-    gray_rgb = np.array([[[128, 128, 128]]], dtype=np.uint8)
-    models = [
-        ScreenColorModel(
-            mean_rgb=mean_rgb,
-            stddev_rgb=(0.0, 0.0, 0.0),
-            samples=((128, 128, 128),),
+            np.array([[[128, 128, 128]]], dtype=np.uint8),
+            model,
+            KeyerParams(),
         )
-        for mean_rgb in ((122.0, 128.0, 134.0), (121.0, 128.0, 135.0))
-    ]
 
-    alpha_values = [
-        int(generate_alpha(gray_rgb, model, KeyerParams())[0, 0])
-        for model in models
-    ]
-
-    assert all(0 < alpha < 128 for alpha in alpha_values)
-    assert abs(alpha_values[1] - alpha_values[0]) < 32
-
-
-def test_generate_alpha_avoids_adjacent_low_chroma_default_cliff() -> None:
-    rgb = np.array([[[16, 0, 224]]], dtype=np.uint8)
-    models = [
-        ScreenColorModel(
-            mean_rgb=mean_rgb,
-            stddev_rgb=(0.0, 0.0, 0.0),
-            samples=(tuple(int(channel) for channel in mean_rgb),),
-        )
-        for mean_rgb in ((112.0, 112.0, 144.0), (113.0, 112.0, 144.0))
-    ]
-
-    alpha_values = [
-        int(generate_alpha(rgb, model, KeyerParams())[0, 0]) for model in models
-    ]
-
-    assert all(0 < alpha < 255 for alpha in alpha_values)
-    assert abs(alpha_values[1] - alpha_values[0]) < 32
-
-
-def test_generate_alpha_stabilizes_low_chroma_perpendicular_residual() -> None:
-    model = ScreenColorModel(
-        mean_rgb=(116.0, 128.0, 140.0),
-        stddev_rgb=(0.0, 0.0, 0.0),
-        samples=((116, 128, 140),),
-    )
-    rgb = np.array([[[128, 156, 152]]], dtype=np.uint8)
-
-    alpha = generate_alpha(
-        rgb, model, KeyerParams(tolerance=0.0, softness=1.0)
-    )
-
-    assert alpha[0, 0] == 72
+    assert str(error.value) == "请选择具有明显主色的纯色幕背景"
 
 
 @mark.parametrize(

@@ -3,9 +3,6 @@ import numpy as np
 
 from .models import KeyerError, KeyerParams, ScreenColorModel
 
-SCREEN_CHROMA_BLEND_START = np.float32(0.03)
-SCREEN_CHROMA_BLEND_END = np.float32(0.10)
-
 
 def _validate_rgb(rgb: object) -> np.ndarray:
     if not isinstance(rgb, np.ndarray) or rgb.dtype != np.uint8 or rgb.ndim != 3:
@@ -23,97 +20,38 @@ def _validate_alpha(alpha: object) -> np.ndarray:
     return alpha
 
 
-def _rgb_distance_confidence(rgb_float: np.ndarray, mean_rgb: np.ndarray) -> np.ndarray:
-    return np.linalg.norm(rgb_float - mean_rgb, axis=2) / np.sqrt(np.float32(3.0))
-
-
-def _remap_confidence(
-    confidence: np.ndarray, lower: np.float32, upper: np.float32
-) -> np.ndarray:
-    position = np.clip(
-        (confidence - lower) / (upper - lower), np.float32(0.0), np.float32(1.0)
-    )
-    return position * position * (
-        np.float32(3.0) - np.float32(2.0) * position
-    )
-
-
 def generate_alpha(
     rgb: np.ndarray, model: ScreenColorModel, params: KeyerParams
 ) -> np.ndarray:
     """Generate an opaque-foreground alpha matte from sampled screen chroma."""
     rgb = _validate_rgb(rgb)
     rgb_float = rgb.astype(np.float32) / np.float32(255.0)
-    mean_rgb = np.asarray(model.mean_rgb, dtype=np.float32)
-    normalized_mean_rgb = mean_rgb / np.float32(255.0)
-    centered_screen = normalized_mean_rgb - np.mean(
-        normalized_mean_rgb, dtype=np.float32
-    )
-    screen_chroma = np.linalg.norm(centered_screen)
-    rgb_distance_confidence = _rgb_distance_confidence(rgb_float, normalized_mean_rgb)
-    variance = np.mean(np.asarray(model.stddev_rgb, dtype=np.float32)) / np.float32(
-        255.0
-    )
-    lower = np.float32(
-        np.clip(
-            np.float32(params.tolerance) + variance,
-            np.float32(0.0),
-            np.float32(1.0),
-        )
-    )
-    upper = np.float32(
-        max(
-            lower + np.float32(0.01),
-            min(np.float32(1.0), lower + np.float32(params.softness)),
-        )
-    )
-    distance_alpha = _remap_confidence(rgb_distance_confidence, lower, upper)
+    screen = np.asarray(model.mean_rgb, dtype=np.float32) / np.float32(255.0)
+    dominant = int(np.argmax(screen))
+    other_channels = [channel for channel in range(3) if channel != dominant]
+    balance = np.float32(params.screen_balance)
 
-    if screen_chroma > SCREEN_CHROMA_BLEND_START:
-        screen_direction = centered_screen / screen_chroma
-        centered_pixels = rgb_float - np.mean(
-            rgb_float, axis=2, keepdims=True, dtype=np.float32
-        )
-        projection = np.sum(
-            centered_pixels * screen_direction, axis=2, dtype=np.float32
-        )
-        axis_confidence = np.clip(
-            np.float32(1.0) - projection / screen_chroma,
-            np.float32(0.0),
-            np.float32(1.0),
-        )
-        axis_alpha = _remap_confidence(axis_confidence, lower, upper)
-        residual = centered_pixels - projection[..., np.newaxis] * screen_direction
-        pixel_chroma = np.linalg.norm(centered_pixels, axis=2)
-        residual_confidence = np.clip(
-            np.linalg.norm(residual, axis=2)
-            / np.maximum(
-                pixel_chroma,
-                max(screen_chroma, np.float32(0.10)),
-            ),
-            np.float32(0.0),
-            np.float32(1.0),
-        )
-        residual_alpha = _remap_confidence(residual_confidence, lower, upper)
-        colored_alpha = np.maximum(axis_alpha, residual_alpha)
-        blend_position = np.clip(
-            (screen_chroma - SCREEN_CHROMA_BLEND_START)
-            / (SCREEN_CHROMA_BLEND_END - SCREEN_CHROMA_BLEND_START),
-            np.float32(0.0),
-            np.float32(1.0),
-        )
-        projection_weight = (
-            blend_position
-            * blend_position
-            * (np.float32(3.0) - np.float32(2.0) * blend_position)
-        )
-        alpha = (
-            distance_alpha * (np.float32(1.0) - projection_weight)
-            + colored_alpha * projection_weight
-        )
-    else:
-        alpha = distance_alpha
+    screen_others = screen[other_channels]
+    balanced_screen_other = (
+        (np.float32(1.0) - balance) * np.max(screen_others)
+        + balance * np.min(screen_others)
+    )
+    screen_saturation = screen[dominant] - balanced_screen_other
+    if screen_saturation < np.float32(0.05):
+        raise KeyerError("请选择具有明显主色的纯色幕背景")
 
+    pixel_others = rgb_float[..., other_channels]
+    balanced_pixel_other = (
+        (np.float32(1.0) - balance) * np.max(pixel_others, axis=2)
+        + balance * np.min(pixel_others, axis=2)
+    )
+    pixel_saturation = rgb_float[..., dominant] - balanced_pixel_other
+    coverage = np.clip(
+        np.float32(params.screen_gain) * pixel_saturation / screen_saturation,
+        np.float32(0.0),
+        np.float32(1.0),
+    )
+    alpha = np.float32(1.0) - coverage
     return np.rint(alpha * np.float32(255.0)).astype(np.uint8)
 
 

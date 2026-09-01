@@ -16,6 +16,13 @@ def _validate_unit_interval(name: str, value: float) -> None:
         raise KeyerError(f"{name} must be between 0 and 1")
 
 
+def _validate_screen_gain(value: float) -> None:
+    if not isinstance(value, Real) or isinstance(value, bool) or not isfinite(value):
+        raise KeyerError("screen_gain must be a finite number")
+    if not 0 <= value <= 2:
+        raise KeyerError("screen_gain must be between 0 and 2")
+
+
 def _validate_range(name: str, value: int, minimum: int, maximum: int) -> None:
     if not isinstance(value, int) or isinstance(value, bool):
         raise KeyerError(f"{name} must be an integer")
@@ -67,8 +74,8 @@ def _normalize_samples(values: object) -> tuple[tuple[int, int, int], ...]:
 
 @dataclass(frozen=True)
 class KeyerParams:
-    tolerance: float = 0.0
-    softness: float = 1.0
+    screen_gain: float = 1.0
+    screen_balance: float = 0.5
     clip_black: float = 0.0
     clip_white: float = 1.0
     shrink_grow: int = 0
@@ -76,8 +83,8 @@ class KeyerParams:
     despill_amount: float = 1.0
 
     def __post_init__(self) -> None:
-        _validate_unit_interval("tolerance", self.tolerance)
-        _validate_unit_interval("softness", self.softness)
+        _validate_screen_gain(self.screen_gain)
+        _validate_unit_interval("screen_balance", self.screen_balance)
         _validate_unit_interval("clip_black", self.clip_black)
         _validate_unit_interval("clip_white", self.clip_white)
         _validate_range("shrink_grow", self.shrink_grow, -10, 10)
