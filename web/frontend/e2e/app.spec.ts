@@ -27,7 +27,16 @@ test('opens Studio Chroma Keyer with disabled initial sampling and export contro
 
 test('stacks the Chroma editor in the constrained desktop workspace without clipping sample coordinates', async ({ page }) => {
   await page.setViewportSize({ width: 787, height: 900 })
+  let inspectRequestCount = 0
+  let pickerRequestCount = 0
+  let releaseInspectResponse!: () => void
+  const inspectResponsePending = new Promise<void>((resolve) => {
+    releaseInspectResponse = resolve
+  })
+
   await page.route('**/api/chroma-keyer/images/inspect', async (route) => {
+    inspectRequestCount += 1
+    await inspectResponsePending
     await route.fulfill({
       contentType: 'application/json',
       body: JSON.stringify({
@@ -38,6 +47,13 @@ test('stacks the Chroma editor in the constrained desktop workspace without clip
         preview_height: 200,
         preview_url: '/api/chroma-keyer/previews/inspect.svg',
       }),
+    })
+  })
+  await page.route('**/api/local-paths/pick-files', async (route) => {
+    pickerRequestCount += 1
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({ cancelled: true, paths: [] }),
     })
   })
   await page.route('**/api/chroma-keyer/images/sample', async (route) => {
@@ -60,8 +76,20 @@ test('stacks the Chroma editor in the constrained desktop workspace without clip
 
   await page.goto('/')
   await page.getByRole('button', { exact: true, name: 'Studio Chroma Keyer' }).click()
-  await page.getByRole('textbox', { name: '输入图片路径' }).fill('E:\\media\\screen.png')
-  await page.getByRole('button', { name: '加载图片' }).click()
+  const inputPath = page.getByRole('textbox', { name: '输入图片路径' })
+  const picker = page.getByRole('button', { name: '指定输入图片路径' })
+  await inputPath.fill('E:\\media\\screen.png')
+  await inputPath.press('Tab')
+
+  await expect.poll(() => inspectRequestCount).toBe(1)
+  await expect(picker).toBeFocused()
+  await expect(picker).toHaveAttribute('aria-disabled', 'true')
+  await picker.press('Enter')
+  expect(inspectRequestCount).toBe(1)
+  expect(pickerRequestCount).toBe(0)
+
+  releaseInspectResponse()
+  await expect(page.getByRole('button', { name: '抠像预览' })).toBeVisible()
   await page.getByRole('button', { name: '抠像预览' }).click({ position: { x: 27, y: 27 } })
   await expect(page.locator('.chroma-sample-item span', { hasText: /^27, 27$/ })).toBeVisible()
 
