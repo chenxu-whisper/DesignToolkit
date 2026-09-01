@@ -169,6 +169,22 @@ describe('PathInput', () => {
     expect(onCommit).toHaveBeenLastCalledWith('D:\\art\\screen.png')
   })
 
+  it('commits once when keyboard focus tabs to the adjacent picker', async () => {
+    const user = userEvent.setup()
+    const onChange = vi.fn()
+    const onCommit = vi.fn()
+    render(<ControlledCommittedPathInput onChange={onChange} onCommit={onCommit} />)
+    const input = screen.getByLabelText('输入媒体路径')
+    const picker = screen.getByRole('button', { name: '指定输入媒体路径' })
+
+    await user.type(input, 'D:\\art\\screen.png')
+    await user.tab()
+
+    expect(picker).toHaveFocus()
+    expect(onCommit).toHaveBeenCalledOnce()
+    expect(onCommit).toHaveBeenCalledWith('D:\\art\\screen.png')
+  })
+
   it('ignores Enter while an IME composition is active', () => {
     const onChange = vi.fn()
     const onCommit = vi.fn()
@@ -195,13 +211,14 @@ describe('PathInput', () => {
     const pickPaths = vi.fn().mockResolvedValue(['E:\\media\\screen.png'])
     render(
       <ControlledCommittedPathInput
-        multiline
         onChange={onChange}
         onCommit={onCommit}
         pickPaths={pickPaths}
       />,
     )
+    const input = screen.getByLabelText('输入媒体路径')
 
+    await user.type(input, 'D:\\typed\\screen.png')
     await user.click(screen.getByRole('button', { name: '指定输入媒体路径' }))
 
     await waitFor(() => expect(onCommit).toHaveBeenCalledWith('E:\\media\\screen.png'))
@@ -262,11 +279,13 @@ describe('PathInput', () => {
         pickPaths={pickPaths}
       />,
     )
+    const input = screen.getByLabelText('输入媒体路径')
 
+    await user.type(input, 'D:\\typed\\screen.png')
     await user.click(screen.getByRole('button', { name: '指定输入媒体路径' }))
 
     await waitFor(() => expect(screen.getByLabelText('本地路径')).toHaveFocus())
-    expect(onChange).not.toHaveBeenCalled()
+    expect(onChange).toHaveBeenLastCalledWith('D:\\typed\\screen.png')
     expect(onCommit).not.toHaveBeenCalled()
   })
 

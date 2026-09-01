@@ -129,6 +129,21 @@ describe('ChromaKeyerPage', () => {
     await waitFor(() => expect(pageMocks.inspectChromaImage).toHaveBeenCalledOnce())
   })
 
+  it('inspects once when keyboard focus tabs from the path to its picker', async () => {
+    const user = renderWithUser()
+    const input = screen.getByLabelText('输入图片路径')
+    const picker = screen.getByRole('button', { name: '指定输入图片路径' })
+
+    await user.type(input, 'E:\\media\\screen.png')
+    await user.tab()
+
+    expect(picker).toHaveFocus()
+    await waitFor(() => expect(pageMocks.inspectChromaImage).toHaveBeenCalledOnce())
+    expect(pageMocks.inspectChromaImage).toHaveBeenCalledWith({
+      inputPath: 'E:\\media\\screen.png',
+    })
+  })
+
   it('shows an input error for a blank committed path', () => {
     render(<ChromaKeyerPage />)
 

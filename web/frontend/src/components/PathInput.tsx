@@ -49,7 +49,8 @@ export function PathInput({
   const [dropError, setDropError] = useState<string | null>(null)
   const [pickerError, setPickerError] = useState<string | null>(null)
   const currentValueRef = useRef(value)
-  const pickerButtonRef = useRef<HTMLButtonElement>(null)
+  const pickerPointerSequenceRef = useRef(0)
+  const suppressPickerBlurRef = useRef(false)
   const skipNextBlurRef = useRef(false)
   currentValueRef.current = value
 
@@ -82,6 +83,21 @@ export function PathInput({
   const applyDraftPath = () => {
     commitValue(draftPath)
     setIsEditorOpen(false)
+  }
+
+  const clearPickerPointerBlur = () => {
+    suppressPickerBlurRef.current = false
+  }
+
+  const armPickerPointerBlur = () => {
+    const pointerSequence = pickerPointerSequenceRef.current + 1
+    pickerPointerSequenceRef.current = pointerSequence
+    suppressPickerBlurRef.current = true
+    window.setTimeout(() => {
+      if (pickerPointerSequenceRef.current === pointerSequence) {
+        clearPickerPointerBlur()
+      }
+    }, 0)
   }
 
   const handlePickerClick = async () => {
@@ -195,7 +211,8 @@ export function PathInput({
                 skipNextBlurRef.current = false
                 return
               }
-              if (event.relatedTarget === pickerButtonRef.current) {
+              if (suppressPickerBlurRef.current) {
+                clearPickerPointerBlur()
                 return
               }
               onCommit?.(event.currentTarget.value)
@@ -223,8 +240,15 @@ export function PathInput({
           aria-label={`指定${label}`}
           className={`icon-button path-picker-button${isEditorOpen || isPicking ? ' path-picker-button-active' : ''}`}
           disabled={disabled || isPicking}
-          onClick={() => void handlePickerClick()}
-          ref={pickerButtonRef}
+          onClick={() => {
+            clearPickerPointerBlur()
+            void handlePickerClick()
+          }}
+          onPointerDown={(event) => {
+            if (event.button === 0) {
+              armPickerPointerBlur()
+            }
+          }}
           title={`指定${label}`}
           type="button"
         >
