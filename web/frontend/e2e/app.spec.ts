@@ -354,6 +354,10 @@ test('contains every slider and value pair at desktop and mobile viewport widths
   ]) {
     await page.setViewportSize(viewport)
     await page.goto('/')
+    await expect(page.locator('meta[name="viewport"]')).toHaveAttribute(
+      'content',
+      'width=device-width,initial-scale=1',
+    )
     await page.getByRole('button', { exact: true, name: 'Studio Chroma Keyer' }).click()
 
     const viewportLayout = await page.evaluate(() => ({
@@ -362,10 +366,14 @@ test('contains every slider and value pair at desktop and mobile viewport widths
       documentClientWidth: document.documentElement.clientWidth,
       documentScrollWidth: document.documentElement.scrollWidth,
       innerWidth: window.innerWidth,
+      visualViewportWidth: window.visualViewport?.width ?? null,
     }))
     expect(viewportLayout.documentScrollWidth).toBeLessThanOrEqual(viewportLayout.documentClientWidth)
     expect(viewportLayout.bodyScrollWidth).toBeLessThanOrEqual(viewportLayout.bodyClientWidth)
     expect(viewportLayout.documentClientWidth).toBeLessThanOrEqual(viewportLayout.innerWidth)
+    if (viewport.width === 390 && viewportLayout.visualViewportWidth !== null) {
+      expect(viewportLayout.visualViewportWidth).toBeCloseTo(390, 0)
+    }
 
     const form = page.locator('.chroma-keyer-form')
     const formBox = await form.boundingBox()
