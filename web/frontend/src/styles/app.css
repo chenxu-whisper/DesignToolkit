@@ -232,7 +232,8 @@ button {
   width: 40px;
 }
 
-.icon-button:disabled {
+.icon-button:disabled,
+.icon-button[aria-disabled='true'] {
   background: #f3f4f6;
   color: #9ca3af;
   cursor: not-allowed;

@@ -63,6 +63,9 @@ describe('MediaResizeForm', () => {
 
     await waitFor(() => expect(screen.getByLabelText('输出路径')).toBeDisabled())
     expect(screen.getByLabelText('输出路径')).toHaveValue('')
-    expect(screen.getByRole('button', { name: '指定输出路径' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: '指定输出路径' })).toHaveAttribute(
+      'aria-disabled',
+      'true',
+    )
   })
 })

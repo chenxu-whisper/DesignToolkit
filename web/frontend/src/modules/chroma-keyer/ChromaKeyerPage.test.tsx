@@ -129,10 +129,12 @@ describe('ChromaKeyerPage', () => {
     await waitFor(() => expect(pageMocks.inspectChromaImage).toHaveBeenCalledOnce())
   })
 
-  it('inspects once when keyboard focus tabs from the path to its picker', async () => {
+  it('keeps the picker focused and guarded while a Tab-committed inspection is pending', async () => {
     const user = renderWithUser()
     const input = screen.getByLabelText('输入图片路径')
     const picker = screen.getByRole('button', { name: '指定输入图片路径' })
+    const inspectRequest = createDeferred<typeof inspectResponse>()
+    pageMocks.inspectChromaImage.mockReturnValueOnce(inspectRequest.promise)
 
     await user.type(input, 'E:\\media\\screen.png')
     await user.tab()
@@ -142,6 +144,22 @@ describe('ChromaKeyerPage', () => {
     expect(pageMocks.inspectChromaImage).toHaveBeenCalledWith({
       inputPath: 'E:\\media\\screen.png',
     })
+    expect(picker).toHaveFocus()
+    expect(picker).not.toBeDisabled()
+    expect(picker).toHaveAttribute('aria-disabled', 'true')
+
+    await user.keyboard('{Enter}')
+    await user.click(picker)
+
+    expect(pageMocks.pickLocalFiles).not.toHaveBeenCalled()
+
+    await act(async () => {
+      inspectRequest.resolve(inspectResponse)
+    })
+
+    await waitFor(() => expect(picker).toHaveAttribute('aria-disabled', 'false'))
+    expect(input).toBeEnabled()
+    expect(picker).toHaveFocus()
   })
 
   it('shows an input error for a blank committed path', () => {
@@ -438,7 +456,10 @@ describe('ChromaKeyerPage', () => {
     })
 
     expect(screen.getByLabelText('输入图片路径')).toBeDisabled()
-    expect(screen.getByRole('button', { name: '指定输入图片路径' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: '指定输入图片路径' })).toHaveAttribute(
+      'aria-disabled',
+      'true',
+    )
     expect(screen.getByRole('button', { name: '导出 PNG' })).toBeDisabled()
   })
 
@@ -453,7 +474,10 @@ describe('ChromaKeyerPage', () => {
     await user.keyboard('{Enter}')
 
     expect(screen.getByLabelText('输入图片路径')).toBeDisabled()
-    expect(screen.getByRole('button', { name: '指定输入图片路径' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: '指定输入图片路径' })).toHaveAttribute(
+      'aria-disabled',
+      'true',
+    )
     expect(screen.getByRole('button', { name: '导出 PNG' })).toBeDisabled()
   })
 

@@ -106,6 +106,34 @@ function ControlledCommittedPathInput({
 }
 
 describe('PathInput', () => {
+  it('keeps an aria-disabled picker focusable and guards all activation', async () => {
+    const user = userEvent.setup()
+    const onChange = vi.fn()
+    const pickPaths = vi.fn().mockResolvedValue(['E:\\media\\screen.png'])
+    render(
+      <PathInput
+        disabled
+        label="输入媒体路径"
+        onChange={onChange}
+        pickPaths={pickPaths}
+        value=""
+      />,
+    )
+    const picker = screen.getByRole('button', { name: '指定输入媒体路径' })
+
+    await user.tab()
+
+    expect(picker).toHaveFocus()
+    expect(picker).not.toBeDisabled()
+    expect(picker).toHaveAttribute('aria-disabled', 'true')
+
+    await user.keyboard('{Enter}')
+    await user.click(picker)
+
+    expect(pickPaths).not.toHaveBeenCalled()
+    expect(onChange).not.toHaveBeenCalled()
+  })
+
   it('commits once on Enter without submitting an enclosing form', async () => {
     const user = userEvent.setup()
     const onChange = vi.fn()

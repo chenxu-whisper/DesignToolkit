@@ -169,6 +169,7 @@ export function PathInput({
     .filter(Boolean)
     .join(' ')
   const ariaDescribedBy = describedBy || undefined
+  const isPickerDisabled = disabled || isPicking
 
   return (
     <div className="field">
@@ -236,10 +237,10 @@ export function PathInput({
         )}
         <button
           aria-controls={isEditorOpen ? editorId : undefined}
+          aria-disabled={isPickerDisabled}
           aria-expanded={isEditorOpen}
           aria-label={`指定${label}`}
           className={`icon-button path-picker-button${isEditorOpen || isPicking ? ' path-picker-button-active' : ''}`}
-          disabled={disabled || isPicking}
           onClick={() => {
             clearPickerPointerBlur()
             void handlePickerClick()
