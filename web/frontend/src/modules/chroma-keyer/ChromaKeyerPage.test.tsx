@@ -266,6 +266,33 @@ describe('ChromaKeyerPage', () => {
     )
   })
 
+  it('applies a pending valid preview after a replacement sample is rejected', async () => {
+    render(<ChromaKeyerPage />)
+
+    await inspectImage()
+    await sampleImage()
+    const preview = screen.getByRole('button', { name: '抠像预览' })
+    await waitFor(() => expect(preview).toHaveAttribute('src', '/api/previews/final.png'))
+    const previewRequest = createDeferred<{ preview_url: string }>()
+    pageMocks.createChromaPreview.mockReturnValueOnce(previewRequest.promise)
+    pageMocks.sampleChromaImage.mockRejectedValueOnce(new Error('请选择具有明显主色的纯色幕背景'))
+
+    fireEvent.click(screen.getByRole('radio', { name: 'Alpha' }))
+    await waitFor(() => expect(pageMocks.createChromaPreview).toHaveBeenCalledTimes(2))
+    await sampleImage()
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('请选择具有明显主色的纯色幕背景')
+    expect(screen.getByText('#2AB448')).toBeInTheDocument()
+
+    await act(async () => {
+      previewRequest.resolve({ preview_url: '/api/previews/pending-valid.png' })
+    })
+
+    expect(preview).toHaveAttribute('src', '/api/previews/pending-valid.png')
+    expect(screen.getByText('#2AB448')).toBeInTheDocument()
+    expect(screen.getByRole('alert')).toHaveTextContent('请选择具有明显主色的纯色幕背景')
+  })
+
   it('clears the inspected session when the input path changes', async () => {
     const user = renderWithUser()
 

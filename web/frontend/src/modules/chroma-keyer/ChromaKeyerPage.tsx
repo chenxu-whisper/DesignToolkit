@@ -121,7 +121,11 @@ export function ChromaKeyerPage() {
     })
   }
 
-  const requestPreview = async (previewValues: ChromaKeyerValues, requestSequence: number) => {
+  const requestPreview = async (
+    previewValues: ChromaKeyerValues,
+    previewSequence: number,
+    actionSequence: number,
+  ) => {
     if (!image || !isPreviewValid(previewValues)) {
       return
     }
@@ -131,12 +135,18 @@ export function ChromaKeyerPage() {
         ...toPayload(previewValues),
         viewMode: previewValues.viewMode,
       })
-      if (mountedRef.current && requestSequence === previewSequenceRef.current) {
+      if (mountedRef.current && previewSequence === previewSequenceRef.current) {
         setPreviewUrl(response.preview_url)
-        setErrors((current) => ({ ...current, samples: undefined }))
+        if (actionSequence === requestSequenceRef.current) {
+          setErrors((current) => ({ ...current, samples: undefined }))
+        }
       }
     } catch (error) {
-      if (mountedRef.current && requestSequence === previewSequenceRef.current) {
+      if (
+        mountedRef.current
+        && previewSequence === previewSequenceRef.current
+        && actionSequence === requestSequenceRef.current
+      ) {
         setErrors((current) => ({
           ...current,
           samples: error instanceof Error && error.message ? error.message : '无法生成预览',
@@ -146,7 +156,8 @@ export function ChromaKeyerPage() {
   }
 
   useEffect(() => {
-    const requestSequence = ++previewSequenceRef.current
+    const previewSequence = ++previewSequenceRef.current
+    const actionSequence = requestSequenceRef.current
     const isViewModeChange = lastViewModeRef.current !== values.viewMode
     lastViewModeRef.current = values.viewMode
     if (!image || !isPreviewValid(values)) {
@@ -154,12 +165,12 @@ export function ChromaKeyerPage() {
     }
 
     if (isViewModeChange) {
-      void requestPreview(values, requestSequence)
+      void requestPreview(values, previewSequence, actionSequence)
       return
     }
 
     const timeout = window.setTimeout(() => {
-      void requestPreview(values, requestSequence)
+      void requestPreview(values, previewSequence, actionSequence)
     }, 150)
     return () => window.clearTimeout(timeout)
   }, [
@@ -227,11 +238,11 @@ export function ChromaKeyerPage() {
     }
 
     const requestSequence = ++requestSequenceRef.current
-    previewSequenceRef.current += 1
     setIsRequestPending(true)
     try {
       const response = await sampleChromaImage({ inputPath: image.inputPath, ...point })
       if (mountedRef.current && requestSequence === requestSequenceRef.current) {
+        previewSequenceRef.current += 1
         setValues((current) => ({ ...current, samples: [[...response.rgb]] }))
         setSampleDetails([
           {
