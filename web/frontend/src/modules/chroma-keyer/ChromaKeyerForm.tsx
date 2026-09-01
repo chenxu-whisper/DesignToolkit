@@ -15,14 +15,18 @@ type ChromaKeyerFormProps = {
 }
 
 const parameterFields = [
-  { id: 'screenGain', label: 'Screen Gain', max: 2, min: 0, step: 0.01 },
-  { id: 'screenBalance', label: 'Screen Balance', max: 1, min: 0, step: 0.01 },
-  { id: 'clipBlack', label: 'Clip Black', max: 1, min: 0, step: 0.01 },
-  { id: 'clipWhite', label: 'Clip White', max: 1, min: 0, step: 0.01 },
-  { id: 'shrinkGrow', label: 'Shrink/Grow', max: 10, min: -10, step: 1 },
-  { id: 'feather', label: 'Feather', max: 10, min: 0, step: 1 },
-  { id: 'despillAmount', label: 'Despill Amount', max: 1, min: 0, step: 0.01 },
+  { fallback: 1, id: 'screenGain', label: 'Screen Gain', max: 2, min: 0, step: 0.01 },
+  { fallback: 0.5, id: 'screenBalance', label: 'Screen Balance', max: 1, min: 0, step: 0.01 },
+  { fallback: 0, id: 'clipBlack', label: 'Clip Black', max: 1, min: 0, step: 0.01 },
+  { fallback: 1, id: 'clipWhite', label: 'Clip White', max: 1, min: 0, step: 0.01 },
+  { fallback: 0, id: 'shrinkGrow', label: 'Shrink/Grow', max: 10, min: -10, step: 1 },
+  { fallback: 0, id: 'feather', label: 'Feather', max: 10, min: 0, step: 1 },
+  { fallback: 1, id: 'despillAmount', label: 'Despill Amount', max: 1, min: 0, step: 0.01 },
 ] as const
+
+function getSliderValue(value: number, min: number, max: number, fallback: number) {
+  return Math.min(max, Math.max(min, Number.isFinite(value) ? value : fallback))
+}
 
 export function ChromaKeyerForm({
   disabled,
@@ -79,27 +83,54 @@ export function ChromaKeyerForm({
           抠像参数
         </h2>
         <div className="chroma-parameter-grid">
-          {parameterFields.map((field) => (
-            <div className="field" key={field.id}>
-              <label className="field-label" htmlFor={`chroma-keyer-${field.id}`}>
-                {field.label}
-              </label>
-              <input
-                aria-describedby={errors[field.id] ? `chroma-keyer-${field.id}-error` : undefined}
-                aria-invalid={errors[field.id] ? 'true' : undefined}
-                className="text-input"
-                disabled={disabled}
-                id={`chroma-keyer-${field.id}`}
-                max={field.max}
-                min={field.min}
-                onChange={(event) => updateValue(field.id, event.target.value === '' ? Number.NaN : Number(event.target.value))}
-                step={field.step}
-                type="number"
-                value={Number.isNaN(values[field.id]) ? '' : values[field.id]}
-              />
-              <FieldError id={`chroma-keyer-${field.id}-error`} message={errors[field.id]} />
-            </div>
-          ))}
+          {parameterFields.map((field) => {
+            const errorId = `chroma-keyer-${field.id}-error`
+            const hasError = Boolean(errors[field.id])
+            const sliderId = `chroma-keyer-${field.id}`
+
+            return (
+              <div className="chroma-parameter-field" key={field.id}>
+                <div className="chroma-parameter-header">
+                  <label className="field-label" htmlFor={`${sliderId}-number`}>
+                    {field.label}
+                  </label>
+                  <input
+                    aria-describedby={hasError ? errorId : undefined}
+                    aria-invalid={hasError ? 'true' : undefined}
+                    aria-label={`${field.label} 数值`}
+                    className="text-input chroma-parameter-number"
+                    disabled={disabled}
+                    id={`${sliderId}-number`}
+                    max={field.max}
+                    min={field.min}
+                    onChange={(event) =>
+                      updateValue(field.id, event.target.value === '' ? Number.NaN : Number(event.target.value))
+                    }
+                    step={field.step}
+                    type="number"
+                    value={Number.isNaN(values[field.id]) ? '' : values[field.id]}
+                  />
+                </div>
+                <input
+                  aria-describedby={hasError ? errorId : undefined}
+                  aria-invalid={hasError ? 'true' : undefined}
+                  className="chroma-parameter-range"
+                  disabled={disabled}
+                  id={sliderId}
+                  max={field.max}
+                  min={field.min}
+                  onChange={(event) => updateValue(field.id, Number(event.target.value))}
+                  step={field.step}
+                  title={field.label}
+                  type="range"
+                  value={getSliderValue(values[field.id], field.min, field.max, field.fallback)}
+                />
+                <div className="chroma-parameter-error">
+                  <FieldError id={errorId} message={errors[field.id]} />
+                </div>
+              </div>
+            )
+          })}
         </div>
         <fieldset className="chroma-view-mode" disabled={disabled}>
           <legend>预览</legend>

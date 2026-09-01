@@ -567,22 +567,72 @@ button {
 
 .chroma-parameter-grid {
   display: grid;
-  gap: 10px;
+  gap: 10px 14px;
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
-.chroma-parameter-grid .field {
+.chroma-parameter-field {
+  display: grid;
   gap: 4px;
+  grid-template-rows: 34px 22px minmax(16px, auto);
+  min-width: 0;
 }
 
-.chroma-parameter-grid .field-label,
+.chroma-parameter-header {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+  justify-content: space-between;
+  min-width: 0;
+}
+
+.chroma-parameter-header .field-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chroma-parameter-header .field-label,
 .chroma-view-mode legend {
   font-size: 12px;
 }
 
-.chroma-parameter-grid .text-input {
+.chroma-parameter-number {
+  flex: 0 0 76px;
+  font-variant-numeric: tabular-nums;
   min-height: 34px;
   padding: 5px 8px;
+  text-align: right;
+  width: 76px;
+}
+
+.chroma-parameter-range {
+  accent-color: #2563eb;
+  cursor: pointer;
+  height: 22px;
+  margin: 0;
+  min-width: 0;
+  padding: 0;
+  width: 100%;
+}
+
+.chroma-parameter-number:focus-visible,
+.chroma-parameter-range:focus-visible {
+  outline: 2px solid #2563eb;
+  outline-offset: 2px;
+}
+
+.chroma-parameter-range:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.chroma-parameter-error {
+  min-height: 16px;
+}
+
+.chroma-parameter-error .field-error {
+  line-height: 16px;
 }
 
 .chroma-view-mode {
@@ -631,6 +681,10 @@ button {
   }
 
   .form-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .chroma-parameter-grid {
     grid-template-columns: minmax(0, 1fr);
   }
 
