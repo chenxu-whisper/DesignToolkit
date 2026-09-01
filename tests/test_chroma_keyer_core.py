@@ -12,6 +12,7 @@ from designtoolkit.chroma_keyer.image_io import (
     default_output_path,
     make_preview_png,
     read_rgb_image,
+    resize_preview_rgb,
     validate_output_path,
     write_rgba_png,
 )
@@ -292,6 +293,42 @@ def test_output_path_must_be_new_png_in_an_existing_parent(tmp_path: Path) -> No
         validate_output_path(input_path, input_path)
     with raises(KeyerError):
         validate_output_path(input_path, tmp_path / "missing" / "result.png")
+
+
+def test_resize_preview_rgb_constrains_size_and_preserves_aspect() -> None:
+    rgb = np.zeros((1200, 1600, 3), dtype=np.uint8)
+
+    resized = resize_preview_rgb(rgb)
+
+    assert resized.shape == (720, 960, 3)
+    assert resized.dtype == np.uint8
+    assert resized.flags.c_contiguous
+
+
+def test_resize_preview_rgb_never_upscales_and_returns_a_contiguous_copy() -> None:
+    rgb = np.zeros((360, 640, 3), dtype=np.uint8)[:, ::-1]
+
+    resized = resize_preview_rgb(rgb)
+
+    assert resized.shape == (360, 640, 3)
+    assert resized.dtype == np.uint8
+    assert resized.flags.c_contiguous
+    assert not np.shares_memory(resized, rgb)
+
+
+def test_resize_preview_rgb_rejects_invalid_limits_and_rgb() -> None:
+    rgb = np.zeros((2, 2, 3), dtype=np.uint8)
+
+    for limits in (
+        {"max_width": True},
+        {"max_width": 0},
+        {"max_height": -1},
+        {"max_height": 1.5},
+    ):
+        with raises(KeyerError):
+            resize_preview_rgb(rgb, **limits)
+    with raises(KeyerError):
+        resize_preview_rgb(np.zeros((2, 2, 3), dtype=np.float32))
 
 
 def test_make_preview_png_constrains_size_preserves_aspect_and_never_upscales() -> None:

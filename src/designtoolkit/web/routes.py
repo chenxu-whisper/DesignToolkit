@@ -18,6 +18,7 @@ from designtoolkit.chroma_keyer.image_io import (
     make_preview_png,
     read_rgb_image,
     read_rgb_image_bytes,
+    resize_preview_rgb,
 )
 from designtoolkit.chroma_keyer.models import KeyerError, KeyerParams
 from designtoolkit.chroma_keyer.sampling import (
@@ -390,7 +391,8 @@ def create_router(
 
             def create_preview_png() -> bytes:
                 params = KeyerParams(**params_data)
-                preview_rgb, alpha = key_rgb(rgb, model, params)
+                preview_rgb = resize_preview_rgb(rgb)
+                preview_rgb, alpha = key_rgb(preview_rgb, model, params)
                 if request.view_mode is ChromaViewMode.FINAL:
                     return make_preview_png(preview_rgb, alpha=alpha)
                 else:

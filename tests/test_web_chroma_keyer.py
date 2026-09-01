@@ -14,7 +14,11 @@ from PIL import Image
 from pytest import mark, raises
 
 from designtoolkit.chroma_keyer.despill import despill
-from designtoolkit.chroma_keyer.image_io import make_preview_png, read_rgb_image
+from designtoolkit.chroma_keyer.image_io import (
+    make_preview_png,
+    read_rgb_image,
+    resize_preview_rgb,
+)
 from designtoolkit.chroma_keyer.matte import generate_alpha, refine_alpha
 from designtoolkit.chroma_keyer.models import KeyerParams, KeyImageResult
 from designtoolkit.chroma_keyer.sampling import screen_model_from_samples
@@ -62,6 +66,7 @@ def _decode_rgba_png(png_bytes: bytes) -> np.ndarray:
 
 
 def _generated_alpha_preview(rgb: np.ndarray) -> bytes:
+    rgb = resize_preview_rgb(rgb)
     model = screen_model_from_samples([[42, 180, 72]])
     alpha = refine_alpha(generate_alpha(rgb, model, KeyerParams()), KeyerParams())
     return make_preview_png(np.repeat(alpha[..., np.newaxis], 3, axis=2))
@@ -1203,7 +1208,7 @@ def test_final_and_alpha_previews_match_the_public_keying_pipeline(
         assert "transparency" not in alpha_image.info
         alpha_preview = np.asarray(alpha_image).copy()
 
-    source_rgb = read_rgb_image(input_path)
+    source_rgb = resize_preview_rgb(read_rgb_image(input_path))
     model = screen_model_from_samples(payload["samples"])
     params = KeyerParams(**payload["params"])
     refined_alpha = refine_alpha(generate_alpha(source_rgb, model, params), params)
@@ -1229,23 +1234,11 @@ def test_final_and_alpha_previews_use_shared_key_rgb_pipeline(
     monkeypatch,
 ) -> None:
     input_path = tmp_path / "input.png"
-    source_rgb = _write_input_image(input_path)
-    expected_keyed_rgb = np.array(
-        [
-            [[10, 20, 30], [40, 50, 60], [70, 80, 90], [100, 110, 120]],
-            [
-                [130, 140, 150],
-                [160, 170, 180],
-                [190, 200, 210],
-                [220, 230, 240],
-            ],
-        ],
-        dtype=np.uint8,
-    )
-    expected_alpha = np.array(
-        [[0, 32, 96, 255], [255, 192, 128, 64]],
-        dtype=np.uint8,
-    )
+    source_rgb = np.full((1200, 1600, 3), [42, 180, 72], dtype=np.uint8)
+    Image.fromarray(source_rgb, mode="RGB").save(input_path)
+    bounded_rgb = resize_preview_rgb(source_rgb)
+    expected_keyed_rgb = np.full_like(bounded_rgb, [10, 20, 30])
+    expected_alpha = np.full(bounded_rgb.shape[:2], 192, dtype=np.uint8)
     pipeline_calls: list[tuple[np.ndarray, KeyerParams]] = []
 
     def key_rgb(
@@ -1273,7 +1266,9 @@ def test_final_and_alpha_previews_use_shared_key_rgb_pipeline(
     assert final_response.status_code == 200
     assert alpha_response.status_code == 200
     assert len(pipeline_calls) == 2
-    assert all(np.array_equal(rgb, source_rgb) for rgb, _ in pipeline_calls)
+    assert source_rgb.shape == (1200, 1600, 3)
+    assert all(rgb.shape == (720, 960, 3) for rgb, _ in pipeline_calls)
+    assert all(np.array_equal(rgb, bounded_rgb) for rgb, _ in pipeline_calls)
     assert all(params == KeyerParams() for _, params in pipeline_calls)
     assert np.array_equal(
         _decode_rgba_png(client.get(final_response.json()["preview_url"]).content),

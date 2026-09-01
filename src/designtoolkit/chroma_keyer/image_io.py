@@ -39,6 +39,18 @@ def _validate_preview_limit(name: str, value: object) -> int:
     return value
 
 
+def _preview_target_size(
+    width: int,
+    height: int,
+    max_width: object,
+    max_height: object,
+) -> tuple[int, int]:
+    max_width = _validate_preview_limit("max_width", max_width)
+    max_height = _validate_preview_limit("max_height", max_height)
+    scale = min(max_width / width, max_height / height, 1.0)
+    return max(1, int(width * scale)), max(1, int(height * scale))
+
+
 def _preview_pixels(rgb: object, alpha: object | None) -> tuple[np.ndarray, str]:
     if (
         isinstance(rgb, np.ndarray)
@@ -137,6 +149,23 @@ def write_rgba_png(output_path: Path, rgb: np.ndarray, alpha: np.ndarray) -> Non
             temporary_path.unlink()
 
 
+def resize_preview_rgb(
+    rgb: np.ndarray,
+    max_width: int = 1280,
+    max_height: int = 720,
+) -> np.ndarray:
+    """Return a bounded, aspect-preserving contiguous copy of RGB pixels."""
+    rgb = _validate_rgb(rgb)
+    height, width = rgb.shape[:2]
+    target_size = _preview_target_size(width, height, max_width, max_height)
+    if target_size == (width, height):
+        return np.array(rgb, dtype=np.uint8, copy=True, order="C")
+
+    image = Image.fromarray(rgb, mode="RGB")
+    resized = image.resize(target_size, Image.Resampling.LANCZOS)
+    return np.array(resized, dtype=np.uint8, copy=True, order="C")
+
+
 def make_preview_png(
     rgb: np.ndarray,
     max_width: int = 1280,
@@ -146,11 +175,8 @@ def make_preview_png(
 ) -> bytes:
     """Encode a bounded, aspect-preserving RGB or RGBA PNG preview."""
     pixels, mode = _preview_pixels(rgb, alpha)
-    max_width = _validate_preview_limit("max_width", max_width)
-    max_height = _validate_preview_limit("max_height", max_height)
     height, width = pixels.shape[:2]
-    scale = min(max_width / width, max_height / height, 1.0)
-    target_size = (max(1, int(width * scale)), max(1, int(height * scale)))
+    target_size = _preview_target_size(width, height, max_width, max_height)
 
     image = Image.fromarray(pixels, mode=mode)
     if target_size != image.size:
