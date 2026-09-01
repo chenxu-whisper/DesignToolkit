@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { useState } from 'react'
 import { describe, expect, it, vi } from 'vitest'
@@ -323,30 +323,34 @@ describe('PathInput', () => {
     const onChange = vi.fn()
     const onCommit = vi.fn()
     const pickPaths = vi.fn(() => selection.promise)
-    render(
-      <ControlledCommittedPathInput
-        initialValue={'C:\\media\\one.mp4'}
+    const { rerender } = render(
+      <PathInput
+        label="输入媒体路径"
         multiline
         onChange={onChange}
         onCommit={onCommit}
         pickPaths={pickPaths}
+        value="C:\\media\\one.mp4"
       />,
     )
-    const input = screen.getByLabelText('输入媒体路径')
 
     await user.click(screen.getByRole('button', { name: '指定输入媒体路径' }))
-    fireEvent.change(input, {
-      target: { value: 'C:\\media\\one.mp4\nD:\\media\\two.mp4' },
-    })
+    rerender(
+      <PathInput
+        label="输入媒体路径"
+        multiline
+        onChange={onChange}
+        onCommit={onCommit}
+        pickPaths={pickPaths}
+        value={'C:\\media\\one.mp4\nD:\\media\\two.mp4'}
+      />,
+    )
     selection.resolve(['E:\\media\\three.mp4'])
 
     await waitFor(() =>
       expect(onCommit).toHaveBeenCalledWith(
         'C:\\media\\one.mp4\nD:\\media\\two.mp4\nE:\\media\\three.mp4',
       ),
-    )
-    expect(input).toHaveValue(
-      'C:\\media\\one.mp4\nD:\\media\\two.mp4\nE:\\media\\three.mp4',
     )
   })
 
@@ -399,13 +403,14 @@ describe('PathInput', () => {
     const onChange = vi.fn()
     const onCommit = vi.fn()
     const resolveDroppedFilePaths = vi.fn(() => resolution.promise)
-    render(
-      <ControlledCommittedPathInput
-        initialValue={'C:\\media\\one.mp4'}
+    const { rerender } = render(
+      <PathInput
+        label="输入媒体路径"
         multiline
         onChange={onChange}
         onCommit={onCommit}
         resolveDroppedFilePaths={resolveDroppedFilePaths}
+        value="C:\\media\\one.mp4"
       />,
     )
     const input = screen.getByLabelText('输入媒体路径')
@@ -417,9 +422,16 @@ describe('PathInput', () => {
       },
     })
     await waitFor(() => expect(resolveDroppedFilePaths).toHaveBeenCalledOnce())
-    fireEvent.change(input, {
-      target: { value: 'C:\\media\\one.mp4\nD:\\media\\two.mp4' },
-    })
+    rerender(
+      <PathInput
+        label="输入媒体路径"
+        multiline
+        onChange={onChange}
+        onCommit={onCommit}
+        resolveDroppedFilePaths={resolveDroppedFilePaths}
+        value={'C:\\media\\one.mp4\nD:\\media\\two.mp4'}
+      />,
+    )
     resolution.resolve(['E:\\media\\three.mp4'])
 
     await waitFor(() =>
@@ -427,9 +439,45 @@ describe('PathInput', () => {
         'C:\\media\\one.mp4\nD:\\media\\two.mp4\nE:\\media\\three.mp4',
       ),
     )
-    expect(input).toHaveValue(
-      'C:\\media\\one.mp4\nD:\\media\\two.mp4\nE:\\media\\three.mp4',
+  })
+
+  it('ignores a resolved drop after a newer typed path is committed', async () => {
+    const user = userEvent.setup()
+    const resolution = deferred<readonly string[]>()
+    const onChange = vi.fn()
+    const onCommit = vi.fn()
+    const resolveDroppedFilePaths = vi.fn(() => resolution.promise)
+    render(
+      <ControlledCommittedPathInput
+        onChange={onChange}
+        onCommit={onCommit}
+        resolveDroppedFilePaths={resolveDroppedFilePaths}
+      />,
     )
+    const input = screen.getByLabelText('输入媒体路径')
+
+    fireEvent.drop(input, {
+      dataTransfer: {
+        files: [new File(['image'], 'old.png', { type: 'image/png' })],
+        getData: () => '',
+      },
+    })
+    await waitFor(() => expect(resolveDroppedFilePaths).toHaveBeenCalledOnce())
+
+    await user.type(input, 'D:\\typed\\new.png')
+    await user.keyboard('{Enter}')
+    expect(onCommit).toHaveBeenCalledOnce()
+    expect(onCommit).toHaveBeenLastCalledWith('D:\\typed\\new.png')
+
+    const changeCount = onChange.mock.calls.length
+    await act(async () => {
+      resolution.resolve(['E:\\resolved\\old.png'])
+      await resolution.promise
+    })
+
+    expect(input).toHaveValue('D:\\typed\\new.png')
+    expect(onChange).toHaveBeenCalledTimes(changeCount)
+    expect(onCommit).toHaveBeenCalledOnce()
   })
 
   it('updates and commits the exact path applied from the editor', async () => {

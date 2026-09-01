@@ -91,7 +91,7 @@ export function ChromaKeyerForm({
             return (
               <div className="chroma-parameter-field" key={field.id}>
                 <div className="chroma-parameter-header">
-                  <label className="field-label" htmlFor={`${sliderId}-number`}>
+                  <label className="field-label" htmlFor={sliderId}>
                     {field.label}
                   </label>
                   <input

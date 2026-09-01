@@ -49,6 +49,7 @@ export function PathInput({
   const [dropError, setDropError] = useState<string | null>(null)
   const [pickerError, setPickerError] = useState<string | null>(null)
   const currentValueRef = useRef(value)
+  const latestIntentRef = useRef(0)
   const pickerPointerSequenceRef = useRef(0)
   const suppressPickerBlurRef = useRef(false)
   const skipNextBlurRef = useRef(false)
@@ -67,6 +68,13 @@ export function PathInput({
     setIsEditorOpen(true)
   }
 
+  const beginIntent = () => {
+    latestIntentRef.current += 1
+    return latestIntentRef.current
+  }
+
+  const isLatestIntent = (intent: number) => latestIntentRef.current === intent
+
   const updateValue = (nextValue: string) => {
     currentValueRef.current = nextValue
     skipNextBlurRef.current = false
@@ -81,6 +89,7 @@ export function PathInput({
   }
 
   const applyDraftPath = () => {
+    beginIntent()
     commitValue(draftPath)
     setIsEditorOpen(false)
   }
@@ -104,6 +113,7 @@ export function PathInput({
     if (disabled || isPicking) {
       return
     }
+    const intent = beginIntent()
     if (!pickPaths) {
       openEditor()
       return
@@ -114,13 +124,18 @@ export function PathInput({
     setIsPicking(true)
     try {
       const paths = await pickPaths()
+      if (!isLatestIntent(intent)) {
+        return
+      }
       if (paths.length > 0) {
         commitValue(valueWithDroppedPaths(currentValueRef.current, paths, multiline))
         setIsEditorOpen(false)
       }
     } catch {
-      setPickerError(PICKER_ERROR)
-      openEditor()
+      if (isLatestIntent(intent)) {
+        setPickerError(PICKER_ERROR)
+        openEditor()
+      }
     } finally {
       setIsPicking(false)
     }
@@ -140,12 +155,16 @@ export function PathInput({
       return
     }
     event.preventDefault()
+    const intent = beginIntent()
     setIsDragActive(false)
     const fileNames = droppedFileNames(event.dataTransfer.files)
     const paths = droppedPathsFromDataTransfer(event.dataTransfer)
     if (paths.length === 0) {
       if (fileNames.length > 0 && resolveDroppedFilePaths) {
         const resolvedPaths = await resolveDroppedFilePaths(fileNames)
+        if (!isLatestIntent(intent)) {
+          return
+        }
         if (resolvedPaths.length > 0) {
           commitValue(valueWithDroppedPaths(currentValueRef.current, resolvedPaths, multiline))
           return
@@ -191,7 +210,10 @@ export function PathInput({
             className={textareaClassName}
             disabled={disabled}
             id={inputId}
-            onChange={(event) => updateValue(event.target.value)}
+            onChange={(event) => {
+              beginIntent()
+              updateValue(event.target.value)
+            }}
             onDragLeave={() => setIsDragActive(false)}
             onDragOver={handleDragOver}
             onDrop={handleDrop}
@@ -218,7 +240,10 @@ export function PathInput({
               }
               onCommit?.(event.currentTarget.value)
             }}
-            onChange={(event) => updateValue(event.target.value)}
+            onChange={(event) => {
+              beginIntent()
+              updateValue(event.target.value)
+            }}
             onDragLeave={() => setIsDragActive(false)}
             onDragOver={handleDragOver}
             onDrop={handleDrop}

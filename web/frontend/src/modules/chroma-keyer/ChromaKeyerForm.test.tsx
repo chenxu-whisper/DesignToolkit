@@ -127,7 +127,8 @@ describe('ChromaKeyerForm', () => {
       const slider = screen.getByRole('slider', { name: label })
       const number = screen.getByRole('spinbutton', { name: `${label} 数值` })
 
-      expect(screen.getByLabelText(label)).toBe(number)
+      expect(screen.getByLabelText(label)).toBe(slider)
+      expect(screen.getByLabelText(label)).toHaveAttribute('type', 'range')
       expect(slider).toHaveValue(String(value))
       expect(number).toHaveValue(value)
       for (const control of [slider, number]) {
