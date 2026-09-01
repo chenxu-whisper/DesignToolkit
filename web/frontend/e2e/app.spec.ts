@@ -25,8 +25,8 @@ test('opens Studio Chroma Keyer with disabled initial sampling and export contro
   await expect(page.getByRole('button', { name: '导出 PNG' })).toBeDisabled()
 })
 
-test('stacks the Chroma editor in the constrained desktop workspace without clipping sample coordinates', async ({ page }) => {
-  await page.setViewportSize({ width: 787, height: 900 })
+test('contains a loaded Chroma sample in the mobile workspace', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 })
   let inspectRequestCount = 0
   let pickerRequestCount = 0
   let releaseInspectResponse!: () => void
@@ -100,9 +100,10 @@ test('stacks the Chroma editor in the constrained desktop workspace without clip
       (element) => element.textContent === '27, 27',
     )
     const sampleItem = sample?.closest<HTMLElement>('.chroma-sample-item')
+    const deleteButton = sampleItem?.querySelector<HTMLElement>('button')
 
-    if (!main || !form || !sample || !sampleItem) {
-      throw new Error('Expected Chroma editor layout and sample coordinate')
+    if (!main || !form || !sample || !sampleItem || !deleteButton) {
+      throw new Error('Expected Chroma editor layout, sample coordinate, and delete button')
     }
 
     const toBox = (element: HTMLElement) => {
@@ -111,12 +112,19 @@ test('stacks the Chroma editor in the constrained desktop workspace without clip
     }
 
     return {
+      deleteButton: toBox(deleteButton),
       form: toBox(form),
       main: toBox(main),
       sample: toBox(sample),
       sampleItem: toBox(sampleItem),
+      sampleItemClientWidth: sampleItem.clientWidth,
+      sampleItemScrollWidth: sampleItem.scrollWidth,
       sampleClientWidth: sample.clientWidth,
       sampleScrollWidth: sample.scrollWidth,
+      viewport: {
+        height: window.innerHeight,
+        width: window.innerWidth,
+      },
     }
   })
 
@@ -124,6 +132,15 @@ test('stacks the Chroma editor in the constrained desktop workspace without clip
   expect(layout.sample.left).toBeGreaterThanOrEqual(layout.sampleItem.left)
   expect(layout.sample.right).toBeLessThanOrEqual(layout.sampleItem.right)
   expect(layout.sampleScrollWidth).toBeLessThanOrEqual(layout.sampleClientWidth)
+  expect(layout.deleteButton.left).toBeGreaterThanOrEqual(layout.sampleItem.left)
+  expect(layout.deleteButton.right).toBeLessThanOrEqual(layout.viewport.width)
+  expect(layout.deleteButton.right).toBeLessThanOrEqual(layout.sampleItem.right)
+  expect(layout.deleteButton.top).toBeGreaterThanOrEqual(layout.sampleItem.top)
+  expect(layout.deleteButton.bottom).toBeLessThanOrEqual(layout.sampleItem.bottom)
+  expect(layout.deleteButton.left).toBeGreaterThanOrEqual(0)
+  expect(layout.deleteButton.top).toBeGreaterThanOrEqual(0)
+  expect(layout.deleteButton.bottom).toBeLessThanOrEqual(layout.viewport.height)
+  expect(layout.sampleItemScrollWidth).toBeLessThanOrEqual(layout.sampleItemClientWidth)
 })
 
 const chromaParameterNames = [

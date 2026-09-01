@@ -712,3 +712,42 @@ button {
     grid-template-columns: 1fr;
   }
 }
+
+@media (max-width: 480px) {
+  .chroma-sample-item {
+    grid-template-areas:
+      "swatch label label delete"
+      "rgb rgb rgb rgb"
+      "hex hex coordinates coordinates";
+    grid-template-columns: 18px minmax(0, 1fr) auto 40px;
+  }
+
+  .chroma-sample-item > * {
+    min-width: 0;
+  }
+
+  .chroma-sample-item > .chroma-swatch {
+    grid-area: swatch;
+  }
+
+  .chroma-sample-item > span:nth-of-type(2) {
+    grid-area: label;
+  }
+
+  .chroma-sample-item > span:nth-of-type(3) {
+    grid-area: rgb;
+  }
+
+  .chroma-sample-item > span:nth-of-type(4) {
+    grid-area: hex;
+  }
+
+  .chroma-sample-item > span:nth-of-type(5) {
+    grid-area: coordinates;
+  }
+
+  .chroma-sample-item > button {
+    grid-area: delete;
+    justify-self: end;
+  }
+}
