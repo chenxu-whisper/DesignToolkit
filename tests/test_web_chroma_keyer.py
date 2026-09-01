@@ -1134,7 +1134,9 @@ def test_sample_accepts_fractional_preview_dimensions_at_the_near_edge(
     tmp_path: Path,
 ) -> None:
     input_path = tmp_path / "input.png"
-    _write_input_image(input_path)
+    pixels = _write_input_image(input_path)
+    pixels[1, 3] = [110, 180, 120]
+    Image.fromarray(pixels, mode="RGB").save(input_path)
 
     response = _client(tmp_path).post(
         "/api/chroma-keyer/images/sample",
@@ -1149,8 +1151,8 @@ def test_sample_accepts_fractional_preview_dimensions_at_the_near_edge(
 
     assert response.status_code == 200
     assert response.json() == {
-        "rgb": [110, 120, 130],
-        "hex": "#6E7882",
+        "rgb": [110, 180, 120],
+        "hex": "#6EB478",
         "source_x": 3,
         "source_y": 1,
     }

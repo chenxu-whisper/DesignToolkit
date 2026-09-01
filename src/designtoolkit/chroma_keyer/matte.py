@@ -1,7 +1,12 @@
 import cv2
 import numpy as np
 
-from .models import KeyerError, KeyerParams, ScreenColorModel
+from .models import (
+    KeyerError,
+    KeyerParams,
+    ScreenColorModel,
+    dominant_screen_channel,
+)
 
 
 def _validate_rgb(rgb: object) -> np.ndarray:
@@ -26,8 +31,8 @@ def generate_alpha(
     """Generate an opaque-foreground alpha matte from sampled screen chroma."""
     rgb = _validate_rgb(rgb)
     rgb_float = rgb.astype(np.float32) / np.float32(255.0)
+    dominant = dominant_screen_channel(model.mean_rgb)
     screen = np.asarray(model.mean_rgb, dtype=np.float32) / np.float32(255.0)
-    dominant = int(np.argmax(screen))
     other_channels = [channel for channel in range(3) if channel != dominant]
     balance = np.float32(params.screen_balance)
 
@@ -37,8 +42,6 @@ def generate_alpha(
         + balance * np.min(screen_others)
     )
     screen_saturation = screen[dominant] - balanced_screen_other
-    if screen_saturation < np.float32(0.05):
-        raise KeyerError("请选择具有明显主色的纯色幕背景")
 
     pixel_others = rgb_float[..., other_channels]
     balanced_pixel_other = (

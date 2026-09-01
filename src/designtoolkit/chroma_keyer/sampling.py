@@ -1,9 +1,7 @@
 from math import floor, isfinite
 from numbers import Real
 
-import numpy as np
-
-from .models import KeyerError, ScreenColorModel
+from .models import KeyerError, ScreenColorModel, dominant_screen_channel
 
 
 def _validate_preview_dimension(name: str, value: object) -> float:
@@ -64,16 +62,7 @@ def screen_model_from_samples(samples: object) -> ScreenColorModel:
         raise KeyerError("samples must contain exactly one screen color")
 
     sample = validated_model.samples[0]
-    screen = np.asarray(sample, dtype=np.float32) / np.float32(255.0)
-    dominant = int(np.argmax(screen))
-    other_channels = [channel for channel in range(3) if channel != dominant]
-    screen_others = screen[other_channels]
-    balanced_screen_other = (
-        np.float32(0.5) * np.max(screen_others)
-        + np.float32(0.5) * np.min(screen_others)
-    )
-    if screen[dominant] - balanced_screen_other < np.float32(0.05):
-        raise KeyerError("请选择具有明显主色的纯色幕背景")
+    dominant_screen_channel(sample)
 
     return ScreenColorModel(
         mean_rgb=tuple(float(channel) for channel in sample),

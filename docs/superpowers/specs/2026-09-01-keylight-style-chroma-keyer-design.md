@@ -46,11 +46,16 @@ pixel_saturation = x[k] - balanced_other(x)
 The sampled color is valid only when:
 
 ```text
-screen_saturation >= 0.05
+screen_dominance = s[k] - max(s[j], s[l])
+screen_dominance >= 0.05
 ```
 
 Otherwise processing fails with the user-facing message:
 `请选择具有明显主色的纯色幕背景`.
+
+This balance-independent check guarantees that the balance-specific
+`screen_saturation` denominator is at least `0.05` for every Screen Balance
+from `0` through `1`.
 
 For Screen Gain `g`:
 
@@ -148,4 +153,3 @@ background sample. On black and white composites:
 - the output must remain source-sized RGBA;
 - the known green foreground bar may shift color and is accepted as the
   documented no-trimap limitation.
-

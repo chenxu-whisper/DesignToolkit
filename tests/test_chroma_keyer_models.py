@@ -9,6 +9,7 @@ from designtoolkit.chroma_keyer.models import (
     KeyImageOptions,
     KeyImageResult,
     ScreenColorModel,
+    dominant_screen_channel,
 )
 
 
@@ -191,6 +192,20 @@ def test_screen_color_model_accepts_valid_rgb_data() -> None:
         stddev_rgb=(0.01, 0.02, 0.03),
         samples=((0, 128, 255),),
     ).samples == ((0, 128, 255),)
+
+
+def test_dominant_screen_channel_returns_argmax_for_clear_rgb() -> None:
+    assert dominant_screen_channel((20, 220, 30)) == 1
+
+
+@mark.parametrize("mean_rgb", [(128, 114, 116), (128, 115, 127)])
+def test_dominant_screen_channel_rejects_unclear_dominance(
+    mean_rgb: tuple[int, int, int],
+) -> None:
+    with raises(KeyerError) as error:
+        dominant_screen_channel(mean_rgb)
+
+    assert str(error.value) == "请选择具有明显主色的纯色幕背景"
 
 
 def test_screen_color_model_normalizes_mutable_sequences() -> None:

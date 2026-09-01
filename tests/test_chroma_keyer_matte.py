@@ -91,18 +91,39 @@ def test_generate_alpha_balance_uses_stronger_and_weaker_other_channels() -> Non
     assert weaker_other_alpha[0, 0] == 64
 
 
-def test_generate_alpha_rejects_low_saturation_screen_model() -> None:
+@mark.parametrize("screen_balance", [0.0, 1.0])
+def test_generate_alpha_accepts_dominant_green_at_balance_endpoints(
+    screen_balance: float,
+) -> None:
+    alpha = generate_alpha(
+        np.array([[[20, 220, 30]]], dtype=np.uint8),
+        ScreenColorModel(
+            mean_rgb=(20.0, 220.0, 30.0),
+            stddev_rgb=(0.0, 0.0, 0.0),
+            samples=((20, 220, 30),),
+        ),
+        KeyerParams(screen_balance=screen_balance),
+    )
+
+    assert alpha.tolist() == [[0]]
+
+
+@mark.parametrize("screen_balance", [0.0, 1.0])
+@mark.parametrize("screen_rgb", [(128, 114, 116), (128, 115, 127)])
+def test_generate_alpha_rejects_low_dominance_screen_model_independent_of_balance(
+    screen_rgb: tuple[int, int, int], screen_balance: float
+) -> None:
     model = ScreenColorModel(
-        mean_rgb=(128.0, 128.0, 128.0),
+        mean_rgb=tuple(float(channel) for channel in screen_rgb),
         stddev_rgb=(0.0, 0.0, 0.0),
-        samples=((128, 128, 128),),
+        samples=(screen_rgb,),
     )
 
     with raises(KeyerError) as error:
         generate_alpha(
-            np.array([[[128, 128, 128]]], dtype=np.uint8),
+            np.array([[screen_rgb]], dtype=np.uint8),
             model,
-            KeyerParams(),
+            KeyerParams(screen_balance=screen_balance),
         )
 
     assert str(error.value) == "请选择具有明显主色的纯色幕背景"

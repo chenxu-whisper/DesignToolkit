@@ -48,11 +48,11 @@ def test_map_preview_point_rejects_invalid_inputs(
 
 
 def test_screen_model_from_samples_returns_the_single_sample_statistics() -> None:
-    model = screen_model_from_samples(((10, 20, 30),))
+    model = screen_model_from_samples(((10, 40, 20),))
 
-    assert model.mean_rgb == (10.0, 20.0, 30.0)
+    assert model.mean_rgb == (10.0, 40.0, 20.0)
     assert model.stddev_rgb == (0.0, 0.0, 0.0)
-    assert model.samples == ((10, 20, 30),)
+    assert model.samples == ((10, 40, 20),)
 
 
 def test_screen_model_from_samples_rejects_missing_samples() -> None:
@@ -65,8 +65,15 @@ def test_screen_model_from_samples_rejects_multiple_samples() -> None:
         screen_model_from_samples(((0, 255, 0), (0, 240, 0)))
 
 
-@mark.parametrize("sample", [(128, 128, 128), (128, 115, 116)])
-def test_screen_model_from_samples_rejects_low_saturation(
+@mark.parametrize(
+    "sample",
+    [
+        (128, 128, 128),
+        (128, 114, 116),
+        (128, 115, 127),
+    ],
+)
+def test_screen_model_from_samples_rejects_low_dominance(
     sample: tuple[int, int, int],
 ) -> None:
     with raises(KeyerError, match="请选择具有明显主色的纯色幕背景"):
