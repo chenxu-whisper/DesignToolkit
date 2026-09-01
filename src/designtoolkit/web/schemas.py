@@ -12,6 +12,10 @@ UnitIntervalFloat = Annotated[
     float,
     Field(strict=True, ge=0, le=1, allow_inf_nan=False),
 ]
+ScreenGainFloat = Annotated[
+    float,
+    Field(strict=True, ge=0, le=2, allow_inf_nan=False),
+]
 
 
 class TaskKind(StrEnum):
@@ -94,8 +98,8 @@ class ChromaSampleResponse(BaseModel):
 class ChromaKeyerParams(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    tolerance: UnitIntervalFloat = 0.0
-    softness: UnitIntervalFloat = 1.0
+    screen_gain: ScreenGainFloat = 1.0
+    screen_balance: UnitIntervalFloat = 0.5
     clip_black: UnitIntervalFloat = 0.0
     clip_white: UnitIntervalFloat = 1.0
     shrink_grow: Annotated[int, Field(strict=True, ge=-10, le=10)] = 0
@@ -113,7 +117,7 @@ class ChromaKeyerTaskRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     input_path: str
-    samples: list[list[RgbChannel]] = Field(min_length=1)
+    samples: list[list[RgbChannel]] = Field(min_length=1, max_length=1)
     params: ChromaKeyerParams
     output_path: str | None = None
 
@@ -136,7 +140,7 @@ class ChromaPreviewRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     input_path: str
-    samples: list[list[RgbChannel]] = Field(default_factory=list)
+    samples: list[list[RgbChannel]] = Field(min_length=1, max_length=1)
     params: ChromaKeyerParams
     view_mode: ChromaViewMode = ChromaViewMode.FINAL
 

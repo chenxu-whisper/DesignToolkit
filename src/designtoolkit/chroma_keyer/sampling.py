@@ -60,12 +60,23 @@ def screen_model_from_samples(samples: object) -> ScreenColorModel:
         stddev_rgb=(0.0, 0.0, 0.0),
         samples=samples,  # type: ignore[arg-type]
     )
-    rgb_samples = np.asarray(validated_model.samples, dtype=np.float32)
-    mean_rgb = tuple(float(value) for value in rgb_samples.mean(axis=0))
-    stddev_rgb = tuple(float(value) for value in rgb_samples.std(axis=0))
+    if len(validated_model.samples) != 1:
+        raise KeyerError("samples must contain exactly one screen color")
+
+    sample = validated_model.samples[0]
+    screen = np.asarray(sample, dtype=np.float32) / np.float32(255.0)
+    dominant = int(np.argmax(screen))
+    other_channels = [channel for channel in range(3) if channel != dominant]
+    screen_others = screen[other_channels]
+    balanced_screen_other = (
+        np.float32(0.5) * np.max(screen_others)
+        + np.float32(0.5) * np.min(screen_others)
+    )
+    if screen[dominant] - balanced_screen_other < np.float32(0.05):
+        raise KeyerError("请选择具有明显主色的纯色幕背景")
 
     return ScreenColorModel(
-        mean_rgb=mean_rgb,
-        stddev_rgb=stddev_rgb,
+        mean_rgb=tuple(float(channel) for channel in sample),
+        stddev_rgb=(0.0, 0.0, 0.0),
         samples=validated_model.samples,
     )

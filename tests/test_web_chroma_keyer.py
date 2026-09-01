@@ -1,6 +1,7 @@
 import asyncio
 import json
 from io import BytesIO
+from math import inf, nan
 from os import utime
 from pathlib import Path
 from queue import Empty
@@ -90,8 +91,8 @@ def test_chroma_keyer_task_request_accepts_the_default_export_contract() -> None
         "input_path": "input.png",
         "samples": [[42, 180, 72]],
         "params": {
-            "tolerance": 0.0,
-            "softness": 1.0,
+            "screen_gain": 1.0,
+            "screen_balance": 0.5,
             "clip_black": 0.0,
             "clip_white": 1.0,
             "shrink_grow": 0,
@@ -106,12 +107,20 @@ def test_chroma_keyer_task_request_accepts_the_default_export_contract() -> None
     "changes",
     [
         {"samples": []},
+        {"samples": [[42, 180, 72], [40, 182, 74]]},
         {"samples": [[42, 180]]},
         {"samples": [[-1, 180, 72]]},
         {"samples": [[42, 180, 256]]},
         {"samples": [[True, 180, 72]]},
         {"params": {"clip_black": 0.5, "clip_white": 0.5}},
-        {"params": {"tolerance": 1.1}},
+        {"params": {"screen_gain": 2.1}},
+        {"params": {"screen_gain": inf}},
+        {"params": {"screen_gain": nan}},
+        {"params": {"screen_gain": True}},
+        {"params": {"screen_balance": 1.1}},
+        {"params": {"screen_balance": inf}},
+        {"params": {"screen_balance": nan}},
+        {"params": {"screen_balance": True}},
         {"output_path": "   "},
     ],
 )
@@ -149,11 +158,44 @@ def test_chroma_preview_request_requires_nested_params() -> None:
         )
 
 
+@mark.parametrize("samples", [[], [[42, 180, 72], [40, 182, 74]]])
+def test_chroma_preview_request_requires_exactly_one_sample(
+    samples: list[list[int]],
+) -> None:
+    with raises(ValueError):
+        ChromaPreviewRequest.model_validate(
+            {
+                "input_path": "input.png",
+                "samples": samples,
+                "params": {},
+            }
+        )
+
+
+@mark.parametrize("legacy_field", ["tolerance", "softness"])
+@mark.parametrize(
+    "request_model",
+    [ChromaKeyerTaskRequest, ChromaPreviewRequest],
+)
+def test_chroma_requests_reject_removed_nested_params(
+    legacy_field: str,
+    request_model: type[ChromaKeyerTaskRequest] | type[ChromaPreviewRequest],
+) -> None:
+    with raises(ValueError):
+        request_model.model_validate(
+            {
+                "input_path": "input.png",
+                "samples": [[42, 180, 72]],
+                "params": {legacy_field: 0.4},
+            }
+        )
+
+
 @mark.parametrize(
     ("legacy_field", "legacy_value"),
     [
-        ("tolerance", 0.4),
-        ("softness", 0.2),
+        ("screen_gain", 1.4),
+        ("screen_balance", 0.2),
         ("clip_black", 0.1),
         ("clip_white", 0.9),
         ("shrink_grow", -1),
@@ -179,8 +221,8 @@ def test_chroma_keyer_task_request_rejects_legacy_flattened_params(
 @mark.parametrize(
     ("legacy_field", "legacy_value"),
     [
-        ("tolerance", 0.4),
-        ("softness", 0.2),
+        ("screen_gain", 1.4),
+        ("screen_balance", 0.2),
         ("clip_black", 0.1),
         ("clip_white", 0.9),
         ("shrink_grow", -1),
@@ -208,10 +250,10 @@ def test_chroma_keyer_adapter_converts_request_to_core_keying_arguments() -> Non
         ChromaKeyerTaskRequest(
             input_path="screen.png",
             output_path="keyed.png",
-            samples=[[42, 180, 72], [40, 182, 74]],
+            samples=[[42, 180, 72]],
             params={
-                "tolerance": 0.4,
-                "softness": 0.2,
+                "screen_gain": 1.4,
+                "screen_balance": 0.2,
                 "clip_black": 0.1,
                 "clip_white": 0.9,
                 "shrink_grow": -2,
@@ -224,10 +266,10 @@ def test_chroma_keyer_adapter_converts_request_to_core_keying_arguments() -> Non
 
     assert options.input_path == Path("screen.png")
     assert options.output_path == Path("keyed.png")
-    assert model.samples == ((42, 180, 72), (40, 182, 74))
+    assert model.samples == ((42, 180, 72),)
     assert params == KeyerParams(
-        tolerance=0.4,
-        softness=0.2,
+        screen_gain=1.4,
+        screen_balance=0.2,
         clip_black=0.1,
         clip_white=0.9,
         shrink_grow=-2,
@@ -509,7 +551,7 @@ def test_chroma_keyer_task_endpoint_rejects_invalid_nested_and_flattened_params(
     )
     flattened_response = client.post(
         "/api/tasks/chroma-keyer",
-        json={**valid_request, "tolerance": 0.4},
+        json={**valid_request, "screen_gain": 1.4},
     )
 
     assert invalid_nested_response.status_code == 400
@@ -1045,7 +1087,7 @@ def test_sample_maps_preview_coordinates_to_source_pixel_with_uppercase_hex(
         "/api/chroma-keyer/images/sample",
         json={
             "input_path": str(input_path),
-            "x": 0.9,
+            "x": 0.1,
             "y": 0.1,
             "preview_width": 2,
             "preview_height": 1,
@@ -1054,10 +1096,37 @@ def test_sample_maps_preview_coordinates_to_source_pixel_with_uppercase_hex(
 
     assert response.status_code == 200
     assert response.json() == {
-        "rgb": [220, 40, 40],
-        "hex": "#DC2828",
-        "source_x": 1,
+        "rgb": [42, 180, 72],
+        "hex": "#2AB448",
+        "source_x": 0,
         "source_y": 0,
+    }
+
+
+def test_sample_rejects_low_saturation_without_returning_rgb(tmp_path: Path) -> None:
+    input_path = tmp_path / "gray.png"
+    Image.fromarray(
+        np.array([[[128, 128, 128]]], dtype=np.uint8),
+        mode="RGB",
+    ).save(input_path)
+
+    response = _client(tmp_path).post(
+        "/api/chroma-keyer/images/sample",
+        json={
+            "input_path": str(input_path),
+            "x": 0,
+            "y": 0,
+            "preview_width": 1,
+            "preview_height": 1,
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": {
+            "code": "invalid_screen_color",
+            "message": "请选择具有明显主色的纯色幕背景",
+        }
     }
 
 
@@ -1101,8 +1170,8 @@ def test_final_and_alpha_previews_match_the_public_keying_pipeline(
         "input_path": str(input_path),
         "samples": [[0, 255, 0]],
         "params": {
-            "tolerance": 0.0,
-            "softness": 1.0,
+            "screen_gain": 1.0,
+            "screen_balance": 0.5,
             "clip_black": 0.0,
             "clip_white": 1.0,
             "shrink_grow": 0,
@@ -1224,8 +1293,8 @@ def test_generated_preview_reuses_request_state_and_varies_by_view_and_params(
         "input_path": str(input_path),
         "samples": [[42, 180, 72]],
         "params": {
-            "tolerance": 0.25,
-            "softness": 0.15,
+            "screen_gain": 1.25,
+            "screen_balance": 0.35,
             "clip_black": 0.0,
             "clip_white": 1.0,
             "shrink_grow": 0,
@@ -1240,11 +1309,11 @@ def test_generated_preview_reuses_request_state_and_varies_by_view_and_params(
         "/api/chroma-keyer/previews",
         json={**payload, "view_mode": "alpha"},
     )
-    tolerance_response = client.post(
+    gain_response = client.post(
         "/api/chroma-keyer/previews",
         json={
             **payload,
-            "params": {**payload["params"], "tolerance": 0.3},
+            "params": {**payload["params"], "screen_gain": 1.3},
         },
     )
 
@@ -1252,15 +1321,15 @@ def test_generated_preview_reuses_request_state_and_varies_by_view_and_params(
     assert first_response.status_code == 200
     assert duplicate_response.status_code == 200
     assert alpha_response.status_code == 200
-    assert tolerance_response.status_code == 200
+    assert gain_response.status_code == 200
     assert duplicate_response.json()["preview_url"] == first_url
     assert alpha_response.json()["preview_url"] != first_url
-    assert tolerance_response.json()["preview_url"] != first_url
+    assert gain_response.json()["preview_url"] != first_url
     for response in (
         first_response,
         duplicate_response,
         alpha_response,
-        tolerance_response,
+        gain_response,
     ):
         preview_url = response.json()["preview_url"]
         UUID(preview_url.rsplit("/", maxsplit=1)[1])
@@ -1295,8 +1364,8 @@ def test_singular_and_plural_preview_routes_share_the_request_cache(
     "changes",
     [
         {},
-        {"tolerance": 0.4},
-        {"softness": 0.2},
+        {"screen_gain": 1.4},
+        {"screen_balance": 0.2},
         {"clip_black": 0.1},
         {"clip_white": 0.9},
         {"shrink_grow": -1},
@@ -1329,8 +1398,8 @@ def test_preview_routes_require_nested_params_and_reject_flattened_params(
 
 
 @mark.parametrize("url", ["/api/chroma-keyer/preview", "/api/chroma-keyer/previews"])
-@mark.parametrize("samples", [None, []])
-def test_preview_rejects_missing_or_empty_samples_for_a_valid_image(
+@mark.parametrize("samples", [None, [], [[42, 180, 72], [40, 182, 74]]])
+def test_preview_schema_rejects_non_single_samples_for_a_valid_image(
     tmp_path: Path,
     url: str,
     samples: list[list[int]] | None,
@@ -1340,8 +1409,8 @@ def test_preview_rejects_missing_or_empty_samples_for_a_valid_image(
     payload: dict[str, object] = {
         "input_path": str(input_path),
         "params": {
-            "tolerance": 0.25,
-            "softness": 0.15,
+            "screen_gain": 1.25,
+            "screen_balance": 0.35,
             "clip_black": 0.0,
             "clip_white": 1.0,
             "shrink_grow": 0,
@@ -1358,7 +1427,7 @@ def test_preview_rejects_missing_or_empty_samples_for_a_valid_image(
     )
 
     assert response.status_code == 400
-    assert response.json()["error"]["code"] == "missing_samples"
+    assert response.json()["error"]["code"] == "invalid_request"
 
 
 def test_unknown_preview_returns_structured_not_found(tmp_path: Path) -> None:

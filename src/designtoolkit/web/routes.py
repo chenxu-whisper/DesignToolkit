@@ -64,6 +64,7 @@ _CHROMA_SNAPSHOT_READ_ATTEMPTS = 3
 _KEYER_ERROR_CODES = {
     "Input image could not be read": "invalid_image",
     "samples must not be empty": "missing_samples",
+    "请选择具有明显主色的纯色幕背景": "invalid_screen_color",
     "Output path already exists": "output_exists",
 }
 
@@ -354,6 +355,10 @@ def create_router(
             raise ApiError("invalid_sample_coordinates", str(exc), 400) from exc
 
         sampled_rgb = [int(channel) for channel in rgb[source_y, source_x]]
+        try:
+            screen_model_from_samples([sampled_rgb])
+        except KeyerError as exc:
+            raise _chroma_keyer_error_response(exc) from exc
         return ChromaSampleResponse(
             rgb=sampled_rgb,
             hex=f"#{sampled_rgb[0]:02X}{sampled_rgb[1]:02X}{sampled_rgb[2]:02X}",

@@ -1,9 +1,7 @@
 from math import inf, nan
 
-import numpy as np
 from pytest import mark, raises
 
-from designtoolkit.chroma_keyer import sampling
 from designtoolkit.chroma_keyer.models import KeyerError
 from designtoolkit.chroma_keyer.sampling import (
     map_preview_point,
@@ -49,30 +47,41 @@ def test_map_preview_point_rejects_invalid_inputs(
         map_preview_point(*arguments)  # type: ignore[arg-type]
 
 
-def test_screen_model_from_samples_calculates_two_sample_statistics() -> None:
-    model = screen_model_from_samples(((10, 20, 30), (30, 40, 50)))
+def test_screen_model_from_samples_returns_the_single_sample_statistics() -> None:
+    model = screen_model_from_samples(((10, 20, 30),))
 
-    assert model.mean_rgb == (20.0, 30.0, 40.0)
-    assert model.stddev_rgb == (10.0, 10.0, 10.0)
-    assert model.samples == ((10, 20, 30), (30, 40, 50))
-
-
-def test_screen_model_from_samples_aggregates_as_float32(monkeypatch: object) -> None:
-    observed_dtypes: list[object] = []
-    original_asarray = np.asarray
-
-    def observe_asarray(*args: object, **kwargs: object) -> np.ndarray:
-        observed_dtypes.append(kwargs["dtype"])
-        return original_asarray(*args, **kwargs)
-
-    monkeypatch.setattr(sampling.np, "asarray", observe_asarray)  # type: ignore[attr-defined]
-
-    screen_model_from_samples(((10, 20, 30),))
-
-    assert observed_dtypes == [np.float32]
+    assert model.mean_rgb == (10.0, 20.0, 30.0)
+    assert model.stddev_rgb == (0.0, 0.0, 0.0)
+    assert model.samples == ((10, 20, 30),)
 
 
-@mark.parametrize("samples", [(), ((0, 0),), ((0, 0, 256),)])
+def test_screen_model_from_samples_rejects_missing_samples() -> None:
+    with raises(KeyerError, match="samples must not be empty"):
+        screen_model_from_samples(())
+
+
+def test_screen_model_from_samples_rejects_multiple_samples() -> None:
+    with raises(KeyerError, match="samples must contain exactly one screen color"):
+        screen_model_from_samples(((0, 255, 0), (0, 240, 0)))
+
+
+@mark.parametrize("sample", [(128, 128, 128), (128, 115, 116)])
+def test_screen_model_from_samples_rejects_low_saturation(
+    sample: tuple[int, int, int],
+) -> None:
+    with raises(KeyerError, match="请选择具有明显主色的纯色幕背景"):
+        screen_model_from_samples((sample,))
+
+
+def test_screen_model_from_samples_accepts_saturation_at_threshold() -> None:
+    assert screen_model_from_samples(((128, 115, 115),)).mean_rgb == (
+        128.0,
+        115.0,
+        115.0,
+    )
+
+
+@mark.parametrize("samples", [((0, 0),), ((0, 0, 256),)])
 def test_screen_model_from_samples_rejects_invalid_rgb_surface(
     samples: object,
 ) -> None:

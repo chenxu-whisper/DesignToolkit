@@ -40,8 +40,8 @@ def chroma_keyer_options_from_request(
         ),
         screen_model_from_samples(request.samples),
         KeyerParams(
-            tolerance=params.tolerance,
-            softness=params.softness,
+            screen_gain=params.screen_gain,
+            screen_balance=params.screen_balance,
             clip_black=params.clip_black,
             clip_white=params.clip_white,
             shrink_grow=params.shrink_grow,
