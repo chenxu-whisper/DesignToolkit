@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test'
+import { test, expect, type Route } from '@playwright/test'
 
 test('smoke test: navigate and switch modules', async ({ page }) => {
   await page.goto('/')
@@ -124,4 +124,281 @@ test('stacks the Chroma editor in the constrained desktop workspace without clip
   expect(layout.sample.left).toBeGreaterThanOrEqual(layout.sampleItem.left)
   expect(layout.sample.right).toBeLessThanOrEqual(layout.sampleItem.right)
   expect(layout.sampleScrollWidth).toBeLessThanOrEqual(layout.sampleClientWidth)
+})
+
+const chromaParameterNames = [
+  'Screen Gain',
+  'Screen Balance',
+  'Clip Black',
+  'Clip White',
+  'Shrink/Grow',
+  'Feather',
+  'Despill Amount',
+] as const
+
+const inputPath = 'E:\\media\\screen.png'
+const inspectPreviewUrl = '/api/chroma-keyer/previews/inspect.svg'
+
+function createDeferred<Value>() {
+  let resolve!: (value: Value) => void
+  const promise = new Promise<Value>((promiseResolve) => {
+    resolve = promiseResolve
+  })
+  return { promise, resolve }
+}
+
+async function fulfillPreviewSvg(route: Route) {
+  const title = new URL(route.request().url()).pathname.split('/').at(-1) ?? 'preview'
+  await route.fulfill({
+    contentType: 'image/svg+xml',
+    body: `<svg xmlns="http://www.w3.org/2000/svg" width="400" height="200"><title>${title}</title><rect width="400" height="200" fill="#2AB448"/></svg>`,
+  })
+}
+
+test('auto-loads the image selected by the native picker exactly once', async ({ page }) => {
+  const inspectBodies: unknown[] = []
+  const pickerBodies: unknown[] = []
+
+  await page.route('**/api/local-paths/pick-files', async (route) => {
+    pickerBodies.push(route.request().postDataJSON())
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({ cancelled: false, paths: [inputPath] }),
+    })
+  })
+  await page.route('**/api/chroma-keyer/images/inspect', async (route) => {
+    inspectBodies.push(route.request().postDataJSON())
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({
+        input_path: inputPath,
+        width: 400,
+        height: 200,
+        preview_width: 400,
+        preview_height: 200,
+        preview_url: inspectPreviewUrl,
+      }),
+    })
+  })
+  await page.route('**/api/chroma-keyer/previews/*.svg', fulfillPreviewSvg)
+
+  await page.goto('/')
+  await page.getByRole('button', { exact: true, name: 'Studio Chroma Keyer' }).click()
+  await expect(page.getByRole('button', { name: '加载图片' })).toHaveCount(0)
+
+  await page.getByRole('button', { name: '指定输入图片路径' }).click()
+
+  await expect(page.getByRole('textbox', { name: '输入图片路径' })).toHaveValue(inputPath)
+  await expect(page.getByRole('button', { name: '抠像预览' })).toHaveAttribute('src', inspectPreviewUrl)
+  expect(pickerBodies).toEqual([{ multiple: false, file_kind: 'image', title: '选择图片文件' }])
+  expect(inspectBodies).toEqual([{ input_path: inputPath }])
+})
+
+test('streams live slider previews without blocking controls and keeps the latest response', async ({ page }) => {
+  type PreviewBody = {
+    input_path: string
+    params: {
+      clip_black: number
+      clip_white: number
+      despill_amount: number
+      feather: number
+      screen_balance: number
+      screen_gain: number
+      shrink_grow: number
+    }
+    samples: number[][]
+    view_mode: 'alpha' | 'final'
+  }
+  type CapturedPreview = {
+    body: PreviewBody
+    fulfilled: Promise<void>
+    release: (previewUrl: string) => void
+  }
+
+  const previews: CapturedPreview[] = []
+
+  await page.clock.install()
+  await page.route('**/api/local-paths/pick-files', async (route) => {
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({ cancelled: false, paths: [inputPath] }),
+    })
+  })
+  await page.route('**/api/chroma-keyer/images/inspect', async (route) => {
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({
+        input_path: inputPath,
+        width: 400,
+        height: 200,
+        preview_width: 400,
+        preview_height: 200,
+        preview_url: inspectPreviewUrl,
+      }),
+    })
+  })
+  await page.route('**/api/chroma-keyer/images/sample', async (route) => {
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({
+        rgb: [42, 180, 72],
+        hex: '#2AB448',
+        source_x: 100,
+        source_y: 50,
+      }),
+    })
+  })
+  await page.route('**/api/chroma-keyer/preview', async (route) => {
+    const response = createDeferred<string>()
+    const fulfilled = createDeferred<void>()
+    const body = route.request().postDataJSON() as PreviewBody
+    previews.push({ body, fulfilled: fulfilled.promise, release: response.resolve })
+
+    if (body.params.screen_gain === 1) {
+      response.resolve(`/api/chroma-keyer/previews/${body.view_mode}-${previews.length}.svg`)
+    }
+
+    const previewUrl = await response.promise
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({ preview_url: previewUrl }),
+    })
+    fulfilled.resolve(undefined)
+  })
+  await page.route('**/api/chroma-keyer/previews/*.svg', fulfillPreviewSvg)
+
+  await page.goto('/')
+  await page.getByRole('button', { exact: true, name: 'Studio Chroma Keyer' }).click()
+  await page.getByRole('button', { name: '指定输入图片路径' }).click()
+  const canvas = page.getByRole('button', { name: '抠像预览' })
+  await expect(canvas).toHaveAttribute('src', inspectPreviewUrl)
+  await canvas.click({ position: { x: 100, y: 50 } })
+  await expect(page.getByText('Screen Color', { exact: true })).toBeVisible()
+
+  for (const name of chromaParameterNames) {
+    await expect(page.getByRole('slider', { name })).toBeVisible()
+  }
+
+  await page.clock.fastForward(150)
+  await page.clock.fastForward(150)
+  await expect.poll(() => previews.length).toBe(1)
+  expect(previews[0].body).toEqual({
+    input_path: inputPath,
+    params: {
+      screen_gain: 1,
+      screen_balance: 0.5,
+      clip_black: 0,
+      clip_white: 1,
+      shrink_grow: 0,
+      feather: 0,
+      despill_amount: 1,
+    },
+    samples: [[42, 180, 72]],
+    view_mode: 'final',
+  })
+  await expect(canvas).toHaveAttribute('src', '/api/chroma-keyer/previews/final-1.svg')
+
+  await page.getByRole('radio', { name: 'Alpha' }).click()
+  await expect.poll(() => previews.length).toBe(2)
+  expect(previews[1].body).toEqual({ ...previews[0].body, view_mode: 'alpha' })
+  await expect(canvas).toHaveAttribute('src', '/api/chroma-keyer/previews/alpha-2.svg')
+
+  await page.getByRole('radio', { name: 'Final' }).click()
+  await expect.poll(() => previews.length).toBe(3)
+  expect(previews[2].body).toEqual(previews[0].body)
+  await expect(canvas).toHaveAttribute('src', '/api/chroma-keyer/previews/final-3.svg')
+
+  const screenGain = page.getByRole('slider', { name: 'Screen Gain' })
+  await screenGain.fill('1.1')
+  await page.clock.fastForward(149)
+  expect(previews).toHaveLength(3)
+  await page.clock.fastForward(1)
+  await expect.poll(() => previews.length).toBe(4)
+  const olderPreview = previews[3]
+
+  await screenGain.fill('1.2')
+  await page.clock.fastForward(149)
+  expect(previews).toHaveLength(4)
+  await page.clock.fastForward(1)
+  await expect.poll(() => previews.length).toBe(5)
+  const latestPreview = previews[4]
+
+  expect(olderPreview.body).toEqual({
+    ...previews[2].body,
+    params: { ...previews[2].body.params, screen_gain: 1.1 },
+  })
+  expect(latestPreview.body).toEqual({
+    ...previews[2].body,
+    params: { ...previews[2].body.params, screen_gain: 1.2 },
+  })
+
+  await expect(screenGain).toBeEnabled()
+  await expect(page.getByRole('spinbutton', { name: 'Screen Gain 数值' })).toBeEnabled()
+  await expect(page.getByRole('radio', { name: 'Alpha' })).toBeEnabled()
+  await expect(page.getByRole('button', { name: '删除 Screen Color' })).toBeEnabled()
+  await expect(page.getByRole('button', { name: '导出 PNG' })).toBeEnabled()
+
+  latestPreview.release('/api/chroma-keyer/previews/latest.svg')
+  await latestPreview.fulfilled
+  await expect(canvas).toHaveAttribute('src', '/api/chroma-keyer/previews/latest.svg')
+
+  olderPreview.release('/api/chroma-keyer/previews/older.svg')
+  await olderPreview.fulfilled
+  await expect(canvas).toHaveAttribute('src', '/api/chroma-keyer/previews/latest.svg')
+})
+
+test('contains every slider and value pair at desktop and mobile viewport widths', async ({ page }) => {
+  for (const viewport of [
+    { width: 1440, height: 900 },
+    { width: 390, height: 844 },
+  ]) {
+    await page.setViewportSize(viewport)
+    await page.goto('/')
+    await page.getByRole('button', { exact: true, name: 'Studio Chroma Keyer' }).click()
+
+    const viewportLayout = await page.evaluate(() => ({
+      bodyClientWidth: document.body.clientWidth,
+      bodyScrollWidth: document.body.scrollWidth,
+      documentClientWidth: document.documentElement.clientWidth,
+      documentScrollWidth: document.documentElement.scrollWidth,
+      innerWidth: window.innerWidth,
+    }))
+    expect(viewportLayout.documentScrollWidth).toBeLessThanOrEqual(viewportLayout.documentClientWidth)
+    expect(viewportLayout.bodyScrollWidth).toBeLessThanOrEqual(viewportLayout.bodyClientWidth)
+    expect(viewportLayout.documentClientWidth).toBeLessThanOrEqual(viewportLayout.innerWidth)
+
+    const form = page.locator('.chroma-keyer-form')
+    const formBox = await form.boundingBox()
+    expect(formBox).not.toBeNull()
+    if (!formBox) {
+      throw new Error(`Expected Chroma form at ${viewport.width}x${viewport.height}`)
+    }
+
+    for (const name of chromaParameterNames) {
+      const slider = page.getByRole('slider', { name })
+      const value = page.getByRole('spinbutton', { name: `${name} 数值` })
+      const field = slider.locator('..')
+      const label = field.locator('label', { hasText: name })
+      await expect(slider).toBeVisible()
+      await expect(value).toBeVisible()
+
+      const [fieldBox, sliderBox, valueBox, labelBox] = await Promise.all([
+        field.boundingBox(),
+        slider.boundingBox(),
+        value.boundingBox(),
+        label.boundingBox(),
+      ])
+      if (!fieldBox || !sliderBox || !valueBox || !labelBox) {
+        throw new Error(`Expected ${name} geometry at ${viewport.width}x${viewport.height}`)
+      }
+
+      for (const controlBox of [sliderBox, valueBox]) {
+        expect(controlBox.x).toBeGreaterThanOrEqual(fieldBox.x - 0.5)
+        expect(controlBox.x + controlBox.width).toBeLessThanOrEqual(fieldBox.x + fieldBox.width + 0.5)
+        expect(controlBox.x).toBeGreaterThanOrEqual(formBox.x - 0.5)
+        expect(controlBox.x + controlBox.width).toBeLessThanOrEqual(formBox.x + formBox.width + 0.5)
+      }
+      expect(labelBox.x + labelBox.width).toBeLessThanOrEqual(valueBox.x)
+    }
+  }
 })
