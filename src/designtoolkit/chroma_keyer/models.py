@@ -49,17 +49,14 @@ def _normalize_rgb_statistics(
 
 def dominant_screen_channel(mean_rgb: object) -> int:
     """Return the clearly dominant channel of an RGB screen color."""
-    normalized_rgb = tuple(
-        channel / 255.0
-        for channel in _normalize_rgb_statistics("mean_rgb", mean_rgb)
-    )
-    dominant = max(range(3), key=normalized_rgb.__getitem__)
+    rgb = _normalize_rgb_statistics("mean_rgb", mean_rgb)
+    dominant = max(range(3), key=rgb.__getitem__)
     strongest_other = max(
         channel
-        for index, channel in enumerate(normalized_rgb)
+        for index, channel in enumerate(rgb)
         if index != dominant
     )
-    if normalized_rgb[dominant] - strongest_other < 0.05:
+    if rgb[dominant] - strongest_other < 12.75:
         raise KeyerError("请选择具有明显主色的纯色幕背景")
     return dominant
 

@@ -1,4 +1,4 @@
-from math import inf, nan
+from math import inf, nan, nextafter
 from pathlib import Path
 
 from pytest import mark, raises
@@ -196,6 +196,27 @@ def test_screen_color_model_accepts_valid_rgb_data() -> None:
 
 def test_dominant_screen_channel_returns_argmax_for_clear_rgb() -> None:
     assert dominant_screen_channel((20, 220, 30)) == 1
+
+
+def test_dominant_screen_channel_accepts_exact_dominance_boundary() -> None:
+    model = ScreenColorModel(
+        mean_rgb=(127.5, 114.75, 114.75),
+        stddev_rgb=(0.0, 0.0, 0.0),
+        samples=((128, 115, 115),),
+    )
+
+    assert dominant_screen_channel(model.mean_rgb) == 0
+
+
+def test_dominant_screen_channel_rejects_just_below_dominance_boundary() -> None:
+    model = ScreenColorModel(
+        mean_rgb=(127.5, nextafter(114.75, inf), 114.75),
+        stddev_rgb=(0.0, 0.0, 0.0),
+        samples=((128, 115, 115),),
+    )
+
+    with raises(KeyerError):
+        dominant_screen_channel(model.mean_rgb)
 
 
 @mark.parametrize("mean_rgb", [(128, 114, 116), (128, 115, 127)])
