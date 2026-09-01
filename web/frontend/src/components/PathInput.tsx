@@ -94,6 +94,11 @@ export function PathInput({
     onCommit?.(nextValue)
   }
 
+  const commitManualValue = (nextValue: string) => {
+    beginIntent()
+    onCommit?.(nextValue)
+  }
+
   const applyDraftPath = () => {
     if (disabled) {
       return
@@ -247,7 +252,7 @@ export function PathInput({
                 clearPickerPointerBlur()
                 return
               }
-              onCommit?.(event.currentTarget.value)
+              commitManualValue(event.currentTarget.value)
             }}
             onChange={(event) => {
               beginIntent()
@@ -260,7 +265,7 @@ export function PathInput({
               if (event.key === 'Enter' && !event.nativeEvent.isComposing) {
                 event.preventDefault()
                 skipNextBlurRef.current = true
-                onCommit?.(event.currentTarget.value)
+                commitManualValue(event.currentTarget.value)
               }
             }}
             placeholder={placeholder}

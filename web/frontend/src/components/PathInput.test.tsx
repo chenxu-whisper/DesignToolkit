@@ -580,6 +580,85 @@ describe('PathInput', () => {
     expect(onCommit).toHaveBeenCalledOnce()
   })
 
+  it('ignores a resolved drop after Enter commits the current explicit path', async () => {
+    const user = userEvent.setup()
+    const resolution = deferred<readonly string[]>()
+    const onChange = vi.fn()
+    const onCommit = vi.fn()
+    const resolveDroppedFilePaths = vi.fn(() => resolution.promise)
+    render(
+      <ControlledCommittedPathInput
+        initialValue={'D:\\explicit\\current.png'}
+        onChange={onChange}
+        onCommit={onCommit}
+        resolveDroppedFilePaths={resolveDroppedFilePaths}
+      />,
+    )
+    const input = screen.getByLabelText('输入媒体路径')
+
+    fireEvent.drop(input, {
+      dataTransfer: {
+        files: [new File(['image'], 'old.png', { type: 'image/png' })],
+        getData: () => '',
+      },
+    })
+    await waitFor(() => expect(resolveDroppedFilePaths).toHaveBeenCalledOnce())
+
+    await user.click(input)
+    await user.keyboard('{Enter}')
+    expect(onChange).not.toHaveBeenCalled()
+    expect(onCommit).toHaveBeenCalledOnce()
+    expect(onCommit).toHaveBeenCalledWith('D:\\explicit\\current.png')
+
+    await act(async () => {
+      resolution.resolve(['E:\\resolved\\old.png'])
+      await resolution.promise
+    })
+
+    expect(input).toHaveValue('D:\\explicit\\current.png')
+    expect(onChange).not.toHaveBeenCalled()
+    expect(onCommit).toHaveBeenCalledOnce()
+  })
+
+  it('ignores a resolved drop after blur commits the current explicit path', async () => {
+    const resolution = deferred<readonly string[]>()
+    const onChange = vi.fn()
+    const onCommit = vi.fn()
+    const resolveDroppedFilePaths = vi.fn(() => resolution.promise)
+    render(
+      <ControlledCommittedPathInput
+        initialValue={'D:\\explicit\\current.png'}
+        onChange={onChange}
+        onCommit={onCommit}
+        resolveDroppedFilePaths={resolveDroppedFilePaths}
+      />,
+    )
+    const input = screen.getByLabelText('输入媒体路径')
+
+    fireEvent.drop(input, {
+      dataTransfer: {
+        files: [new File(['image'], 'old.png', { type: 'image/png' })],
+        getData: () => '',
+      },
+    })
+    await waitFor(() => expect(resolveDroppedFilePaths).toHaveBeenCalledOnce())
+
+    fireEvent.focus(input)
+    fireEvent.blur(input)
+    expect(onChange).not.toHaveBeenCalled()
+    expect(onCommit).toHaveBeenCalledOnce()
+    expect(onCommit).toHaveBeenCalledWith('D:\\explicit\\current.png')
+
+    await act(async () => {
+      resolution.resolve(['E:\\resolved\\old.png'])
+      await resolution.promise
+    })
+
+    expect(input).toHaveValue('D:\\explicit\\current.png')
+    expect(onChange).not.toHaveBeenCalled()
+    expect(onCommit).toHaveBeenCalledOnce()
+  })
+
   it('updates and commits the exact path applied from the editor', async () => {
     const user = userEvent.setup()
     const onChange = vi.fn()

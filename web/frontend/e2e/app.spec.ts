@@ -308,28 +308,56 @@ test('streams live slider previews without blocking controls and keeps the lates
   expect(previews[2].body).toEqual(previews[0].body)
   await expect(canvas).toHaveAttribute('src', '/api/chroma-keyer/previews/final-3.svg')
 
+  const parameterChanges: ReadonlyArray<{
+    key: keyof PreviewBody['params']
+    name: (typeof chromaParameterNames)[number]
+    value: number
+  }> = [
+    { key: 'screen_balance', name: 'Screen Balance', value: 0.6 },
+    { key: 'clip_black', name: 'Clip Black', value: 0.1 },
+    { key: 'clip_white', name: 'Clip White', value: 0.9 },
+    { key: 'shrink_grow', name: 'Shrink/Grow', value: 2 },
+    { key: 'feather', name: 'Feather', value: 3 },
+    { key: 'despill_amount', name: 'Despill Amount', value: 0.8 },
+  ]
+  let expectedBody = previews[2].body
+
+  for (const change of parameterChanges) {
+    const previousCount = previews.length
+    await page.getByRole('slider', { name: change.name }).fill(String(change.value))
+    await page.clock.fastForward(150)
+    await expect.poll(() => previews.length).toBe(previousCount + 1)
+
+    expectedBody = {
+      ...expectedBody,
+      params: { ...expectedBody.params, [change.key]: change.value },
+    }
+    expect(previews.at(-1)?.body).toEqual(expectedBody)
+  }
+
   const screenGain = page.getByRole('slider', { name: 'Screen Gain' })
+  const previewCountBeforeGain = previews.length
   await screenGain.fill('1.1')
   await page.clock.fastForward(149)
-  expect(previews).toHaveLength(3)
+  expect(previews).toHaveLength(previewCountBeforeGain)
   await page.clock.fastForward(1)
-  await expect.poll(() => previews.length).toBe(4)
-  const olderPreview = previews[3]
+  await expect.poll(() => previews.length).toBe(previewCountBeforeGain + 1)
+  const olderPreview = previews.at(-1)!
 
   await screenGain.fill('1.2')
   await page.clock.fastForward(149)
-  expect(previews).toHaveLength(4)
+  expect(previews).toHaveLength(previewCountBeforeGain + 1)
   await page.clock.fastForward(1)
-  await expect.poll(() => previews.length).toBe(5)
-  const latestPreview = previews[4]
+  await expect.poll(() => previews.length).toBe(previewCountBeforeGain + 2)
+  const latestPreview = previews.at(-1)!
 
   expect(olderPreview.body).toEqual({
-    ...previews[2].body,
-    params: { ...previews[2].body.params, screen_gain: 1.1 },
+    ...expectedBody,
+    params: { ...expectedBody.params, screen_gain: 1.1 },
   })
   expect(latestPreview.body).toEqual({
-    ...previews[2].body,
-    params: { ...previews[2].body.params, screen_gain: 1.2 },
+    ...expectedBody,
+    params: { ...expectedBody.params, screen_gain: 1.2 },
   })
 
   await expect(screenGain).toBeEnabled()
@@ -358,6 +386,7 @@ test('contains every slider and value pair at desktop and mobile viewport widths
       'content',
       'width=device-width,initial-scale=1',
     )
+    await expect(page.locator('html')).toHaveAttribute('lang', 'zh-CN')
     await page.getByRole('button', { exact: true, name: 'Studio Chroma Keyer' }).click()
 
     const viewportLayout = await page.evaluate(() => ({
