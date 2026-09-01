@@ -1,5 +1,5 @@
 import { FolderOpen } from 'lucide-react'
-import { type DragEvent, useEffect, useId, useState } from 'react'
+import { type DragEvent, useEffect, useId, useRef, useState } from 'react'
 import { FieldError } from './FieldError'
 
 const DROP_PATH_ERROR = '浏览器未提供文件真实路径，请使用文件夹按钮粘贴本地路径'
@@ -48,6 +48,10 @@ export function PathInput({
   const [draftPath, setDraftPath] = useState(value)
   const [dropError, setDropError] = useState<string | null>(null)
   const [pickerError, setPickerError] = useState<string | null>(null)
+  const currentValueRef = useRef(value)
+  const pickerButtonRef = useRef<HTMLButtonElement>(null)
+  const skipNextBlurRef = useRef(false)
+  currentValueRef.current = value
 
   useEffect(() => {
     if (isEditorOpen) {
@@ -57,12 +61,14 @@ export function PathInput({
 
   const openEditor = () => {
     if (!isEditorOpen) {
-      setDraftPath(value)
+      setDraftPath(currentValueRef.current)
     }
     setIsEditorOpen(true)
   }
 
   const updateValue = (nextValue: string) => {
+    currentValueRef.current = nextValue
+    skipNextBlurRef.current = false
     setDropError(null)
     setPickerError(null)
     onChange(nextValue)
@@ -93,7 +99,7 @@ export function PathInput({
     try {
       const paths = await pickPaths()
       if (paths.length > 0) {
-        commitValue(valueWithDroppedPaths(value, paths, multiline))
+        commitValue(valueWithDroppedPaths(currentValueRef.current, paths, multiline))
         setIsEditorOpen(false)
       }
     } catch {
@@ -119,14 +125,13 @@ export function PathInput({
     }
     event.preventDefault()
     setIsDragActive(false)
-    const currentValue = event.currentTarget.value
     const fileNames = droppedFileNames(event.dataTransfer.files)
     const paths = droppedPathsFromDataTransfer(event.dataTransfer)
     if (paths.length === 0) {
       if (fileNames.length > 0 && resolveDroppedFilePaths) {
         const resolvedPaths = await resolveDroppedFilePaths(fileNames)
         if (resolvedPaths.length > 0) {
-          commitValue(valueWithDroppedPaths(currentValue, resolvedPaths, multiline))
+          commitValue(valueWithDroppedPaths(currentValueRef.current, resolvedPaths, multiline))
           return
         }
       }
@@ -135,7 +140,7 @@ export function PathInput({
       }
       return
     }
-    commitValue(valueWithDroppedPaths(currentValue, paths, multiline))
+    commitValue(valueWithDroppedPaths(currentValueRef.current, paths, multiline))
   }
 
   const inputClassName = `text-input${isDragActive ? ' path-drop-active' : ''}`
@@ -185,13 +190,24 @@ export function PathInput({
             className={inputClassName}
             disabled={disabled}
             id={inputId}
-            onBlur={(event) => onCommit?.(event.currentTarget.value)}
+            onBlur={(event) => {
+              if (skipNextBlurRef.current) {
+                skipNextBlurRef.current = false
+                return
+              }
+              if (event.relatedTarget === pickerButtonRef.current) {
+                return
+              }
+              onCommit?.(event.currentTarget.value)
+            }}
             onChange={(event) => updateValue(event.target.value)}
             onDragLeave={() => setIsDragActive(false)}
             onDragOver={handleDragOver}
             onDrop={handleDrop}
             onKeyDown={(event) => {
-              if (event.key === 'Enter') {
+              if (event.key === 'Enter' && !event.nativeEvent.isComposing) {
+                event.preventDefault()
+                skipNextBlurRef.current = true
                 onCommit?.(event.currentTarget.value)
               }
             }}
@@ -208,6 +224,7 @@ export function PathInput({
           className={`icon-button path-picker-button${isEditorOpen || isPicking ? ' path-picker-button-active' : ''}`}
           disabled={disabled || isPicking}
           onClick={() => void handlePickerClick()}
+          ref={pickerButtonRef}
           title={`指定${label}`}
           type="button"
         >

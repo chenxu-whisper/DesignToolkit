@@ -4,6 +4,14 @@ import { useState } from 'react'
 import { describe, expect, it, vi } from 'vitest'
 import { PathInput } from './PathInput'
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise
+  })
+  return { promise, resolve }
+}
+
 function ControlledPathInput() {
   const [value, setValue] = useState('C:\\input\\clip.mp4')
 
@@ -98,11 +106,21 @@ function ControlledCommittedPathInput({
 }
 
 describe('PathInput', () => {
-  it('commits a manually typed single-line path on Enter but not on raw changes', async () => {
+  it('commits once on Enter without submitting an enclosing form', async () => {
     const user = userEvent.setup()
     const onChange = vi.fn()
     const onCommit = vi.fn()
-    render(<ControlledCommittedPathInput onChange={onChange} onCommit={onCommit} />)
+    const onSubmit = vi.fn()
+    render(
+      <form
+        onSubmit={(event) => {
+          event.preventDefault()
+          onSubmit()
+        }}
+      >
+        <ControlledCommittedPathInput onChange={onChange} onCommit={onCommit} />
+      </form>,
+    )
     const input = screen.getByLabelText('输入媒体路径')
 
     await user.type(input, 'D:\\art\\screen.png')
@@ -114,6 +132,27 @@ describe('PathInput', () => {
 
     expect(onCommit).toHaveBeenCalledOnce()
     expect(onCommit).toHaveBeenLastCalledWith('D:\\art\\screen.png')
+    expect(onSubmit).not.toHaveBeenCalled()
+  })
+
+  it('skips only the blur immediately following Enter', async () => {
+    const user = userEvent.setup()
+    const onChange = vi.fn()
+    const onCommit = vi.fn()
+    render(<ControlledCommittedPathInput onChange={onChange} onCommit={onCommit} />)
+    const input = screen.getByLabelText('输入媒体路径')
+
+    await user.type(input, 'D:\\art\\screen.png')
+    await user.keyboard('{Enter}')
+    fireEvent.blur(input)
+
+    expect(onCommit).toHaveBeenCalledOnce()
+
+    fireEvent.change(input, { target: { value: 'D:\\art\\replacement.png' } })
+    fireEvent.blur(input)
+
+    expect(onCommit).toHaveBeenCalledTimes(2)
+    expect(onCommit).toHaveBeenLastCalledWith('D:\\art\\replacement.png')
   })
 
   it('commits the current single-line path on blur', async () => {
@@ -128,6 +167,25 @@ describe('PathInput', () => {
 
     expect(onCommit).toHaveBeenCalledOnce()
     expect(onCommit).toHaveBeenLastCalledWith('D:\\art\\screen.png')
+  })
+
+  it('ignores Enter while an IME composition is active', () => {
+    const onChange = vi.fn()
+    const onCommit = vi.fn()
+    render(
+      <ControlledCommittedPathInput
+        initialValue="D:\\art\\screen.png"
+        onChange={onChange}
+        onCommit={onCommit}
+      />,
+    )
+
+    fireEvent.keyDown(screen.getByLabelText('输入媒体路径'), {
+      isComposing: true,
+      key: 'Enter',
+    })
+
+    expect(onCommit).not.toHaveBeenCalled()
   })
 
   it('updates and commits the exact path returned by the native picker', async () => {
@@ -149,6 +207,27 @@ describe('PathInput', () => {
     await waitFor(() => expect(onCommit).toHaveBeenCalledWith('E:\\media\\screen.png'))
     expect(onChange).toHaveBeenCalledWith('E:\\media\\screen.png')
     expect(onCommit).toHaveBeenCalledOnce()
+  })
+
+  it('does not blur-commit the typed path when a picker click is cancelled', async () => {
+    const user = userEvent.setup()
+    const onChange = vi.fn()
+    const onCommit = vi.fn()
+    const pickPaths = vi.fn().mockResolvedValue([])
+    render(
+      <ControlledCommittedPathInput
+        onChange={onChange}
+        onCommit={onCommit}
+        pickPaths={pickPaths}
+      />,
+    )
+    const input = screen.getByLabelText('输入媒体路径')
+
+    await user.type(input, 'D:\\typed\\screen.png')
+    await user.click(screen.getByRole('button', { name: '指定输入媒体路径' }))
+
+    await waitFor(() => expect(pickPaths).toHaveBeenCalledOnce())
+    expect(onCommit).not.toHaveBeenCalled()
   })
 
   it('does not commit when the native picker is cancelled', async () => {
@@ -189,6 +268,39 @@ describe('PathInput', () => {
     await waitFor(() => expect(screen.getByLabelText('本地路径')).toHaveFocus())
     expect(onChange).not.toHaveBeenCalled()
     expect(onCommit).not.toHaveBeenCalled()
+  })
+
+  it('merges picker paths with the latest multiline value after awaiting', async () => {
+    const user = userEvent.setup()
+    const selection = deferred<readonly string[]>()
+    const onChange = vi.fn()
+    const onCommit = vi.fn()
+    const pickPaths = vi.fn(() => selection.promise)
+    render(
+      <ControlledCommittedPathInput
+        initialValue={'C:\\media\\one.mp4'}
+        multiline
+        onChange={onChange}
+        onCommit={onCommit}
+        pickPaths={pickPaths}
+      />,
+    )
+    const input = screen.getByLabelText('输入媒体路径')
+
+    await user.click(screen.getByRole('button', { name: '指定输入媒体路径' }))
+    fireEvent.change(input, {
+      target: { value: 'C:\\media\\one.mp4\nD:\\media\\two.mp4' },
+    })
+    selection.resolve(['E:\\media\\three.mp4'])
+
+    await waitFor(() =>
+      expect(onCommit).toHaveBeenCalledWith(
+        'C:\\media\\one.mp4\nD:\\media\\two.mp4\nE:\\media\\three.mp4',
+      ),
+    )
+    expect(input).toHaveValue(
+      'C:\\media\\one.mp4\nD:\\media\\two.mp4\nE:\\media\\three.mp4',
+    )
   })
 
   it('updates and commits the exact directly dropped path', () => {
@@ -233,6 +345,44 @@ describe('PathInput', () => {
     await waitFor(() => expect(onCommit).toHaveBeenCalledWith('E:\\resolved\\screen.png'))
     expect(onChange).toHaveBeenCalledWith('E:\\resolved\\screen.png')
     expect(onCommit).toHaveBeenCalledOnce()
+  })
+
+  it('merges resolved drop paths with the latest multiline value after awaiting', async () => {
+    const resolution = deferred<readonly string[]>()
+    const onChange = vi.fn()
+    const onCommit = vi.fn()
+    const resolveDroppedFilePaths = vi.fn(() => resolution.promise)
+    render(
+      <ControlledCommittedPathInput
+        initialValue={'C:\\media\\one.mp4'}
+        multiline
+        onChange={onChange}
+        onCommit={onCommit}
+        resolveDroppedFilePaths={resolveDroppedFilePaths}
+      />,
+    )
+    const input = screen.getByLabelText('输入媒体路径')
+
+    fireEvent.drop(input, {
+      dataTransfer: {
+        files: [new File(['video'], 'three.mp4', { type: 'video/mp4' })],
+        getData: () => '',
+      },
+    })
+    await waitFor(() => expect(resolveDroppedFilePaths).toHaveBeenCalledOnce())
+    fireEvent.change(input, {
+      target: { value: 'C:\\media\\one.mp4\nD:\\media\\two.mp4' },
+    })
+    resolution.resolve(['E:\\media\\three.mp4'])
+
+    await waitFor(() =>
+      expect(onCommit).toHaveBeenCalledWith(
+        'C:\\media\\one.mp4\nD:\\media\\two.mp4\nE:\\media\\three.mp4',
+      ),
+    )
+    expect(input).toHaveValue(
+      'C:\\media\\one.mp4\nD:\\media\\two.mp4\nE:\\media\\three.mp4',
+    )
   })
 
   it('updates and commits the exact path applied from the editor', async () => {
