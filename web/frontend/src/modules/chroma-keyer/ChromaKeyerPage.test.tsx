@@ -130,12 +130,16 @@ describe('ChromaKeyerPage', () => {
     )
   })
 
-  it('preserves the previous Screen Color when a replacement sample is rejected', async () => {
-    render(<ChromaKeyerPage />)
+  it('preserves the previous Screen Color and payloads when a replacement sample is rejected', async () => {
+    const user = renderWithUser()
 
     await inspectImage()
     await sampleImage()
-    await waitFor(() => expect(pageMocks.createChromaPreview).toHaveBeenCalledTimes(1))
+    await waitFor(() =>
+      expect(pageMocks.createChromaPreview).toHaveBeenCalledWith(
+        expect.objectContaining({ samples: [[42, 180, 72]] }),
+      ),
+    )
     pageMocks.sampleChromaImage.mockRejectedValueOnce(new Error('请选择具有明显主色的纯色幕背景'))
 
     await sampleImage()
@@ -145,6 +149,25 @@ describe('ChromaKeyerPage', () => {
     expect(screen.getByText('RGB(42, 180, 72)')).toBeInTheDocument()
     expect(screen.getByText('400, 200')).toBeInTheDocument()
     expect(screen.getAllByRole('button', { name: '删除 Screen Color' })).toHaveLength(1)
+    expect(screen.getByRole('button', { name: '导出 PNG' })).toBeEnabled()
+
+    fireEvent.change(screen.getByLabelText('Screen Balance'), { target: { value: '0.35' } })
+    await waitFor(() =>
+      expect(pageMocks.createChromaPreview).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          params: expect.objectContaining({ screenBalance: 0.35 }),
+          samples: [[42, 180, 72]],
+        }),
+      ),
+    )
+
+    await user.click(screen.getByRole('button', { name: '导出 PNG' }))
+    expect(pageMocks.createChromaKeyerTask).toHaveBeenCalledWith(
+      expect.objectContaining({
+        params: expect.objectContaining({ screenBalance: 0.35 }),
+        samples: [[42, 180, 72]],
+      }),
+    )
   })
 
   it('clears the inspected session when the input path changes', async () => {
@@ -186,6 +209,31 @@ describe('ChromaKeyerPage', () => {
         expect.objectContaining({
           samples: [[42, 180, 72]],
           viewMode: 'alpha',
+        }),
+      ),
+    )
+  })
+
+  it('requests a new preview with the updated Screen Balance', async () => {
+    render(<ChromaKeyerPage />)
+
+    await inspectImage()
+    await sampleImage()
+    await waitFor(() =>
+      expect(pageMocks.createChromaPreview).toHaveBeenCalledWith(
+        expect.objectContaining({
+          params: expect.objectContaining({ screenBalance: 0.5 }),
+        }),
+      ),
+    )
+
+    fireEvent.change(screen.getByLabelText('Screen Balance'), { target: { value: '0.35' } })
+
+    await waitFor(() =>
+      expect(pageMocks.createChromaPreview).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          params: expect.objectContaining({ screenBalance: 0.35 }),
+          samples: [[42, 180, 72]],
         }),
       ),
     )
@@ -296,20 +344,36 @@ describe('ChromaKeyerPage', () => {
     )
   })
 
-  it('deletes one sample and clears all samples', async () => {
+  it('deletes the Screen Color and restores the inspected source preview', async () => {
     const user = renderWithUser()
 
     await inspectImage()
     await sampleImage()
-    await waitFor(() => expect(screen.getByText('#2AB448')).toBeInTheDocument())
+    const preview = screen.getByRole('button', { name: '抠像预览' })
+    await waitFor(() => expect(preview).toHaveAttribute('src', '/api/previews/final.png'))
 
     await user.click(screen.getByRole('button', { name: '删除 Screen Color' }))
-    expect(screen.queryByText('#2AB448')).not.toBeInTheDocument()
 
-    await sampleImage()
-    await waitFor(() => expect(screen.getByText('#2AB448')).toBeInTheDocument())
-    await user.click(screen.getByRole('button', { name: '清除全部采样点' }))
     expect(screen.queryByText('#2AB448')).not.toBeInTheDocument()
+    expect(preview).toHaveAttribute('src', inspectResponse.preview_url)
+    expect(screen.getByRole('button', { name: '导出 PNG' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: '清除全部采样点' })).toBeDisabled()
+  })
+
+  it('clears the Screen Color and restores the inspected source preview', async () => {
+    const user = renderWithUser()
+
+    await inspectImage()
+    await sampleImage()
+    const preview = screen.getByRole('button', { name: '抠像预览' })
+    await waitFor(() => expect(preview).toHaveAttribute('src', '/api/previews/final.png'))
+
+    await user.click(screen.getByRole('button', { name: '清除全部采样点' }))
+
+    expect(screen.queryByText('#2AB448')).not.toBeInTheDocument()
+    expect(preview).toHaveAttribute('src', inspectResponse.preview_url)
+    expect(screen.getByRole('button', { name: '导出 PNG' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: '清除全部采样点' })).toBeDisabled()
   })
 
   it('exports the complete nested chroma payload after validation', async () => {
