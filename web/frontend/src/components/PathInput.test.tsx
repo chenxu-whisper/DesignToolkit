@@ -73,6 +73,7 @@ function ControlledBatchPathInputWithPicker({
 }
 
 function ControlledCommittedPathInput({
+  disabled = false,
   initialValue = '',
   multiline = false,
   onChange,
@@ -80,6 +81,7 @@ function ControlledCommittedPathInput({
   pickPaths,
   resolveDroppedFilePaths,
 }: {
+  disabled?: boolean
   initialValue?: string
   multiline?: boolean
   onChange: (value: string) => void
@@ -91,6 +93,7 @@ function ControlledCommittedPathInput({
 
   return (
     <PathInput
+      disabled={disabled}
       label="输入媒体路径"
       multiline={multiline}
       onChange={(nextValue) => {
@@ -132,6 +135,103 @@ describe('PathInput', () => {
 
     expect(pickPaths).not.toHaveBeenCalled()
     expect(onChange).not.toHaveBeenCalled()
+  })
+
+  it('cancels a pending picker intent when disabled and permits a new pick after re-enable', async () => {
+    const user = userEvent.setup()
+    const firstSelection = deferred<readonly string[]>()
+    const onChange = vi.fn()
+    const onCommit = vi.fn()
+    const pickPaths = vi
+      .fn()
+      .mockImplementationOnce(() => firstSelection.promise)
+      .mockResolvedValueOnce(['F:\\picked\\new.png'])
+    const renderInput = (disabled: boolean) => (
+      <ControlledCommittedPathInput
+        disabled={disabled}
+        initialValue={'C:\\existing\\path.png'}
+        onChange={onChange}
+        onCommit={onCommit}
+        pickPaths={pickPaths}
+      />
+    )
+    const { rerender } = render(renderInput(false))
+    const input = screen.getByLabelText('输入媒体路径')
+    const picker = screen.getByRole('button', { name: '指定输入媒体路径' })
+
+    await user.click(picker)
+    expect(picker).toHaveAttribute('aria-disabled', 'true')
+
+    rerender(renderInput(true))
+    await act(async () => {
+      firstSelection.resolve(['E:\\picked\\stale.png'])
+      await firstSelection.promise
+    })
+
+    expect(input).toHaveValue('C:\\existing\\path.png')
+    expect(onChange).not.toHaveBeenCalled()
+    expect(onCommit).not.toHaveBeenCalled()
+
+    rerender(renderInput(false))
+    expect(picker).toHaveAttribute('aria-disabled', 'false')
+    await user.click(picker)
+
+    await waitFor(() => expect(onCommit).toHaveBeenCalledWith('F:\\picked\\new.png'))
+    expect(input).toHaveValue('F:\\picked\\new.png')
+    expect(onChange).toHaveBeenCalledOnce()
+  })
+
+  it('cancels a pending drop resolution when disabled and permits a new drop after re-enable', async () => {
+    const firstResolution = deferred<readonly string[]>()
+    const onChange = vi.fn()
+    const onCommit = vi.fn()
+    const resolveDroppedFilePaths = vi
+      .fn()
+      .mockImplementationOnce(() => firstResolution.promise)
+      .mockResolvedValueOnce(['F:\\resolved\\new.png'])
+    const renderInput = (disabled: boolean) => (
+      <ControlledCommittedPathInput
+        disabled={disabled}
+        initialValue={'C:\\existing\\path.png'}
+        multiline
+        onChange={onChange}
+        onCommit={onCommit}
+        resolveDroppedFilePaths={resolveDroppedFilePaths}
+      />
+    )
+    const { rerender } = render(renderInput(false))
+    const input = screen.getByLabelText('输入媒体路径')
+
+    fireEvent.drop(input, {
+      dataTransfer: {
+        files: [new File(['stale'], 'stale.png', { type: 'image/png' })],
+        getData: () => '',
+      },
+    })
+    await waitFor(() => expect(resolveDroppedFilePaths).toHaveBeenCalledOnce())
+
+    rerender(renderInput(true))
+    await act(async () => {
+      firstResolution.resolve(['E:\\resolved\\stale.png'])
+      await firstResolution.promise
+    })
+
+    expect(input).toHaveValue('C:\\existing\\path.png')
+    expect(onChange).not.toHaveBeenCalled()
+    expect(onCommit).not.toHaveBeenCalled()
+
+    rerender(renderInput(false))
+    fireEvent.drop(input, {
+      dataTransfer: {
+        files: [new File(['new'], 'new.png', { type: 'image/png' })],
+        getData: () => '',
+      },
+    })
+
+    const expectedValue = 'C:\\existing\\path.png\nF:\\resolved\\new.png'
+    await waitFor(() => expect(onCommit).toHaveBeenCalledWith(expectedValue))
+    expect(input).toHaveValue(expectedValue)
+    expect(onChange).toHaveBeenCalledOnce()
   })
 
   it('commits once on Enter without submitting an enclosing form', async () => {

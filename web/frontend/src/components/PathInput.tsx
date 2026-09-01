@@ -61,6 +61,12 @@ export function PathInput({
     }
   }, [editorId, isEditorOpen])
 
+  useEffect(() => {
+    if (disabled) {
+      latestIntentRef.current += 1
+    }
+  }, [disabled])
+
   const openEditor = () => {
     if (!isEditorOpen) {
       setDraftPath(currentValueRef.current)
