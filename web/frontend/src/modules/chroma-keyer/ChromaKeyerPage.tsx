@@ -27,6 +27,16 @@ type InspectedImage = {
   width: number
 }
 
+const previewParameterFields = [
+  'screenGain',
+  'screenBalance',
+  'clipBlack',
+  'clipWhite',
+  'shrinkGrow',
+  'feather',
+  'despillAmount',
+] as const
+
 function toPayload(values: ChromaKeyerValues): ChromaKeyerPayload {
   if (values.samples.length !== 1) {
     throw new Error('需要且只能保留一个背景采样颜色')
@@ -71,6 +81,7 @@ export function ChromaKeyerPage() {
   const mountedRef = useRef(true)
   const inspectingPathRef = useRef<string | null>(null)
   const requestSequenceRef = useRef(0)
+  const previewSequenceRef = useRef(0)
   const lastViewModeRef = useRef(values.viewMode)
   const disabledByTask = status === 'queued' || status === 'running' || isCreating
   const disabled = disabledByTask || isRequestPending
@@ -85,6 +96,7 @@ export function ChromaKeyerPage() {
 
   const invalidateRequests = () => {
     requestSequenceRef.current += 1
+    previewSequenceRef.current += 1
   }
 
   const updateValues = (nextValues: ChromaKeyerValues) => {
@@ -99,54 +111,56 @@ export function ChromaKeyerPage() {
       return
     }
     setValues(nextValues)
-    setErrors((current) => ({ ...current, [lastChangedField(values, nextValues)]: undefined }))
+    const validationErrors = validateChromaKeyerValues(nextValues)
+    setErrors((current) => {
+      const nextErrors = { ...current }
+      for (const field of previewParameterFields) {
+        nextErrors[field] = validationErrors[field]
+      }
+      return nextErrors
+    })
   }
 
-  const requestPreview = async (previewValues: ChromaKeyerValues) => {
+  const requestPreview = async (previewValues: ChromaKeyerValues, requestSequence: number) => {
     if (!image || !isPreviewValid(previewValues)) {
       return
     }
 
-    const requestSequence = ++requestSequenceRef.current
-    setIsRequestPending(true)
     try {
       const response = await createChromaPreview({
         ...toPayload(previewValues),
         viewMode: previewValues.viewMode,
       })
-      if (mountedRef.current && requestSequence === requestSequenceRef.current) {
+      if (mountedRef.current && requestSequence === previewSequenceRef.current) {
         setPreviewUrl(response.preview_url)
         setErrors((current) => ({ ...current, samples: undefined }))
       }
     } catch (error) {
-      if (mountedRef.current && requestSequence === requestSequenceRef.current) {
+      if (mountedRef.current && requestSequence === previewSequenceRef.current) {
         setErrors((current) => ({
           ...current,
           samples: error instanceof Error && error.message ? error.message : '无法生成预览',
         }))
       }
-    } finally {
-      if (mountedRef.current && requestSequence === requestSequenceRef.current) {
-        setIsRequestPending(false)
-      }
     }
   }
 
   useEffect(() => {
+    const requestSequence = ++previewSequenceRef.current
+    const isViewModeChange = lastViewModeRef.current !== values.viewMode
+    lastViewModeRef.current = values.viewMode
     if (!image || !isPreviewValid(values)) {
       return
     }
 
-    const isViewModeChange = lastViewModeRef.current !== values.viewMode
-    lastViewModeRef.current = values.viewMode
     if (isViewModeChange) {
-      void requestPreview(values)
+      void requestPreview(values, requestSequence)
       return
     }
 
     const timeout = window.setTimeout(() => {
-      void requestPreview(values)
-    }, 250)
+      void requestPreview(values, requestSequence)
+    }, 150)
     return () => window.clearTimeout(timeout)
   }, [
     image,
@@ -173,6 +187,7 @@ export function ChromaKeyerPage() {
     }
 
     const requestSequence = ++requestSequenceRef.current
+    previewSequenceRef.current += 1
     inspectingPathRef.current = inputPath
     setIsRequestPending(true)
     setErrors({})
@@ -212,6 +227,7 @@ export function ChromaKeyerPage() {
     }
 
     const requestSequence = ++requestSequenceRef.current
+    previewSequenceRef.current += 1
     setIsRequestPending(true)
     try {
       const response = await sampleChromaImage({ inputPath: image.inputPath, ...point })
@@ -389,8 +405,4 @@ export function ChromaKeyerPage() {
 
 function isPreviewValid(values: ChromaKeyerValues): boolean {
   return Object.keys(validateChromaKeyerValues(values)).length === 0
-}
-
-function lastChangedField(previous: ChromaKeyerValues, next: ChromaKeyerValues): keyof ChromaKeyerValues {
-  return (Object.keys(next) as Array<keyof ChromaKeyerValues>).find((key) => previous[key] !== next[key]) ?? 'inputPath'
 }

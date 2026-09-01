@@ -1,7 +1,7 @@
 import { StrictMode } from 'react'
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { useLogStore } from '../../state/useLogStore'
 import { useTaskStore } from '../../state/useTaskStore'
 import { ChromaKeyerPage } from './ChromaKeyerPage'
@@ -77,6 +77,10 @@ beforeEach(() => {
   pageMocks.createChromaKeyerTask.mockResolvedValue({ status: 'queued', task_id: 'chroma-task-1' })
   useTaskStore.getState().resetTask()
   useLogStore.getState().clearEvents()
+})
+
+afterEach(() => {
+  vi.useRealTimers()
 })
 
 describe('ChromaKeyerPage', () => {
@@ -350,7 +354,7 @@ describe('ChromaKeyerPage', () => {
   })
 
   it('requests Final and immediately re-requests Alpha previews with complete samples', async () => {
-    const user = renderWithUser()
+    render(<ChromaKeyerPage />)
 
     await inspectImage()
     await sampleImage()
@@ -368,19 +372,23 @@ describe('ChromaKeyerPage', () => {
         }),
       ),
     )
-    await user.click(screen.getByRole('radio', { name: 'Alpha' }))
+    pageMocks.createChromaPreview.mockClear()
+    vi.useFakeTimers()
 
-    await waitFor(() =>
-      expect(pageMocks.createChromaPreview).toHaveBeenLastCalledWith(
-        expect.objectContaining({
-          samples: [[42, 180, 72]],
-          viewMode: 'alpha',
-        }),
-      ),
+    await act(async () => {
+      fireEvent.click(screen.getByRole('radio', { name: 'Alpha' }))
+    })
+
+    expect(pageMocks.createChromaPreview).toHaveBeenCalledOnce()
+    expect(pageMocks.createChromaPreview).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        samples: [[42, 180, 72]],
+        viewMode: 'alpha',
+      }),
     )
   })
 
-  it('requests a new preview with the updated Screen Balance', async () => {
+  it('debounces valid parameter changes for 150 ms and replaces the pending timer', async () => {
     render(<ChromaKeyerPage />)
 
     await inspectImage()
@@ -392,16 +400,272 @@ describe('ChromaKeyerPage', () => {
         }),
       ),
     )
+    pageMocks.createChromaPreview.mockClear()
+    vi.useFakeTimers()
 
     fireEvent.change(screen.getByLabelText('Screen Balance'), { target: { value: '0.35' } })
+    act(() => {
+      vi.advanceTimersByTime(149)
+    })
+    expect(pageMocks.createChromaPreview).not.toHaveBeenCalled()
 
-    await waitFor(() =>
-      expect(pageMocks.createChromaPreview).toHaveBeenLastCalledWith(
-        expect.objectContaining({
-          params: expect.objectContaining({ screenBalance: 0.35 }),
-          samples: [[42, 180, 72]],
-        }),
-      ),
+    fireEvent.change(screen.getByLabelText('Screen Balance'), { target: { value: '0.4' } })
+    act(() => {
+      vi.advanceTimersByTime(149)
+    })
+    expect(pageMocks.createChromaPreview).not.toHaveBeenCalled()
+
+    await act(async () => {
+      vi.advanceTimersByTime(1)
+    })
+    expect(pageMocks.createChromaPreview).toHaveBeenCalledOnce()
+    expect(pageMocks.createChromaPreview).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        params: expect.objectContaining({ screenBalance: 0.4 }),
+        samples: [[42, 180, 72]],
+      }),
+    )
+  })
+
+  it('keeps the form and sampling controls enabled while a preview request is pending', async () => {
+    const user = renderWithUser()
+
+    await inspectImage()
+    await sampleImage()
+    await waitFor(() => expect(pageMocks.createChromaPreview).toHaveBeenCalledOnce())
+    const previewRequest = createDeferred<{ preview_url: string }>()
+    pageMocks.createChromaPreview.mockReturnValueOnce(previewRequest.promise)
+
+    await user.click(screen.getByRole('radio', { name: 'Alpha' }))
+
+    expect(pageMocks.createChromaPreview).toHaveBeenCalledTimes(2)
+    expect(screen.getByRole('slider', { name: 'Screen Gain' })).toBeEnabled()
+    expect(screen.getByRole('spinbutton', { name: 'Screen Gain 数值' })).toBeEnabled()
+    expect(screen.getByLabelText('输出路径（可选）')).toBeEnabled()
+    expect(screen.getByRole('button', { name: '导出 PNG' })).toBeEnabled()
+    expect(screen.getByRole('button', { name: '删除 Screen Color' })).toBeEnabled()
+  })
+
+  it('allows overlapping parameter previews and renders only the latest success', async () => {
+    render(<ChromaKeyerPage />)
+
+    await inspectImage()
+    await sampleImage()
+    await waitFor(() => expect(pageMocks.createChromaPreview).toHaveBeenCalledOnce())
+    const olderRequest = createDeferred<{ preview_url: string }>()
+    const latestRequest = createDeferred<{ preview_url: string }>()
+    pageMocks.createChromaPreview
+      .mockReturnValueOnce(olderRequest.promise)
+      .mockReturnValueOnce(latestRequest.promise)
+    pageMocks.createChromaPreview.mockClear()
+    vi.useFakeTimers()
+
+    fireEvent.change(screen.getByLabelText('Screen Gain'), { target: { value: '1.2' } })
+    act(() => {
+      vi.advanceTimersByTime(150)
+    })
+    fireEvent.change(screen.getByLabelText('Screen Gain'), { target: { value: '1.4' } })
+    act(() => {
+      vi.advanceTimersByTime(150)
+    })
+
+    expect(pageMocks.createChromaPreview).toHaveBeenCalledTimes(2)
+    expect(pageMocks.createChromaPreview).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ params: expect.objectContaining({ screenGain: 1.2 }) }),
+    )
+    expect(pageMocks.createChromaPreview).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ params: expect.objectContaining({ screenGain: 1.4 }) }),
+    )
+
+    await act(async () => {
+      latestRequest.resolve({ preview_url: '/api/previews/latest.png' })
+    })
+    expect(screen.getByRole('button', { name: '抠像预览' })).toHaveAttribute(
+      'src',
+      '/api/previews/latest.png',
+    )
+
+    await act(async () => {
+      olderRequest.resolve({ preview_url: '/api/previews/stale.png' })
+    })
+    expect(screen.getByRole('button', { name: '抠像预览' })).toHaveAttribute(
+      'src',
+      '/api/previews/latest.png',
+    )
+  })
+
+  it('ignores a stale preview error after the latest preview succeeds', async () => {
+    render(<ChromaKeyerPage />)
+
+    await inspectImage()
+    await sampleImage()
+    await waitFor(() => expect(pageMocks.createChromaPreview).toHaveBeenCalledOnce())
+    const olderRequest = createDeferred<{ preview_url: string }>()
+    const latestRequest = createDeferred<{ preview_url: string }>()
+    pageMocks.createChromaPreview
+      .mockReturnValueOnce(olderRequest.promise)
+      .mockReturnValueOnce(latestRequest.promise)
+    pageMocks.createChromaPreview.mockClear()
+    vi.useFakeTimers()
+
+    fireEvent.change(screen.getByLabelText('Screen Gain'), { target: { value: '1.2' } })
+    act(() => {
+      vi.advanceTimersByTime(150)
+    })
+    fireEvent.change(screen.getByLabelText('Screen Gain'), { target: { value: '1.4' } })
+    act(() => {
+      vi.advanceTimersByTime(150)
+    })
+
+    expect(pageMocks.createChromaPreview).toHaveBeenCalledTimes(2)
+    await act(async () => {
+      latestRequest.resolve({ preview_url: '/api/previews/latest.png' })
+    })
+    await act(async () => {
+      olderRequest.reject(new Error('过期预览失败'))
+    })
+
+    expect(screen.getByRole('button', { name: '抠像预览' })).toHaveAttribute(
+      'src',
+      '/api/previews/latest.png',
+    )
+    expect(screen.queryByText('过期预览失败')).not.toBeInTheDocument()
+  })
+
+  it('keeps action pending state when a stale preview finishes', async () => {
+    render(<ChromaKeyerPage />)
+
+    await inspectImage()
+    await sampleImage()
+    await waitFor(() => expect(pageMocks.createChromaPreview).toHaveBeenCalledOnce())
+    const previewRequest = createDeferred<{ preview_url: string }>()
+    const sampleRequest = createDeferred<{
+      hex: string
+      rgb: [number, number, number]
+      source_x: number
+      source_y: number
+    }>()
+    pageMocks.createChromaPreview.mockReturnValueOnce(previewRequest.promise)
+    pageMocks.sampleChromaImage.mockReturnValueOnce(sampleRequest.promise)
+
+    fireEvent.click(screen.getByRole('radio', { name: 'Alpha' }))
+    await sampleImage()
+
+    expect(pageMocks.sampleChromaImage).toHaveBeenCalledTimes(2)
+    expect(screen.getByLabelText('输入图片路径')).toBeDisabled()
+
+    await act(async () => {
+      previewRequest.resolve({ preview_url: '/api/previews/stale.png' })
+    })
+
+    expect(screen.getByLabelText('输入图片路径')).toBeDisabled()
+
+    await act(async () => {
+      sampleRequest.resolve({
+        hex: '#32C850',
+        rgb: [50, 200, 80],
+        source_x: 400,
+        source_y: 200,
+      })
+    })
+    expect(screen.getByLabelText('输入图片路径')).toBeEnabled()
+  })
+
+  it('keeps the last successful preview visible when the latest preview fails', async () => {
+    render(<ChromaKeyerPage />)
+
+    await inspectImage()
+    await sampleImage()
+    const preview = screen.getByRole('button', { name: '抠像预览' })
+    await waitFor(() => expect(preview).toHaveAttribute('src', '/api/previews/final.png'))
+    pageMocks.createChromaPreview.mockRejectedValueOnce(new Error('最新预览失败'))
+    pageMocks.createChromaPreview.mockClear()
+    vi.useFakeTimers()
+
+    fireEvent.change(screen.getByLabelText('Screen Gain'), { target: { value: '1.4' } })
+    await act(async () => {
+      vi.advanceTimersByTime(150)
+    })
+
+    expect(pageMocks.createChromaPreview).toHaveBeenCalledOnce()
+    expect(preview).toHaveAttribute('src', '/api/previews/final.png')
+    expect(screen.getByRole('alert')).toHaveTextContent('最新预览失败')
+  })
+
+  it('shows numeric validation and sends no preview for an invalid parameter', async () => {
+    render(<ChromaKeyerPage />)
+
+    await inspectImage()
+    await sampleImage()
+    await waitFor(() => expect(pageMocks.createChromaPreview).toHaveBeenCalledOnce())
+    pageMocks.createChromaPreview.mockClear()
+    vi.useFakeTimers()
+
+    fireEvent.change(screen.getByRole('spinbutton', { name: 'Screen Gain 数值' }), {
+      target: { value: '' },
+    })
+    act(() => {
+      vi.advanceTimersByTime(500)
+    })
+
+    expect(screen.getByRole('alert')).toHaveTextContent('Screen Gain 必须是 0 到 2 之间的有限数值')
+    expect(pageMocks.createChromaPreview).not.toHaveBeenCalled()
+  })
+
+  it('shows cross-field validation and sends no preview when Clip Black is not below Clip White', async () => {
+    render(<ChromaKeyerPage />)
+
+    await inspectImage()
+    await sampleImage()
+    await waitFor(() => expect(pageMocks.createChromaPreview).toHaveBeenCalledOnce())
+    pageMocks.createChromaPreview.mockClear()
+    vi.useFakeTimers()
+
+    fireEvent.change(screen.getByRole('spinbutton', { name: 'Clip Black 数值' }), {
+      target: { value: '1' },
+    })
+    act(() => {
+      vi.advanceTimersByTime(500)
+    })
+
+    expect(screen.getByRole('alert')).toHaveTextContent('Clip Black 必须小于 Clip White')
+    expect(pageMocks.createChromaPreview).not.toHaveBeenCalled()
+  })
+
+  it('keeps a corrected parameter debounced after a view change made while invalid', async () => {
+    render(<ChromaKeyerPage />)
+
+    await inspectImage()
+    await sampleImage()
+    await waitFor(() => expect(pageMocks.createChromaPreview).toHaveBeenCalledOnce())
+    pageMocks.createChromaPreview.mockImplementation(() => new Promise(() => {}))
+    pageMocks.createChromaPreview.mockClear()
+    vi.useFakeTimers()
+
+    fireEvent.change(screen.getByRole('spinbutton', { name: 'Screen Gain 数值' }), {
+      target: { value: '' },
+    })
+    fireEvent.click(screen.getByRole('radio', { name: 'Alpha' }))
+    fireEvent.change(screen.getByRole('spinbutton', { name: 'Screen Gain 数值' }), {
+      target: { value: '1.2' },
+    })
+
+    expect(pageMocks.createChromaPreview).not.toHaveBeenCalled()
+    act(() => {
+      vi.advanceTimersByTime(149)
+    })
+    expect(pageMocks.createChromaPreview).not.toHaveBeenCalled()
+
+    await act(async () => {
+      vi.advanceTimersByTime(1)
+    })
+    expect(pageMocks.createChromaPreview).toHaveBeenCalledWith(
+      expect.objectContaining({
+        params: expect.objectContaining({ screenGain: 1.2 }),
+        viewMode: 'alpha',
+      }),
     )
   })
 
@@ -626,8 +890,10 @@ function renderWithUser() {
 
 function createDeferred<T>() {
   let resolve!: (value: T) => void
-  const promise = new Promise<T>((nextResolve) => {
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((nextResolve, nextReject) => {
     resolve = nextResolve
+    reject = nextReject
   })
-  return { promise, resolve }
+  return { promise, reject, resolve }
 }
