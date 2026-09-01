@@ -270,4 +270,3 @@ Start port `8765`, load `assets/frame/test_frame_2.png` through the native
 picker, sample one valid green pixel, and exercise all seven sliders in Final
 and Alpha modes. Verify automatic loading, latest preview behavior, export,
 console/network health, and non-overlapping layout at `1440x900` and `390x844`.
-
