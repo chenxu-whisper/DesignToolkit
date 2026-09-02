@@ -35,6 +35,8 @@ describe('apiClient', () => {
   it('models chroma payloads with exactly one RGB sample', () => {
     expectTypeOf<ChromaKeyerPayload['samples']>().toEqualTypeOf<readonly [ChromaKeyerRgbSample]>()
     expectTypeOf<ChromaVideoKeyerPayload['samples']>().toEqualTypeOf<readonly [ChromaKeyerRgbSample]>()
+    expectTypeOf<ChromaKeyerPayload>().not.toMatchTypeOf<ChromaVideoKeyerPayload>()
+    expectTypeOf<ChromaVideoKeyerPayload>().toMatchTypeOf<Parameters<typeof createChromaVideoKeyerTask>[0]>()
     expectTypeOf<ChromaVideoPreviewPayload['viewMode']>().toEqualTypeOf<'final' | 'alpha'>()
     expectTypeOf<Parameters<typeof inspectChromaVideo>[0]>().toEqualTypeOf<ChromaVideoInspectRequest>()
     expectTypeOf<Parameters<typeof createChromaVideoFrame>[0]>().toEqualTypeOf<ChromaVideoFrameRequest>()

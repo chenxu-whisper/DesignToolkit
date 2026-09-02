@@ -156,6 +156,7 @@ export type ChromaVideoPreviewResponse = ChromaPreviewResponse & {
 }
 
 export type ChromaVideoKeyerPayload = Omit<ChromaKeyerPayload, 'outputPath'> & {
+  outputPath?: never
   outputRoot?: string
 }
 
