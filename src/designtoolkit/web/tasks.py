@@ -437,6 +437,7 @@ class TaskManager:
         self._mark_running(task.task_id)
         task_started_at = self._clock()
         last_reported_frames = 0
+        emitted_percentage_buckets: set[int] = set()
 
         def report_progress(
             processed_frames: int,
@@ -446,6 +447,8 @@ class TaskManager:
             force: bool = False,
         ) -> None:
             nonlocal last_reported_frames
+            if processed_frames <= last_reported_frames:
+                return
             interval = max(1, estimated_total // 100) if estimated_total else 30
             if (
                 not force
@@ -453,6 +456,14 @@ class TaskManager:
                 and processed_frames % interval != 0
             ):
                 return
+            percentage_bucket: int | None = None
+            if estimated_total:
+                percentage_bucket = min(
+                    processed_frames * 100 // estimated_total,
+                    100,
+                )
+                if not force and percentage_bucket in emitted_percentage_buckets:
+                    return
             details: dict[str, object] = {
                 "processed_frames": processed_frames,
                 "current_path": str(current_path),
@@ -474,6 +485,8 @@ class TaskManager:
                 details=details,
             )
             last_reported_frames = processed_frames
+            if percentage_bucket is not None:
+                emitted_percentage_buckets.add(percentage_bucket)
 
         try:
             if self._video_keyer is None:

@@ -471,6 +471,27 @@ def test_rejects_existing_final_directory_without_changing_it(
     assert temporary_directories(tmp_path) == []
 
 
+def test_rejects_existing_final_file_without_changing_it(tmp_path: Path) -> None:
+    input_path = make_input(tmp_path)
+    final_path = tmp_path / "clip_keyed_frames"
+    final_path.write_bytes(b"keep me")
+    stream = TrackedStream(frames())
+    decoder = FakeDecoder(stream)
+
+    with pytest.raises(KeyerError, match="Final output directory already exists"):
+        key_video_to_png_sequence(
+            VideoKeyOptions(input_path=input_path),
+            decoder,
+            screen_model(),
+            KeyerParams(),
+        )
+
+    assert final_path.read_bytes() == b"keep me"
+    assert decoder.iteration_calls == []
+    assert not stream.closed
+    assert temporary_directories(tmp_path) == []
+
+
 def test_decoder_failure_after_one_frame_preserves_keyer_error_and_cleans(
     tmp_path: Path,
 ) -> None:
@@ -680,13 +701,17 @@ def test_partial_final_rename_failure_removes_published_directory(
 ) -> None:
     input_path = make_input(tmp_path)
     stream = TrackedStream(frames())
-    original_replace = Path.replace
+    original_publish = video_export._publish_directory_no_replace
 
-    def replace_then_fail(source: Path, target: Path) -> Path:
-        original_replace(source, target)
+    def publish_then_fail(source: Path, target: Path) -> None:
+        original_publish(source, target)
         raise OSError("rename completion was not reported")
 
-    monkeypatch.setattr(Path, "replace", replace_then_fail)
+    monkeypatch.setattr(
+        video_export,
+        "_publish_directory_no_replace",
+        publish_then_fail,
+    )
 
     with pytest.raises(KeyerError, match="Video PNG sequence export failed") as error:
         key_video_to_png_sequence(
@@ -709,7 +734,7 @@ def test_rename_failure_does_not_remove_unowned_final_directory(
     input_path = make_input(tmp_path)
     stream = TrackedStream(frames())
 
-    def replace_with_unowned_final(source: Path, target: Path) -> Path:
+    def publish_with_unowned_final(source: Path, target: Path) -> None:
         video_export.rmtree(source)
         target.mkdir()
         (target / "unrelated.txt").write_text("keep me", encoding="utf-8")
@@ -720,7 +745,11 @@ def test_rename_failure_does_not_remove_unowned_final_directory(
             )
         raise OSError("rename raced with another publisher")
 
-    monkeypatch.setattr(Path, "replace", replace_with_unowned_final)
+    monkeypatch.setattr(
+        video_export,
+        "_publish_directory_no_replace",
+        publish_with_unowned_final,
+    )
 
     with pytest.raises(KeyerError, match="Video PNG sequence export failed") as error:
         key_video_to_png_sequence(
@@ -733,6 +762,87 @@ def test_rename_failure_does_not_remove_unowned_final_directory(
     final_dir = tmp_path / "clip_keyed_frames"
     assert isinstance(error.value.__cause__, OSError)
     assert (final_dir / "unrelated.txt").read_text(encoding="utf-8") == "keep me"
+    assert temporary_directories(tmp_path) == []
+    assert stream.closed
+
+
+def test_publish_race_does_not_replace_empty_destination_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_path = make_input(tmp_path)
+    stream = TrackedStream(frames()[:1])
+    final_dir = tmp_path / "clip_keyed_frames"
+    original_publish = video_export._publish_directory_no_replace
+    destination_identity: tuple[int, int] | None = None
+
+    def publish_after_competing_directory(
+        source: Path,
+        destination: Path,
+    ) -> None:
+        nonlocal destination_identity
+        destination.mkdir()
+        stat = destination.stat()
+        destination_identity = (stat.st_dev, stat.st_ino)
+        original_publish(source, destination)
+
+    monkeypatch.setattr(
+        video_export,
+        "_publish_directory_no_replace",
+        publish_after_competing_directory,
+    )
+
+    with pytest.raises(KeyerError, match="Video PNG sequence export failed"):
+        key_video_to_png_sequence(
+            VideoKeyOptions(input_path=input_path),
+            FakeDecoder(stream),
+            screen_model(),
+            KeyerParams(),
+        )
+
+    stat = final_dir.stat()
+    assert (stat.st_dev, stat.st_ino) == destination_identity
+    assert list(final_dir.iterdir()) == []
+    assert temporary_directories(tmp_path) == []
+    assert stream.closed
+
+
+def test_publish_race_does_not_replace_dangling_destination_symlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_path = make_input(tmp_path)
+    stream = TrackedStream(frames()[:1])
+    final_dir = tmp_path / "clip_keyed_frames"
+    dangling_target = tmp_path / "missing-target"
+    original_publish = video_export._publish_directory_no_replace
+
+    def publish_after_competing_symlink(
+        source: Path,
+        destination: Path,
+    ) -> None:
+        try:
+            destination.symlink_to(dangling_target, target_is_directory=True)
+        except OSError as error:
+            pytest.skip(f"directory symlinks are unavailable: {error}")
+        original_publish(source, destination)
+
+    monkeypatch.setattr(
+        video_export,
+        "_publish_directory_no_replace",
+        publish_after_competing_symlink,
+    )
+
+    with pytest.raises(KeyerError, match="Video PNG sequence export failed"):
+        key_video_to_png_sequence(
+            VideoKeyOptions(input_path=input_path),
+            FakeDecoder(stream),
+            screen_model(),
+            KeyerParams(),
+        )
+
+    assert final_dir.is_symlink()
+    assert final_dir.readlink() == dangling_target
     assert temporary_directories(tmp_path) == []
     assert stream.closed
 

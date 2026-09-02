@@ -976,6 +976,74 @@ def test_chroma_video_keyer_task_throttles_monotonic_progress_and_logs_actuals(
     assert completed.details["elapsed_seconds"] >= 0
 
 
+@mark.parametrize(
+    ("estimated_total", "actual_total"),
+    [(199, 199), (6, 10_000)],
+)
+def test_chroma_video_keyer_task_caps_estimated_progress_cardinality(
+    tmp_path: Path,
+    estimated_total: int,
+    actual_total: int,
+) -> None:
+    input_path = tmp_path / "clip.mp4"
+    output_root = tmp_path / "frames"
+    output_root.mkdir()
+    final_dir = output_root / "clip_keyed_frames"
+    decoder = FakeVideoDecoder(
+        metadata=VideoMetadata(
+            width=4,
+            height=2,
+            fps=2.0,
+            duration_seconds=3.0,
+            estimated_frame_count=estimated_total,
+            codec="fake",
+        )
+    )
+    log_store = LogStore()
+
+    def video_keyer(options, _decoder, _model, _params, progress_callback):
+        assert progress_callback is not None
+        for processed_frames in range(1, actual_total + 1):
+            progress_callback(
+                processed_frames,
+                estimated_total,
+                output_root / f"clip_keyed_{processed_frames:06d}.png",
+            )
+        return VideoKeyResult(
+            output_dir=final_dir,
+            manifest_path=final_dir / "manifest.json",
+            frame_count=actual_total,
+            metadata=decoder.metadata,
+        )
+
+    task_manager = TaskManager(
+        log_store=log_store,
+        video_keyer=video_keyer,
+        video_decoder_factory=lambda: decoder,
+        run_async=False,
+    )
+
+    task = task_manager.create_chroma_video_keyer_task(
+        ChromaVideoKeyerTaskRequest(
+            input_path=str(input_path),
+            samples=[[42, 180, 72]],
+            params={},
+            output_root=str(output_root),
+        )
+    )
+
+    processed_frames = [
+        event.details["processed_frames"]
+        for event in log_store.history(task.task_id)
+        if event.level is LogLevel.PROGRESS
+        and "processed_frames" in event.details
+    ]
+    assert len(processed_frames) <= 102
+    assert processed_frames[0] == 1
+    assert processed_frames[-1] == actual_total
+    assert processed_frames == sorted(set(processed_frames))
+
+
 def test_chroma_video_keyer_export_failure_marks_failed_and_releases_slot(
     tmp_path: Path,
 ) -> None:

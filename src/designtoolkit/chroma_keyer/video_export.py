@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import ctypes
+import errno
 import json
+import os
+import sys
 from contextlib import closing
 from pathlib import Path
 from shutil import rmtree
@@ -21,6 +25,14 @@ from .video_models import (
 _OWNERSHIP_MARKER_NAME = ".designtoolkit-video-export-owner"
 _CLEANUP_RETRY_DELAYS = (0.01, 0.02)
 _WINDOWS_SHARING_VIOLATIONS = {5, 32, 33}
+_AT_FDCWD = -100
+_RENAME_NOREPLACE = 1
+_UNSUPPORTED_RENAME_ERRNOS = {
+    errno.EINVAL,
+    errno.ENOSYS,
+    errno.ENOTSUP,
+    errno.EOPNOTSUPP,
+}
 
 
 def _create_temporary_directory(output_root: Path, input_stem: str) -> Path:
@@ -63,6 +75,56 @@ def _remove_directory(path: Path) -> None:
             sleep(_CLEANUP_RETRY_DELAYS[attempt])
 
     raise KeyerError(f"Failed to clean export directory: {path}") from cleanup_error
+
+
+def _publish_directory_no_replace(source: Path, destination: Path) -> None:
+    if os.name == "nt":
+        os.rename(source, destination)
+        return
+    if sys.platform != "linux":
+        raise KeyerError(
+            "Atomic no-replace directory publication is unavailable "
+            f"on platform {sys.platform}"
+        )
+
+    try:
+        renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
+    except (AttributeError, OSError) as error:
+        raise KeyerError(
+            "Atomic no-replace directory publication is unavailable: "
+            "libc renameat2 is missing"
+        ) from error
+
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        _AT_FDCWD,
+        os.fsencode(source),
+        _AT_FDCWD,
+        os.fsencode(destination),
+        _RENAME_NOREPLACE,
+    )
+    if result == 0:
+        return
+
+    error_number = ctypes.get_errno()
+    native_error = OSError(
+        error_number,
+        os.strerror(error_number),
+        destination,
+    )
+    if error_number in _UNSUPPORTED_RENAME_ERRNOS:
+        raise KeyerError(
+            "Atomic no-replace directory publication is unavailable: "
+            "renameat2 RENAME_NOREPLACE is unsupported"
+        ) from native_error
+    raise native_error
 
 
 def _manifest(
@@ -159,7 +221,7 @@ def key_video_to_png_sequence(
             manifest_file.write("\n")
 
         try:
-            temporary_dir.replace(final_dir)
+            _publish_directory_no_replace(temporary_dir, final_dir)
         except Exception:
             if _is_owned_directory(final_dir, ownership_token):
                 published_directory = final_dir
