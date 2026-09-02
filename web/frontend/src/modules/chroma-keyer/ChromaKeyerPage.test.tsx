@@ -9,19 +9,33 @@ import { ChromaKeyerPage } from './ChromaKeyerPage'
 const pageMocks = vi.hoisted(() => ({
   createChromaKeyerTask: vi.fn(),
   createChromaPreview: vi.fn(),
+  createChromaVideoFrame: vi.fn(),
+  createChromaVideoKeyerTask: vi.fn(),
+  createChromaVideoPreview: vi.fn(),
   inspectChromaImage: vi.fn(),
+  inspectChromaVideo: vi.fn(),
+  pickLocalDirectory: vi.fn(),
   pickLocalFiles: vi.fn(),
+  pickLocalSaveFile: vi.fn(),
   resolveDroppedFilePaths: vi.fn(),
   sampleChromaImage: vi.fn(),
+  sampleChromaVideo: vi.fn(),
 }))
 
 vi.mock('../../services/apiClient', () => ({
   createChromaKeyerTask: pageMocks.createChromaKeyerTask,
   createChromaPreview: pageMocks.createChromaPreview,
+  createChromaVideoFrame: pageMocks.createChromaVideoFrame,
+  createChromaVideoKeyerTask: pageMocks.createChromaVideoKeyerTask,
+  createChromaVideoPreview: pageMocks.createChromaVideoPreview,
   inspectChromaImage: pageMocks.inspectChromaImage,
+  inspectChromaVideo: pageMocks.inspectChromaVideo,
+  pickLocalDirectory: pageMocks.pickLocalDirectory,
   pickLocalFiles: pageMocks.pickLocalFiles,
+  pickLocalSaveFile: pageMocks.pickLocalSaveFile,
   resolveDroppedFilePaths: pageMocks.resolveDroppedFilePaths,
   sampleChromaImage: pageMocks.sampleChromaImage,
+  sampleChromaVideo: pageMocks.sampleChromaVideo,
 }))
 
 const inspectResponse = {
@@ -31,6 +45,19 @@ const inspectResponse = {
   preview_url: '/api/previews/input.png',
   preview_width: 400,
   width: 800,
+}
+
+const videoInspectResponse = {
+  duration_seconds: 12.5,
+  estimated_frame_count: 375,
+  fps: 30,
+  height: 1080,
+  input_path: 'E:\\media\\screen.mp4',
+  preview_height: 360,
+  preview_url: '/api/previews/video-first.png',
+  preview_width: 640,
+  timestamp_seconds: 0,
+  width: 1920,
 }
 
 async function inspectImage() {
@@ -58,23 +85,57 @@ async function sampleImage() {
   })
 }
 
+async function inspectVideo() {
+  const input = screen.getByLabelText('输入图片路径')
+  fireEvent.change(input, { target: { value: 'E:\\media\\screen.mp4' } })
+  fireEvent.keyDown(input, { key: 'Enter' })
+  await screen.findByRole('slider', { name: '视频时间轴' })
+}
+
 beforeEach(() => {
   pageMocks.createChromaKeyerTask.mockReset()
   pageMocks.createChromaPreview.mockReset()
+  pageMocks.createChromaVideoFrame.mockReset()
+  pageMocks.createChromaVideoKeyerTask.mockReset()
+  pageMocks.createChromaVideoPreview.mockReset()
   pageMocks.inspectChromaImage.mockReset()
+  pageMocks.inspectChromaVideo.mockReset()
+  pageMocks.pickLocalDirectory.mockReset()
   pageMocks.pickLocalFiles.mockReset()
+  pageMocks.pickLocalSaveFile.mockReset()
   pageMocks.resolveDroppedFilePaths.mockReset()
   pageMocks.sampleChromaImage.mockReset()
+  pageMocks.sampleChromaVideo.mockReset()
   pageMocks.pickLocalFiles.mockResolvedValue({ cancelled: false, paths: ['E:\\media\\screen.png'] })
   pageMocks.inspectChromaImage.mockResolvedValue(inspectResponse)
+  pageMocks.inspectChromaVideo.mockResolvedValue(videoInspectResponse)
   pageMocks.sampleChromaImage.mockResolvedValue({
     hex: '#2AB448',
     rgb: [42, 180, 72],
     source_x: 400,
     source_y: 200,
   })
+  pageMocks.sampleChromaVideo.mockResolvedValue({
+    hex: '#2AB448',
+    rgb: [42, 180, 72],
+    source_x: 960,
+    source_y: 540,
+    timestamp_seconds: 0,
+  })
   pageMocks.createChromaPreview.mockResolvedValue({ preview_url: '/api/previews/final.png' })
+  pageMocks.createChromaVideoFrame.mockResolvedValue({
+    preview_url: '/api/previews/video-frame.png',
+    timestamp_seconds: 1.25,
+  })
+  pageMocks.createChromaVideoPreview.mockResolvedValue({
+    preview_url: '/api/previews/video-keyed.png',
+    timestamp_seconds: 1.25,
+  })
   pageMocks.createChromaKeyerTask.mockResolvedValue({ status: 'queued', task_id: 'chroma-task-1' })
+  pageMocks.createChromaVideoKeyerTask.mockResolvedValue({
+    status: 'queued',
+    task_id: 'chroma-video-task-1',
+  })
   useTaskStore.getState().resetTask()
   useLogStore.getState().clearEvents()
 })
@@ -333,7 +394,7 @@ describe('ChromaKeyerPage', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('图片无法读取')
     expect(screen.getByLabelText('输入图片路径')).toHaveValue('E:\\media\\broken.png')
     expect(screen.queryByRole('button', { name: '抠像预览' })).not.toBeInTheDocument()
-    expect(screen.getByText('加载一张本地图片后，可在画面中吸取背景颜色。')).toBeInTheDocument()
+    expect(screen.getByText('加载本地图片或视频后，可在画面中吸取背景颜色。')).toBeInTheDocument()
   })
 
   it('does not let a slower older inspection overwrite a newer committed path', async () => {
@@ -907,6 +968,287 @@ describe('ChromaKeyerPage', () => {
     })
     expect(useLogStore.getState().events).toHaveLength(1)
     expect(useLogStore.getState().events[0]?.message).toBe('已有日志')
+  })
+
+  it('detects a committed video path and renders its first frame with metadata', async () => {
+    render(<ChromaKeyerPage />)
+
+    await inspectVideo()
+
+    expect(pageMocks.inspectChromaVideo).toHaveBeenCalledOnce()
+    expect(pageMocks.inspectChromaVideo).toHaveBeenCalledWith({ inputPath: 'E:\\media\\screen.mp4' })
+    expect(pageMocks.inspectChromaImage).not.toHaveBeenCalled()
+    expect(screen.getByRole('button', { name: '抠像预览' })).toHaveAttribute(
+      'src',
+      '/api/previews/video-first.png',
+    )
+    expect(screen.getByText('30 FPS')).toBeInTheDocument()
+    expect(screen.getByText('1920 × 1080')).toBeInTheDocument()
+    expect(screen.getByText('约 375 帧')).toBeInTheDocument()
+  })
+
+  it('debounces video seeks for 100 ms and never renders a stale frame response', async () => {
+    const olderRequest = createDeferred<{ preview_url: string; timestamp_seconds: number }>()
+    const latestRequest = createDeferred<{ preview_url: string; timestamp_seconds: number }>()
+    pageMocks.createChromaVideoFrame
+      .mockReturnValueOnce(olderRequest.promise)
+      .mockReturnValueOnce(latestRequest.promise)
+    render(<ChromaKeyerPage />)
+    await inspectVideo()
+    pageMocks.createChromaVideoFrame.mockClear()
+    pageMocks.createChromaVideoFrame
+      .mockReturnValueOnce(olderRequest.promise)
+      .mockReturnValueOnce(latestRequest.promise)
+    vi.useFakeTimers()
+    const timeline = screen.getByRole('slider', { name: '视频时间轴' })
+
+    fireEvent.change(timeline, { target: { value: '1' } })
+    act(() => {
+      vi.advanceTimersByTime(99)
+    })
+    expect(pageMocks.createChromaVideoFrame).not.toHaveBeenCalled()
+    await act(async () => {
+      vi.advanceTimersByTime(1)
+    })
+
+    fireEvent.change(timeline, { target: { value: '2' } })
+    await act(async () => {
+      vi.advanceTimersByTime(100)
+    })
+
+    expect(pageMocks.createChromaVideoFrame).toHaveBeenNthCalledWith(1, {
+      inputPath: 'E:\\media\\screen.mp4',
+      timestampSeconds: 1,
+    })
+    expect(pageMocks.createChromaVideoFrame).toHaveBeenNthCalledWith(2, {
+      inputPath: 'E:\\media\\screen.mp4',
+      timestampSeconds: 2,
+    })
+
+    await act(async () => {
+      latestRequest.resolve({ preview_url: '/api/previews/video-latest.png', timestamp_seconds: 2 })
+    })
+    expect(screen.getByRole('button', { name: '抠像预览' })).toHaveAttribute(
+      'src',
+      '/api/previews/video-latest.png',
+    )
+
+    await act(async () => {
+      olderRequest.resolve({ preview_url: '/api/previews/video-stale.png', timestamp_seconds: 1 })
+    })
+    expect(screen.getByRole('button', { name: '抠像预览' })).toHaveAttribute(
+      'src',
+      '/api/previews/video-latest.png',
+    )
+    expect(timeline).toHaveValue('2')
+  })
+
+  it('releases sample pending state when a newer video seek supersedes it', async () => {
+    const sampleRequest = createDeferred<{
+      hex: string
+      rgb: [number, number, number]
+      source_x: number
+      source_y: number
+      timestamp_seconds: number
+    }>()
+    pageMocks.sampleChromaVideo.mockReturnValueOnce(sampleRequest.promise)
+    render(<ChromaKeyerPage />)
+    await inspectVideo()
+
+    await sampleImage()
+    expect(screen.getByLabelText('输入图片路径')).toBeDisabled()
+
+    fireEvent.change(screen.getByRole('slider', { name: '视频时间轴' }), {
+      target: { value: '1.25' },
+    })
+    await waitFor(() => expect(pageMocks.createChromaVideoFrame).toHaveBeenCalledOnce())
+
+    expect(screen.getByLabelText('输入图片路径')).toBeEnabled()
+    await act(async () => {
+      sampleRequest.resolve({
+        hex: '#2AB448',
+        rgb: [42, 180, 72],
+        source_x: 960,
+        source_y: 540,
+        timestamp_seconds: 0,
+      })
+    })
+    expect(screen.queryByText('#2AB448')).not.toBeInTheDocument()
+  })
+
+  it('samples the selected video timestamp through the current preview dimensions', async () => {
+    render(<ChromaKeyerPage />)
+    await inspectVideo()
+
+    fireEvent.change(screen.getByRole('slider', { name: '视频时间轴' }), {
+      target: { value: '1.25' },
+    })
+    await waitFor(() => expect(pageMocks.createChromaVideoFrame).toHaveBeenCalledOnce())
+    await sampleImage()
+
+    expect(pageMocks.sampleChromaVideo).toHaveBeenCalledWith({
+      inputPath: 'E:\\media\\screen.mp4',
+      previewHeight: 200,
+      previewWidth: 400,
+      timestampSeconds: 1.25,
+      x: 200,
+      y: 100,
+    })
+    expect(pageMocks.sampleChromaImage).not.toHaveBeenCalled()
+    expect(screen.getByText('#2AB448')).toBeInTheDocument()
+  })
+
+  it('uses keyed video previews after sampling and preserves the sample and all parameters across seeks', async () => {
+    render(<ChromaKeyerPage />)
+    await inspectVideo()
+    await sampleImage()
+    await waitFor(() => expect(screen.getByText('#2AB448')).toBeInTheDocument())
+
+    fireEvent.change(screen.getByLabelText('Screen Gain'), { target: { value: '1.4' } })
+    fireEvent.change(screen.getByLabelText('Screen Balance'), { target: { value: '0.35' } })
+    fireEvent.change(screen.getByLabelText('Clip Black'), { target: { value: '0.1' } })
+    fireEvent.change(screen.getByLabelText('Clip White'), { target: { value: '0.9' } })
+    fireEvent.change(screen.getByLabelText('Shrink/Grow'), { target: { value: '2' } })
+    fireEvent.change(screen.getByLabelText('Feather'), { target: { value: '3' } })
+    fireEvent.change(screen.getByLabelText('Despill Amount'), { target: { value: '0.8' } })
+    fireEvent.click(screen.getByRole('radio', { name: 'Alpha' }))
+    await waitFor(() => expect(pageMocks.createChromaVideoPreview).toHaveBeenCalled())
+    pageMocks.createChromaVideoPreview.mockClear()
+    pageMocks.createChromaVideoFrame.mockClear()
+    vi.useFakeTimers()
+
+    fireEvent.change(screen.getByRole('slider', { name: '视频时间轴' }), {
+      target: { value: '2.5' },
+    })
+    await act(async () => {
+      vi.advanceTimersByTime(100)
+    })
+
+    expect(pageMocks.createChromaVideoFrame).not.toHaveBeenCalled()
+    expect(pageMocks.createChromaVideoPreview).toHaveBeenCalledWith({
+      inputPath: 'E:\\media\\screen.mp4',
+      params: {
+        clipBlack: 0.1,
+        clipWhite: 0.9,
+        despillAmount: 0.8,
+        feather: 3,
+        screenBalance: 0.35,
+        screenGain: 1.4,
+        shrinkGrow: 2,
+      },
+      samples: [[42, 180, 72]],
+      timestampSeconds: 2.5,
+      viewMode: 'alpha',
+    })
+    expect(screen.getAllByText('Screen Color')).toHaveLength(1)
+  })
+
+  it('loads the unkeyed frame at the current timestamp when the video sample is removed', async () => {
+    const user = renderWithUser()
+    await inspectVideo()
+    await sampleImage()
+    await waitFor(() => expect(pageMocks.createChromaVideoPreview).toHaveBeenCalled())
+    pageMocks.createChromaVideoPreview.mockResolvedValueOnce({
+      preview_url: '/api/previews/video-keyed-2.png',
+      timestamp_seconds: 2,
+    })
+
+    fireEvent.change(screen.getByRole('slider', { name: '视频时间轴' }), {
+      target: { value: '2' },
+    })
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: '抠像预览' })).toHaveAttribute(
+        'src',
+        '/api/previews/video-keyed-2.png',
+      ),
+    )
+    pageMocks.createChromaVideoFrame.mockClear()
+    pageMocks.createChromaVideoFrame.mockResolvedValueOnce({
+      preview_url: '/api/previews/video-unkeyed-2.png',
+      timestamp_seconds: 2,
+    })
+
+    await user.click(screen.getByRole('button', { name: '删除 Screen Color' }))
+
+    await waitFor(() =>
+      expect(pageMocks.createChromaVideoFrame).toHaveBeenCalledWith({
+        inputPath: 'E:\\media\\screen.mp4',
+        timestampSeconds: 2,
+      }),
+    )
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: '抠像预览' })).toHaveAttribute(
+        'src',
+        '/api/previews/video-unkeyed-2.png',
+      ),
+    )
+  })
+
+  it('exports video to outputRoot without sending an image outputPath', async () => {
+    const user = renderWithUser()
+    await inspectVideo()
+    await sampleImage()
+    await waitFor(() => expect(screen.getByRole('button', { name: '导出 PNG 序列' })).toBeEnabled())
+
+    await user.type(screen.getByLabelText('输出根目录（可选）'), 'E:\\exports')
+    await user.click(screen.getByRole('button', { name: '导出 PNG 序列' }))
+
+    expect(pageMocks.createChromaVideoKeyerTask).toHaveBeenCalledWith({
+      inputPath: 'E:\\media\\screen.mp4',
+      outputRoot: 'E:\\exports',
+      params: {
+        clipBlack: 0,
+        clipWhite: 1,
+        despillAmount: 1,
+        feather: 0,
+        screenBalance: 0.5,
+        screenGain: 1,
+        shrinkGrow: 0,
+      },
+      samples: [[42, 180, 72]],
+    })
+    expect(pageMocks.createChromaVideoKeyerTask.mock.calls[0]?.[0]).not.toHaveProperty('outputPath')
+    expect(pageMocks.createChromaKeyerTask).not.toHaveBeenCalled()
+  })
+
+  it('clears video-only state when switching to an image and keeps image export semantics', async () => {
+    const user = renderWithUser()
+    await inspectVideo()
+    fireEvent.change(screen.getByRole('slider', { name: '视频时间轴' }), {
+      target: { value: '1.25' },
+    })
+    await user.type(screen.getByLabelText('输出根目录（可选）'), 'E:\\exports')
+    const input = screen.getByLabelText('输入图片路径')
+
+    fireEvent.change(input, { target: { value: 'E:\\media\\screen.png' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+
+    expect(await screen.findByRole('button', { name: '抠像预览' })).toHaveAttribute(
+      'src',
+      '/api/previews/input.png',
+    )
+    expect(screen.queryByRole('slider', { name: '视频时间轴' })).not.toBeInTheDocument()
+    expect(screen.getByLabelText('输出路径（可选）')).toHaveValue('')
+    expect(screen.queryByLabelText('输出根目录（可选）')).not.toBeInTheDocument()
+
+    await sampleImage()
+    await waitFor(() => expect(screen.getByRole('button', { name: '导出 PNG' })).toBeEnabled())
+    await user.click(screen.getByRole('button', { name: '导出 PNG' }))
+
+    expect(pageMocks.createChromaKeyerTask).toHaveBeenCalledWith({
+      inputPath: 'E:\\media\\screen.png',
+      outputPath: undefined,
+      params: {
+        clipBlack: 0,
+        clipWhite: 1,
+        despillAmount: 1,
+        feather: 0,
+        screenBalance: 0.5,
+        screenGain: 1,
+        shrinkGrow: 0,
+      },
+      samples: [[42, 180, 72]],
+    })
   })
 })
 

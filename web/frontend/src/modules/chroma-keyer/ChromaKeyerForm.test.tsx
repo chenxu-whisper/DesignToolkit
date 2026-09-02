@@ -7,18 +7,21 @@ import { ChromaKeyerForm } from './ChromaKeyerForm'
 import type { ChromaKeyerErrors, ChromaKeyerValues } from './chromaKeyerValidation'
 
 const apiMocks = vi.hoisted(() => ({
+  pickLocalDirectory: vi.fn(),
   pickLocalFiles: vi.fn(),
   pickLocalSaveFile: vi.fn(),
   resolveDroppedFilePaths: vi.fn(),
 }))
 
 vi.mock('../../services/apiClient', () => ({
+  pickLocalDirectory: apiMocks.pickLocalDirectory,
   pickLocalFiles: apiMocks.pickLocalFiles,
   pickLocalSaveFile: apiMocks.pickLocalSaveFile,
   resolveDroppedFilePaths: apiMocks.resolveDroppedFilePaths,
 }))
 
 beforeEach(() => {
+  apiMocks.pickLocalDirectory.mockReset()
   apiMocks.pickLocalFiles.mockReset()
   apiMocks.pickLocalSaveFile.mockReset()
   apiMocks.resolveDroppedFilePaths.mockReset()
@@ -46,7 +49,7 @@ function ControlledForm({
 }
 
 describe('ChromaKeyerForm', () => {
-  it('uses the native picker for one local image path', async () => {
+  it('uses the native picker for one local media path without adding a manual load button', async () => {
     const user = userEvent.setup()
     const onChange = vi.fn()
     const onInputPathCommit = vi.fn()
@@ -70,9 +73,9 @@ describe('ChromaKeyerForm', () => {
     expect(onInputPathCommit).toHaveBeenCalledOnce()
     expect(onInputPathCommit).toHaveBeenCalledWith('E:\\media\\screen.png')
     expect(apiMocks.pickLocalFiles).toHaveBeenCalledWith({
-      fileKind: 'image',
+      fileKind: 'media',
       multiple: false,
-      title: '选择图片文件',
+      title: '选择图片或视频文件',
     })
   })
 
@@ -99,6 +102,40 @@ describe('ChromaKeyerForm', () => {
       fileKind: 'image',
       title: '选择 PNG 输出路径',
     })
+    expect(screen.queryByLabelText('输出根目录（可选）')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '导出 PNG' })).toBeInTheDocument()
+  })
+
+  it('renders a directory output picker and PNG sequence action for video', async () => {
+    const user = userEvent.setup()
+    const onChange = vi.fn()
+    const values = {
+      ...createChromaKeyerDefaultValues(),
+      inputPath: 'E:\\media\\screen.mp4',
+      mediaKind: 'video' as const,
+      samples: [[42, 180, 72] as [number, number, number]],
+    }
+    apiMocks.pickLocalDirectory.mockResolvedValue({ cancelled: false, paths: ['E:\\exports'] })
+
+    render(
+      <ChromaKeyerForm
+        disabled={false}
+        errors={{}}
+        onChange={onChange}
+        onInputPathCommit={vi.fn()}
+        onSubmit={vi.fn()}
+        values={values}
+      />,
+    )
+
+    expect(screen.queryByLabelText('输出路径（可选）')).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: '指定输出根目录（可选）' }))
+
+    await waitFor(() =>
+      expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ outputRoot: 'E:\\exports' })),
+    )
+    expect(apiMocks.pickLocalDirectory).toHaveBeenCalledWith({ title: '选择 PNG 序列输出根目录' })
+    expect(screen.getByRole('button', { name: '导出 PNG 序列' })).toBeEnabled()
   })
 
   it('renders a bounded slider and compact number input for every chroma parameter', () => {
