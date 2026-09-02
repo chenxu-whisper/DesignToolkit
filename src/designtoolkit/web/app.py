@@ -7,6 +7,8 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from designtoolkit.chroma_keyer.video_io import ImageioVideoDecoder
+from designtoolkit.chroma_keyer.video_models import VideoDecoder
 from designtoolkit.web.logs import LogStore
 from designtoolkit.web.native_picker import LocalPathPicker
 from designtoolkit.web.routes import ApiError, create_router, error_response
@@ -22,9 +24,11 @@ def create_app(
     *,
     local_path_roots: list[Path] | None = None,
     local_path_picker: LocalPathPicker | None = None,
+    video_decoder: VideoDecoder | None = None,
 ) -> FastAPI:
     log_store = task_manager.log_store if task_manager is not None else LogStore()
     manager = task_manager or TaskManager(log_store=log_store)
+    decoder = video_decoder if video_decoder is not None else ImageioVideoDecoder()
     app = FastAPI(title="DesignToolkit Web GUI")
 
     @app.exception_handler(ApiError)
@@ -43,6 +47,7 @@ def create_app(
             manager,
             local_path_roots=local_path_roots,
             local_path_picker=local_path_picker,
+            video_decoder=decoder,
         ),
     )
     frontend_dist = _frontend_dist_dir()
@@ -51,4 +56,5 @@ def create_app(
 
     app.state.task_manager = manager
     app.state.log_store = log_store
+    app.state.video_decoder = decoder
     return app

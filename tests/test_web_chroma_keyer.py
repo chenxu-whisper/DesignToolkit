@@ -20,8 +20,9 @@ from designtoolkit.chroma_keyer.image_io import (
     resize_preview_rgb,
 )
 from designtoolkit.chroma_keyer.matte import generate_alpha, refine_alpha
-from designtoolkit.chroma_keyer.models import KeyerParams, KeyImageResult
+from designtoolkit.chroma_keyer.models import KeyerError, KeyerParams, KeyImageResult
 from designtoolkit.chroma_keyer.sampling import screen_model_from_samples
+from designtoolkit.chroma_keyer.video_models import VideoMetadata
 from designtoolkit.web import routes as web_routes
 from designtoolkit.web.adapters import chroma_keyer_options_from_request
 from designtoolkit.web.app import create_app
@@ -30,6 +31,14 @@ from designtoolkit.web.logs import LogStore
 from designtoolkit.web.schemas import (
     ChromaKeyerTaskRequest,
     ChromaPreviewRequest,
+    ChromaVideoFrameRequest,
+    ChromaVideoFrameResponse,
+    ChromaVideoInspectRequest,
+    ChromaVideoInspectResponse,
+    ChromaVideoPreviewRequest,
+    ChromaVideoPreviewResponse,
+    ChromaVideoSampleRequest,
+    ChromaVideoSampleResponse,
     LogLevel,
     LogPhase,
     TaskKind,
@@ -52,6 +61,63 @@ def _write_input_image(path: Path) -> np.ndarray:
 
 def _client(tmp_path: Path) -> TestClient:
     return TestClient(create_app(local_path_roots=[tmp_path]))
+
+
+class FakeVideoDecoder:
+    def __init__(
+        self,
+        *,
+        metadata: VideoMetadata | None = None,
+        full_frame: np.ndarray | None = None,
+        preview_frame: np.ndarray | None = None,
+    ) -> None:
+        self.metadata = metadata or VideoMetadata(
+            width=4,
+            height=2,
+            fps=2.0,
+            duration_seconds=3.0,
+            estimated_frame_count=6,
+            codec="fake",
+        )
+        self.full_frame = (
+            full_frame.copy()
+            if full_frame is not None
+            else np.full((2, 4, 3), [42, 180, 72], dtype=np.uint8)
+        )
+        self.preview_frame = (
+            preview_frame.copy()
+            if preview_frame is not None
+            else self.full_frame[:, ::2].copy()
+        )
+        self.calls: list[tuple[str, Path, float | None]] = []
+
+    def probe(self, path: Path) -> VideoMetadata:
+        self.calls.append(("probe", path, None))
+        return self.metadata
+
+    def read_frame(self, path: Path, timestamp_seconds: float) -> np.ndarray:
+        self.calls.append(("read_frame", path, timestamp_seconds))
+        return self.full_frame.copy()
+
+    def read_preview_frame(
+        self,
+        path: Path,
+        timestamp_seconds: float,
+    ) -> np.ndarray:
+        self.calls.append(("read_preview_frame", path, timestamp_seconds))
+        return self.preview_frame.copy()
+
+    def iter_frames(self, path: Path):
+        raise AssertionError(f"iter_frames must not be called for previews: {path}")
+
+
+def _video_client(tmp_path: Path, decoder: FakeVideoDecoder) -> TestClient:
+    return TestClient(
+        create_app(
+            local_path_roots=[tmp_path],
+            video_decoder=decoder,
+        )
+    )
 
 
 def _decode_rgb_png(png_bytes: bytes) -> np.ndarray:
@@ -83,6 +149,190 @@ def _replace_image_preserving_metadata(path: Path, rgb: np.ndarray) -> None:
         path,
         ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns),
     )
+
+
+def test_chroma_video_schemas_accept_exact_contracts() -> None:
+    assert ChromaVideoInspectRequest(input_path="clip.mp4").model_dump() == {
+        "input_path": "clip.mp4",
+    }
+    assert ChromaVideoInspectResponse(
+        input_path="clip.mp4",
+        width=1920,
+        height=1080,
+        preview_width=960,
+        preview_height=540,
+        preview_url="/api/chroma-keyer/previews/inspect",
+        duration_seconds=12.5,
+        fps=30.0,
+        estimated_frame_count=375,
+        timestamp_seconds=0.0,
+    ).model_dump() == {
+        "input_path": "clip.mp4",
+        "width": 1920,
+        "height": 1080,
+        "preview_width": 960,
+        "preview_height": 540,
+        "preview_url": "/api/chroma-keyer/previews/inspect",
+        "duration_seconds": 12.5,
+        "fps": 30.0,
+        "estimated_frame_count": 375,
+        "timestamp_seconds": 0.0,
+    }
+    assert ChromaVideoFrameRequest(
+        input_path="clip.mp4",
+        timestamp_seconds=1.25,
+    ).model_dump() == {
+        "input_path": "clip.mp4",
+        "timestamp_seconds": 1.25,
+    }
+    assert ChromaVideoFrameResponse(
+        preview_url="/api/chroma-keyer/previews/frame",
+        timestamp_seconds=1.25,
+    ).model_dump() == {
+        "preview_url": "/api/chroma-keyer/previews/frame",
+        "timestamp_seconds": 1.25,
+    }
+    assert ChromaVideoSampleRequest(
+        input_path="clip.mp4",
+        timestamp_seconds=1.25,
+        x=10.5,
+        y=20.5,
+        preview_width=960.0,
+        preview_height=540.0,
+    ).model_dump() == {
+        "input_path": "clip.mp4",
+        "timestamp_seconds": 1.25,
+        "x": 10.5,
+        "y": 20.5,
+        "preview_width": 960.0,
+        "preview_height": 540.0,
+    }
+    assert ChromaVideoSampleResponse(
+        rgb=[42, 180, 72],
+        hex="#2AB448",
+        source_x=21,
+        source_y=41,
+        timestamp_seconds=1.25,
+    ).model_dump() == {
+        "rgb": [42, 180, 72],
+        "hex": "#2AB448",
+        "source_x": 21,
+        "source_y": 41,
+        "timestamp_seconds": 1.25,
+    }
+    assert ChromaVideoPreviewRequest(
+        input_path="clip.mp4",
+        timestamp_seconds=1.25,
+        samples=[[42, 180, 72]],
+        params={},
+        view_mode="alpha",
+    ).model_dump(mode="json") == {
+        "input_path": "clip.mp4",
+        "timestamp_seconds": 1.25,
+        "samples": [[42, 180, 72]],
+        "params": {
+            "screen_gain": 1.0,
+            "screen_balance": 0.5,
+            "clip_black": 0.0,
+            "clip_white": 1.0,
+            "shrink_grow": 0,
+            "feather": 0,
+            "despill_amount": 1.0,
+        },
+        "view_mode": "alpha",
+    }
+    assert ChromaVideoPreviewResponse(
+        preview_url="/api/chroma-keyer/previews/keyed",
+        timestamp_seconds=1.25,
+    ).model_dump() == {
+        "preview_url": "/api/chroma-keyer/previews/keyed",
+        "timestamp_seconds": 1.25,
+    }
+
+
+@mark.parametrize(
+    ("request_model", "payload"),
+    [
+        (ChromaVideoInspectRequest, {"input_path": "clip.mp4", "extra": True}),
+        (
+            ChromaVideoFrameRequest,
+            {"input_path": "clip.mp4", "timestamp_seconds": 0.0, "extra": True},
+        ),
+        (
+            ChromaVideoSampleRequest,
+            {
+                "input_path": "clip.mp4",
+                "timestamp_seconds": 0.0,
+                "x": 0.0,
+                "y": 0.0,
+                "preview_width": 1.0,
+                "preview_height": 1.0,
+                "extra": True,
+            },
+        ),
+        (
+            ChromaVideoPreviewRequest,
+            {
+                "input_path": "clip.mp4",
+                "timestamp_seconds": 0.0,
+                "samples": [[42, 180, 72]],
+                "params": {},
+                "extra": True,
+            },
+        ),
+    ],
+)
+def test_chroma_video_request_schemas_forbid_extra_fields(
+    request_model: type,
+    payload: dict[str, object],
+) -> None:
+    with raises(ValueError):
+        request_model.model_validate(payload)
+
+
+@mark.parametrize("timestamp_seconds", [-0.1, inf, -inf, nan, True])
+@mark.parametrize(
+    ("request_model", "payload"),
+    [
+        (ChromaVideoFrameRequest, {}),
+        (
+            ChromaVideoSampleRequest,
+            {"x": 0.0, "y": 0.0, "preview_width": 1.0, "preview_height": 1.0},
+        ),
+        (
+            ChromaVideoPreviewRequest,
+            {"samples": [[42, 180, 72]], "params": {}},
+        ),
+    ],
+)
+def test_chroma_video_timestamp_requests_require_strict_finite_nonnegative_float(
+    request_model: type,
+    payload: dict[str, object],
+    timestamp_seconds: object,
+) -> None:
+    with raises(ValueError):
+        request_model.model_validate(
+            {
+                "input_path": "clip.mp4",
+                "timestamp_seconds": timestamp_seconds,
+                **payload,
+            }
+        )
+
+
+@mark.parametrize("samples", [[], [[42, 180, 72], [40, 182, 74]]])
+def test_chroma_video_preview_requires_exactly_one_sample(
+    samples: list[list[int]],
+) -> None:
+    with raises(ValueError):
+        ChromaVideoPreviewRequest.model_validate(
+            {
+                "input_path": "clip.mp4",
+                "timestamp_seconds": 0.0,
+                "samples": samples,
+                "params": {},
+            }
+        )
 
 
 def test_chroma_keyer_task_request_accepts_the_default_export_contract() -> None:
@@ -747,6 +997,390 @@ def test_inspect_returns_dimensions_and_a_retrievable_preview(tmp_path: Path) ->
     assert preview.status_code == 200
     assert preview.headers["content-type"] == "image/png"
     assert preview.content.startswith(b"\x89PNG\r\n\x1a\n")
+
+
+def test_video_inspect_returns_metadata_and_first_bounded_frame(
+    tmp_path: Path,
+) -> None:
+    input_path = tmp_path / "clip.mp4"
+    input_path.write_bytes(b"fake video source")
+    preview_frame = np.array(
+        [[[42, 180, 72], [220, 40, 40]]],
+        dtype=np.uint8,
+    )
+    decoder = FakeVideoDecoder(preview_frame=preview_frame)
+    client = _video_client(tmp_path, decoder)
+
+    response = client.post(
+        "/api/chroma-keyer/videos/inspect",
+        json={"input_path": str(input_path)},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body == {
+        "input_path": str(input_path),
+        "width": 4,
+        "height": 2,
+        "preview_width": 2,
+        "preview_height": 1,
+        "preview_url": body["preview_url"],
+        "duration_seconds": 3.0,
+        "fps": 2.0,
+        "estimated_frame_count": 6,
+        "timestamp_seconds": 0.0,
+    }
+    assert decoder.calls == [
+        ("probe", input_path, None),
+        ("read_preview_frame", input_path, 0.0),
+    ]
+    preview = client.get(body["preview_url"])
+    assert preview.status_code == 200
+    assert np.array_equal(_decode_rgb_png(preview.content), preview_frame)
+
+
+def test_video_frame_returns_bounded_frame_at_validated_timestamp(
+    tmp_path: Path,
+) -> None:
+    input_path = tmp_path / "clip.mp4"
+    input_path.write_bytes(b"fake video source")
+    preview_frame = np.array(
+        [[[30, 50, 200], [220, 40, 40]]],
+        dtype=np.uint8,
+    )
+    decoder = FakeVideoDecoder(preview_frame=preview_frame)
+    client = _video_client(tmp_path, decoder)
+
+    response = client.post(
+        "/api/chroma-keyer/videos/frame",
+        json={"input_path": str(input_path), "timestamp_seconds": 1.25},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["timestamp_seconds"] == 1.25
+    assert decoder.calls == [
+        ("probe", input_path, None),
+        ("read_preview_frame", input_path, 1.25),
+    ]
+    preview = client.get(response.json()["preview_url"])
+    assert np.array_equal(_decode_rgb_png(preview.content), preview_frame)
+
+
+def test_video_sample_maps_source_coordinates_to_actual_full_frame_shape(
+    tmp_path: Path,
+) -> None:
+    input_path = tmp_path / "clip.mp4"
+    input_path.write_bytes(b"fake video source")
+    full_frame = np.array(
+        [[[128, 128, 128], [220, 40, 40]]],
+        dtype=np.uint8,
+    )
+    decoder = FakeVideoDecoder(full_frame=full_frame)
+    client = _video_client(tmp_path, decoder)
+
+    response = client.post(
+        "/api/chroma-keyer/videos/sample",
+        json={
+            "input_path": str(input_path),
+            "timestamp_seconds": 1.25,
+            "x": 1.5,
+            "y": 0.75,
+            "preview_width": 2.0,
+            "preview_height": 1.0,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "rgb": [220, 40, 40],
+        "hex": "#DC2828",
+        "source_x": 3,
+        "source_y": 1,
+        "timestamp_seconds": 1.25,
+    }
+    assert decoder.calls == [
+        ("probe", input_path, None),
+        ("read_frame", input_path, 1.25),
+    ]
+
+
+def test_video_sample_rejects_low_dominance_color(tmp_path: Path) -> None:
+    input_path = tmp_path / "clip.mp4"
+    input_path.write_bytes(b"fake video source")
+    decoder = FakeVideoDecoder(
+        full_frame=np.array([[[128, 128, 128]]], dtype=np.uint8)
+    )
+    client = _video_client(tmp_path, decoder)
+
+    response = client.post(
+        "/api/chroma-keyer/videos/sample",
+        json={
+            "input_path": str(input_path),
+            "timestamp_seconds": 0.0,
+            "x": 0.0,
+            "y": 0.0,
+            "preview_width": 1.0,
+            "preview_height": 1.0,
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": {
+            "code": "invalid_screen_color",
+            "message": "请选择具有明显主色的纯色幕背景",
+        }
+    }
+
+
+def test_video_final_and_alpha_previews_key_bounded_timestamp_frames(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    input_path = tmp_path / "clip.mp4"
+    input_path.write_bytes(b"fake video source")
+    bounded_frame = np.array(
+        [[[42, 180, 72], [220, 40, 40]]],
+        dtype=np.uint8,
+    )
+    keyed_rgb = np.array(
+        [[[10, 20, 30], [40, 50, 60]]],
+        dtype=np.uint8,
+    )
+    alpha = np.array([[0, 192]], dtype=np.uint8)
+    decoder = FakeVideoDecoder(preview_frame=bounded_frame)
+    pipeline_calls: list[tuple[np.ndarray, KeyerParams]] = []
+
+    def key_rgb(
+        rgb: np.ndarray,
+        _model,
+        params: KeyerParams,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        pipeline_calls.append((rgb.copy(), params))
+        return keyed_rgb, alpha
+
+    monkeypatch.setattr(web_routes, "key_rgb", key_rgb)
+    client = _video_client(tmp_path, decoder)
+    payload = {
+        "input_path": str(input_path),
+        "timestamp_seconds": 1.25,
+        "samples": [[42, 180, 72]],
+        "params": {},
+    }
+
+    final_response = client.post("/api/chroma-keyer/videos/preview", json=payload)
+    alpha_response = client.post(
+        "/api/chroma-keyer/videos/preview",
+        json={**payload, "view_mode": "alpha"},
+    )
+
+    assert final_response.status_code == 200
+    assert alpha_response.status_code == 200
+    assert final_response.json()["timestamp_seconds"] == 1.25
+    assert alpha_response.json()["timestamp_seconds"] == 1.25
+    assert len(pipeline_calls) == 2
+    assert all(np.array_equal(rgb, bounded_frame) for rgb, _ in pipeline_calls)
+    assert all(params == KeyerParams() for _, params in pipeline_calls)
+    assert np.array_equal(
+        _decode_rgba_png(client.get(final_response.json()["preview_url"]).content),
+        np.dstack((keyed_rgb, alpha)),
+    )
+    assert np.array_equal(
+        _decode_rgb_png(client.get(alpha_response.json()["preview_url"]).content),
+        np.repeat(alpha[..., np.newaxis], 3, axis=2),
+    )
+    assert decoder.calls == [
+        ("probe", input_path, None),
+        ("read_preview_frame", input_path, 1.25),
+        ("probe", input_path, None),
+        ("read_preview_frame", input_path, 1.25),
+    ]
+
+
+def test_video_preview_cache_keys_cover_all_request_state_and_source_content(
+    tmp_path: Path,
+) -> None:
+    input_path = tmp_path / "clip.mp4"
+    input_path.write_bytes(b"video version one")
+    decoder = FakeVideoDecoder()
+    client = _video_client(tmp_path, decoder)
+    payload = {
+        "input_path": str(input_path),
+        "timestamp_seconds": 0.5,
+        "samples": [[42, 180, 72]],
+        "params": {},
+    }
+
+    first = client.post("/api/chroma-keyer/videos/preview", json=payload)
+    duplicate = client.post("/api/chroma-keyer/videos/preview", json=payload)
+    changed_timestamp = client.post(
+        "/api/chroma-keyer/videos/preview",
+        json={**payload, "timestamp_seconds": 1.0},
+    )
+    changed_params = client.post(
+        "/api/chroma-keyer/videos/preview",
+        json={**payload, "params": {"screen_gain": 1.25}},
+    )
+    changed_view = client.post(
+        "/api/chroma-keyer/videos/preview",
+        json={**payload, "view_mode": "alpha"},
+    )
+    frame = client.post(
+        "/api/chroma-keyer/videos/frame",
+        json={
+            "input_path": str(input_path),
+            "timestamp_seconds": payload["timestamp_seconds"],
+        },
+    )
+    original_stat = input_path.stat()
+    input_path.write_bytes(b"video version two")
+    utime(input_path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+    changed_source = client.post("/api/chroma-keyer/videos/preview", json=payload)
+
+    responses = [
+        first,
+        duplicate,
+        changed_timestamp,
+        changed_params,
+        changed_view,
+        frame,
+        changed_source,
+    ]
+    assert all(response.status_code == 200 for response in responses)
+    first_url = first.json()["preview_url"]
+    assert duplicate.json()["preview_url"] == first_url
+    assert len(
+        {
+            first_url,
+            changed_timestamp.json()["preview_url"],
+            changed_params.json()["preview_url"],
+            changed_view.json()["preview_url"],
+            frame.json()["preview_url"],
+            changed_source.json()["preview_url"],
+        }
+    ) == 6
+    assert [
+        timestamp
+        for method, _path, timestamp in decoder.calls
+        if method == "read_preview_frame"
+    ] == [0.5, 1.0, 0.5, 0.5, 0.5, 0.5]
+
+
+def test_video_preview_retries_when_source_changes_during_decode(
+    tmp_path: Path,
+) -> None:
+    input_path = tmp_path / "clip.mp4"
+    input_path.write_bytes(b"video version one")
+    source_stat = input_path.stat()
+    replacement_frame = np.array([[[220, 40, 40]]], dtype=np.uint8)
+
+    class SourceChangingDecoder(FakeVideoDecoder):
+        def read_preview_frame(
+            self,
+            path: Path,
+            timestamp_seconds: float,
+        ) -> np.ndarray:
+            self.calls.append(("read_preview_frame", path, timestamp_seconds))
+            if sum(call[0] == "read_preview_frame" for call in self.calls) == 1:
+                path.write_bytes(b"video version two")
+                utime(path, ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns))
+            return replacement_frame.copy()
+
+    decoder = SourceChangingDecoder()
+    client = _video_client(tmp_path, decoder)
+    payload = {
+        "input_path": str(input_path),
+        "timestamp_seconds": 0.5,
+        "samples": [[42, 180, 72]],
+        "params": {},
+    }
+
+    first = client.post("/api/chroma-keyer/videos/preview", json=payload)
+    duplicate = client.post("/api/chroma-keyer/videos/preview", json=payload)
+
+    assert first.status_code == 200
+    assert duplicate.status_code == 200
+    assert duplicate.json()["preview_url"] == first.json()["preview_url"]
+    assert sum(
+        method == "read_preview_frame" for method, _path, _timestamp in decoder.calls
+    ) == 2
+
+
+def test_video_decoder_failure_returns_structured_invalid_video(
+    tmp_path: Path,
+) -> None:
+    input_path = tmp_path / "clip.mp4"
+    input_path.write_bytes(b"invalid video")
+
+    class InvalidVideoDecoder(FakeVideoDecoder):
+        def probe(self, path: Path) -> VideoMetadata:
+            raise KeyerError("Video could not be opened")
+
+    response = _video_client(tmp_path, InvalidVideoDecoder()).post(
+        "/api/chroma-keyer/videos/inspect",
+        json={"input_path": str(input_path)},
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": {
+            "code": "invalid_video",
+            "message": "Video could not be opened",
+        }
+    }
+
+
+@mark.parametrize(
+    ("url", "payload"),
+    [
+        (
+            "/api/chroma-keyer/videos/frame",
+            {},
+        ),
+        (
+            "/api/chroma-keyer/videos/sample",
+            {
+                "x": 0.0,
+                "y": 0.0,
+                "preview_width": 1.0,
+                "preview_height": 1.0,
+            },
+        ),
+        (
+            "/api/chroma-keyer/videos/preview",
+            {
+                "samples": [[42, 180, 72]],
+                "params": {},
+            },
+        ),
+    ],
+)
+def test_video_routes_reject_out_of_range_timestamp_before_frame_read(
+    tmp_path: Path,
+    url: str,
+    payload: dict[str, object],
+) -> None:
+    input_path = tmp_path / "clip.mp4"
+    input_path.write_bytes(b"fake video source")
+    decoder = FakeVideoDecoder()
+
+    response = _video_client(tmp_path, decoder).post(
+        url,
+        json={
+            "input_path": str(input_path),
+            "timestamp_seconds": 3.0,
+            **payload,
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": {
+            "code": "invalid_timestamp",
+            "message": "timestamp must satisfy 0 <= timestamp < duration_seconds",
+        }
+    }
+    assert decoder.calls == [("probe", input_path, None)]
 
 
 def test_inspect_succeeds_when_eviction_interleaves_after_cache_insertion(

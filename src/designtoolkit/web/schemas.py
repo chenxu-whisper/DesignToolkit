@@ -16,6 +16,14 @@ ScreenGainFloat = Annotated[
     float,
     Field(strict=True, ge=0, le=2, allow_inf_nan=False),
 ]
+TimestampSeconds = Annotated[
+    float,
+    Field(strict=True, ge=0, allow_inf_nan=False),
+]
+PositiveFloat = Annotated[
+    float,
+    Field(strict=True, gt=0, allow_inf_nan=False),
+]
 
 
 class TaskKind(StrEnum):
@@ -161,6 +169,53 @@ class ChromaPreviewRequest(BaseModel):
 
 class ChromaPreviewResponse(BaseModel):
     preview_url: str
+
+
+class ChromaVideoInspectRequest(ChromaImageInspectRequest):
+    model_config = ConfigDict(extra="forbid")
+
+
+class ChromaVideoInspectResponse(ChromaImageInspectResponse):
+    model_config = ConfigDict(extra="forbid")
+
+    duration_seconds: PositiveFloat
+    fps: PositiveFloat
+    estimated_frame_count: PositiveInt
+    timestamp_seconds: TimestampSeconds
+
+
+class ChromaVideoFrameRequest(ChromaVideoInspectRequest):
+    timestamp_seconds: TimestampSeconds
+
+
+class ChromaVideoFrameResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    preview_url: str
+    timestamp_seconds: TimestampSeconds
+
+
+class ChromaVideoSampleRequest(ChromaVideoFrameRequest):
+    x: float = Field(strict=True, allow_inf_nan=False)
+    y: float = Field(strict=True, allow_inf_nan=False)
+    preview_width: float = Field(strict=True, allow_inf_nan=False)
+    preview_height: float = Field(strict=True, allow_inf_nan=False)
+
+
+class ChromaVideoSampleResponse(ChromaSampleResponse):
+    model_config = ConfigDict(extra="forbid")
+
+    timestamp_seconds: TimestampSeconds
+
+
+class ChromaVideoPreviewRequest(ChromaPreviewRequest):
+    timestamp_seconds: TimestampSeconds
+
+
+class ChromaVideoPreviewResponse(ChromaPreviewResponse):
+    model_config = ConfigDict(extra="forbid")
+
+    timestamp_seconds: TimestampSeconds
 
 
 class VideoFramesTaskRequest(BaseModel):
