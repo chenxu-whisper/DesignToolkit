@@ -1,3 +1,5 @@
+import type { KeyboardEvent } from 'react'
+
 type ChromaVideoTimelineProps = {
   disabled?: boolean
   durationSeconds: number
@@ -28,8 +30,34 @@ export function ChromaVideoTimeline({
   width,
 }: ChromaVideoTimelineProps) {
   const max = getLastVideoFrameTime(durationSeconds, fps)
+  const frameStep = 1 / fps
   const clampedValue = Math.min(max, Math.max(0, Number.isFinite(value) ? value : 0))
   const timecode = `${formatTimecode(clampedValue)} / ${formatTimecode(durationSeconds)}`
+  const handleKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
+    let nextValue: number
+
+    switch (event.key) {
+      case 'ArrowLeft':
+      case 'ArrowDown':
+        nextValue = clampedValue - frameStep
+        break
+      case 'ArrowRight':
+      case 'ArrowUp':
+        nextValue = clampedValue + frameStep
+        break
+      case 'Home':
+        nextValue = 0
+        break
+      case 'End':
+        nextValue = max
+        break
+      default:
+        return
+    }
+
+    event.preventDefault()
+    onChange(Math.min(max, Math.max(0, nextValue)))
+  }
 
   return (
     <div className="chroma-video-timeline" data-testid="chroma-video-timeline">
@@ -45,13 +73,14 @@ export function ChromaVideoTimeline({
           max={max}
           min={0}
           onChange={(event) => onChange(Number(event.target.value))}
-          step={1 / fps}
+          onKeyDown={handleKeyDown}
+          step={frameStep}
           type="range"
           value={clampedValue}
         />
         <output className="chroma-video-timecode">{timecode}</output>
       </div>
-      <dl className="chroma-video-metadata">
+      <dl className="chroma-video-metadata" data-testid="chroma-video-timeline-metadata">
         <div>
           <dt>帧率</dt>
           <dd>{formatNumber(fps)} FPS</dd>

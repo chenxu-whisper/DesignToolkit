@@ -636,25 +636,26 @@ export function ChromaKeyerPage() {
               previewUrl={previewUrl}
               samples={sampleDetails}
               viewMode={values.viewMode}
-            />
+            >
+              {media.kind === 'video' ? (
+                <>
+                  <ChromaVideoTimeline
+                    disabled={disabledByTask}
+                    durationSeconds={media.durationSeconds}
+                    estimatedFrameCount={media.estimatedFrameCount}
+                    fps={media.fps}
+                    height={media.height}
+                    onChange={handleSeek}
+                    value={values.timestampSeconds}
+                    width={media.width}
+                  />
+                  <FieldError message={errors.timestampSeconds} />
+                </>
+              ) : null}
+            </ChromaKeyerCanvas>
           ) : (
             <div className="chroma-empty-preview">加载本地图片或视频后，可在画面中吸取背景颜色。</div>
           )}
-          {media?.kind === 'video' ? (
-            <>
-              <ChromaVideoTimeline
-                disabled={disabledByTask}
-                durationSeconds={media.durationSeconds}
-                estimatedFrameCount={media.estimatedFrameCount}
-                fps={media.fps}
-                height={media.height}
-                onChange={handleSeek}
-                value={values.timestampSeconds}
-                width={media.width}
-              />
-              <FieldError message={errors.timestampSeconds} />
-            </>
-          ) : null}
           <div className="chroma-sample-toolbar">
             <h2 className="chroma-section-title">采样颜色</h2>
             <button

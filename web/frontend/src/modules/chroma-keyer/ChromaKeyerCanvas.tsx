@@ -1,4 +1,4 @@
-import type { KeyboardEvent, MouseEvent } from 'react'
+import type { KeyboardEvent, MouseEvent, ReactNode } from 'react'
 
 export type ChromaCanvasSample = {
   hex: string
@@ -8,6 +8,7 @@ export type ChromaCanvasSample = {
 }
 
 type ChromaKeyerCanvasProps = {
+  children?: ReactNode
   onSample: (point: { x: number; y: number; previewWidth: number; previewHeight: number }) => void
   originalHeight?: number
   originalWidth?: number
@@ -41,6 +42,7 @@ export function buildChromaSamplePayload(
 }
 
 export function ChromaKeyerCanvas({
+  children,
   onSample,
   originalHeight,
   originalWidth,
@@ -100,6 +102,7 @@ export function ChromaKeyerCanvas({
             ))
           : null}
       </div>
+      {children}
       <p className="chroma-preview-instructions" id="chroma-keyer-preview-sampling-instructions">
         点击预览采样，或聚焦后按 Enter 或空格从画面中心采样。
       </p>

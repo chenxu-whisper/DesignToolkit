@@ -67,7 +67,8 @@ describe('ChromaKeyerForm', () => {
     )
 
     expect(screen.queryByRole('button', { name: '加载图片' })).not.toBeInTheDocument()
-    await user.click(screen.getByRole('button', { name: '指定输入图片路径' }))
+    expect(screen.getByLabelText('输入图片或视频路径')).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: '指定输入图片或视频路径' }))
 
     await waitFor(() => expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ inputPath: 'E:\\media\\screen.png' })))
     expect(onInputPathCommit).toHaveBeenCalledOnce()

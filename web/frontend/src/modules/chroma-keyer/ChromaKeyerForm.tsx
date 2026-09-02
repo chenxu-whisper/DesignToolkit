@@ -61,7 +61,7 @@ export function ChromaKeyerForm({
           disabled={disabled}
           error={errors.inputPath}
           id="chroma-keyer-input-path"
-          label="输入图片路径"
+          label="输入图片或视频路径"
           onChange={(value) => updateValue('inputPath', value)}
           onCommit={onInputPathCommit}
           pickPaths={async () => {

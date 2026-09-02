@@ -62,7 +62,7 @@ const videoInspectResponse = {
 
 async function inspectImage() {
   const user = userEvent.setup()
-  await user.type(screen.getByLabelText('输入图片路径'), 'E:\\media\\screen.png')
+  await user.type(screen.getByLabelText('输入图片或视频路径'), 'E:\\media\\screen.png')
   await user.keyboard('{Enter}')
   return user
 }
@@ -86,7 +86,7 @@ async function sampleImage() {
 }
 
 async function inspectVideo() {
-  const input = screen.getByLabelText('输入图片路径')
+  const input = screen.getByLabelText('输入图片或视频路径')
   fireEvent.change(input, { target: { value: 'E:\\media\\screen.mp4' } })
   fireEvent.keyDown(input, { key: 'Enter' })
   await screen.findByRole('slider', { name: '视频时间轴' })
@@ -149,7 +149,7 @@ describe('ChromaKeyerPage', () => {
     const user = renderWithUser()
 
     expect(screen.queryByRole('button', { name: '加载图片' })).not.toBeInTheDocument()
-    await user.click(screen.getByRole('button', { name: '指定输入图片路径' }))
+    await user.click(screen.getByRole('button', { name: '指定输入图片或视频路径' }))
 
     await waitFor(() =>
       expect(pageMocks.inspectChromaImage).toHaveBeenCalledWith({
@@ -157,13 +157,13 @@ describe('ChromaKeyerPage', () => {
       }),
     )
     expect(pageMocks.inspectChromaImage).toHaveBeenCalledOnce()
-    expect(screen.getByLabelText('输入图片路径')).toHaveValue('E:\\media\\screen.png')
+    expect(screen.getByLabelText('输入图片或视频路径')).toHaveValue('E:\\media\\screen.png')
     expect(await screen.findByRole('button', { name: '抠像预览' })).toBeInTheDocument()
   })
 
   it('does not inspect while typing and commits once on Enter followed by blur', async () => {
     const user = renderWithUser()
-    const input = screen.getByLabelText('输入图片路径')
+    const input = screen.getByLabelText('输入图片或视频路径')
     const inspectRequest = createDeferred<typeof inspectResponse>()
     pageMocks.inspectChromaImage.mockReturnValueOnce(inspectRequest.promise)
 
@@ -184,7 +184,7 @@ describe('ChromaKeyerPage', () => {
 
   it('commits a manually typed path on blur', async () => {
     const user = renderWithUser()
-    const input = screen.getByLabelText('输入图片路径')
+    const input = screen.getByLabelText('输入图片或视频路径')
 
     await user.type(input, 'E:\\media\\screen.png')
 
@@ -196,8 +196,8 @@ describe('ChromaKeyerPage', () => {
 
   it('keeps the picker focused and guarded while a Tab-committed inspection is pending', async () => {
     const user = renderWithUser()
-    const input = screen.getByLabelText('输入图片路径')
-    const picker = screen.getByRole('button', { name: '指定输入图片路径' })
+    const input = screen.getByLabelText('输入图片或视频路径')
+    const picker = screen.getByRole('button', { name: '指定输入图片或视频路径' })
     const inspectRequest = createDeferred<typeof inspectResponse>()
     pageMocks.inspectChromaImage.mockReturnValueOnce(inspectRequest.promise)
 
@@ -230,7 +230,7 @@ describe('ChromaKeyerPage', () => {
   it('shows an input error for a blank committed path', () => {
     render(<ChromaKeyerPage />)
 
-    fireEvent.keyDown(screen.getByLabelText('输入图片路径'), { key: 'Enter' })
+    fireEvent.keyDown(screen.getByLabelText('输入图片或视频路径'), { key: 'Enter' })
 
     expect(screen.getByRole('alert')).toHaveTextContent('请输入图片路径')
     expect(pageMocks.inspectChromaImage).not.toHaveBeenCalled()
@@ -360,8 +360,8 @@ describe('ChromaKeyerPage', () => {
     await inspectImage()
     await sampleImage()
     await waitFor(() => expect(screen.getByText('#2AB448')).toBeInTheDocument())
-    await user.clear(screen.getByLabelText('输入图片路径'))
-    await user.type(screen.getByLabelText('输入图片路径'), 'E:\\media\\replacement.png')
+    await user.clear(screen.getByLabelText('输入图片或视频路径'))
+    await user.type(screen.getByLabelText('输入图片或视频路径'), 'E:\\media\\replacement.png')
 
     expect(screen.queryByRole('img', { name: '抠像预览' })).not.toBeInTheDocument()
     expect(screen.queryByText('#2AB448')).not.toBeInTheDocument()
@@ -373,7 +373,7 @@ describe('ChromaKeyerPage', () => {
     await inspectImage()
     await sampleImage()
     await waitFor(() => expect(screen.getByText('#2AB448')).toBeInTheDocument())
-    const input = screen.getByLabelText('输入图片路径')
+    const input = screen.getByLabelText('输入图片或视频路径')
 
     await user.click(input)
     await user.keyboard('{Enter}')
@@ -388,11 +388,11 @@ describe('ChromaKeyerPage', () => {
     const user = renderWithUser()
     pageMocks.inspectChromaImage.mockRejectedValueOnce(new Error('图片无法读取'))
 
-    await user.type(screen.getByLabelText('输入图片路径'), 'E:\\media\\broken.png')
+    await user.type(screen.getByLabelText('输入图片或视频路径'), 'E:\\media\\broken.png')
     await user.keyboard('{Enter}')
 
     expect(await screen.findByRole('alert')).toHaveTextContent('图片无法读取')
-    expect(screen.getByLabelText('输入图片路径')).toHaveValue('E:\\media\\broken.png')
+    expect(screen.getByLabelText('输入图片或视频路径')).toHaveValue('E:\\media\\broken.png')
     expect(screen.queryByRole('button', { name: '抠像预览' })).not.toBeInTheDocument()
     expect(screen.getByText('加载本地图片或视频后，可在画面中吸取背景颜色。')).toBeInTheDocument()
   })
@@ -404,7 +404,7 @@ describe('ChromaKeyerPage', () => {
       .mockReturnValueOnce(oldRequest.promise)
       .mockReturnValueOnce(newRequest.promise)
     render(<ChromaKeyerPage />)
-    const input = screen.getByLabelText('输入图片路径')
+    const input = screen.getByLabelText('输入图片或视频路径')
 
     fireEvent.change(input, { target: { value: 'E:\\media\\old.png' } })
     fireEvent.keyDown(input, { key: 'Enter' })
@@ -434,7 +434,7 @@ describe('ChromaKeyerPage', () => {
       })
     })
 
-    expect(screen.getByLabelText('输入图片路径')).toHaveValue('E:\\media\\new.png')
+    expect(screen.getByLabelText('输入图片或视频路径')).toHaveValue('E:\\media\\new.png')
     expect(screen.getByRole('button', { name: '抠像预览' })).toHaveAttribute(
       'src',
       '/api/previews/new.png',
@@ -642,13 +642,13 @@ describe('ChromaKeyerPage', () => {
     await sampleImage()
 
     expect(pageMocks.sampleChromaImage).toHaveBeenCalledTimes(2)
-    expect(screen.getByLabelText('输入图片路径')).toBeDisabled()
+    expect(screen.getByLabelText('输入图片或视频路径')).toBeDisabled()
 
     await act(async () => {
       previewRequest.resolve({ preview_url: '/api/previews/stale.png' })
     })
 
-    expect(screen.getByLabelText('输入图片路径')).toBeDisabled()
+    expect(screen.getByLabelText('输入图片或视频路径')).toBeDisabled()
 
     await act(async () => {
       sampleRequest.resolve({
@@ -658,7 +658,7 @@ describe('ChromaKeyerPage', () => {
         source_y: 200,
       })
     })
-    expect(screen.getByLabelText('输入图片路径')).toBeEnabled()
+    expect(screen.getByLabelText('输入图片或视频路径')).toBeEnabled()
   })
 
   it('keeps the last successful preview visible when the latest preview fails', async () => {
@@ -807,8 +807,8 @@ describe('ChromaKeyerPage', () => {
       useTaskStore.getState().startTask({ kind: 'video_frames', taskId: 'running-task' })
     })
 
-    expect(screen.getByLabelText('输入图片路径')).toBeDisabled()
-    expect(screen.getByRole('button', { name: '指定输入图片路径' })).toHaveAttribute(
+    expect(screen.getByLabelText('输入图片或视频路径')).toBeDisabled()
+    expect(screen.getByRole('button', { name: '指定输入图片或视频路径' })).toHaveAttribute(
       'aria-disabled',
       'true',
     )
@@ -822,11 +822,11 @@ describe('ChromaKeyerPage', () => {
 
     render(<ChromaKeyerPage />)
 
-    await user.type(screen.getByLabelText('输入图片路径'), 'E:\\media\\screen.png')
+    await user.type(screen.getByLabelText('输入图片或视频路径'), 'E:\\media\\screen.png')
     await user.keyboard('{Enter}')
 
-    expect(screen.getByLabelText('输入图片路径')).toBeDisabled()
-    expect(screen.getByRole('button', { name: '指定输入图片路径' })).toHaveAttribute(
+    expect(screen.getByLabelText('输入图片或视频路径')).toBeDisabled()
+    expect(screen.getByRole('button', { name: '指定输入图片或视频路径' })).toHaveAttribute(
       'aria-disabled',
       'true',
     )
@@ -846,7 +846,7 @@ describe('ChromaKeyerPage', () => {
       </StrictMode>,
     )
 
-    await user.type(screen.getByLabelText('输入图片路径'), 'E:\\media\\screen.png')
+    await user.type(screen.getByLabelText('输入图片或视频路径'), 'E:\\media\\screen.png')
     await user.keyboard('{Enter}')
     await act(async () => {
       inspectRequest.resolve(inspectResponse)
@@ -987,6 +987,27 @@ describe('ChromaKeyerPage', () => {
     expect(screen.getByText('约 375 帧')).toBeInTheDocument()
   })
 
+  it('renders the video timeline and its error directly below the canvas', async () => {
+    pageMocks.createChromaVideoFrame.mockRejectedValueOnce(new Error('视频帧无法读取'))
+    render(<ChromaKeyerPage />)
+    await inspectVideo()
+
+    fireEvent.change(screen.getByRole('slider', { name: '视频时间轴' }), {
+      target: { value: '1' },
+    })
+
+    const error = await screen.findByRole('alert')
+    const canvas = screen.getByRole('button', { name: '抠像预览' }).parentElement
+    const timeline = screen.getByTestId('chroma-video-timeline')
+    const instructions = screen.getByText(
+      '点击预览采样，或聚焦后按 Enter 或空格从画面中心采样。',
+    )
+
+    expect(canvas?.nextElementSibling).toBe(timeline)
+    expect(timeline.nextElementSibling).toBe(error)
+    expect(error.nextElementSibling).toBe(instructions)
+  })
+
   it('debounces video seeks for 100 ms and never renders a stale frame response', async () => {
     const olderRequest = createDeferred<{ preview_url: string; timestamp_seconds: number }>()
     const latestRequest = createDeferred<{ preview_url: string; timestamp_seconds: number }>()
@@ -1056,14 +1077,14 @@ describe('ChromaKeyerPage', () => {
     await inspectVideo()
 
     await sampleImage()
-    expect(screen.getByLabelText('输入图片路径')).toBeDisabled()
+    expect(screen.getByLabelText('输入图片或视频路径')).toBeDisabled()
 
     fireEvent.change(screen.getByRole('slider', { name: '视频时间轴' }), {
       target: { value: '1.25' },
     })
     await waitFor(() => expect(pageMocks.createChromaVideoFrame).toHaveBeenCalledOnce())
 
-    expect(screen.getByLabelText('输入图片路径')).toBeEnabled()
+    expect(screen.getByLabelText('输入图片或视频路径')).toBeEnabled()
     await act(async () => {
       sampleRequest.resolve({
         hex: '#2AB448',
@@ -1218,7 +1239,7 @@ describe('ChromaKeyerPage', () => {
       target: { value: '1.25' },
     })
     await user.type(screen.getByLabelText('输出根目录（可选）'), 'E:\\exports')
-    const input = screen.getByLabelText('输入图片路径')
+    const input = screen.getByLabelText('输入图片或视频路径')
 
     fireEvent.change(input, { target: { value: 'E:\\media\\screen.png' } })
     fireEvent.keyDown(input, { key: 'Enter' })

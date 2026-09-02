@@ -114,4 +114,26 @@ describe('ChromaKeyerCanvas', () => {
       expect(canvas).not.toHaveClass('chroma-preview-canvas-final')
     }
   })
+
+  it('renders compositional content between the canvas and sampling instructions', () => {
+    render(
+      <ChromaKeyerCanvas
+        onSample={vi.fn()}
+        previewUrl="/preview.png"
+        samples={[]}
+        viewMode="final"
+      >
+        <div data-testid="canvas-slot">Timeline</div>
+      </ChromaKeyerCanvas>,
+    )
+
+    const canvas = screen.getByRole('button', { name: '抠像预览' }).parentElement
+    const slot = screen.getByTestId('canvas-slot')
+    const instructions = screen.getByText(
+      '点击预览采样，或聚焦后按 Enter 或空格从画面中心采样。',
+    )
+
+    expect(canvas?.nextElementSibling).toBe(slot)
+    expect(slot.nextElementSibling).toBe(instructions)
+  })
 })

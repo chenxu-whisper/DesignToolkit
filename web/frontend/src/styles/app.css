@@ -497,26 +497,29 @@ button {
 .chroma-video-timeline {
   display: grid;
   gap: 6px;
-  min-width: 0;
-  width: 100%;
+  inline-size: 100%;
+  max-inline-size: 100%;
+  min-inline-size: 0;
 }
 
 .chroma-video-timeline-controls {
   align-items: center;
   display: grid;
   gap: 10px;
-  grid-template-columns: minmax(0, 1fr) 176px;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 176px);
+  max-inline-size: 100%;
   min-height: 28px;
-  min-width: 0;
+  min-inline-size: 0;
 }
 
 .chroma-video-timeline-range {
   accent-color: #2563eb;
   cursor: pointer;
   height: 22px;
+  inline-size: 100%;
   margin: 0;
-  min-width: 0;
-  width: 100%;
+  max-inline-size: 100%;
+  min-inline-size: 0;
 }
 
 .chroma-video-timeline-range:focus-visible {
@@ -533,24 +536,29 @@ button {
   color: #334155;
   font-size: 12px;
   font-variant-numeric: tabular-nums;
+  max-inline-size: 100%;
+  overflow: hidden;
   text-align: right;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .chroma-video-metadata {
   color: #64748b;
-  display: flex;
-  flex-wrap: wrap;
+  display: grid;
   font-size: 12px;
   gap: 6px 16px;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 120px), 1fr));
   margin: 0;
-  min-width: 0;
+  max-inline-size: 100%;
+  min-inline-size: 0;
+  overflow-wrap: anywhere;
 }
 
 .chroma-video-metadata div {
   display: flex;
   gap: 4px;
-  min-width: 0;
+  min-inline-size: 0;
 }
 
 .chroma-video-metadata dt {
@@ -565,7 +573,8 @@ button {
 
 .chroma-video-metadata dd {
   margin: 0;
-  white-space: nowrap;
+  max-inline-size: 100%;
+  overflow-wrap: anywhere;
 }
 
 .chroma-sample-marker {
