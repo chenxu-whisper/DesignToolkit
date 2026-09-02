@@ -190,6 +190,29 @@ def test_probe_rejects_a_stream_without_metadata_and_closes(tmp_path: Path) -> N
     assert read_frames.generators[0].closed
 
 
+def test_probe_maps_lazy_startup_failure_to_open_error_and_closes(
+    tmp_path: Path,
+) -> None:
+    path = make_video_path(tmp_path)
+
+    class LazyStartupFailure(TrackedFrames):
+        def __next__(self) -> object:
+            self.next_count += 1
+            raise OSError("deferred decoder startup failure")
+
+    generator = LazyStartupFailure([])
+
+    def read_frames(*args: object, **kwargs: object) -> LazyStartupFailure:
+        return generator
+
+    with raises(KeyerError, match="^Video could not be opened$") as error_info:
+        make_decoder(read_frames).probe(path)
+
+    assert isinstance(error_info.value.__cause__, OSError)
+    assert generator.next_count == 1
+    assert generator.closed
+
+
 def test_read_frame_seeks_once_and_returns_writable_rgb_copy(tmp_path: Path) -> None:
     path = make_video_path(tmp_path)
     read_frames = FakeReadFrames(
@@ -308,7 +331,7 @@ def test_iter_frames_closes_when_caller_closes_before_reading_frames(
     read_frames = FakeReadFrames([dict(VALID_METADATA), FRAME_BYTES])
 
     _, frames = make_decoder(read_frames).iter_frames(path)
-    frames.close()  # type: ignore[attr-defined]
+    frames.close()
 
     assert read_frames.generators[0].next_count == 1
     assert read_frames.generators[0].closed
@@ -419,7 +442,7 @@ def test_bundled_ffmpeg_probes_and_decodes_tiny_video(
     frame = decoder.read_frame(path, 0.0)
     iter_metadata, frames = decoder.iter_frames(path)
     first_iterated_frame = next(frames)
-    frames.close()  # type: ignore[attr-defined]
+    frames.close()
 
     assert (metadata.width, metadata.height) == (16, 12)
     assert metadata.fps == pytest.approx(5.0)
@@ -429,3 +452,58 @@ def test_bundled_ffmpeg_probes_and_decodes_tiny_video(
     assert frame.dtype == np.uint8
     assert iter_metadata == metadata
     assert first_iterated_frame.shape == (12, 16, 3)
+
+
+def test_bundled_ffmpeg_clamps_valid_end_seek_to_last_frame(
+    tmp_path: Path,
+) -> None:
+    ffmpeg_exe = FfmpegBackend().get_ffmpeg_exe()
+    encoder_lines = _available_encoders(ffmpeg_exe)
+    if not any(
+        line.split()[1] == "ffv1"
+        for line in encoder_lines.splitlines()
+        if len(line.split()) >= 2
+    ):
+        pytest.skip("Bundled FFmpeg does not provide encoder ffv1")
+
+    path = tmp_path / "end-seek.mkv"
+    command = [
+        ffmpeg_exe,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "color=c=red:s=16x12:r=10:d=2",
+        "-vf",
+        "drawbox=x=0:y=0:w=iw:h=ih:color=blue:t=fill:enable='gte(t,1)'",
+        "-an",
+        "-c:v",
+        "ffv1",
+        "-y",
+        str(path),
+    ]
+    completed = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+    decoder = ImageioVideoDecoder()
+    metadata = decoder.probe(path)
+    frame = decoder.read_frame(path, 1.95)
+    _, stream = decoder.iter_frames(path)
+    decoded_frames = list(stream)
+
+    assert metadata.fps == pytest.approx(10.0)
+    assert metadata.duration_seconds == pytest.approx(2.0)
+    assert len(decoded_frames) == 20
+    assert np.array_equal(frame, decoded_frames[-1])
+    assert not np.array_equal(decoded_frames[0], decoded_frames[-1])
+    with raises(KeyerError, match="timestamp"):
+        decoder.read_frame(path, metadata.duration_seconds)

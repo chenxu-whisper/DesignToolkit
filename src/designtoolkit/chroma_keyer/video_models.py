@@ -86,6 +86,11 @@ class VideoKeyResult:
         _validate_positive_integer("frame_count", self.frame_count)
 
 
+class VideoFrameStream(Iterator[np.ndarray], Protocol):
+    def close(self) -> None:
+        raise NotImplementedError
+
+
 class VideoDecoder(Protocol):
     def probe(self, path: Path) -> VideoMetadata:
         raise NotImplementedError
@@ -96,7 +101,7 @@ class VideoDecoder(Protocol):
     def read_preview_frame(self, path: Path, timestamp_seconds: float) -> np.ndarray:
         raise NotImplementedError
 
-    def iter_frames(self, path: Path) -> tuple[VideoMetadata, Iterator[np.ndarray]]:
+    def iter_frames(self, path: Path) -> tuple[VideoMetadata, VideoFrameStream]:
         raise NotImplementedError
 
 

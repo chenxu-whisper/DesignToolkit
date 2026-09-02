@@ -11,6 +11,7 @@ from designtoolkit.chroma_keyer import (
     SUPPORTED_VIDEO_SUFFIXES,
     ProgressCallback,
     VideoDecoder,
+    VideoFrameStream,
     VideoKeyOptions,
     VideoKeyResult,
     VideoMetadata,
@@ -249,6 +250,12 @@ def test_video_decoder_protocol_declares_required_methods() -> None:
     ]
 
 
+def test_video_frame_stream_protocol_exposes_deterministic_cleanup() -> None:
+    assert issubclass(VideoFrameStream, Iterator)
+    assert list(signature(VideoFrameStream.close).parameters) == ["self"]
+    assert VideoFrameStream.close.__annotations__ == {"return": None}
+
+
 def test_progress_callback_protocol_is_callable_with_progress_contract() -> None:
     assert list(signature(ProgressCallback.__call__).parameters) == [
         "self",
@@ -278,7 +285,7 @@ def test_protocol_annotations_include_numpy_frames_and_iterator_result() -> None
     assert VideoDecoder.read_preview_frame.__annotations__["return"] is np.ndarray
     assert (
         VideoDecoder.iter_frames.__annotations__["return"]
-        == tuple[VideoMetadata, Iterator[np.ndarray]]
+        == tuple[VideoMetadata, VideoFrameStream]
     )
     assert ProgressCallback.__call__.__annotations__ == {
         "processed_frames": int,

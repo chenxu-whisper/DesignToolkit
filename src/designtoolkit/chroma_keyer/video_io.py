@@ -11,7 +11,13 @@ from designtoolkit.video_frames.ffmpeg_backend import FfmpegBackend
 
 from .image_io import resize_preview_rgb
 from .models import KeyerError
-from .video_models import VideoMetadata, validate_timestamp, validate_video_path_suffix
+from .video_models import (
+    VideoFrameStream,
+    VideoMetadata,
+    clamp_timeline_timestamp,
+    validate_timestamp,
+    validate_video_path_suffix,
+)
 
 ReadFrames = Callable[..., Iterator[object]]
 AvailabilityValidator = Callable[[], object]
@@ -65,8 +71,10 @@ def _normalize_metadata(raw_metadata: object) -> VideoMetadata:
 def _read_metadata(frames: Iterator[object]) -> VideoMetadata:
     try:
         raw_metadata = next(frames)
-    except (StopIteration, Exception) as error:
+    except StopIteration as error:
         raise KeyerError("Video metadata is missing or invalid") from error
+    except Exception as error:
+        raise KeyerError("Video could not be opened") from error
     return _normalize_metadata(raw_metadata)
 
 
@@ -174,7 +182,10 @@ class ImageioVideoDecoder:
 
     def read_frame(self, path: Path, timestamp_seconds: float) -> np.ndarray:
         metadata = self.probe(path)
-        timestamp = validate_timestamp(timestamp_seconds, metadata)
+        timestamp = clamp_timeline_timestamp(
+            validate_timestamp(timestamp_seconds, metadata),
+            metadata,
+        )
         frames = self._open_frames(
             path,
             input_params=["-ss", str(timestamp)],
@@ -206,7 +217,7 @@ class ImageioVideoDecoder:
     def iter_frames(
         self,
         path: Path,
-    ) -> tuple[VideoMetadata, Iterator[np.ndarray]]:
+    ) -> tuple[VideoMetadata, VideoFrameStream]:
         frames = self._open_frames(path)
         try:
             metadata = _read_metadata(frames)
