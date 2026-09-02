@@ -27,7 +27,7 @@ def metadata(**overrides: object) -> VideoMetadata:
         "width": 1920,
         "height": 1080,
         "fps": 25.0,
-        "duration": 4.0,
+        "duration_seconds": 4.0,
         "estimated_frame_count": 100,
         "codec": "h264",
     }
@@ -36,9 +36,16 @@ def metadata(**overrides: object) -> VideoMetadata:
 
 
 def test_video_metadata_accepts_valid_values_and_exposes_frame_step() -> None:
-    value = metadata()
+    value = VideoMetadata(
+        width=1920,
+        height=1080,
+        fps=25.0,
+        duration_seconds=4.0,
+        estimated_frame_count=100,
+        codec="h264",
+    )
 
-    assert value == VideoMetadata(1920, 1080, 25.0, 4.0, 100, "h264")
+    assert value.duration_seconds == 4.0
     assert value.frame_step_seconds == 0.04
 
 
@@ -58,8 +65,8 @@ def test_video_metadata_rejects_invalid_positive_integer_fields(
         metadata(**{field: value})
 
 
-@mark.parametrize("field", ["fps", "duration"])
-@mark.parametrize("value", [True, 0.0, -1.0, nan, inf, -inf, "25"])
+@mark.parametrize("field", ["fps", "duration_seconds"])
+@mark.parametrize("value", [True, 0.0, -1.0, nan, inf, -inf, 10**400, "25"])
 def test_video_metadata_rejects_invalid_positive_real_fields(
     field: str, value: object
 ) -> None:
@@ -109,13 +116,13 @@ def test_video_key_result_rejects_invalid_frame_count(frame_count: object) -> No
 
 def test_validate_timestamp_accepts_start_and_value_before_duration() -> None:
     video_metadata = metadata()
-    final_valid_value = nextafter(video_metadata.duration, 0.0)
+    final_valid_value = nextafter(video_metadata.duration_seconds, 0.0)
 
     assert validate_timestamp(0, video_metadata) == 0.0
     assert validate_timestamp(final_valid_value, video_metadata) == final_valid_value
 
 
-@mark.parametrize("value", [True, nan, inf, -inf, "1"])
+@mark.parametrize("value", [True, nan, inf, -inf, 10**400, "1"])
 def test_validate_timestamp_rejects_non_finite_real_values(value: object) -> None:
     with raises(KeyerError, match="^timestamp must be a finite number$"):
         validate_timestamp(value, metadata())
@@ -125,7 +132,7 @@ def test_validate_timestamp_rejects_non_finite_real_values(value: object) -> Non
 def test_validate_timestamp_rejects_values_outside_video(value: float) -> None:
     with raises(
         KeyerError,
-        match=r"^timestamp must satisfy 0 <= timestamp < duration$",
+        match=r"^timestamp must satisfy 0 <= timestamp < duration_seconds$",
     ):
         validate_timestamp(value, metadata())
 
@@ -135,13 +142,13 @@ def test_last_frame_timestamp_is_one_frame_before_duration() -> None:
 
 
 def test_last_frame_timestamp_never_reaches_duration_after_rounding() -> None:
-    video_metadata = metadata(duration=1e20, fps=1e20)
+    video_metadata = metadata(duration_seconds=1e20, fps=1e20)
 
     assert last_frame_timestamp(video_metadata) == nextafter(1e20, 0.0)
 
 
 def test_last_frame_timestamp_clamps_short_video_to_zero() -> None:
-    assert last_frame_timestamp(metadata(duration=0.01, fps=25.0)) == 0.0
+    assert last_frame_timestamp(metadata(duration_seconds=0.01, fps=25.0)) == 0.0
 
 
 @mark.parametrize(
@@ -154,7 +161,7 @@ def test_clamp_timeline_timestamp_clamps_to_available_frame_range(
     assert clamp_timeline_timestamp(value, metadata()) == expected
 
 
-@mark.parametrize("value", [True, nan, inf, -inf, "1"])
+@mark.parametrize("value", [True, nan, inf, -inf, 10**400, "1"])
 def test_clamp_timeline_timestamp_rejects_non_finite_real_values(
     value: object,
 ) -> None:
@@ -203,21 +210,21 @@ def test_video_decoder_protocol_declares_required_methods() -> None:
     }
     assert list(signature(VideoDecoder.probe).parameters) == [
         "self",
-        "input_path",
+        "path",
     ]
     assert list(signature(VideoDecoder.read_frame).parameters) == [
         "self",
-        "input_path",
-        "timestamp",
+        "path",
+        "timestamp_seconds",
     ]
     assert list(signature(VideoDecoder.read_preview_frame).parameters) == [
         "self",
-        "input_path",
-        "timestamp",
+        "path",
+        "timestamp_seconds",
     ]
     assert list(signature(VideoDecoder.iter_frames).parameters) == [
         "self",
-        "input_path",
+        "path",
     ]
 
 
@@ -231,9 +238,30 @@ def test_progress_callback_protocol_is_callable_with_progress_contract() -> None
 
 
 def test_protocol_annotations_include_numpy_frames_and_iterator_result() -> None:
+    assert VideoDecoder.probe.__annotations__ == {
+        "path": Path,
+        "return": VideoMetadata,
+    }
+    assert VideoDecoder.read_frame.__annotations__ == {
+        "path": Path,
+        "timestamp_seconds": float,
+        "return": np.ndarray,
+    }
+    assert VideoDecoder.read_preview_frame.__annotations__ == {
+        "path": Path,
+        "timestamp_seconds": float,
+        "return": np.ndarray,
+    }
+    assert VideoDecoder.iter_frames.__annotations__["path"] is Path
     assert VideoDecoder.read_frame.__annotations__["return"] is np.ndarray
     assert VideoDecoder.read_preview_frame.__annotations__["return"] is np.ndarray
     assert (
         VideoDecoder.iter_frames.__annotations__["return"]
         == tuple[VideoMetadata, Iterator[np.ndarray]]
     )
+    assert ProgressCallback.__call__.__annotations__ == {
+        "processed_frames": int,
+        "estimated_total": int | None,
+        "current_path": Path,
+        "return": None,
+    }
