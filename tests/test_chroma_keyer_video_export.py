@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import gc
 import json
+import weakref
 from collections.abc import Callable, Iterator
+from fractions import Fraction
 from pathlib import Path
 
 import numpy as np
@@ -236,6 +239,94 @@ def test_exports_frames_lazily_as_source_sized_rgba_with_manifest_and_progress(
     assert temporary_directories(output_root) == []
 
 
+def test_manifest_serializes_accepted_non_builtin_parameter_numbers(
+    tmp_path: Path,
+) -> None:
+    input_path = make_input(tmp_path)
+    params = KeyerParams(
+        screen_gain=np.float32(1.25),
+        screen_balance=Fraction(1, 3),
+        clip_black=np.float32(0.125),
+        clip_white=Fraction(7, 8),
+        shrink_grow=-2,
+        feather=3,
+        despill_amount=Fraction(3, 4),
+    )
+
+    result = key_video_to_png_sequence(
+        VideoKeyOptions(input_path=input_path),
+        FakeDecoder(TrackedStream(frames()[:1])),
+        screen_model(),
+        params,
+    )
+
+    manifest_params = json.loads(result.manifest_path.read_bytes())["params"]
+    assert manifest_params == {
+        "screen_gain": float(params.screen_gain),
+        "screen_balance": float(params.screen_balance),
+        "clip_black": float(params.clip_black),
+        "clip_white": float(params.clip_white),
+        "shrink_grow": int(params.shrink_grow),
+        "feather": int(params.feather),
+        "despill_amount": float(params.despill_amount),
+    }
+
+
+def test_releases_frame_arrays_before_requesting_the_next_frame(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_path = make_input(tmp_path)
+    array_references: list[weakref.ReferenceType[np.ndarray]] = []
+    original_key_rgb = core.key_rgb
+
+    class CollectibleStream(Iterator[np.ndarray]):
+        def __init__(self) -> None:
+            self.index = 0
+            self.closed = False
+
+        def __iter__(self) -> CollectibleStream:
+            return self
+
+        def __next__(self) -> np.ndarray:
+            if self.index:
+                gc.collect()
+                assert all(reference() is None for reference in array_references)
+                array_references.clear()
+            if self.index == 2:
+                raise StopIteration
+            frame = np.full((1, 2, 3), self.index, dtype=np.uint8)
+            self.index += 1
+            return frame
+
+        def close(self) -> None:
+            self.closed = True
+
+    def track_arrays(
+        rgb: np.ndarray,
+        model: ScreenColorModel,
+        params: KeyerParams,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        keyed_rgb, alpha = original_key_rgb(rgb, model, params)
+        array_references.extend(
+            (weakref.ref(rgb), weakref.ref(keyed_rgb), weakref.ref(alpha))
+        )
+        return keyed_rgb, alpha
+
+    stream = CollectibleStream()
+    monkeypatch.setattr(video_export.core, "key_rgb", track_arrays)
+
+    result = key_video_to_png_sequence(
+        VideoKeyOptions(input_path=input_path),
+        FakeDecoder(stream),  # type: ignore[arg-type]
+        screen_model(),
+        KeyerParams(),
+    )
+
+    assert result.frame_count == 2
+    assert stream.closed
+
+
 def test_default_output_root_is_input_parent(tmp_path: Path) -> None:
     input_path = make_input(tmp_path)
     stream = TrackedStream(frames()[:1])
@@ -249,6 +340,48 @@ def test_default_output_root_is_input_parent(tmp_path: Path) -> None:
 
     assert result.output_dir == tmp_path / "clip_keyed_frames"
     assert stream.closed
+
+
+def test_success_removes_ownership_marker(tmp_path: Path) -> None:
+    input_path = make_input(tmp_path)
+
+    result = key_video_to_png_sequence(
+        VideoKeyOptions(input_path=input_path),
+        FakeDecoder(TrackedStream(frames()[:1])),
+        screen_model(),
+        KeyerParams(),
+    )
+
+    assert not (
+        result.output_dir / ".designtoolkit-video-export-owner"
+    ).exists()
+
+
+def test_marker_removal_failure_cleans_owned_published_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_path = make_input(tmp_path)
+    stream = TrackedStream(frames()[:1])
+    original_unlink = Path.unlink
+
+    def fail_marker_unlink(path: Path, *args: object, **kwargs: object) -> None:
+        if path.name == ".designtoolkit-video-export-owner":
+            raise PermissionError("marker is busy")
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_marker_unlink)
+
+    with pytest.raises(KeyerError, match="Video PNG sequence export failed") as error:
+        key_video_to_png_sequence(
+            VideoKeyOptions(input_path=input_path),
+            FakeDecoder(stream),
+            screen_model(),
+            KeyerParams(),
+        )
+
+    assert isinstance(error.value.__cause__, PermissionError)
+    assert_failed_export_is_clean(tmp_path, stream)
 
 
 @pytest.mark.parametrize(
@@ -440,6 +573,83 @@ def test_progress_callback_failure_cleans_temporary_output(
     assert_failed_export_is_clean(tmp_path, stream)
 
 
+@pytest.mark.parametrize("transient_failures", [1, 2])
+def test_cleanup_retries_transient_permission_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    transient_failures: int,
+) -> None:
+    input_path = make_input(tmp_path)
+    stream = TrackedStream(frames())
+    original_rmtree = video_export.rmtree
+    cleanup_attempts: list[Path] = []
+    sleep_delays: list[float] = []
+
+    def flaky_rmtree(path: Path, *args: object, **kwargs: object) -> None:
+        cleanup_attempts.append(path)
+        if len(cleanup_attempts) <= transient_failures:
+            raise PermissionError("directory is busy")
+        original_rmtree(path, *args, **kwargs)
+
+    def fail_progress(*args: object) -> None:
+        raise RuntimeError("callback failed")
+
+    monkeypatch.setattr(video_export, "rmtree", flaky_rmtree)
+    monkeypatch.setattr(video_export, "sleep", sleep_delays.append, raising=False)
+
+    with pytest.raises(KeyerError, match="Video PNG sequence export failed") as error:
+        key_video_to_png_sequence(
+            VideoKeyOptions(input_path=input_path),
+            FakeDecoder(stream),
+            screen_model(),
+            KeyerParams(),
+            fail_progress,
+        )
+
+    assert isinstance(error.value.__cause__, RuntimeError)
+    assert len(cleanup_attempts) == transient_failures + 1
+    assert sleep_delays == [0.01, 0.02][:transient_failures]
+    assert_failed_export_is_clean(tmp_path, stream)
+
+
+def test_cleanup_exhaustion_raises_path_specific_keyer_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_path = make_input(tmp_path)
+    stream = TrackedStream(frames())
+    cleanup_attempts: list[Path] = []
+    sleep_delays: list[float] = []
+
+    def fail_rmtree(path: Path, *args: object, **kwargs: object) -> None:
+        cleanup_attempts.append(path)
+        raise PermissionError("directory remains busy")
+
+    def fail_progress(*args: object) -> None:
+        raise RuntimeError("callback failed")
+
+    monkeypatch.setattr(video_export, "rmtree", fail_rmtree)
+    monkeypatch.setattr(video_export, "sleep", sleep_delays.append, raising=False)
+
+    with pytest.raises(KeyerError, match="Failed to clean export directory") as error:
+        key_video_to_png_sequence(
+            VideoKeyOptions(input_path=input_path),
+            FakeDecoder(stream),
+            screen_model(),
+            KeyerParams(),
+            fail_progress,
+        )
+
+    assert len(cleanup_attempts) == 3
+    assert sleep_delays == [0.01, 0.02]
+    assert str(cleanup_attempts[0]) in str(error.value)
+    assert isinstance(error.value.__cause__, PermissionError)
+    assert isinstance(error.value.__context__, KeyerError)
+    assert isinstance(error.value.__context__.__cause__, RuntimeError)
+    assert temporary_directories(tmp_path) == [cleanup_attempts[0]]
+    assert stream.closed
+
+
 def test_manifest_writer_failure_cleans_temporary_output(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -488,6 +698,43 @@ def test_partial_final_rename_failure_removes_published_directory(
 
     assert isinstance(error.value.__cause__, OSError)
     assert_failed_export_is_clean(tmp_path, stream)
+
+
+@pytest.mark.parametrize("marker_contents", [None, "another-export"])
+def test_rename_failure_does_not_remove_unowned_final_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    marker_contents: str | None,
+) -> None:
+    input_path = make_input(tmp_path)
+    stream = TrackedStream(frames())
+
+    def replace_with_unowned_final(source: Path, target: Path) -> Path:
+        video_export.rmtree(source)
+        target.mkdir()
+        (target / "unrelated.txt").write_text("keep me", encoding="utf-8")
+        if marker_contents is not None:
+            (target / ".designtoolkit-video-export-owner").write_text(
+                marker_contents,
+                encoding="ascii",
+            )
+        raise OSError("rename raced with another publisher")
+
+    monkeypatch.setattr(Path, "replace", replace_with_unowned_final)
+
+    with pytest.raises(KeyerError, match="Video PNG sequence export failed") as error:
+        key_video_to_png_sequence(
+            VideoKeyOptions(input_path=input_path),
+            FakeDecoder(stream),
+            screen_model(),
+            KeyerParams(),
+        )
+
+    final_dir = tmp_path / "clip_keyed_frames"
+    assert isinstance(error.value.__cause__, OSError)
+    assert (final_dir / "unrelated.txt").read_text(encoding="utf-8") == "keep me"
+    assert temporary_directories(tmp_path) == []
+    assert stream.closed
 
 
 def test_zero_decoded_frames_fails_and_cleans(tmp_path: Path) -> None:
