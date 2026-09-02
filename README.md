@@ -114,10 +114,22 @@ uv run designtoolkit web
 
 在以上命令启动的本地 Web GUI 中，点击侧边栏的 `Studio Chroma Keyer`：
 
-- 仅接受一张本地 PNG、JPG 或 JPEG 图片，可通过本地选择器或路径输入
-- 在画布上吸取实际背景色；仅支持一个 RGB 通道明确主导的幕色，通常为绿色、蓝色或红色；青色、黄色、品红色和中性色会被拒绝
-- 支持 `Final` 与 `Alpha` 预览，并导出原图尺寸的 RGBA PNG
-- 当前不支持视频和图片序列
+- 接受一张本地 PNG、JPG、JPEG 图片，或一个 MOV、MP4、M4V、WebM、MKV、AVI
+  视频；视频是否可读取取决于随应用分发的 FFmpeg 解码能力
+- 图片或视频路径经选择、拖放解析、Enter 或失焦确认后自动加载；视频显示当前帧
+  预览、时间轴、帧率、源尺寸和估算帧数，连续 seek 只保留最新结果
+- 在当前图片或视频帧上吸取实际背景色；仅支持一个 RGB 通道明确主导的幕色，
+  通常为绿色、蓝色或红色；青色、黄色、品红色和中性色会被拒绝
+- `Screen Color` 以及 Screen Gain、Screen Balance、Clip Black、Clip White、
+  Shrink/Grow、Feather、Despill Amount 七个参数在整个视频中保持不变
+- 图片和当前视频帧均支持 `Final` 与 `Alpha` 预览；图片导出原图尺寸 RGBA PNG
+- 视频按完整时长和原始解码帧率导出源尺寸 RGBA PNG 序列，帧名为
+  `<视频名>_keyed_%06d.png`，从 1 开始连续编号
+- 视频输出目录包含 `manifest.json`，记录源路径、尺寸、帧率、时长、实际帧数、
+  命名模式、Screen Color 和全部七项参数
+- 视频导出显示逐帧进度；内容先写入临时目录，全部完成后原子发布
+  `<视频名>_keyed_frames`。图片文件和视频目录均不覆盖已有输出
+- v1 不处理音频，不提供取消、入点/出点范围、批量抠像、参数关键帧或图片序列输入
 
 前端开发（热重载模式，端口 5173）：
 
