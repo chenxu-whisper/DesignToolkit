@@ -1,5 +1,6 @@
 import asyncio
 import json
+from hashlib import sha256
 from io import BytesIO
 from math import inf, nan
 from os import utime
@@ -118,6 +119,53 @@ def _video_client(tmp_path: Path, decoder: FakeVideoDecoder) -> TestClient:
             video_decoder=decoder,
         )
     )
+
+
+def _track_bounded_binary_reads(
+    monkeypatch,
+    target_path: Path,
+    *,
+    max_read_size: int,
+) -> tuple[list[int], list[Path]]:
+    requested_sizes: list[int] = []
+    opened_paths: list[Path] = []
+    resolved_target = target_path.resolve()
+    original_open = Path.open
+    original_read_bytes = Path.read_bytes
+
+    class TrackedBinaryFile:
+        def __init__(self, file_object) -> None:
+            self._file_object = file_object
+
+        def __enter__(self):
+            self._file_object.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._file_object.__exit__(*args)
+
+        def read(self, size: int = -1) -> bytes:
+            requested_sizes.append(size)
+            if size < 0 or size > max_read_size:
+                raise AssertionError(f"unbounded video read requested: {size}")
+            return self._file_object.read(size)
+
+    def tracked_open(path: Path, *args, **kwargs):
+        file_object = original_open(path, *args, **kwargs)
+        mode = args[0] if args else kwargs.get("mode", "r")
+        if path.resolve() == resolved_target and mode == "rb":
+            opened_paths.append(path)
+            return TrackedBinaryFile(file_object)
+        return file_object
+
+    def forbidden_read_bytes(path: Path) -> bytes:
+        if path.resolve() == resolved_target:
+            raise AssertionError("video fingerprint must not call Path.read_bytes")
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "open", tracked_open)
+    monkeypatch.setattr(Path, "read_bytes", forbidden_read_bytes)
+    return requested_sizes, opened_paths
 
 
 def _decode_rgb_png(png_bytes: bytes) -> np.ndarray:
@@ -1037,6 +1085,135 @@ def test_video_inspect_returns_metadata_and_first_bounded_frame(
     preview = client.get(body["preview_url"])
     assert preview.status_code == 200
     assert np.array_equal(_decode_rgb_png(preview.content), preview_frame)
+
+
+def test_video_fingerprint_streams_sparse_file_in_bounded_chunks(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    chunk_size = 1024 * 1024
+    input_path = tmp_path / "sparse.mp4"
+    prefix = b"video-start"
+    suffix = b"video-end"
+    suffix_offset = (3 * chunk_size) + 17
+    with input_path.open("wb") as video_file:
+        video_file.write(prefix)
+        video_file.seek(suffix_offset)
+        video_file.write(suffix)
+    source_stat = input_path.stat()
+
+    expected_hash = sha256()
+    expected_hash.update(prefix)
+    remaining_zeros = suffix_offset - len(prefix)
+    while remaining_zeros:
+        zero_count = min(chunk_size, remaining_zeros)
+        expected_hash.update(b"\0" * zero_count)
+        remaining_zeros -= zero_count
+    expected_hash.update(suffix)
+
+    requested_sizes, opened_paths = _track_bounded_binary_reads(
+        monkeypatch,
+        input_path,
+        max_read_size=chunk_size,
+    )
+
+    fingerprint = web_routes._video_source_fingerprint(input_path)
+
+    assert fingerprint == {
+        "path": str(input_path.resolve()),
+        "mtime_ns": source_stat.st_mtime_ns,
+        "size": suffix_offset + len(suffix),
+        "content_sha256": expected_hash.hexdigest(),
+    }
+    assert opened_paths == [input_path.resolve()]
+    assert requested_sizes
+    assert max(requested_sizes) <= chunk_size
+
+
+def test_video_cache_miss_streams_fingerprints_before_and_after_decode(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    chunk_size = 1024 * 1024
+    input_path = tmp_path / "clip.mp4"
+    with input_path.open("wb") as video_file:
+        video_file.seek((2 * chunk_size) + 41)
+        video_file.write(b"video-end")
+    requested_sizes, opened_paths = _track_bounded_binary_reads(
+        monkeypatch,
+        input_path,
+        max_read_size=chunk_size,
+    )
+    decoder = FakeVideoDecoder()
+
+    response = _video_client(tmp_path, decoder).post(
+        "/api/chroma-keyer/videos/inspect",
+        json={"input_path": str(input_path)},
+    )
+
+    assert response.status_code == 200
+    assert opened_paths == [input_path.resolve(), input_path.resolve()]
+    assert requested_sizes
+    assert max(requested_sizes) <= chunk_size
+    assert decoder.calls == [
+        ("probe", input_path, None),
+        ("read_preview_frame", input_path, 0.0),
+    ]
+
+
+@mark.parametrize(
+    ("read_error", "message"),
+    [
+        (FileNotFoundError("gone"), "Input path does not exist"),
+        (OSError("denied"), "Video could not be opened"),
+    ],
+)
+def test_video_fingerprint_read_errors_return_structured_video_errors(
+    tmp_path: Path,
+    monkeypatch,
+    read_error: OSError,
+    message: str,
+) -> None:
+    input_path = tmp_path / "clip.mp4"
+    input_path.write_bytes(b"fake video source")
+    resolved_input = input_path.resolve()
+    original_open = Path.open
+
+    class FailingReadFile:
+        def __init__(self, file_object) -> None:
+            self._file_object = file_object
+
+        def __enter__(self):
+            self._file_object.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._file_object.__exit__(*args)
+
+        def read(self, _size: int = -1) -> bytes:
+            raise read_error
+
+    def failing_open(path: Path, *args, **kwargs):
+        mode = args[0] if args else kwargs.get("mode", "r")
+        if path.resolve() == resolved_input and mode == "rb":
+            if isinstance(read_error, FileNotFoundError):
+                raise read_error
+            return FailingReadFile(original_open(path, *args, **kwargs))
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", failing_open)
+    response = _video_client(tmp_path, FakeVideoDecoder()).post(
+        "/api/chroma-keyer/videos/inspect",
+        json={"input_path": str(input_path)},
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": {
+            "code": "invalid_video",
+            "message": message,
+        }
+    }
 
 
 def test_video_frame_returns_bounded_frame_at_validated_timestamp(

@@ -72,6 +72,7 @@ from designtoolkit.web.tasks import TaskConflictError, TaskManager
 _INVALID_REQUEST_ERRORS = (ValueError, VideoFrameError, MediaResizeError)
 _TERMINAL_PHASES = (LogPhase.COMPLETED, LogPhase.FAILED)
 _CHROMA_SNAPSHOT_READ_ATTEMPTS = 3
+_CHROMA_VIDEO_HASH_CHUNK_SIZE = 1024 * 1024
 _KEYER_ERROR_CODES = {
     "Input image could not be read": "invalid_image",
     "samples must not be empty": "missing_samples",
@@ -171,6 +172,16 @@ def _read_rgb_snapshot(input_path: Path) -> tuple[np.ndarray, dict[str, str | in
     raise KeyerError("Input image changed while it was being read")
 
 
+def _hash_file_chunks(input_path: Path) -> tuple[int, str]:
+    content_hash = sha256()
+    size = 0
+    with input_path.open("rb") as source_file:
+        while chunk := source_file.read(_CHROMA_VIDEO_HASH_CHUNK_SIZE):
+            content_hash.update(chunk)
+            size += len(chunk)
+    return size, content_hash.hexdigest()
+
+
 def _video_source_fingerprint(input_path: Path) -> dict[str, str | int]:
     try:
         resolved_path = input_path.resolve(strict=True)
@@ -182,7 +193,7 @@ def _video_source_fingerprint(input_path: Path) -> dict[str, str | int]:
     for _ in range(_CHROMA_SNAPSHOT_READ_ATTEMPTS):
         before_read = _source_stat(resolved_path)
         try:
-            source_bytes = resolved_path.read_bytes()
+            size, content_sha256 = _hash_file_chunks(resolved_path)
         except FileNotFoundError as exc:
             raise KeyerError("Input path does not exist") from exc
         except OSError as exc:
@@ -192,8 +203,8 @@ def _video_source_fingerprint(input_path: Path) -> dict[str, str | int]:
             return {
                 "path": str(resolved_path),
                 "mtime_ns": after_read.st_mtime_ns,
-                "size": len(source_bytes),
-                "content_sha256": sha256(source_bytes).hexdigest(),
+                "size": size,
+                "content_sha256": content_sha256,
             }
     raise KeyerError("Input video changed while it was being read")
 
