@@ -1173,6 +1173,57 @@ describe('ChromaKeyerPage', () => {
     expect(screen.getByRole('slider', { name: '视频时间轴' })).toHaveValue('1')
   })
 
+  it('blocks sampled video seeks until keyed preview parameters are valid', async () => {
+    render(<ChromaKeyerPage />)
+    await inspectVideo()
+    await sampleImage()
+    await waitFor(() => expect(pageMocks.createChromaVideoPreview).toHaveBeenCalledOnce())
+    pageMocks.createChromaVideoFrame.mockClear()
+    pageMocks.createChromaVideoPreview.mockClear()
+    vi.useFakeTimers()
+    const timeline = screen.getByRole('slider', { name: '视频时间轴' })
+    const initialTimestamp = timeline.getAttribute('value')
+
+    fireEvent.change(screen.getByRole('spinbutton', { name: 'Screen Gain 数值' }), {
+      target: { value: '' },
+    })
+    fireEvent.change(screen.getByLabelText('输出根目录（可选）'), {
+      target: { value: 'E:\\media\\screen.mp4' },
+    })
+
+    expect(timeline).toBeDisabled()
+    fireEvent.keyDown(timeline, { key: 'ArrowRight' })
+    await act(async () => {
+      vi.advanceTimersByTime(500)
+    })
+    expect(timeline).toHaveValue(initialTimestamp)
+    expect(pageMocks.createChromaVideoFrame).not.toHaveBeenCalled()
+    expect(pageMocks.createChromaVideoPreview).not.toHaveBeenCalled()
+
+    pageMocks.createChromaVideoPreview.mockResolvedValueOnce({
+      preview_url: '/api/previews/video-keyed-restored.png',
+      timestamp_seconds: 1,
+    })
+    fireEvent.change(screen.getByRole('spinbutton', { name: 'Screen Gain 数值' }), {
+      target: { value: '1.2' },
+    })
+
+    expect(timeline).toBeEnabled()
+    fireEvent.change(timeline, { target: { value: '1' } })
+    await act(async () => {
+      vi.advanceTimersByTime(100)
+    })
+
+    expect(pageMocks.createChromaVideoFrame).not.toHaveBeenCalled()
+    expect(pageMocks.createChromaVideoPreview).toHaveBeenCalledWith(
+      expect.objectContaining({
+        params: expect.objectContaining({ screenGain: 1.2 }),
+        timestampSeconds: 1,
+      }),
+    )
+    expect(timeline).toHaveValue('1')
+  })
+
   it('keeps a seek valid until a debounced replacement preview actually dispatches', async () => {
     pageMocks.createChromaVideoPreview.mockResolvedValueOnce({
       preview_url: '/api/previews/video-keyed-zero.png',
