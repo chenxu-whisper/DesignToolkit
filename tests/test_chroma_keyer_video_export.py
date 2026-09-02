@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import errno
 import gc
 import json
+import os
 import weakref
 from collections.abc import Callable, Iterator
 from fractions import Fraction
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -128,6 +131,166 @@ def assert_failed_export_is_clean(root: Path, stream: TrackedStream) -> None:
     assert not (root / "clip_keyed_frames").exists()
     assert temporary_directories(root) == []
     assert stream.closed
+
+
+class FakeRenameAt2:
+    def __init__(self, result: int) -> None:
+        self.result = result
+        self.calls: list[tuple[object, ...]] = []
+        self.argtypes: tuple[object, ...] | None = None
+        self.restype: object | None = None
+
+    def __call__(self, *args: object) -> int:
+        self.calls.append(args)
+        return self.result
+
+
+def patch_linux_publication_dependencies(
+    monkeypatch: pytest.MonkeyPatch,
+    libc: object,
+    *,
+    error_number: int = 0,
+) -> list[tuple[object, bool]]:
+    load_calls: list[tuple[object, bool]] = []
+
+    def load_library(name: object, *, use_errno: bool) -> object:
+        load_calls.append((name, use_errno))
+        return libc
+
+    monkeypatch.setattr(video_export.os, "name", "posix")
+    monkeypatch.setattr(video_export.sys, "platform", "linux")
+    monkeypatch.setattr(video_export.ctypes, "CDLL", load_library)
+    monkeypatch.setattr(video_export.ctypes, "get_errno", lambda: error_number)
+    return load_calls
+
+
+def test_publish_directory_no_replace_uses_linux_renameat2_no_replace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = Path("staging")
+    destination = Path("published")
+    renameat2 = FakeRenameAt2(result=0)
+    load_calls = patch_linux_publication_dependencies(
+        monkeypatch,
+        SimpleNamespace(renameat2=renameat2),
+    )
+
+    video_export._publish_directory_no_replace(source, destination)
+
+    assert load_calls == [(None, True)]
+    assert renameat2.argtypes == (
+        video_export.ctypes.c_int,
+        video_export.ctypes.c_char_p,
+        video_export.ctypes.c_int,
+        video_export.ctypes.c_char_p,
+        video_export.ctypes.c_uint,
+    )
+    assert renameat2.restype is video_export.ctypes.c_int
+    assert renameat2.calls == [
+        (
+            video_export._AT_FDCWD,
+            os.fsencode(source),
+            video_export._AT_FDCWD,
+            os.fsencode(destination),
+            video_export._RENAME_NOREPLACE,
+        )
+    ]
+
+
+def test_publish_directory_no_replace_propagates_linux_eexist(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = Path("staging")
+    destination = Path("published")
+    renameat2 = FakeRenameAt2(result=-1)
+    patch_linux_publication_dependencies(
+        monkeypatch,
+        SimpleNamespace(renameat2=renameat2),
+        error_number=errno.EEXIST,
+    )
+
+    with pytest.raises(FileExistsError) as error:
+        video_export._publish_directory_no_replace(source, destination)
+
+    assert error.value.errno == errno.EEXIST
+    assert error.value.filename == destination
+
+
+@pytest.mark.parametrize(
+    "error_number",
+    sorted(
+        {
+            errno.EINVAL,
+            errno.ENOSYS,
+            errno.ENOTSUP,
+            errno.EOPNOTSUPP,
+        }
+    ),
+    ids=lambda error_number: errno.errorcode[error_number],
+)
+def test_publish_directory_no_replace_fails_closed_for_unsupported_linux_errno(
+    monkeypatch: pytest.MonkeyPatch,
+    error_number: int,
+) -> None:
+    source = Path("staging")
+    destination = Path("published")
+    renameat2 = FakeRenameAt2(result=-1)
+    patch_linux_publication_dependencies(
+        monkeypatch,
+        SimpleNamespace(renameat2=renameat2),
+        error_number=error_number,
+    )
+
+    with pytest.raises(
+        KeyerError,
+        match=(
+            "Atomic no-replace directory publication is unavailable: "
+            "renameat2 RENAME_NOREPLACE is unsupported"
+        ),
+    ) as error:
+        video_export._publish_directory_no_replace(source, destination)
+
+    assert isinstance(error.value.__cause__, OSError)
+    assert error.value.__cause__.errno == error_number
+    assert error.value.__cause__.filename == destination
+
+
+def test_publish_directory_no_replace_propagates_unexpected_linux_errno(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = Path("staging")
+    destination = Path("published")
+    renameat2 = FakeRenameAt2(result=-1)
+    patch_linux_publication_dependencies(
+        monkeypatch,
+        SimpleNamespace(renameat2=renameat2),
+        error_number=errno.EACCES,
+    )
+
+    with pytest.raises(OSError) as error:
+        video_export._publish_directory_no_replace(source, destination)
+
+    assert error.value.errno == errno.EACCES
+    assert error.value.filename == destination
+
+
+def test_publish_directory_no_replace_fails_closed_without_linux_renameat2(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = Path("staging")
+    destination = Path("published")
+    patch_linux_publication_dependencies(monkeypatch, SimpleNamespace())
+
+    with pytest.raises(
+        KeyerError,
+        match=(
+            "Atomic no-replace directory publication is unavailable: "
+            "libc renameat2 is missing"
+        ),
+    ) as error:
+        video_export._publish_directory_no_replace(source, destination)
+
+    assert isinstance(error.value.__cause__, AttributeError)
 
 
 def test_exports_frames_lazily_as_source_sized_rgba_with_manifest_and_progress(
