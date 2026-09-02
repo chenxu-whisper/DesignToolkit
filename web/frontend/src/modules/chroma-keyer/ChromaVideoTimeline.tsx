@@ -3,9 +3,11 @@ import type { KeyboardEvent } from 'react'
 type ChromaVideoTimelineProps = {
   disabled?: boolean
   durationSeconds: number
+  errorId?: string
   estimatedFrameCount: number
   fps: number
   height: number
+  invalid?: boolean
   onChange: (timestampSeconds: number) => void
   value: number
   width: number
@@ -22,9 +24,11 @@ export function getLastVideoFrameTime(durationSeconds: number, fps: number): num
 export function ChromaVideoTimeline({
   disabled = false,
   durationSeconds,
+  errorId,
   estimatedFrameCount,
   fps,
   height,
+  invalid = false,
   onChange,
   value,
   width,
@@ -66,6 +70,8 @@ export function ChromaVideoTimeline({
         data-testid="chroma-video-timeline-controls"
       >
         <input
+          aria-describedby={invalid ? errorId : undefined}
+          aria-invalid={invalid || undefined}
           aria-label="视频时间轴"
           aria-valuetext={timecode}
           className="chroma-video-timeline-range"

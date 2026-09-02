@@ -78,6 +78,28 @@ describe('ChromaKeyerCanvas', () => {
     expect(onSample).toHaveBeenCalledWith({ x: 200, y: 100, previewHeight: 200.5, previewWidth: 400.5 })
   })
 
+  it('semantically disables pointer and keyboard sampling when requested', () => {
+    const onSample = vi.fn()
+    render(
+      <ChromaKeyerCanvas
+        disabled
+        onSample={onSample}
+        previewUrl="/preview.png"
+        samples={[]}
+        viewMode="final"
+      />,
+    )
+    const image = screen.getByRole('button', { name: '抠像预览' })
+
+    fireEvent.click(image, { clientX: 10, clientY: 10 })
+    fireEvent.keyDown(image, { key: 'Enter' })
+
+    expect(image).toHaveAttribute('aria-disabled', 'true')
+    expect(image).toHaveAttribute('tabindex', '-1')
+    expect(image).toHaveClass('chroma-preview-image-disabled')
+    expect(onSample).not.toHaveBeenCalled()
+  })
+
   it('maps returned original coordinates to stable numbered markers', () => {
     render(
       <ChromaKeyerCanvas

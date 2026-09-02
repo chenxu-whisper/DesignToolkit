@@ -999,10 +999,14 @@ describe('ChromaKeyerPage', () => {
     const error = await screen.findByRole('alert')
     const canvas = screen.getByRole('button', { name: '抠像预览' }).parentElement
     const timeline = screen.getByTestId('chroma-video-timeline')
+    const timelineRange = screen.getByRole('slider', { name: '视频时间轴' })
     const instructions = screen.getByText(
       '点击预览采样，或聚焦后按 Enter 或空格从画面中心采样。',
     )
 
+    expect(error).toHaveAttribute('id', 'chroma-video-timestamp-error')
+    expect(timelineRange).toHaveAttribute('aria-describedby', 'chroma-video-timestamp-error')
+    expect(timelineRange).toHaveAttribute('aria-invalid', 'true')
     expect(canvas?.nextElementSibling).toBe(timeline)
     expect(timeline.nextElementSibling).toBe(error)
     expect(error.nextElementSibling).toBe(instructions)
@@ -1062,6 +1066,147 @@ describe('ChromaKeyerPage', () => {
       '/api/previews/video-latest.png',
     )
     expect(timeline).toHaveValue('2')
+  })
+
+  it('ignores sampling while the latest requested video timestamp is still rendering', async () => {
+    const seekRequest = createDeferred<{ preview_url: string; timestamp_seconds: number }>()
+    pageMocks.createChromaVideoFrame.mockReturnValueOnce(seekRequest.promise)
+    render(<ChromaKeyerPage />)
+    await inspectVideo()
+    vi.useFakeTimers()
+
+    fireEvent.change(screen.getByRole('slider', { name: '视频时间轴' }), {
+      target: { value: '1' },
+    })
+    await act(async () => {
+      vi.advanceTimersByTime(100)
+    })
+    const image = screen.getByRole('button', { name: '抠像预览' })
+    vi.spyOn(image, 'getBoundingClientRect').mockReturnValue({
+      bottom: 220,
+      height: 200,
+      left: 10,
+      right: 410,
+      toJSON: () => ({}),
+      top: 20,
+      width: 400,
+      x: 10,
+      y: 20,
+    })
+    fireEvent.click(image, { clientX: 210, clientY: 120 })
+
+    expect(pageMocks.sampleChromaVideo).not.toHaveBeenCalled()
+  })
+
+  it('samples the backend-resolved timestamp after the latest frame renders', async () => {
+    pageMocks.createChromaVideoFrame.mockResolvedValueOnce({
+      preview_url: '/api/previews/video-resolved.png',
+      timestamp_seconds: 1.2,
+    })
+    render(<ChromaKeyerPage />)
+    await inspectVideo()
+
+    fireEvent.change(screen.getByRole('slider', { name: '视频时间轴' }), {
+      target: { value: '1.25' },
+    })
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: '抠像预览' })).toHaveAttribute(
+        'src',
+        '/api/previews/video-resolved.png',
+      ),
+    )
+    expect(screen.getByRole('slider', { name: '视频时间轴' })).toHaveValue('1.2')
+
+    await sampleImage()
+
+    expect(pageMocks.sampleChromaVideo).toHaveBeenCalledWith(
+      expect.objectContaining({ timestampSeconds: 1.2 }),
+    )
+  })
+
+  it('rolls a failed seek back to the rendered timestamp and keeps that frame sampleable', async () => {
+    pageMocks.createChromaVideoFrame.mockRejectedValueOnce(new Error('视频帧无法读取'))
+    render(<ChromaKeyerPage />)
+    await inspectVideo()
+
+    fireEvent.change(screen.getByRole('slider', { name: '视频时间轴' }), {
+      target: { value: '1' },
+    })
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('视频帧无法读取')
+    expect(screen.getByRole('slider', { name: '视频时间轴' })).toHaveValue('0')
+
+    await sampleImage()
+
+    expect(pageMocks.sampleChromaVideo).toHaveBeenCalledWith(
+      expect.objectContaining({ timestampSeconds: 0 }),
+    )
+  })
+
+  it('keeps an unsampled seek valid when a parameter change cannot dispatch a keyed preview', async () => {
+    const seekRequest = createDeferred<{ preview_url: string; timestamp_seconds: number }>()
+    pageMocks.createChromaVideoFrame.mockReturnValueOnce(seekRequest.promise)
+    render(<ChromaKeyerPage />)
+    await inspectVideo()
+    vi.useFakeTimers()
+
+    fireEvent.change(screen.getByRole('slider', { name: '视频时间轴' }), {
+      target: { value: '1' },
+    })
+    await act(async () => {
+      vi.advanceTimersByTime(100)
+    })
+    fireEvent.change(screen.getByLabelText('Screen Gain'), { target: { value: '1.4' } })
+
+    expect(pageMocks.createChromaVideoPreview).not.toHaveBeenCalled()
+    await act(async () => {
+      seekRequest.resolve({
+        preview_url: '/api/previews/video-unkeyed-latest.png',
+        timestamp_seconds: 1,
+      })
+    })
+
+    expect(screen.getByRole('button', { name: '抠像预览' })).toHaveAttribute(
+      'src',
+      '/api/previews/video-unkeyed-latest.png',
+    )
+    expect(screen.getByRole('slider', { name: '视频时间轴' })).toHaveValue('1')
+  })
+
+  it('keeps a seek valid until a debounced replacement preview actually dispatches', async () => {
+    pageMocks.createChromaVideoPreview.mockResolvedValueOnce({
+      preview_url: '/api/previews/video-keyed-zero.png',
+      timestamp_seconds: 0,
+    })
+    render(<ChromaKeyerPage />)
+    await inspectVideo()
+    await sampleImage()
+    await waitFor(() => expect(pageMocks.createChromaVideoPreview).toHaveBeenCalledOnce())
+    pageMocks.createChromaVideoPreview.mockClear()
+    const seekRequest = createDeferred<{ preview_url: string; timestamp_seconds: number }>()
+    pageMocks.createChromaVideoPreview.mockReturnValueOnce(seekRequest.promise)
+    vi.useFakeTimers()
+
+    fireEvent.change(screen.getByRole('slider', { name: '视频时间轴' }), {
+      target: { value: '1' },
+    })
+    await act(async () => {
+      vi.advanceTimersByTime(100)
+    })
+    fireEvent.change(screen.getByLabelText('Screen Gain'), { target: { value: '1.4' } })
+
+    expect(pageMocks.createChromaVideoPreview).toHaveBeenCalledOnce()
+    await act(async () => {
+      seekRequest.resolve({
+        preview_url: '/api/previews/video-keyed-seek.png',
+        timestamp_seconds: 1,
+      })
+    })
+
+    expect(screen.getByRole('button', { name: '抠像预览' })).toHaveAttribute(
+      'src',
+      '/api/previews/video-keyed-seek.png',
+    )
   })
 
   it('releases sample pending state when a newer video seek supersedes it', async () => {

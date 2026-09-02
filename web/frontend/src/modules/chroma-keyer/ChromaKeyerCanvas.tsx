@@ -9,6 +9,7 @@ export type ChromaCanvasSample = {
 
 type ChromaKeyerCanvasProps = {
   children?: ReactNode
+  disabled?: boolean
   onSample: (point: { x: number; y: number; previewWidth: number; previewHeight: number }) => void
   originalHeight?: number
   originalWidth?: number
@@ -43,6 +44,7 @@ export function buildChromaSamplePayload(
 
 export function ChromaKeyerCanvas({
   children,
+  disabled = false,
   onSample,
   originalHeight,
   originalWidth,
@@ -51,6 +53,10 @@ export function ChromaKeyerCanvas({
   viewMode,
 }: ChromaKeyerCanvasProps) {
   const sampleAt = (element: HTMLImageElement, clientX: number, clientY: number) => {
+    if (disabled) {
+      return
+    }
+
     const payload = buildChromaSamplePayload(element.getBoundingClientRect(), clientX, clientY)
     if (payload) {
       onSample(payload)
@@ -79,12 +85,13 @@ export function ChromaKeyerCanvas({
         <img
           alt="抠像预览"
           aria-describedby="chroma-keyer-preview-sampling-instructions"
-          className="chroma-preview-image"
+          aria-disabled={disabled || undefined}
+          className={`chroma-preview-image${disabled ? ' chroma-preview-image-disabled' : ''}`}
           onClick={handleClick}
           onKeyDown={handleKeyDown}
           role="button"
           src={previewUrl}
-          tabIndex={0}
+          tabIndex={disabled ? -1 : 0}
         />
         {originalWidth && originalHeight
           ? samples.map((sample, index) => (

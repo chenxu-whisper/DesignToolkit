@@ -63,6 +63,29 @@ describe('ChromaVideoTimeline', () => {
     expect(screen.getByText('约 375 帧')).toBeInTheDocument()
   })
 
+  it('associates an error with the range without replacing its timecode value text', () => {
+    render(
+      <ChromaVideoTimeline
+        {...defaultProps}
+        errorId="chroma-video-timestamp-error"
+        invalid
+      />,
+    )
+
+    expect(screen.getByRole('slider', { name: '视频时间轴' })).toHaveAttribute(
+      'aria-describedby',
+      'chroma-video-timestamp-error',
+    )
+    expect(screen.getByRole('slider', { name: '视频时间轴' })).toHaveAttribute(
+      'aria-invalid',
+      'true',
+    )
+    expect(screen.getByRole('slider', { name: '视频时间轴' })).toHaveAttribute(
+      'aria-valuetext',
+      '00:00:01.250 / 00:00:12.500',
+    )
+  })
+
   it('preserves normal range change events for pointer input', () => {
     const onChange = vi.fn()
     render(<ChromaVideoTimeline {...defaultProps} onChange={onChange} />)

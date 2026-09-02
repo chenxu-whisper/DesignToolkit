@@ -494,6 +494,11 @@ button {
   object-fit: contain;
 }
 
+.chroma-preview-image-disabled {
+  cursor: not-allowed;
+  opacity: 0.65;
+}
+
 .chroma-video-timeline {
   display: grid;
   gap: 6px;
