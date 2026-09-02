@@ -13,12 +13,14 @@ from designtoolkit.chroma_keyer.image_io import (
     validate_output_path,
 )
 from designtoolkit.chroma_keyer.models import (
+    KeyerError,
     KeyerParams,
     KeyImageOptions,
     KeyImageResult,
     ScreenColorModel,
 )
 from designtoolkit.chroma_keyer.video_export import key_video_to_png_sequence
+from designtoolkit.chroma_keyer.video_io import ImageioVideoDecoder
 from designtoolkit.chroma_keyer.video_models import (
     ProgressCallback,
     VideoDecoder,
@@ -69,6 +71,7 @@ VideoKeyer = Callable[
     ],
     VideoKeyResult,
 ]
+VideoDecoderFactory = Callable[[], VideoDecoder]
 BackendFactory = Callable[[], FrameExportBackend | ResizeBackend]
 Clock = Callable[[], float]
 
@@ -112,6 +115,7 @@ class TaskManager:
         media_resizer: MediaResizer | None = resize_media,
         keyer: Keyer | None = key_image,
         video_keyer: VideoKeyer | None = key_video_to_png_sequence,
+        video_decoder_factory: VideoDecoderFactory = ImageioVideoDecoder,
         backend_factory: BackendFactory | None = None,
         clock: Clock = perf_counter,
         run_async: bool = True,
@@ -121,6 +125,7 @@ class TaskManager:
         self._media_resizer = media_resizer
         self._keyer = keyer
         self._video_keyer = video_keyer
+        self._video_decoder_factory = video_decoder_factory
         self._backend_factory = backend_factory or self._default_backend
         self._clock = clock
         self._run_async = run_async
@@ -240,11 +245,14 @@ class TaskManager:
     def create_chroma_video_keyer_task(
         self,
         request: ChromaVideoKeyerTaskRequest,
-        decoder: VideoDecoder,
     ) -> TaskRecord:
         options, model, params = chroma_video_keyer_options_from_request(request)
         output_root = options.output_root or options.input_path.parent
+        if not output_root.exists() or not output_root.is_dir():
+            raise KeyerError("Output root must exist and be a directory")
         output_dir = output_root / f"{options.input_path.stem}_keyed_frames"
+        if output_dir.exists():
+            raise KeyerError("Final output directory already exists")
         task = self.reserve_task(
             kind=TaskKind.CHROMA_KEYER,
             input_path=str(options.input_path),
@@ -256,7 +264,6 @@ class TaskManager:
                 lambda: self._run_chroma_video_keyer(
                     task,
                     options,
-                    decoder,
                     model,
                     params,
                 ),
@@ -424,7 +431,6 @@ class TaskManager:
         self,
         task: TaskRecord,
         options: VideoKeyOptions,
-        decoder: VideoDecoder,
         model: ScreenColorModel,
         params: KeyerParams,
     ) -> None:
@@ -472,6 +478,7 @@ class TaskManager:
         try:
             if self._video_keyer is None:
                 raise RuntimeError("chroma video keyer is not configured")
+            decoder = self._video_decoder_factory()
             result = self._video_keyer(
                 options,
                 decoder,

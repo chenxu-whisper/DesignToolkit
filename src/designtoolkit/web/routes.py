@@ -84,6 +84,7 @@ _KEYER_ERROR_CODES = {
     "samples must not be empty": "missing_samples",
     "请选择具有明显主色的纯色幕背景": "invalid_screen_color",
     "Output path already exists": "output_exists",
+    "Final output directory already exists": "output_exists",
 }
 
 
@@ -481,7 +482,7 @@ def create_router(
         request: ChromaVideoKeyerTaskRequest,
     ) -> TaskCreateResponse:
         try:
-            task = task_manager.create_chroma_video_keyer_task(request, decoder)
+            task = task_manager.create_chroma_video_keyer_task(request)
         except TaskConflictError as exc:
             raise ApiError("task_conflict", str(exc), 409) from exc
         except KeyerError as exc:

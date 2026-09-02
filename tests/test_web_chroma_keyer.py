@@ -725,13 +725,13 @@ def test_chroma_video_keyer_task_endpoint_exports_to_computed_final_directory(
     task_manager = TaskManager(
         log_store=LogStore(),
         video_keyer=video_keyer,
+        video_decoder_factory=lambda: decoder,
         run_async=False,
     )
     client = TestClient(
         create_app(
             task_manager=task_manager,
             local_path_roots=[tmp_path],
-            video_decoder=decoder,
         )
     )
 
@@ -761,11 +761,148 @@ def test_chroma_video_keyer_task_endpoint_exports_to_computed_final_directory(
     assert progress_callback is not None
 
 
+def test_chroma_video_keyer_task_manager_creates_fresh_decoder_per_export(
+    tmp_path: Path,
+) -> None:
+    created_decoders: list[FakeVideoDecoder] = []
+    supplied_decoders: list[FakeVideoDecoder] = []
+
+    def video_decoder_factory() -> FakeVideoDecoder:
+        decoder = FakeVideoDecoder()
+        created_decoders.append(decoder)
+        return decoder
+
+    def video_keyer(options, decoder, _model, _params, _progress_callback):
+        supplied_decoders.append(decoder)
+        output_dir = tmp_path / f"{options.input_path.stem}_keyed_frames"
+        return VideoKeyResult(
+            output_dir=output_dir,
+            manifest_path=output_dir / "manifest.json",
+            frame_count=1,
+            metadata=decoder.metadata,
+        )
+
+    task_manager = TaskManager(
+        log_store=LogStore(),
+        video_keyer=video_keyer,
+        video_decoder_factory=video_decoder_factory,
+        run_async=False,
+    )
+
+    for input_name in ("first.mp4", "second.mp4"):
+        task_manager.create_chroma_video_keyer_task(
+            ChromaVideoKeyerTaskRequest(
+                input_path=str(tmp_path / input_name),
+                samples=[[42, 180, 72]],
+                params={},
+            )
+        )
+
+    assert supplied_decoders == created_decoders
+    assert len(created_decoders) == 2
+    assert created_decoders[0] is not created_decoders[1]
+
+
+def test_chroma_video_keyer_endpoint_does_not_export_with_preview_decoder(
+    tmp_path: Path,
+) -> None:
+    input_path = tmp_path / "clip.mp4"
+    input_path.write_bytes(b"fake video source")
+    preview_decoder = FakeVideoDecoder()
+    export_decoder = FakeVideoDecoder()
+    factory_calls = 0
+    supplied_decoders = []
+
+    def video_decoder_factory() -> FakeVideoDecoder:
+        nonlocal factory_calls
+        factory_calls += 1
+        return export_decoder
+
+    def video_keyer(options, decoder, _model, _params, _progress_callback):
+        supplied_decoders.append(decoder)
+        output_dir = tmp_path / "clip_keyed_frames"
+        return VideoKeyResult(
+            output_dir=output_dir,
+            manifest_path=output_dir / "manifest.json",
+            frame_count=1,
+            metadata=decoder.metadata,
+        )
+
+    task_manager = TaskManager(
+        log_store=LogStore(),
+        video_keyer=video_keyer,
+        video_decoder_factory=video_decoder_factory,
+        run_async=False,
+    )
+    client = TestClient(
+        create_app(
+            task_manager=task_manager,
+            local_path_roots=[tmp_path],
+            video_decoder=preview_decoder,
+        )
+    )
+
+    response = client.post(
+        "/api/tasks/chroma-keyer-video",
+        json={
+            "input_path": str(input_path),
+            "samples": [[42, 180, 72]],
+            "params": {},
+        },
+    )
+
+    assert response.status_code == 200
+    assert factory_calls == 1
+    assert supplied_decoders == [export_decoder]
+    assert supplied_decoders[0] is not preview_decoder
+
+
+def test_chroma_video_keyer_endpoint_rejects_existing_final_dir_before_reserving(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    input_path = tmp_path / "clip.mp4"
+    input_path.write_bytes(b"fake video source")
+    final_dir = tmp_path / "clip_keyed_frames"
+    final_dir.mkdir()
+    task_manager = TaskManager(log_store=LogStore(), run_async=False)
+
+    def fail_reservation(**_kwargs):
+        raise AssertionError("existing output must be rejected before reservation")
+
+    monkeypatch.setattr(task_manager, "reserve_task", fail_reservation)
+    client = TestClient(
+        create_app(
+            task_manager=task_manager,
+            local_path_roots=[tmp_path],
+            video_decoder=FakeVideoDecoder(),
+        )
+    )
+
+    response = client.post(
+        "/api/tasks/chroma-keyer-video",
+        json={
+            "input_path": str(input_path),
+            "samples": [[42, 180, 72]],
+            "params": {},
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "error": {
+            "code": "output_exists",
+            "message": "Final output directory already exists",
+        }
+    }
+
+
 def test_chroma_video_keyer_task_throttles_monotonic_progress_and_logs_actuals(
     tmp_path: Path,
 ) -> None:
     input_path = tmp_path / "clip.mp4"
     output_root = tmp_path / "frames"
+    output_root.mkdir()
     final_dir = output_root / "clip_keyed_frames"
     decoder = FakeVideoDecoder()
     log_store = LogStore()
@@ -795,6 +932,7 @@ def test_chroma_video_keyer_task_throttles_monotonic_progress_and_logs_actuals(
     task_manager = TaskManager(
         log_store=log_store,
         video_keyer=video_keyer,
+        video_decoder_factory=lambda: decoder,
         clock=clock,
         run_async=False,
     )
@@ -805,8 +943,7 @@ def test_chroma_video_keyer_task_throttles_monotonic_progress_and_logs_actuals(
             samples=[[42, 180, 72]],
             params={},
             output_root=str(output_root),
-        ),
-        decoder,
+        )
     )
 
     events = log_store.history(task.task_id)
@@ -851,6 +988,7 @@ def test_chroma_video_keyer_export_failure_marks_failed_and_releases_slot(
     task_manager = TaskManager(
         log_store=LogStore(),
         video_keyer=failing_video_keyer,
+        video_decoder_factory=lambda: decoder,
         run_async=False,
     )
     task = task_manager.create_chroma_video_keyer_task(
@@ -858,8 +996,7 @@ def test_chroma_video_keyer_export_failure_marks_failed_and_releases_slot(
             input_path=str(input_path),
             samples=[[42, 180, 72]],
             params={},
-        ),
-        decoder,
+        )
     )
 
     assert task.status is TaskStatus.FAILED
@@ -903,6 +1040,7 @@ def test_chroma_video_keyer_task_endpoint_shares_active_task_conflict(
     task_manager = TaskManager(
         log_store=LogStore(),
         video_keyer=blocking_video_keyer,
+        video_decoder_factory=lambda: decoder,
         run_async=True,
     )
     client = TestClient(
