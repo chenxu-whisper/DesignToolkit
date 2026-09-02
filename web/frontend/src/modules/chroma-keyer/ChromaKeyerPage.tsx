@@ -460,6 +460,10 @@ export function ChromaKeyerPage() {
 
       try {
         const hasSample = seekValues.samples.length === 1
+        if (hasSample && !areKeyedPreviewInputsValid(seekValues)) {
+          rollbackRequestedTimestamp()
+          return
+        }
         const response = hasSample
           ? await createChromaVideoPreview({
               ...toBasePayload(seekValues),

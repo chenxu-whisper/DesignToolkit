@@ -1173,6 +1173,64 @@ describe('ChromaKeyerPage', () => {
     expect(screen.getByRole('slider', { name: '视频时间轴' })).toHaveValue('1')
   })
 
+  it('rolls back a sampled seek invalidated before its debounce fires and permits the next valid seek', async () => {
+    pageMocks.createChromaVideoPreview.mockResolvedValueOnce({
+      preview_url: '/api/previews/video-keyed-zero.png',
+      timestamp_seconds: 0,
+    })
+    render(<ChromaKeyerPage />)
+    await inspectVideo()
+    await sampleImage()
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: '抠像预览' })).toHaveAttribute(
+        'src',
+        '/api/previews/video-keyed-zero.png',
+      ),
+    )
+    pageMocks.createChromaVideoFrame.mockClear()
+    pageMocks.createChromaVideoPreview.mockClear()
+    vi.useFakeTimers()
+    const timeline = screen.getByRole('slider', { name: '视频时间轴' })
+    const preview = screen.getByRole('button', { name: '抠像预览' })
+
+    fireEvent.change(timeline, { target: { value: '1' } })
+    fireEvent.change(screen.getByRole('spinbutton', { name: 'Screen Gain 数值' }), {
+      target: { value: '' },
+    })
+    await act(async () => {
+      vi.advanceTimersByTime(100)
+    })
+
+    expect(pageMocks.createChromaVideoFrame).not.toHaveBeenCalled()
+    expect(pageMocks.createChromaVideoPreview).not.toHaveBeenCalled()
+    expect(timeline).toHaveValue('0')
+    expect(preview).toBeEnabled()
+    expect(preview).toHaveAttribute('src', '/api/previews/video-keyed-zero.png')
+    expect(screen.getByText('#2AB448')).toBeInTheDocument()
+
+    pageMocks.createChromaVideoPreview.mockResolvedValueOnce({
+      preview_url: '/api/previews/video-keyed-two.png',
+      timestamp_seconds: 2,
+    })
+    fireEvent.change(screen.getByRole('spinbutton', { name: 'Screen Gain 数值' }), {
+      target: { value: '1.2' },
+    })
+    fireEvent.change(timeline, { target: { value: '2' } })
+    await act(async () => {
+      vi.advanceTimersByTime(100)
+    })
+
+    expect(pageMocks.createChromaVideoFrame).not.toHaveBeenCalled()
+    expect(pageMocks.createChromaVideoPreview).toHaveBeenCalledOnce()
+    expect(pageMocks.createChromaVideoPreview).toHaveBeenCalledWith(
+      expect.objectContaining({
+        params: expect.objectContaining({ screenGain: 1.2 }),
+        timestampSeconds: 2,
+      }),
+    )
+    expect(timeline).toHaveValue('2')
+  })
+
   it('blocks sampled video seeks until keyed preview parameters are valid', async () => {
     render(<ChromaKeyerPage />)
     await inspectVideo()
