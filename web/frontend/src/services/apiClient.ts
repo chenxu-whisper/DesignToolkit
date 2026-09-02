@@ -1,6 +1,6 @@
 import type { TaskKind, TaskStatus } from './taskTypes'
 
-type TaskCreateResponse = {
+export type TaskCreateResponse = {
   task_id: string
   status: Exclude<TaskStatus, 'idle'>
 }
@@ -64,6 +64,7 @@ export type MediaResizePayload = MediaResizeBasePayload &
   )
 
 export type ChromaKeyerRgbSample = readonly [red: number, green: number, blue: number]
+export type ChromaViewMode = 'final' | 'alpha'
 
 export type ChromaKeyerParams = {
   screenGain: number
@@ -111,11 +112,51 @@ export type ChromaImageSampleResponse = {
 }
 
 export type ChromaPreviewPayload = Omit<ChromaKeyerPayload, 'outputPath'> & {
-  viewMode: 'final' | 'alpha'
+  viewMode: ChromaViewMode
 }
 
 export type ChromaPreviewResponse = {
   preview_url: string
+}
+
+export type ChromaVideoInspectRequest = ChromaImageInspectRequest
+
+export type ChromaVideoInspectResponse = ChromaImageInspectResponse & {
+  duration_seconds: number
+  fps: number
+  estimated_frame_count: number
+  timestamp_seconds: number
+}
+
+export type ChromaVideoFrameRequest = {
+  inputPath: string
+  timestampSeconds: number
+}
+
+export type ChromaVideoFrameResponse = {
+  preview_url: string
+  timestamp_seconds: number
+}
+
+export type ChromaVideoSampleRequest = ChromaImageSampleRequest & {
+  timestampSeconds: number
+}
+
+export type ChromaVideoSampleResponse = ChromaImageSampleResponse & {
+  timestamp_seconds: number
+}
+
+export type ChromaVideoPreviewPayload = Omit<ChromaKeyerPayload, 'outputPath'> & {
+  timestampSeconds: number
+  viewMode: ChromaViewMode
+}
+
+export type ChromaVideoPreviewResponse = ChromaPreviewResponse & {
+  timestamp_seconds: number
+}
+
+export type ChromaVideoKeyerPayload = Omit<ChromaKeyerPayload, 'outputPath'> & {
+  outputRoot?: string
 }
 
 export type DroppedFilePathResolveResponse = {
@@ -192,22 +233,45 @@ function chromaParamsToWire(params: ChromaKeyerParams) {
   }
 }
 
-function chromaPayloadToWire(payload: ChromaKeyerPayload) {
-  const outputPath = payload.outputPath?.trim()
+function chromaBasePayloadToWire(payload: Omit<ChromaKeyerPayload, 'outputPath'>) {
   return {
     input_path: payload.inputPath,
     samples: payload.samples,
     params: chromaParamsToWire(payload.params),
+  }
+}
+
+function chromaPayloadToWire(payload: ChromaKeyerPayload) {
+  const outputPath = payload.outputPath?.trim()
+  return {
+    ...chromaBasePayloadToWire(payload),
     ...(outputPath ? { output_path: outputPath } : {}),
   }
 }
 
 function chromaPreviewPayloadToWire(payload: ChromaPreviewPayload) {
   return {
-    input_path: payload.inputPath,
-    samples: payload.samples,
-    params: chromaParamsToWire(payload.params),
+    ...chromaBasePayloadToWire(payload),
     view_mode: payload.viewMode,
+  }
+}
+
+function chromaVideoPreviewPayloadToWire(payload: ChromaVideoPreviewPayload) {
+  const { input_path, ...previewPayload } = chromaPreviewPayloadToWire(payload)
+  return {
+    input_path,
+    timestamp_seconds: payload.timestampSeconds,
+    ...previewPayload,
+  }
+}
+
+function chromaVideoKeyerPayloadToWire(payload: ChromaVideoKeyerPayload) {
+  const { input_path, ...keyerPayload } = chromaBasePayloadToWire(payload)
+  const outputRoot = payload.outputRoot?.trim()
+  return {
+    input_path,
+    ...(outputRoot ? { output_root: outputRoot } : {}),
+    ...keyerPayload,
   }
 }
 
@@ -227,12 +291,47 @@ export function sampleChromaImage(payload: ChromaImageSampleRequest): Promise<Ch
   })
 }
 
+export function inspectChromaVideo(payload: ChromaVideoInspectRequest): Promise<ChromaVideoInspectResponse> {
+  return request<ChromaVideoInspectResponse>('/api/chroma-keyer/videos/inspect', {
+    input_path: payload.inputPath,
+  })
+}
+
+export function createChromaVideoFrame(payload: ChromaVideoFrameRequest): Promise<ChromaVideoFrameResponse> {
+  return request<ChromaVideoFrameResponse>('/api/chroma-keyer/videos/frame', {
+    input_path: payload.inputPath,
+    timestamp_seconds: payload.timestampSeconds,
+  })
+}
+
+export function sampleChromaVideo(payload: ChromaVideoSampleRequest): Promise<ChromaVideoSampleResponse> {
+  return request<ChromaVideoSampleResponse>('/api/chroma-keyer/videos/sample', {
+    input_path: payload.inputPath,
+    timestamp_seconds: payload.timestampSeconds,
+    x: payload.x,
+    y: payload.y,
+    preview_width: payload.previewWidth,
+    preview_height: payload.previewHeight,
+  })
+}
+
 export function createChromaPreview(payload: ChromaPreviewPayload): Promise<ChromaPreviewResponse> {
   return request<ChromaPreviewResponse>('/api/chroma-keyer/preview', chromaPreviewPayloadToWire(payload))
 }
 
+export function createChromaVideoPreview(payload: ChromaVideoPreviewPayload): Promise<ChromaVideoPreviewResponse> {
+  return request<ChromaVideoPreviewResponse>(
+    '/api/chroma-keyer/videos/preview',
+    chromaVideoPreviewPayloadToWire(payload),
+  )
+}
+
 export function createChromaKeyerTask(payload: ChromaKeyerPayload): Promise<TaskCreateResponse> {
   return request<TaskCreateResponse>('/api/tasks/chroma-keyer', chromaPayloadToWire(payload))
+}
+
+export function createChromaVideoKeyerTask(payload: ChromaVideoKeyerPayload): Promise<TaskCreateResponse> {
+  return request<TaskCreateResponse>('/api/tasks/chroma-keyer-video', chromaVideoKeyerPayloadToWire(payload))
 }
 
 export function getTask(taskId: string): Promise<TaskResponse> {

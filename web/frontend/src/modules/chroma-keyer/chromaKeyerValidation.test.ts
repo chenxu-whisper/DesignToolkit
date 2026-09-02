@@ -1,12 +1,14 @@
 import { describe, expect, it } from 'vitest'
 import { createChromaKeyerDefaultValues, chromaKeyerDefaultValues } from './chromaKeyerDefaults'
-import { validateChromaKeyerValues } from './chromaKeyerValidation'
+import { isVideoPath, validateChromaKeyerValues } from './chromaKeyerValidation'
 
 describe('chromaKeyerDefaultValues', () => {
   it('uses the initial chroma keyer form values', () => {
     expect(chromaKeyerDefaultValues).toEqual({
       inputPath: '',
+      mediaKind: null,
       outputPath: '',
+      outputRoot: '',
       samples: [],
       screenGain: 1,
       screenBalance: 0.5,
@@ -15,6 +17,7 @@ describe('chromaKeyerDefaultValues', () => {
       shrinkGrow: 0,
       feather: 0,
       despillAmount: 1,
+      timestampSeconds: 0,
       viewMode: 'final',
     })
   })
@@ -24,6 +27,26 @@ describe('chromaKeyerDefaultValues', () => {
     firstValues.samples.push([42, 180, 72])
 
     expect(createChromaKeyerDefaultValues().samples).toEqual([])
+  })
+})
+
+describe('isVideoPath', () => {
+  it.each(['clip.mov', 'clip.mp4', 'clip.m4v', 'clip.webm', 'clip.mkv', 'clip.avi'])(
+    'recognizes the supported %s suffix',
+    (path) => {
+      expect(isVideoPath(path)).toBe(true)
+    },
+  )
+
+  it.each(['CLIP.MOV', 'Clip.Mp4', 'clip.M4V', 'clip.WeBm', 'clip.MkV', 'clip.AvI'])(
+    'normalizes case for %s',
+    (path) => {
+      expect(isVideoPath(path)).toBe(true)
+    },
+  )
+
+  it.each(['screen.png', 'clip.mp4.png', 'clip', 'clip.mp4.backup'])('rejects unsupported path %s', (path) => {
+    expect(isVideoPath(path)).toBe(false)
   })
 })
 
@@ -159,4 +182,47 @@ describe('validateChromaKeyerValues', () => {
       }),
     ).toEqual({ clipBlack: 'Clip Black 必须小于 Clip White' })
   })
+
+  it('validates image output paths without validating stale video output roots', () => {
+    expect(
+      validateChromaKeyerValues({
+        ...createChromaKeyerDefaultValues(),
+        inputPath: 'screen.png',
+        mediaKind: 'image',
+        outputPath: 'screen.png',
+        outputRoot: 'screen.png',
+        samples: [[42, 180, 72]],
+      }),
+    ).toEqual({ outputPath: '输出路径不能等于输入路径' })
+  })
+
+  it('validates video output roots without validating stale image output paths', () => {
+    expect(
+      validateChromaKeyerValues({
+        ...createChromaKeyerDefaultValues(),
+        inputPath: 'screen.mp4',
+        mediaKind: 'video',
+        outputPath: 'screen.mp4',
+        outputRoot: 'screen.mp4',
+        samples: [[42, 180, 72]],
+      }),
+    ).toEqual({ outputRoot: '输出目录不能等于输入路径' })
+  })
+
+  it.each([Number.NaN, Number.POSITIVE_INFINITY, -0.01])(
+    'rejects invalid video timestamp %s without changing image validation',
+    (timestampSeconds) => {
+      const baseValues = {
+        ...createChromaKeyerDefaultValues(),
+        inputPath: 'screen.mp4',
+        samples: [[42, 180, 72] as [number, number, number]],
+        timestampSeconds,
+      }
+
+      expect(validateChromaKeyerValues({ ...baseValues, mediaKind: 'video' })).toEqual({
+        timestampSeconds: '视频时间必须是大于或等于 0 的有限数值',
+      })
+      expect(validateChromaKeyerValues({ ...baseValues, mediaKind: 'image' })).toEqual({})
+    },
+  )
 })

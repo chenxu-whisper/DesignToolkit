@@ -2,7 +2,9 @@ export type ChromaKeyerRgbSample = [red: number, green: number, blue: number]
 
 export type ChromaKeyerValues = {
   inputPath: string
+  mediaKind: 'image' | 'video' | null
   outputPath: string
+  outputRoot: string
   samples: ChromaKeyerRgbSample[]
   screenGain: number
   screenBalance: number
@@ -11,6 +13,7 @@ export type ChromaKeyerValues = {
   shrinkGrow: number
   feather: number
   despillAmount: number
+  timestampSeconds: number
   viewMode: 'final' | 'alpha'
 }
 
@@ -20,11 +23,30 @@ function isUnitInterval(value: number): boolean {
   return Number.isFinite(value) && value >= 0 && value <= 1
 }
 
+const VIDEO_SUFFIXES = ['.mov', '.mp4', '.m4v', '.webm', '.mkv', '.avi'] as const
+
+export function isVideoPath(path: string): boolean {
+  const normalizedPath = path.trim().toLowerCase()
+  return VIDEO_SUFFIXES.some((suffix) => normalizedPath.endsWith(suffix))
+}
+
 export function validateChromaKeyerValues(values: ChromaKeyerValues): ChromaKeyerErrors {
   const errors: ChromaKeyerErrors = {}
+  const inputPath = values.inputPath.trim()
 
-  if (!values.inputPath.trim()) {
+  if (!inputPath) {
     errors.inputPath = '请输入图片路径'
+  }
+  if (values.mediaKind === 'image' && values.outputPath.trim() === inputPath && inputPath) {
+    errors.outputPath = '输出路径不能等于输入路径'
+  }
+  if (values.mediaKind === 'video') {
+    if (values.outputRoot.trim() === inputPath && inputPath) {
+      errors.outputRoot = '输出目录不能等于输入路径'
+    }
+    if (!Number.isFinite(values.timestampSeconds) || values.timestampSeconds < 0) {
+      errors.timestampSeconds = '视频时间必须是大于或等于 0 的有限数值'
+    }
   }
   if (values.samples.length === 0) {
     errors.samples = '请先在画布上吸取需要抠除的背景颜色'

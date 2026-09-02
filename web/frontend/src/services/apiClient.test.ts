@@ -2,18 +2,29 @@ import { afterEach, describe, expect, expectTypeOf, it, vi } from 'vitest'
 import {
   createChromaKeyerTask,
   createChromaPreview,
+  createChromaVideoFrame,
+  createChromaVideoKeyerTask,
+  createChromaVideoPreview,
   createMediaResizeTask,
   createVideoFramesTask,
   getTask,
   inspectChromaImage,
+  inspectChromaVideo,
   pickLocalDirectory,
   pickLocalFiles,
   pickLocalSaveFile,
   resolveDroppedFilePaths,
   sampleChromaImage,
+  sampleChromaVideo,
   type ChromaKeyerPayload,
   type ChromaKeyerRgbSample,
   type ChromaPreviewPayload,
+  type ChromaVideoFrameRequest,
+  type ChromaVideoInspectRequest,
+  type ChromaVideoKeyerPayload,
+  type ChromaVideoPreviewPayload,
+  type ChromaVideoSampleRequest,
+  type TaskCreateResponse,
 } from './apiClient'
 
 afterEach(() => {
@@ -23,6 +34,11 @@ afterEach(() => {
 describe('apiClient', () => {
   it('models chroma payloads with exactly one RGB sample', () => {
     expectTypeOf<ChromaKeyerPayload['samples']>().toEqualTypeOf<readonly [ChromaKeyerRgbSample]>()
+    expectTypeOf<ChromaVideoKeyerPayload['samples']>().toEqualTypeOf<readonly [ChromaKeyerRgbSample]>()
+    expectTypeOf<ChromaVideoPreviewPayload['viewMode']>().toEqualTypeOf<'final' | 'alpha'>()
+    expectTypeOf<Parameters<typeof inspectChromaVideo>[0]>().toEqualTypeOf<ChromaVideoInspectRequest>()
+    expectTypeOf<Parameters<typeof createChromaVideoFrame>[0]>().toEqualTypeOf<ChromaVideoFrameRequest>()
+    expectTypeOf<Parameters<typeof sampleChromaVideo>[0]>().toEqualTypeOf<ChromaVideoSampleRequest>()
   })
 
   it('posts video frame tasks', async () => {
@@ -147,6 +163,165 @@ describe('apiClient', () => {
         preview_height: 720,
       }),
     })
+  })
+
+  it('inspects a chroma keyer video and returns metadata with the resolved timestamp', async () => {
+    const body = {
+      input_path: 'screen.mp4',
+      width: 1920,
+      height: 1080,
+      preview_width: 1280,
+      preview_height: 720,
+      preview_url: '/api/chroma-keyer/previews/video-inspect-1',
+      duration_seconds: 12.5,
+      fps: 30,
+      estimated_frame_count: 375,
+      timestamp_seconds: 0,
+    }
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify(body)))
+
+    await expect(inspectChromaVideo({ inputPath: 'screen.mp4' })).resolves.toEqual(body)
+    expect(fetchMock).toHaveBeenCalledWith('/api/chroma-keyer/videos/inspect', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ input_path: 'screen.mp4' }),
+    })
+  })
+
+  it('loads an unkeyed video frame at a timestamp', async () => {
+    const body = {
+      preview_url: '/api/chroma-keyer/previews/video-frame-1',
+      timestamp_seconds: 1.25,
+    }
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify(body)))
+
+    await expect(createChromaVideoFrame({ inputPath: 'screen.mp4', timestampSeconds: 1.3 })).resolves.toEqual(body)
+    expect(fetchMock).toHaveBeenCalledWith('/api/chroma-keyer/videos/frame', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        input_path: 'screen.mp4',
+        timestamp_seconds: 1.3,
+      }),
+    })
+  })
+
+  it('samples a chroma keyer video at preview coordinates and a timestamp', async () => {
+    const body = {
+      rgb: [42, 180, 72],
+      hex: '#2AB448',
+      source_x: 630,
+      source_y: 405,
+      timestamp_seconds: 1.25,
+    }
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify(body)))
+
+    await expect(
+      sampleChromaVideo({
+        inputPath: 'screen.mp4',
+        timestampSeconds: 1.3,
+        x: 0.5,
+        y: 0.75,
+        previewWidth: 1280,
+        previewHeight: 720,
+      }),
+    ).resolves.toEqual(body)
+    expect(fetchMock).toHaveBeenCalledWith('/api/chroma-keyer/videos/sample', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        input_path: 'screen.mp4',
+        timestamp_seconds: 1.3,
+        x: 0.5,
+        y: 0.75,
+        preview_width: 1280,
+        preview_height: 720,
+      }),
+    })
+  })
+
+  it('posts keyed video previews with timestamp and nested snake case params', async () => {
+    const body = {
+      preview_url: '/api/chroma-keyer/previews/video-final-1',
+      timestamp_seconds: 1.25,
+    }
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify(body)))
+    const payload: ChromaVideoPreviewPayload = {
+      inputPath: 'screen.mp4',
+      timestampSeconds: 1.3,
+      samples: [[42, 180, 72]],
+      params: {
+        screenGain: 1.25,
+        screenBalance: 0.35,
+        clipBlack: 0,
+        clipWhite: 1,
+        shrinkGrow: 0,
+        feather: 0,
+        despillAmount: 0.5,
+      },
+      viewMode: 'final',
+    }
+
+    await expect(createChromaVideoPreview(payload)).resolves.toEqual(body)
+    expect(fetchMock).toHaveBeenCalledWith('/api/chroma-keyer/videos/preview', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        input_path: 'screen.mp4',
+        timestamp_seconds: 1.3,
+        samples: [[42, 180, 72]],
+        params: {
+          screen_gain: 1.25,
+          screen_balance: 0.35,
+          clip_black: 0,
+          clip_white: 1,
+          shrink_grow: 0,
+          feather: 0,
+          despill_amount: 0.5,
+        },
+        view_mode: 'final',
+      }),
+    })
+  })
+
+  it('creates chroma video tasks with output_root instead of image output_path', async () => {
+    const body: TaskCreateResponse = { task_id: 'task-video-chroma-1', status: 'queued' }
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify(body)))
+    const payload: ChromaVideoKeyerPayload = {
+      inputPath: 'screen.mp4',
+      outputRoot: 'E:\\exports',
+      samples: [[42, 180, 72]],
+      params: {
+        screenGain: 1.25,
+        screenBalance: 0.35,
+        clipBlack: 0,
+        clipWhite: 1,
+        shrinkGrow: 0,
+        feather: 0,
+        despillAmount: 0.5,
+      },
+    }
+
+    await expect(createChromaVideoKeyerTask(payload)).resolves.toEqual(body)
+    expect(fetchMock).toHaveBeenCalledWith('/api/tasks/chroma-keyer-video', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        input_path: 'screen.mp4',
+        output_root: 'E:\\exports',
+        samples: [[42, 180, 72]],
+        params: {
+          screen_gain: 1.25,
+          screen_balance: 0.35,
+          clip_black: 0,
+          clip_white: 1,
+          shrink_grow: 0,
+          feather: 0,
+          despill_amount: 0.5,
+        },
+      }),
+    })
+    expect(JSON.parse(fetchMock.mock.calls[0][1]?.body as string)).not.toHaveProperty('output_path')
   })
 
   it('posts canonical chroma preview requests with nested snake case params', async () => {
