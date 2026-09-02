@@ -18,6 +18,13 @@ from designtoolkit.chroma_keyer.models import (
     KeyImageResult,
     ScreenColorModel,
 )
+from designtoolkit.chroma_keyer.video_export import key_video_to_png_sequence
+from designtoolkit.chroma_keyer.video_models import (
+    ProgressCallback,
+    VideoDecoder,
+    VideoKeyOptions,
+    VideoKeyResult,
+)
 from designtoolkit.media_resize import (
     MediaResizeOptions,
     MediaResizeResult,
@@ -32,12 +39,14 @@ from designtoolkit.video_frames import (
 )
 from designtoolkit.web.adapters import (
     chroma_keyer_options_from_request,
+    chroma_video_keyer_options_from_request,
     media_resize_options_list_from_request,
     video_frame_options_list_from_request,
 )
 from designtoolkit.web.logs import LogStore
 from designtoolkit.web.schemas import (
     ChromaKeyerTaskRequest,
+    ChromaVideoKeyerTaskRequest,
     LogLevel,
     LogPhase,
     MediaResizeTaskRequest,
@@ -50,6 +59,16 @@ from designtoolkit.web.schemas import (
 Exporter = Callable[[VideoFrameOptions, FrameExportBackend], ExportResult]
 MediaResizer = Callable[[MediaResizeOptions, ResizeBackend], MediaResizeResult]
 Keyer = Callable[[KeyImageOptions, ScreenColorModel, KeyerParams], KeyImageResult]
+VideoKeyer = Callable[
+    [
+        VideoKeyOptions,
+        VideoDecoder,
+        ScreenColorModel,
+        KeyerParams,
+        ProgressCallback | None,
+    ],
+    VideoKeyResult,
+]
 BackendFactory = Callable[[], FrameExportBackend | ResizeBackend]
 Clock = Callable[[], float]
 
@@ -92,6 +111,7 @@ class TaskManager:
         exporter: Exporter | None = export_video_frames,
         media_resizer: MediaResizer | None = resize_media,
         keyer: Keyer | None = key_image,
+        video_keyer: VideoKeyer | None = key_video_to_png_sequence,
         backend_factory: BackendFactory | None = None,
         clock: Clock = perf_counter,
         run_async: bool = True,
@@ -100,6 +120,7 @@ class TaskManager:
         self._exporter = exporter
         self._media_resizer = media_resizer
         self._keyer = keyer
+        self._video_keyer = video_keyer
         self._backend_factory = backend_factory or self._default_backend
         self._clock = clock
         self._run_async = run_async
@@ -211,6 +232,34 @@ class TaskManager:
             self._start(
                 task,
                 lambda: self._run_chroma_keyer(task, options, model, params),
+            )
+        except Exception as exc:
+            self._mark_failed(task.task_id, str(exc))
+        return self.get_task(task.task_id) or task
+
+    def create_chroma_video_keyer_task(
+        self,
+        request: ChromaVideoKeyerTaskRequest,
+        decoder: VideoDecoder,
+    ) -> TaskRecord:
+        options, model, params = chroma_video_keyer_options_from_request(request)
+        output_root = options.output_root or options.input_path.parent
+        output_dir = output_root / f"{options.input_path.stem}_keyed_frames"
+        task = self.reserve_task(
+            kind=TaskKind.CHROMA_KEYER,
+            input_path=str(options.input_path),
+            output_path=str(output_dir),
+        )
+        try:
+            self._start(
+                task,
+                lambda: self._run_chroma_video_keyer(
+                    task,
+                    options,
+                    decoder,
+                    model,
+                    params,
+                ),
             )
         except Exception as exc:
             self._mark_failed(task.task_id, str(exc))
@@ -371,6 +420,108 @@ class TaskManager:
             elapsed_seconds=self._elapsed_seconds(task_started_at),
         )
 
+    def _run_chroma_video_keyer(
+        self,
+        task: TaskRecord,
+        options: VideoKeyOptions,
+        decoder: VideoDecoder,
+        model: ScreenColorModel,
+        params: KeyerParams,
+    ) -> None:
+        self._mark_running(task.task_id)
+        task_started_at = self._clock()
+        last_reported_frames = 0
+
+        def report_progress(
+            processed_frames: int,
+            estimated_total: int | None,
+            current_path,
+            *,
+            force: bool = False,
+        ) -> None:
+            nonlocal last_reported_frames
+            interval = max(1, estimated_total // 100) if estimated_total else 30
+            if (
+                not force
+                and processed_frames != 1
+                and processed_frames % interval != 0
+            ):
+                return
+            details: dict[str, object] = {
+                "processed_frames": processed_frames,
+                "current_path": str(current_path),
+                "elapsed_seconds": self._elapsed_seconds(task_started_at),
+            }
+            if estimated_total:
+                details["total_frames"] = estimated_total
+                details["progress"] = min(processed_frames / estimated_total, 1.0)
+                message = (
+                    f"Processed video frame {processed_frames}/{estimated_total}"
+                )
+            else:
+                message = f"Processed video frame {processed_frames}"
+            self.log_store.append(
+                task_id=task.task_id,
+                level=LogLevel.PROGRESS,
+                phase=LogPhase.RUNNING,
+                message=message,
+                details=details,
+            )
+            last_reported_frames = processed_frames
+
+        try:
+            if self._video_keyer is None:
+                raise RuntimeError("chroma video keyer is not configured")
+            result = self._video_keyer(
+                options,
+                decoder,
+                model,
+                params,
+                report_progress,
+            )
+            estimated_total = result.metadata.estimated_frame_count
+            if last_reported_frames == 0:
+                report_progress(
+                    1,
+                    estimated_total,
+                    result.output_dir
+                    / f"{options.input_path.stem}_keyed_{1:06d}.png",
+                    force=True,
+                )
+            if last_reported_frames != result.frame_count:
+                report_progress(
+                    result.frame_count,
+                    estimated_total,
+                    result.output_dir
+                    / (
+                        f"{options.input_path.stem}_keyed_"
+                        f"{result.frame_count:06d}.png"
+                    ),
+                    force=True,
+                )
+            elapsed_seconds = self._elapsed_seconds(task_started_at)
+            self.log_store.append(
+                task_id=task.task_id,
+                level=LogLevel.SUCCESS,
+                phase=LogPhase.RUNNING,
+                message=f"Completed chroma video key: {options.input_path}",
+                details={
+                    "input_path": str(options.input_path),
+                    "output_path": str(result.output_dir),
+                    "frame_count": result.frame_count,
+                    "elapsed_seconds": elapsed_seconds,
+                },
+            )
+        except Exception as exc:
+            self._mark_failed(task.task_id, str(exc))
+            return
+        self._mark_succeeded(
+            task.task_id,
+            str(result.output_dir),
+            elapsed_seconds=self._elapsed_seconds(task_started_at),
+            frame_count=result.frame_count,
+        )
+
     def _mark_running(self, task_id: str) -> None:
         with self._lock:
             task = self._records[task_id]
@@ -389,10 +540,13 @@ class TaskManager:
         output_path: str,
         *,
         elapsed_seconds: float | None = None,
+        frame_count: int | None = None,
     ) -> None:
         details: dict[str, object] = {"output_path": output_path}
         if elapsed_seconds is not None:
             details["elapsed_seconds"] = elapsed_seconds
+        if frame_count is not None:
+            details["frame_count"] = frame_count
         self.mark_finished(
             task_id,
             status=TaskStatus.SUCCEEDED,

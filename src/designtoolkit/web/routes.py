@@ -53,6 +53,7 @@ from designtoolkit.web.schemas import (
     ChromaVideoFrameResponse,
     ChromaVideoInspectRequest,
     ChromaVideoInspectResponse,
+    ChromaVideoKeyerTaskRequest,
     ChromaVideoPreviewRequest,
     ChromaVideoPreviewResponse,
     ChromaVideoSampleRequest,
@@ -473,6 +474,18 @@ def create_router(
             raise ApiError("task_conflict", str(exc), 409) from exc
         except KeyerError as exc:
             raise _chroma_keyer_error_response(exc) from exc
+        return TaskCreateResponse(task_id=task.task_id, status=task.status)
+
+    @router.post("/tasks/chroma-keyer-video", response_model=TaskCreateResponse)
+    def create_chroma_video_keyer(
+        request: ChromaVideoKeyerTaskRequest,
+    ) -> TaskCreateResponse:
+        try:
+            task = task_manager.create_chroma_video_keyer_task(request, decoder)
+        except TaskConflictError as exc:
+            raise ApiError("task_conflict", str(exc), 409) from exc
+        except KeyerError as exc:
+            raise _chroma_video_error_response(exc) from exc
         return TaskCreateResponse(task_id=task.task_id, status=task.status)
 
     @router.post(

@@ -144,6 +144,29 @@ class ChromaKeyerTaskRequest(BaseModel):
         return value
 
 
+class ChromaVideoKeyerTaskRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    input_path: str
+    samples: list[list[RgbChannel]] = Field(min_length=1, max_length=1)
+    params: ChromaKeyerParams
+    output_root: str | None = None
+
+    @field_validator("input_path", "output_root")
+    @classmethod
+    def validate_paths(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("path must not be blank")
+        return value
+
+    @field_validator("samples")
+    @classmethod
+    def validate_samples(cls, value: list[list[int]]) -> list[list[int]]:
+        if any(len(sample) != 3 for sample in value):
+            raise ValueError("each sample must contain exactly three channels")
+        return value
+
+
 class ChromaPreviewRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

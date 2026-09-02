@@ -23,9 +23,12 @@ from designtoolkit.chroma_keyer.image_io import (
 from designtoolkit.chroma_keyer.matte import generate_alpha, refine_alpha
 from designtoolkit.chroma_keyer.models import KeyerError, KeyerParams, KeyImageResult
 from designtoolkit.chroma_keyer.sampling import screen_model_from_samples
-from designtoolkit.chroma_keyer.video_models import VideoMetadata
+from designtoolkit.chroma_keyer.video_models import VideoKeyResult, VideoMetadata
 from designtoolkit.web import routes as web_routes
-from designtoolkit.web.adapters import chroma_keyer_options_from_request
+from designtoolkit.web.adapters import (
+    chroma_keyer_options_from_request,
+    chroma_video_keyer_options_from_request,
+)
 from designtoolkit.web.app import create_app
 from designtoolkit.web.chroma_previews import ChromaPreviewStore
 from designtoolkit.web.logs import LogStore
@@ -36,6 +39,7 @@ from designtoolkit.web.schemas import (
     ChromaVideoFrameResponse,
     ChromaVideoInspectRequest,
     ChromaVideoInspectResponse,
+    ChromaVideoKeyerTaskRequest,
     ChromaVideoPreviewRequest,
     ChromaVideoPreviewResponse,
     ChromaVideoSampleRequest,
@@ -406,6 +410,54 @@ def test_chroma_keyer_task_request_accepts_the_default_export_contract() -> None
     }
 
 
+def test_chroma_video_keyer_task_request_accepts_the_export_contract() -> None:
+    request = ChromaVideoKeyerTaskRequest(
+        input_path="clip.mp4",
+        samples=[[42, 180, 72]],
+        params={},
+        output_root="frames",
+    )
+
+    assert request.model_dump() == {
+        "input_path": "clip.mp4",
+        "samples": [[42, 180, 72]],
+        "params": {
+            "screen_gain": 1.0,
+            "screen_balance": 0.5,
+            "clip_black": 0.0,
+            "clip_white": 1.0,
+            "shrink_grow": 0,
+            "feather": 0,
+            "despill_amount": 1.0,
+        },
+        "output_root": "frames",
+    }
+
+
+@mark.parametrize(
+    "changes",
+    [
+        {"samples": []},
+        {"samples": [[42, 180, 72], [40, 182, 74]]},
+        {"output_root": "   "},
+        {"output_path": "legacy.png"},
+        {"extra": True},
+    ],
+)
+def test_chroma_video_keyer_task_request_rejects_invalid_or_extra_fields(
+    changes: dict[str, object],
+) -> None:
+    with raises(ValueError):
+        ChromaVideoKeyerTaskRequest.model_validate(
+            {
+                "input_path": "clip.mp4",
+                "samples": [[42, 180, 72]],
+                "params": {},
+                **changes,
+            }
+        )
+
+
 @mark.parametrize(
     "changes",
     [
@@ -581,6 +633,38 @@ def test_chroma_keyer_adapter_converts_request_to_core_keying_arguments() -> Non
     )
 
 
+def test_chroma_video_keyer_adapter_converts_request_to_export_arguments() -> None:
+    options, model, params = chroma_video_keyer_options_from_request(
+        ChromaVideoKeyerTaskRequest(
+            input_path="clip.mp4",
+            output_root="frames",
+            samples=[[42, 180, 72]],
+            params={
+                "screen_gain": 1.4,
+                "screen_balance": 0.2,
+                "clip_black": 0.1,
+                "clip_white": 0.9,
+                "shrink_grow": -2,
+                "feather": 3,
+                "despill_amount": 0.75,
+            },
+        )
+    )
+
+    assert options.input_path == Path("clip.mp4")
+    assert options.output_root == Path("frames")
+    assert model.samples == ((42, 180, 72),)
+    assert params == KeyerParams(
+        screen_gain=1.4,
+        screen_balance=0.2,
+        clip_black=0.1,
+        clip_white=0.9,
+        shrink_grow=-2,
+        feather=3,
+        despill_amount=0.75,
+    )
+
+
 def test_chroma_keyer_task_manager_exports_default_source_sized_rgba_png(
     tmp_path: Path,
 ) -> None:
@@ -615,6 +699,246 @@ def test_chroma_keyer_task_manager_exports_default_source_sized_rgba_png(
         (LogLevel.SUCCESS, LogPhase.COMPLETED),
     ]
     assert events[-1].details["elapsed_seconds"] >= 0
+
+
+def test_chroma_video_keyer_task_endpoint_exports_to_computed_final_directory(
+    tmp_path: Path,
+) -> None:
+    input_path = tmp_path / "clip.mp4"
+    input_path.write_bytes(b"fake video source")
+    output_root = tmp_path / "frames"
+    output_root.mkdir()
+    decoder = FakeVideoDecoder()
+    export_calls = []
+
+    def video_keyer(options, supplied_decoder, model, params, progress_callback):
+        export_calls.append(
+            (options, supplied_decoder, model, params, progress_callback)
+        )
+        return VideoKeyResult(
+            output_dir=output_root / "clip_keyed_frames",
+            manifest_path=output_root / "clip_keyed_frames" / "manifest.json",
+            frame_count=6,
+            metadata=decoder.metadata,
+        )
+
+    task_manager = TaskManager(
+        log_store=LogStore(),
+        video_keyer=video_keyer,
+        run_async=False,
+    )
+    client = TestClient(
+        create_app(
+            task_manager=task_manager,
+            local_path_roots=[tmp_path],
+            video_decoder=decoder,
+        )
+    )
+
+    response = client.post(
+        "/api/tasks/chroma-keyer-video",
+        json={
+            "input_path": str(input_path),
+            "samples": [[42, 180, 72]],
+            "params": {},
+            "output_root": str(output_root),
+        },
+    )
+
+    assert response.status_code == 200
+    task = task_manager.get_task(response.json()["task_id"])
+    assert task is not None
+    assert task.kind is TaskKind.CHROMA_KEYER
+    assert task.status is TaskStatus.SUCCEEDED
+    assert task.output_path == str(output_root / "clip_keyed_frames")
+    assert len(export_calls) == 1
+    options, supplied_decoder, model, params, progress_callback = export_calls[0]
+    assert options.input_path == input_path
+    assert options.output_root == output_root
+    assert supplied_decoder is decoder
+    assert model.samples == ((42, 180, 72),)
+    assert params == KeyerParams()
+    assert progress_callback is not None
+
+
+def test_chroma_video_keyer_task_throttles_monotonic_progress_and_logs_actuals(
+    tmp_path: Path,
+) -> None:
+    input_path = tmp_path / "clip.mp4"
+    output_root = tmp_path / "frames"
+    final_dir = output_root / "clip_keyed_frames"
+    decoder = FakeVideoDecoder()
+    log_store = LogStore()
+
+    def video_keyer(options, _decoder, _model, _params, progress_callback):
+        assert progress_callback is not None
+        for processed_frames in range(1, 10_004):
+            progress_callback(
+                processed_frames,
+                10_000,
+                output_root / f"clip_keyed_{processed_frames:06d}.png",
+            )
+        return VideoKeyResult(
+            output_dir=final_dir,
+            manifest_path=final_dir / "manifest.json",
+            frame_count=10_003,
+            metadata=decoder.metadata,
+        )
+
+    clock_value = 0.0
+
+    def clock() -> float:
+        nonlocal clock_value
+        clock_value += 0.001
+        return clock_value
+
+    task_manager = TaskManager(
+        log_store=log_store,
+        video_keyer=video_keyer,
+        clock=clock,
+        run_async=False,
+    )
+
+    task = task_manager.create_chroma_video_keyer_task(
+        ChromaVideoKeyerTaskRequest(
+            input_path=str(input_path),
+            samples=[[42, 180, 72]],
+            params={},
+            output_root=str(output_root),
+        ),
+        decoder,
+    )
+
+    events = log_store.history(task.task_id)
+    frame_progress = [
+        event
+        for event in events
+        if event.level is LogLevel.PROGRESS
+        and "processed_frames" in event.details
+    ]
+    processed_frames = [
+        event.details["processed_frames"] for event in frame_progress
+    ]
+    assert len(frame_progress) <= 102
+    assert processed_frames[0] == 1
+    assert processed_frames[-1] == 10_003
+    assert processed_frames == sorted(set(processed_frames))
+    assert all(0 <= event.details["progress"] <= 1 for event in frame_progress)
+    assert all(event.details["elapsed_seconds"] >= 0 for event in frame_progress)
+
+    running_success = next(
+        event
+        for event in events
+        if event.level is LogLevel.SUCCESS and event.phase is LogPhase.RUNNING
+    )
+    completed = events[-1]
+    assert running_success.details["frame_count"] == 10_003
+    assert running_success.details["elapsed_seconds"] >= 0
+    assert completed.phase is LogPhase.COMPLETED
+    assert completed.details["frame_count"] == 10_003
+    assert completed.details["elapsed_seconds"] >= 0
+
+
+def test_chroma_video_keyer_export_failure_marks_failed_and_releases_slot(
+    tmp_path: Path,
+) -> None:
+    input_path = tmp_path / "clip.mp4"
+    decoder = FakeVideoDecoder()
+
+    def failing_video_keyer(*_args):
+        raise KeyerError("Video PNG sequence export failed")
+
+    task_manager = TaskManager(
+        log_store=LogStore(),
+        video_keyer=failing_video_keyer,
+        run_async=False,
+    )
+    task = task_manager.create_chroma_video_keyer_task(
+        ChromaVideoKeyerTaskRequest(
+            input_path=str(input_path),
+            samples=[[42, 180, 72]],
+            params={},
+        ),
+        decoder,
+    )
+
+    assert task.status is TaskStatus.FAILED
+    assert task.error == "Video PNG sequence export failed"
+    replacement = task_manager.reserve_task(
+        kind=TaskKind.CHROMA_KEYER,
+        input_path=str(input_path),
+        output_path=str(tmp_path / "replacement_keyed_frames"),
+    )
+    assert replacement.status is TaskStatus.QUEUED
+
+
+def test_chroma_video_keyer_task_endpoint_shares_active_task_conflict(
+    tmp_path: Path,
+) -> None:
+    input_path = tmp_path / "clip.mp4"
+    input_path.write_bytes(b"fake video source")
+    decoder = FakeVideoDecoder()
+    export_started = Event()
+    release_export = Event()
+    export_finished = Event()
+
+    def blocking_video_keyer(
+        options,
+        _decoder,
+        _model,
+        _params,
+        _progress_callback,
+    ):
+        export_started.set()
+        assert release_export.wait(timeout=1)
+        output_dir = options.input_path.parent / "clip_keyed_frames"
+        export_finished.set()
+        return VideoKeyResult(
+            output_dir=output_dir,
+            manifest_path=output_dir / "manifest.json",
+            frame_count=1,
+            metadata=decoder.metadata,
+        )
+
+    task_manager = TaskManager(
+        log_store=LogStore(),
+        video_keyer=blocking_video_keyer,
+        run_async=True,
+    )
+    client = TestClient(
+        create_app(
+            task_manager=task_manager,
+            local_path_roots=[tmp_path],
+            video_decoder=decoder,
+        )
+    )
+    request_body = {
+        "input_path": str(input_path),
+        "samples": [[42, 180, 72]],
+        "params": {},
+    }
+
+    first_response = client.post(
+        "/api/tasks/chroma-keyer-video",
+        json=request_body,
+    )
+    assert first_response.status_code == 200
+    assert export_started.wait(timeout=1)
+
+    conflict_response = client.post(
+        "/api/tasks/chroma-keyer-video",
+        json=request_body,
+    )
+
+    assert conflict_response.status_code == 409
+    assert conflict_response.json() == {
+        "error": {
+            "code": "task_conflict",
+            "message": "A task is already running",
+        }
+    }
+    release_export.set()
+    assert export_finished.wait(timeout=1)
 
 
 def test_chroma_keyer_task_endpoint_creates_and_reports_completed_task(

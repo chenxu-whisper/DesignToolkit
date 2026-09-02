@@ -8,6 +8,7 @@ from designtoolkit.chroma_keyer.models import (
     ScreenColorModel,
 )
 from designtoolkit.chroma_keyer.sampling import screen_model_from_samples
+from designtoolkit.chroma_keyer.video_models import VideoKeyOptions
 from designtoolkit.media_resize import MediaResizeOptions
 from designtoolkit.video_frames import (
     VideoFrameError,
@@ -17,6 +18,7 @@ from designtoolkit.video_frames import (
 )
 from designtoolkit.web.schemas import (
     ChromaKeyerTaskRequest,
+    ChromaVideoKeyerTaskRequest,
     MediaResizeTaskRequest,
     VideoFramesTaskRequest,
 )
@@ -37,6 +39,28 @@ def chroma_keyer_options_from_request(
         KeyImageOptions(
             input_path=Path(request.input_path),
             output_path=Path(request.output_path) if request.output_path else None,
+        ),
+        screen_model_from_samples(request.samples),
+        KeyerParams(
+            screen_gain=params.screen_gain,
+            screen_balance=params.screen_balance,
+            clip_black=params.clip_black,
+            clip_white=params.clip_white,
+            shrink_grow=params.shrink_grow,
+            feather=params.feather,
+            despill_amount=params.despill_amount,
+        ),
+    )
+
+
+def chroma_video_keyer_options_from_request(
+    request: ChromaVideoKeyerTaskRequest,
+) -> tuple[VideoKeyOptions, ScreenColorModel, KeyerParams]:
+    params = request.params
+    return (
+        VideoKeyOptions(
+            input_path=Path(request.input_path),
+            output_root=Path(request.output_root) if request.output_root else None,
         ),
         screen_model_from_samples(request.samples),
         KeyerParams(
