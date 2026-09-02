@@ -49,6 +49,16 @@ def test_video_metadata_accepts_valid_values_and_exposes_frame_step() -> None:
     assert value.frame_step_seconds == 0.04
 
 
+@mark.parametrize(("field", "value"), [("fps", 25), ("duration_seconds", 4)])
+def test_video_metadata_normalizes_integer_real_fields_to_float(
+    field: str, value: int
+) -> None:
+    video_metadata = metadata(**{field: value})
+
+    assert getattr(video_metadata, field) == float(value)
+    assert type(getattr(video_metadata, field)) is float
+
+
 def test_video_metadata_is_immutable() -> None:
     value = metadata()
 
@@ -120,6 +130,17 @@ def test_validate_timestamp_accepts_start_and_value_before_duration() -> None:
 
     assert validate_timestamp(0, video_metadata) == 0.0
     assert validate_timestamp(final_valid_value, video_metadata) == final_valid_value
+
+
+def test_validate_timestamp_rejects_rounded_integer_duration_endpoint() -> None:
+    duration_seconds = 2**53 + 1
+    video_metadata = metadata(duration_seconds=duration_seconds)
+
+    with raises(
+        KeyerError,
+        match=r"^timestamp must satisfy 0 <= timestamp < duration_seconds$",
+    ):
+        validate_timestamp(duration_seconds, video_metadata)
 
 
 @mark.parametrize("value", [True, nan, inf, -inf, 10**400, "1"])

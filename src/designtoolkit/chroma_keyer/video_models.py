@@ -29,12 +29,13 @@ def _normalize_finite_real(value: object, error_message: str) -> float:
     return normalized
 
 
-def _validate_positive_real(name: str, value: object) -> None:
+def _normalize_positive_real(name: str, value: object) -> float:
     normalized = _normalize_finite_real(
         value, f"{name} must be a finite positive number"
     )
     if normalized <= 0:
         raise KeyerError(f"{name} must be a finite positive number")
+    return normalized
 
 
 def _normalize_timestamp(value: object) -> float:
@@ -53,8 +54,12 @@ class VideoMetadata:
     def __post_init__(self) -> None:
         _validate_positive_integer("width", self.width)
         _validate_positive_integer("height", self.height)
-        _validate_positive_real("fps", self.fps)
-        _validate_positive_real("duration_seconds", self.duration_seconds)
+        object.__setattr__(self, "fps", _normalize_positive_real("fps", self.fps))
+        object.__setattr__(
+            self,
+            "duration_seconds",
+            _normalize_positive_real("duration_seconds", self.duration_seconds),
+        )
         _validate_positive_integer("estimated_frame_count", self.estimated_frame_count)
         if not isinstance(self.codec, str) or not self.codec.strip():
             raise KeyerError("codec must be a non-blank string")
