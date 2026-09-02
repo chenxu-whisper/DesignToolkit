@@ -26,10 +26,15 @@ from designtoolkit.chroma_keyer.sampling import (
     screen_model_from_samples,
 )
 from designtoolkit.chroma_keyer.video_io import ImageioVideoDecoder
-from designtoolkit.chroma_keyer.video_models import VideoDecoder, validate_timestamp
+from designtoolkit.chroma_keyer.video_models import (
+    VideoDecoder,
+    VideoMetadata,
+    clamp_timeline_timestamp,
+    validate_timestamp,
+)
 from designtoolkit.media_resize import MediaResizeError
 from designtoolkit.video_frames import VideoFrameError
-from designtoolkit.web.chroma_previews import ChromaPreviewStore
+from designtoolkit.web.chroma_previews import ChromaPreviewEntry, ChromaPreviewStore
 from designtoolkit.web.local_paths import resolve_dropped_file_paths
 from designtoolkit.web.native_picker import (
     LocalPathPicker,
@@ -120,13 +125,17 @@ def _chroma_preview_url(preview_id: str) -> str:
     return f"/api/chroma-keyer/previews/{preview_id}"
 
 
-def _source_stat(input_path: Path):
+def _source_stat(
+    input_path: Path,
+    *,
+    read_error_message: str = "Input image could not be read",
+):
     try:
         source_stat = input_path.stat()
     except FileNotFoundError as exc:
         raise KeyerError("Input path does not exist") from exc
     except OSError as exc:
-        raise KeyerError("Input image could not be read") from exc
+        raise KeyerError(read_error_message) from exc
     if not S_ISREG(source_stat.st_mode):
         raise KeyerError("Input path must be a file")
     return source_stat
@@ -191,14 +200,20 @@ def _video_source_fingerprint(input_path: Path) -> dict[str, str | int]:
         raise KeyerError("Video could not be opened") from exc
 
     for _ in range(_CHROMA_SNAPSHOT_READ_ATTEMPTS):
-        before_read = _source_stat(resolved_path)
+        before_read = _source_stat(
+            resolved_path,
+            read_error_message="Video could not be opened",
+        )
         try:
             size, content_sha256 = _hash_file_chunks(resolved_path)
         except FileNotFoundError as exc:
             raise KeyerError("Input path does not exist") from exc
         except OSError as exc:
             raise KeyerError("Video could not be opened") from exc
-        after_read = _source_stat(resolved_path)
+        after_read = _source_stat(
+            resolved_path,
+            read_error_message="Video could not be opened",
+        )
         if _source_version(before_read) == _source_version(after_read):
             return {
                 "path": str(resolved_path),
@@ -243,40 +258,98 @@ class _VideoSourceChangedError(Exception):
     pass
 
 
+def _resolve_video_timestamp(
+    requested_timestamp: float,
+    metadata: VideoMetadata,
+) -> float:
+    return clamp_timeline_timestamp(
+        validate_timestamp(requested_timestamp, metadata),
+        metadata,
+    )
+
+
+def _read_stable_video_frame(
+    input_path: Path,
+    decoder: VideoDecoder,
+    requested_timestamp: float,
+    read_frame: Callable[[Path, float], np.ndarray],
+) -> tuple[VideoMetadata, float, np.ndarray]:
+    for _ in range(_CHROMA_SNAPSHOT_READ_ATTEMPTS):
+        source_fingerprint = _video_source_fingerprint(input_path)
+        try:
+            metadata = decoder.probe(input_path)
+            timestamp_seconds = _resolve_video_timestamp(
+                requested_timestamp,
+                metadata,
+            )
+            rgb = read_frame(input_path, timestamp_seconds)
+        except KeyerError:
+            if _video_source_fingerprint(input_path) != source_fingerprint:
+                continue
+            raise
+        if _video_source_fingerprint(input_path) == source_fingerprint:
+            return metadata, timestamp_seconds, rgb
+    raise KeyerError("Input video changed while it was being read")
+
+
 def _get_stable_video_preview_entry(
     store: ChromaPreviewStore,
     input_path: Path,
     preview_kind: str,
-    create_png_bytes: Callable[[], bytes],
+    decoder: VideoDecoder,
+    requested_timestamp: float,
+    read_frame: Callable[[Path, float], np.ndarray],
+    create_png_bytes: Callable[[np.ndarray], bytes],
     *,
     samples: list[list[int]] | None = None,
     params: dict[str, float | int] | None = None,
     view_mode: ChromaViewMode | None = None,
-    timestamp_seconds: float,
-):
+) -> tuple[VideoMetadata, float, ChromaPreviewEntry]:
     for _ in range(_CHROMA_SNAPSHOT_READ_ATTEMPTS):
         source_fingerprint = _video_source_fingerprint(input_path)
-        cache_key = _chroma_preview_cache_key(
-            preview_kind,
-            source_fingerprint,
-            samples=samples,
-            params=params,
-            view_mode=view_mode,
-            timestamp_seconds=timestamp_seconds,
-        )
-
-        def create_stable_preview(
-            expected_fingerprint: dict[str, str | int] = source_fingerprint,
-        ) -> bytes:
-            png_bytes = create_png_bytes()
-            if _video_source_fingerprint(input_path) != expected_fingerprint:
-                raise _VideoSourceChangedError
-            return png_bytes
-
         try:
-            return store.get_or_put_entry(cache_key, create_stable_preview)
+            metadata = decoder.probe(input_path)
+            timestamp_seconds = _resolve_video_timestamp(
+                requested_timestamp,
+                metadata,
+            )
+            cache_key = _chroma_preview_cache_key(
+                preview_kind,
+                source_fingerprint,
+                samples=samples,
+                params=params,
+                view_mode=view_mode,
+                timestamp_seconds=timestamp_seconds,
+            )
+            generated = False
+
+            def create_stable_preview(
+                expected_timestamp: float = timestamp_seconds,
+                expected_fingerprint: dict[str, str | int] = source_fingerprint,
+            ) -> bytes:
+                nonlocal generated
+                generated = True
+                rgb = read_frame(input_path, expected_timestamp)
+                png_bytes = create_png_bytes(rgb)
+                if _video_source_fingerprint(input_path) != expected_fingerprint:
+                    raise _VideoSourceChangedError
+                return png_bytes
+
+            preview_entry = store.get_or_put_entry(
+                cache_key,
+                create_stable_preview,
+            )
         except _VideoSourceChangedError:
             continue
+        except KeyerError:
+            if _video_source_fingerprint(input_path) != source_fingerprint:
+                continue
+            raise
+        if (
+            generated
+            or _video_source_fingerprint(input_path) == source_fingerprint
+        ):
+            return metadata, timestamp_seconds, preview_entry
     raise KeyerError("Input video changed while it was being read")
 
 
@@ -444,16 +517,16 @@ def create_router(
     ) -> ChromaVideoInspectResponse:
         try:
             input_path = Path(request.input_path)
-            metadata = decoder.probe(input_path)
-            timestamp_seconds = validate_timestamp(0.0, metadata)
-            preview_entry = _get_stable_video_preview_entry(
-                chroma_preview_store,
-                input_path,
-                "video_inspect",
-                lambda: make_preview_png(
-                    decoder.read_preview_frame(input_path, timestamp_seconds)
-                ),
-                timestamp_seconds=timestamp_seconds,
+            metadata, timestamp_seconds, preview_entry = (
+                _get_stable_video_preview_entry(
+                    chroma_preview_store,
+                    input_path,
+                    "video_inspect",
+                    decoder,
+                    0.0,
+                    decoder.read_preview_frame,
+                    make_preview_png,
+                )
             )
         except KeyerError as exc:
             raise _chroma_video_error_response(exc) from exc
@@ -482,19 +555,16 @@ def create_router(
     ) -> ChromaVideoFrameResponse:
         try:
             input_path = Path(request.input_path)
-            metadata = decoder.probe(input_path)
-            timestamp_seconds = validate_timestamp(
-                request.timestamp_seconds,
-                metadata,
-            )
-            preview_entry = _get_stable_video_preview_entry(
-                chroma_preview_store,
-                input_path,
-                "video_frame",
-                lambda: make_preview_png(
-                    decoder.read_preview_frame(input_path, timestamp_seconds)
-                ),
-                timestamp_seconds=timestamp_seconds,
+            _metadata, timestamp_seconds, preview_entry = (
+                _get_stable_video_preview_entry(
+                    chroma_preview_store,
+                    input_path,
+                    "video_frame",
+                    decoder,
+                    request.timestamp_seconds,
+                    decoder.read_preview_frame,
+                    make_preview_png,
+                )
             )
         except KeyerError as exc:
             raise _chroma_video_error_response(exc) from exc
@@ -513,12 +583,12 @@ def create_router(
     ) -> ChromaVideoSampleResponse:
         try:
             input_path = Path(request.input_path)
-            metadata = decoder.probe(input_path)
-            timestamp_seconds = validate_timestamp(
+            metadata, timestamp_seconds, rgb = _read_stable_video_frame(
+                input_path,
+                decoder,
                 request.timestamp_seconds,
-                metadata,
+                decoder.read_frame,
             )
-            rgb = decoder.read_frame(input_path, timestamp_seconds)
         except KeyerError as exc:
             raise _chroma_video_error_response(exc) from exc
 
@@ -559,16 +629,10 @@ def create_router(
     ) -> ChromaVideoPreviewResponse:
         try:
             input_path = Path(request.input_path)
-            metadata = decoder.probe(input_path)
-            timestamp_seconds = validate_timestamp(
-                request.timestamp_seconds,
-                metadata,
-            )
             model = screen_model_from_samples(request.samples)
             params_data = request.params.model_dump(mode="json")
 
-            def create_preview_png() -> bytes:
-                rgb = decoder.read_preview_frame(input_path, timestamp_seconds)
+            def create_preview_png(rgb: np.ndarray) -> bytes:
                 params = KeyerParams(**params_data)
                 preview_rgb, alpha = key_rgb(rgb, model, params)
                 if request.view_mode is ChromaViewMode.FINAL:
@@ -576,15 +640,19 @@ def create_router(
                 alpha_rgb = np.repeat(alpha[..., np.newaxis], 3, axis=2)
                 return make_preview_png(alpha_rgb)
 
-            preview_entry = _get_stable_video_preview_entry(
-                chroma_preview_store,
-                input_path,
-                "video_generated",
-                create_preview_png,
-                samples=request.samples,
-                params=params_data,
-                view_mode=request.view_mode,
-                timestamp_seconds=timestamp_seconds,
+            _metadata, timestamp_seconds, preview_entry = (
+                _get_stable_video_preview_entry(
+                    chroma_preview_store,
+                    input_path,
+                    "video_generated",
+                    decoder,
+                    request.timestamp_seconds,
+                    decoder.read_preview_frame,
+                    create_preview_png,
+                    samples=request.samples,
+                    params=params_data,
+                    view_mode=request.view_mode,
+                )
             )
         except KeyerError as exc:
             raise _chroma_video_error_response(exc) from exc
