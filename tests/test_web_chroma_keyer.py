@@ -3,6 +3,7 @@ import json
 from hashlib import sha256
 from io import BytesIO
 from math import inf, nan
+from os import path as os_path
 from os import utime
 from pathlib import Path
 from queue import Empty
@@ -12,7 +13,7 @@ from uuid import UUID
 import numpy as np
 from fastapi.testclient import TestClient
 from PIL import Image
-from pytest import mark, raises
+from pytest import mark, raises, skip
 
 from designtoolkit.chroma_keyer.despill import despill
 from designtoolkit.chroma_keyer.image_io import (
@@ -895,6 +896,80 @@ def test_chroma_video_keyer_endpoint_rejects_existing_final_dir_before_reserving
             "message": "Final output directory already exists",
         }
     }
+
+
+def test_chroma_video_keyer_endpoint_rejects_dangling_final_symlink_before_reserving(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    input_path = tmp_path / "clip.mp4"
+    input_path.write_bytes(b"fake video source")
+    final_dir = tmp_path / "clip_keyed_frames"
+    try:
+        final_dir.symlink_to(tmp_path / "missing-target", target_is_directory=True)
+    except OSError as error:
+        if getattr(error, "winerror", None) == 1314:
+            skip(f"directory symlink privilege is unavailable: {error}")
+        raise
+    task_manager = TaskManager(log_store=LogStore(), run_async=False)
+
+    def fail_reservation(**_kwargs):
+        raise AssertionError("occupied output must be rejected before reservation")
+
+    monkeypatch.setattr(task_manager, "reserve_task", fail_reservation)
+    client = TestClient(
+        create_app(
+            task_manager=task_manager,
+            local_path_roots=[tmp_path],
+            video_decoder=FakeVideoDecoder(),
+        )
+    )
+
+    response = client.post(
+        "/api/tasks/chroma-keyer-video",
+        json={
+            "input_path": str(input_path),
+            "samples": [[42, 180, 72]],
+            "params": {},
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "error": {
+            "code": "output_exists",
+            "message": "Final output directory already exists",
+        }
+    }
+
+
+def test_chroma_video_keyer_task_uses_lexists_before_reserving(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    input_path = tmp_path / "clip.mp4"
+    final_dir = tmp_path / "clip_keyed_frames"
+    task_manager = TaskManager(log_store=LogStore(), run_async=False)
+
+    monkeypatch.setattr(
+        os_path,
+        "lexists",
+        lambda path: Path(path) == final_dir,
+    )
+
+    def fail_reservation(**_kwargs):
+        raise AssertionError("occupied output must be rejected before reservation")
+
+    monkeypatch.setattr(task_manager, "reserve_task", fail_reservation)
+
+    with raises(KeyerError, match="Final output directory already exists"):
+        task_manager.create_chroma_video_keyer_task(
+            ChromaVideoKeyerTaskRequest(
+                input_path=str(input_path),
+                samples=[[42, 180, 72]],
+                params={},
+            )
+        )
 
 
 def test_chroma_video_keyer_task_throttles_monotonic_progress_and_logs_actuals(

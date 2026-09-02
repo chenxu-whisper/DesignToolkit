@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -251,7 +252,7 @@ class TaskManager:
         if not output_root.exists() or not output_root.is_dir():
             raise KeyerError("Output root must exist and be a directory")
         output_dir = output_root / f"{options.input_path.stem}_keyed_frames"
-        if output_dir.exists():
+        if os.path.lexists(output_dir):
             raise KeyerError("Final output directory already exists")
         task = self.reserve_task(
             kind=TaskKind.CHROMA_KEYER,

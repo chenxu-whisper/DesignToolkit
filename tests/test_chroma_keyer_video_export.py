@@ -342,7 +342,7 @@ def test_default_output_root_is_input_parent(tmp_path: Path) -> None:
     assert stream.closed
 
 
-def test_success_removes_ownership_marker(tmp_path: Path) -> None:
+def test_success_does_not_publish_ownership_marker(tmp_path: Path) -> None:
     input_path = make_input(tmp_path)
 
     result = key_video_to_png_sequence(
@@ -355,33 +355,6 @@ def test_success_removes_ownership_marker(tmp_path: Path) -> None:
     assert not (
         result.output_dir / ".designtoolkit-video-export-owner"
     ).exists()
-
-
-def test_marker_removal_failure_cleans_owned_published_directory(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    input_path = make_input(tmp_path)
-    stream = TrackedStream(frames()[:1])
-    original_unlink = Path.unlink
-
-    def fail_marker_unlink(path: Path, *args: object, **kwargs: object) -> None:
-        if path.name == ".designtoolkit-video-export-owner":
-            raise PermissionError("marker is busy")
-        original_unlink(path, *args, **kwargs)
-
-    monkeypatch.setattr(Path, "unlink", fail_marker_unlink)
-
-    with pytest.raises(KeyerError, match="Video PNG sequence export failed") as error:
-        key_video_to_png_sequence(
-            VideoKeyOptions(input_path=input_path),
-            FakeDecoder(stream),
-            screen_model(),
-            KeyerParams(),
-        )
-
-    assert isinstance(error.value.__cause__, PermissionError)
-    assert_failed_export_is_clean(tmp_path, stream)
 
 
 @pytest.mark.parametrize(
@@ -695,22 +668,23 @@ def test_manifest_writer_failure_cleans_temporary_output(
     assert_failed_export_is_clean(tmp_path, stream)
 
 
-def test_partial_final_rename_failure_removes_published_directory(
+def test_publish_failure_cleans_temporary_directory(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     input_path = make_input(tmp_path)
     stream = TrackedStream(frames())
-    original_publish = video_export._publish_directory_no_replace
+    temporary_dir: Path | None = None
 
-    def publish_then_fail(source: Path, target: Path) -> None:
-        original_publish(source, target)
-        raise OSError("rename completion was not reported")
+    def fail_publish(source: Path, _target: Path) -> None:
+        nonlocal temporary_dir
+        temporary_dir = source
+        raise OSError("publish failed")
 
     monkeypatch.setattr(
         video_export,
         "_publish_directory_no_replace",
-        publish_then_fail,
+        fail_publish,
     )
 
     with pytest.raises(KeyerError, match="Video PNG sequence export failed") as error:
@@ -722,14 +696,96 @@ def test_partial_final_rename_failure_removes_published_directory(
         )
 
     assert isinstance(error.value.__cause__, OSError)
+    assert temporary_dir is not None
+    assert not temporary_dir.exists()
     assert_failed_export_is_clean(tmp_path, stream)
 
 
-@pytest.mark.parametrize("marker_contents", [None, "another-export"])
-def test_rename_failure_does_not_remove_unowned_final_directory(
+def test_successful_publish_never_touches_replaced_destination(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    marker_contents: str | None,
+) -> None:
+    input_path = make_input(tmp_path)
+    stream = TrackedStream(frames()[:1])
+    final_dir = tmp_path / "clip_keyed_frames"
+    displaced_dir = tmp_path / "displaced-export"
+    foreign_dir = tmp_path / "foreign-directory"
+    foreign_file = foreign_dir / "unrelated.txt"
+    foreign_dir.mkdir()
+    foreign_file.write_text("keep me", encoding="utf-8")
+    foreign_identity = foreign_dir.stat()
+    original_publish = video_export._publish_directory_no_replace
+
+    def publish_then_replace_destination(
+        source: Path,
+        destination: Path,
+    ) -> None:
+        original_publish(source, destination)
+        destination.rename(displaced_dir)
+        foreign_dir.rename(destination)
+        video_export.rmtree(displaced_dir)
+
+    monkeypatch.setattr(
+        video_export,
+        "_publish_directory_no_replace",
+        publish_then_replace_destination,
+    )
+
+    result = key_video_to_png_sequence(
+        VideoKeyOptions(input_path=input_path),
+        FakeDecoder(stream),
+        screen_model(),
+        KeyerParams(),
+    )
+
+    final_identity = final_dir.stat()
+    assert result.output_dir == final_dir
+    assert result.manifest_path == final_dir / "manifest.json"
+    assert (final_identity.st_dev, final_identity.st_ino) == (
+        foreign_identity.st_dev,
+        foreign_identity.st_ino,
+    )
+    final_foreign_file = final_dir / foreign_file.name
+    assert final_foreign_file.read_text(encoding="utf-8") == "keep me"
+    assert list(final_dir.iterdir()) == [final_foreign_file]
+    assert temporary_directories(tmp_path) == []
+    assert stream.closed
+
+
+def test_result_is_prepared_before_successful_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_path = make_input(tmp_path)
+    expected_result = object()
+    events: list[str] = []
+    original_publish = video_export._publish_directory_no_replace
+
+    def build_result(**_kwargs: object) -> object:
+        events.append("result")
+        return expected_result
+
+    def publish(source: Path, destination: Path) -> None:
+        events.append("publish")
+        original_publish(source, destination)
+
+    monkeypatch.setattr(video_export, "VideoKeyResult", build_result)
+    monkeypatch.setattr(video_export, "_publish_directory_no_replace", publish)
+
+    result = key_video_to_png_sequence(
+        VideoKeyOptions(input_path=input_path),
+        FakeDecoder(TrackedStream(frames()[:1])),
+        screen_model(),
+        KeyerParams(),
+    )
+
+    assert result is expected_result
+    assert events == ["result", "publish"]
+
+
+def test_publish_failure_does_not_remove_foreign_final_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     input_path = make_input(tmp_path)
     stream = TrackedStream(frames())
@@ -738,11 +794,6 @@ def test_rename_failure_does_not_remove_unowned_final_directory(
         video_export.rmtree(source)
         target.mkdir()
         (target / "unrelated.txt").write_text("keep me", encoding="utf-8")
-        if marker_contents is not None:
-            (target / ".designtoolkit-video-export-owner").write_text(
-                marker_contents,
-                encoding="ascii",
-            )
         raise OSError("rename raced with another publisher")
 
     monkeypatch.setattr(
