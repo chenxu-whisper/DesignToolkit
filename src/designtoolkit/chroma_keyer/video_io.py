@@ -180,8 +180,15 @@ class ImageioVideoDecoder:
         finally:
             _close_frames(frames)
 
-    def read_frame(self, path: Path, timestamp_seconds: float) -> np.ndarray:
-        metadata = self.probe(path)
+    def read_frame(
+        self,
+        path: Path,
+        timestamp_seconds: float,
+        *,
+        metadata: VideoMetadata | None = None,
+    ) -> np.ndarray:
+        if metadata is None:
+            metadata = self.probe(path)
         timestamp = clamp_timeline_timestamp(
             validate_timestamp(timestamp_seconds, metadata),
             metadata,
@@ -211,8 +218,16 @@ class ImageioVideoDecoder:
         self,
         path: Path,
         timestamp_seconds: float,
+        *,
+        metadata: VideoMetadata | None = None,
     ) -> np.ndarray:
-        return resize_preview_rgb(self.read_frame(path, timestamp_seconds))
+        return resize_preview_rgb(
+            self.read_frame(
+                path,
+                timestamp_seconds,
+                metadata=metadata,
+            )
+        )
 
     def iter_frames(
         self,

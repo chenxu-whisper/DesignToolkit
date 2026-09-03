@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
+from functools import lru_cache
 from hashlib import sha256
 from io import BytesIO
+from os import stat_result
 from pathlib import Path
 from queue import Empty
 from stat import S_ISREG
@@ -79,6 +83,8 @@ _INVALID_REQUEST_ERRORS = (ValueError, VideoFrameError, MediaResizeError)
 _TERMINAL_PHASES = (LogPhase.COMPLETED, LogPhase.FAILED)
 _CHROMA_SNAPSHOT_READ_ATTEMPTS = 3
 _CHROMA_VIDEO_HASH_CHUNK_SIZE = 1024 * 1024
+_CHROMA_VIDEO_HASH_CACHE_SIZE = 32
+_CHROMA_VIDEO_METADATA_CACHE_SIZE = 32
 _KEYER_ERROR_CODES = {
     "Input image could not be read": "invalid_image",
     "samples must not be empty": "missing_samples",
@@ -193,7 +199,91 @@ def _hash_file_chunks(input_path: Path) -> tuple[int, str]:
     return size, content_hash.hexdigest()
 
 
-def _video_source_fingerprint(input_path: Path) -> dict[str, str | int]:
+def _windows_change_time_ns(input_path: Path) -> int:
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    class FileBasicInfo(ctypes.Structure):
+        _fields_ = [
+            ("creation_time", ctypes.c_longlong),
+            ("last_access_time", ctypes.c_longlong),
+            ("last_write_time", ctypes.c_longlong),
+            ("change_time", ctypes.c_longlong),
+            ("file_attributes", wintypes.DWORD),
+        ]
+
+    get_file_information = ctypes.WinDLL(
+        "kernel32",
+        use_last_error=True,
+    ).GetFileInformationByHandleEx
+    get_file_information.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+    ]
+    get_file_information.restype = wintypes.BOOL
+
+    file_descriptor = os.open(input_path, os.O_RDONLY | os.O_BINARY)
+    try:
+        file_info = FileBasicInfo()
+        if not get_file_information(
+            msvcrt.get_osfhandle(file_descriptor),
+            0,
+            ctypes.byref(file_info),
+            ctypes.sizeof(file_info),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return int(file_info.change_time) * 100
+    finally:
+        os.close(file_descriptor)
+
+
+def _source_change_time_ns(
+    input_path: Path,
+    source_stat: stat_result,
+) -> int:
+    if os.name == "nt":
+        return _windows_change_time_ns(input_path)
+    return source_stat.st_ctime_ns
+
+
+def _video_source_version(
+    input_path: Path,
+    source_stat: stat_result,
+) -> tuple[int, int, int, int, int, int]:
+    try:
+        change_time_ns = _source_change_time_ns(input_path, source_stat)
+    except FileNotFoundError as exc:
+        raise KeyerError("Input path does not exist") from exc
+    except OSError as exc:
+        raise KeyerError("Video could not be opened") from exc
+    return (
+        source_stat.st_dev,
+        source_stat.st_ino,
+        source_stat.st_ctime_ns,
+        change_time_ns,
+        source_stat.st_mtime_ns,
+        source_stat.st_size,
+    )
+
+
+@lru_cache(maxsize=_CHROMA_VIDEO_HASH_CACHE_SIZE)
+def _cached_video_content_hash(
+    resolved_path: Path,
+    source_version: tuple[int, int, int, int, int, int],
+) -> tuple[int, str]:
+    return _hash_file_chunks(resolved_path)
+
+
+@dataclass(frozen=True)
+class _VideoSourceSnapshot:
+    fingerprint: dict[str, str | int]
+    version: tuple[int, int, int, int, int, int]
+
+
+def _video_source_snapshot(input_path: Path) -> _VideoSourceSnapshot:
     try:
         resolved_path = input_path.resolve(strict=True)
     except FileNotFoundError as exc:
@@ -206,8 +296,12 @@ def _video_source_fingerprint(input_path: Path) -> dict[str, str | int]:
             resolved_path,
             read_error_message="Video could not be opened",
         )
+        source_version = _video_source_version(resolved_path, before_read)
         try:
-            size, content_sha256 = _hash_file_chunks(resolved_path)
+            size, content_sha256 = _cached_video_content_hash(
+                resolved_path,
+                source_version,
+            )
         except FileNotFoundError as exc:
             raise KeyerError("Input path does not exist") from exc
         except OSError as exc:
@@ -216,14 +310,22 @@ def _video_source_fingerprint(input_path: Path) -> dict[str, str | int]:
             resolved_path,
             read_error_message="Video could not be opened",
         )
-        if _source_version(before_read) == _source_version(after_read):
-            return {
-                "path": str(resolved_path),
-                "mtime_ns": after_read.st_mtime_ns,
-                "size": size,
-                "content_sha256": content_sha256,
-            }
+        after_version = _video_source_version(resolved_path, after_read)
+        if source_version == after_version:
+            return _VideoSourceSnapshot(
+                fingerprint={
+                    "path": str(resolved_path),
+                    "mtime_ns": after_read.st_mtime_ns,
+                    "size": size,
+                    "content_sha256": content_sha256,
+                },
+                version=after_version,
+            )
     raise KeyerError("Input video changed while it was being read")
+
+
+def _video_source_fingerprint(input_path: Path) -> dict[str, str | int]:
+    return _video_source_snapshot(input_path).fingerprint
 
 
 def _chroma_preview_cache_key(
@@ -272,24 +374,31 @@ def _resolve_video_timestamp(
 
 def _read_stable_video_frame(
     input_path: Path,
-    decoder: VideoDecoder,
     requested_timestamp: float,
-    read_frame: Callable[[Path, float], np.ndarray],
+    get_metadata: Callable[
+        [Path, _VideoSourceSnapshot],
+        VideoMetadata,
+    ],
+    read_frame: Callable[..., np.ndarray],
 ) -> tuple[VideoMetadata, float, np.ndarray]:
     for _ in range(_CHROMA_SNAPSHOT_READ_ATTEMPTS):
-        source_fingerprint = _video_source_fingerprint(input_path)
+        source_snapshot = _video_source_snapshot(input_path)
         try:
-            metadata = decoder.probe(input_path)
+            metadata = get_metadata(input_path, source_snapshot)
             timestamp_seconds = _resolve_video_timestamp(
                 requested_timestamp,
                 metadata,
             )
-            rgb = read_frame(input_path, timestamp_seconds)
+            rgb = read_frame(
+                input_path,
+                timestamp_seconds,
+                metadata=metadata,
+            )
         except KeyerError:
-            if _video_source_fingerprint(input_path) != source_fingerprint:
+            if _video_source_snapshot(input_path) != source_snapshot:
                 continue
             raise
-        if _video_source_fingerprint(input_path) == source_fingerprint:
+        if _video_source_snapshot(input_path) == source_snapshot:
             return metadata, timestamp_seconds, rgb
     raise KeyerError("Input video changed while it was being read")
 
@@ -298,9 +407,12 @@ def _get_stable_video_preview_entry(
     store: ChromaPreviewStore,
     input_path: Path,
     preview_kind: str,
-    decoder: VideoDecoder,
     requested_timestamp: float,
-    read_frame: Callable[[Path, float], np.ndarray],
+    get_metadata: Callable[
+        [Path, _VideoSourceSnapshot],
+        VideoMetadata,
+    ],
+    read_frame: Callable[..., np.ndarray],
     create_png_bytes: Callable[[np.ndarray], bytes],
     *,
     samples: list[list[int]] | None = None,
@@ -308,16 +420,16 @@ def _get_stable_video_preview_entry(
     view_mode: ChromaViewMode | None = None,
 ) -> tuple[VideoMetadata, float, ChromaPreviewEntry]:
     for _ in range(_CHROMA_SNAPSHOT_READ_ATTEMPTS):
-        source_fingerprint = _video_source_fingerprint(input_path)
+        source_snapshot = _video_source_snapshot(input_path)
         try:
-            metadata = decoder.probe(input_path)
+            metadata = get_metadata(input_path, source_snapshot)
             timestamp_seconds = _resolve_video_timestamp(
                 requested_timestamp,
                 metadata,
             )
             cache_key = _chroma_preview_cache_key(
                 preview_kind,
-                source_fingerprint,
+                source_snapshot.fingerprint,
                 samples=samples,
                 params=params,
                 view_mode=view_mode,
@@ -327,13 +439,18 @@ def _get_stable_video_preview_entry(
 
             def create_stable_preview(
                 expected_timestamp: float = timestamp_seconds,
-                expected_fingerprint: dict[str, str | int] = source_fingerprint,
+                expected_snapshot: _VideoSourceSnapshot = source_snapshot,
+                expected_metadata: VideoMetadata = metadata,
             ) -> bytes:
                 nonlocal generated
                 generated = True
-                rgb = read_frame(input_path, expected_timestamp)
+                rgb = read_frame(
+                    input_path,
+                    expected_timestamp,
+                    metadata=expected_metadata,
+                )
                 png_bytes = create_png_bytes(rgb)
-                if _video_source_fingerprint(input_path) != expected_fingerprint:
+                if _video_source_snapshot(input_path) != expected_snapshot:
                     raise _VideoSourceChangedError
                 return png_bytes
 
@@ -344,13 +461,10 @@ def _get_stable_video_preview_entry(
         except _VideoSourceChangedError:
             continue
         except KeyerError:
-            if _video_source_fingerprint(input_path) != source_fingerprint:
+            if _video_source_snapshot(input_path) != source_snapshot:
                 continue
             raise
-        if (
-            generated
-            or _video_source_fingerprint(input_path) == source_fingerprint
-        ):
+        if generated or _video_source_snapshot(input_path) == source_snapshot:
             return metadata, timestamp_seconds, preview_entry
     raise KeyerError("Input video changed while it was being read")
 
@@ -379,6 +493,24 @@ def create_router(
     picker = local_path_picker or TkinterLocalPathPicker()
     decoder = video_decoder if video_decoder is not None else ImageioVideoDecoder()
     chroma_preview_store = ChromaPreviewStore()
+
+    @lru_cache(maxsize=_CHROMA_VIDEO_METADATA_CACHE_SIZE)
+    def get_cached_video_metadata(
+        input_path: Path,
+        _fingerprint_items: tuple[tuple[str, str | int], ...],
+        _source_version: tuple[int, int, int, int, int, int],
+    ) -> VideoMetadata:
+        return decoder.probe(input_path)
+
+    def get_video_metadata(
+        input_path: Path,
+        source_snapshot: _VideoSourceSnapshot,
+    ) -> VideoMetadata:
+        return get_cached_video_metadata(
+            input_path,
+            tuple(sorted(source_snapshot.fingerprint.items())),
+            source_snapshot.version,
+        )
 
     @router.get("/health")
     def health() -> dict[str, str]:
@@ -536,8 +668,8 @@ def create_router(
                     chroma_preview_store,
                     input_path,
                     "video_inspect",
-                    decoder,
                     0.0,
+                    get_video_metadata,
                     decoder.read_preview_frame,
                     make_preview_png,
                 )
@@ -574,8 +706,8 @@ def create_router(
                     chroma_preview_store,
                     input_path,
                     "video_frame",
-                    decoder,
                     request.timestamp_seconds,
+                    get_video_metadata,
                     decoder.read_preview_frame,
                     make_preview_png,
                 )
@@ -599,8 +731,8 @@ def create_router(
             input_path = Path(request.input_path)
             metadata, timestamp_seconds, rgb = _read_stable_video_frame(
                 input_path,
-                decoder,
                 request.timestamp_seconds,
+                get_video_metadata,
                 decoder.read_frame,
             )
         except KeyerError as exc:
@@ -659,8 +791,8 @@ def create_router(
                     chroma_preview_store,
                     input_path,
                     "video_generated",
-                    decoder,
                     request.timestamp_seconds,
+                    get_video_metadata,
                     decoder.read_preview_frame,
                     create_preview_png,
                     samples=request.samples,

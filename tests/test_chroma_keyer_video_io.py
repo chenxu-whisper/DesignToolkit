@@ -10,6 +10,7 @@ from pytest import raises
 
 from designtoolkit.chroma_keyer.models import KeyerError
 from designtoolkit.chroma_keyer.video_io import ImageioVideoDecoder
+from designtoolkit.chroma_keyer.video_models import VideoMetadata
 from designtoolkit.video_frames.ffmpeg_backend import FfmpegBackend
 
 VALID_METADATA = {
@@ -237,6 +238,60 @@ def test_read_frame_seeks_once_and_returns_writable_rgb_copy(tmp_path: Path) -> 
         },
     )
     assert all(generator.closed for generator in read_frames.generators)
+
+
+def test_read_frame_uses_preprobed_metadata_without_second_ffmpeg_probe(
+    tmp_path: Path,
+) -> None:
+    path = make_video_path(tmp_path)
+    metadata = VideoMetadata(
+        width=4,
+        height=2,
+        fps=25.0,
+        duration_seconds=2.0,
+        estimated_frame_count=50,
+        codec="h264",
+    )
+    read_frames = FakeReadFrames([dict(VALID_METADATA), FRAME_BYTES])
+
+    frame = make_decoder(read_frames).read_frame(
+        path,
+        1.99,
+        metadata=metadata,
+    )
+
+    assert frame.shape == (2, 4, 3)
+    assert read_frames.calls == [
+        (
+            path,
+            {
+                "pix_fmt": "rgb24",
+                "input_params": ["-ss", "1.96"],
+                "output_params": ["-frames:v", "1"],
+            },
+        )
+    ]
+    assert read_frames.generators[0].closed
+
+
+def test_read_frame_rejects_invalid_timestamp_before_open_with_preprobed_metadata(
+    tmp_path: Path,
+) -> None:
+    path = make_video_path(tmp_path)
+    metadata = VideoMetadata(
+        width=4,
+        height=2,
+        fps=25.0,
+        duration_seconds=2.0,
+        estimated_frame_count=50,
+        codec="h264",
+    )
+    read_frames = FakeReadFrames()
+
+    with raises(KeyerError, match="timestamp"):
+        make_decoder(read_frames).read_frame(path, 2.0, metadata=metadata)
+
+    assert read_frames.calls == []
 
 
 def test_preview_uses_identical_seek_and_bounds_large_frame(

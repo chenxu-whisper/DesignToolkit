@@ -238,11 +238,13 @@ def test_video_decoder_protocol_declares_required_methods() -> None:
         "self",
         "path",
         "timestamp_seconds",
+        "metadata",
     ]
     assert list(signature(VideoDecoder.read_preview_frame).parameters) == [
         "self",
         "path",
         "timestamp_seconds",
+        "metadata",
     ]
     assert list(signature(VideoDecoder.iter_frames).parameters) == [
         "self",
@@ -273,11 +275,13 @@ def test_protocol_annotations_include_numpy_frames_and_iterator_result() -> None
     assert VideoDecoder.read_frame.__annotations__ == {
         "path": Path,
         "timestamp_seconds": float,
+        "metadata": VideoMetadata | None,
         "return": np.ndarray,
     }
     assert VideoDecoder.read_preview_frame.__annotations__ == {
         "path": Path,
         "timestamp_seconds": float,
+        "metadata": VideoMetadata | None,
         "return": np.ndarray,
     }
     assert VideoDecoder.iter_frames.__annotations__["path"] is Path
