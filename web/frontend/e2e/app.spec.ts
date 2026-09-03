@@ -743,7 +743,7 @@ test('keeps the loaded video editor within desktop and 390px mobile layouts', as
   await installVideoPreviewRoutes(page)
 
   for (const viewport of [
-    { width: 1440, height: 900 },
+    { width: 1026, height: 900 },
     { width: 390, height: 844 },
   ]) {
     await page.setViewportSize(viewport)
@@ -759,12 +759,15 @@ test('keeps the loaded video editor within desktop and 390px mobile layouts', as
       const form = editor.querySelector<HTMLElement>('.chroma-keyer-form')
       const timeline = editor.querySelector<HTMLElement>('.chroma-video-timeline')
       const metadata = editor.querySelector<HTMLElement>('.chroma-video-metadata')
-      if (!main || !form || !timeline || !metadata) {
+      const parameterHeaders = Array.from(
+        editor.querySelectorAll<HTMLElement>('.chroma-parameter-header'),
+      )
+      if (!main || !form || !timeline || !metadata || parameterHeaders.length !== 7) {
         throw new Error('Expected loaded video editor geometry')
       }
       const toBox = (element: HTMLElement) => {
-        const { bottom, left, right, top } = element.getBoundingClientRect()
-        return { bottom, left, right, top }
+        const { bottom, height, left, right, top, width } = element.getBoundingClientRect()
+        return { bottom, height, left, right, top, width }
       }
       return {
         bodyClientWidth: document.body.clientWidth,
@@ -774,6 +777,26 @@ test('keeps the loaded video editor within desktop and 390px mobile layouts', as
         form: toBox(form),
         main: toBox(main),
         metadata: toBox(metadata),
+        parameters: parameterHeaders.map((header) => {
+          const card = header.closest<HTMLElement>('.chroma-parameter-field')
+          const label = header.querySelector<HTMLElement>('.field-label')
+          const number = header.querySelector<HTMLElement>('.chroma-parameter-number')
+          if (!card || !label || !number) {
+            throw new Error('Expected Chroma parameter label and numeric input')
+          }
+          const style = getComputedStyle(label)
+          return {
+            card: toBox(card),
+            header: toBox(header),
+            label: toBox(label),
+            labelClientWidth: label.clientWidth,
+            labelScrollWidth: label.scrollWidth,
+            name: label.textContent?.trim() ?? '',
+            number: toBox(number),
+            textOverflow: style.textOverflow,
+            whiteSpace: style.whiteSpace,
+          }
+        }),
         timeline: toBox(timeline),
       }
     })
@@ -784,6 +807,22 @@ test('keeps the loaded video editor within desktop and 390px mobile layouts', as
     expect(layout.timeline.right).toBeLessThanOrEqual(layout.main.right + 0.5)
     expect(layout.metadata.left).toBeGreaterThanOrEqual(layout.main.left - 0.5)
     expect(layout.metadata.right).toBeLessThanOrEqual(layout.main.right + 0.5)
+    expect(layout.parameters.map(({ name }) => name)).toEqual(chromaParameterNames)
+    for (const parameter of layout.parameters) {
+      expect(parameter.labelScrollWidth).toBeLessThanOrEqual(parameter.labelClientWidth + 1)
+      expect(parameter.textOverflow).not.toBe('ellipsis')
+      expect(parameter.whiteSpace).not.toBe('nowrap')
+      expect(parameter.header.height).toBeCloseTo(34, 0)
+      expect(parameter.number.width).toBeCloseTo(76, 0)
+      expect(parameter.label.left).toBeGreaterThanOrEqual(parameter.header.left - 0.5)
+      expect(parameter.label.right).toBeLessThanOrEqual(parameter.header.right + 0.5)
+      expect(parameter.label.top).toBeGreaterThanOrEqual(parameter.header.top - 0.5)
+      expect(parameter.label.bottom).toBeLessThanOrEqual(parameter.header.bottom + 0.5)
+      expect(parameter.label.left).toBeGreaterThanOrEqual(parameter.card.left - 0.5)
+      expect(parameter.label.right).toBeLessThanOrEqual(parameter.card.right + 0.5)
+      expect(parameter.label.top).toBeGreaterThanOrEqual(parameter.card.top - 0.5)
+      expect(parameter.label.bottom).toBeLessThanOrEqual(parameter.card.bottom + 0.5)
+    }
     if (viewport.width === 390) {
       expect(layout.main.bottom).toBeLessThanOrEqual(layout.form.top + 0.5)
     } else {

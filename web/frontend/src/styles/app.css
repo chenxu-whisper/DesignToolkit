@@ -675,9 +675,9 @@ button {
 }
 
 .chroma-parameter-header .field-label {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  line-height: 14px;
+  overflow-wrap: anywhere;
+  white-space: normal;
 }
 
 .chroma-parameter-header .field-label,
