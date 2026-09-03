@@ -21,6 +21,7 @@ import { ChromaKeyerCanvas, type ChromaCanvasSample } from './ChromaKeyerCanvas'
 import { createChromaKeyerDefaultValues } from './chromaKeyerDefaults'
 import { ChromaKeyerForm } from './ChromaKeyerForm'
 import { ChromaVideoTimeline, getLastVideoFrameTime } from './ChromaVideoTimeline'
+import { useChromaVideoPlayback } from './useChromaVideoPlayback'
 import {
   isVideoPath,
   validateChromaKeyerValues,
@@ -60,7 +61,6 @@ const previewParameterFields = [
 
 const keyedPreviewFields = ['samples', ...previewParameterFields] as const
 const videoTimestampErrorId = 'chroma-video-timestamp-error'
-const noOp = () => {}
 
 function toBasePayload(values: ChromaKeyerValues): Omit<ChromaKeyerPayload, 'outputPath'> {
   if (values.samples.length !== 1) {
@@ -123,6 +123,7 @@ export function ChromaKeyerPage() {
   const previewSequenceRef = useRef(0)
   const renderedTimestampRef = useRef<number | null>(null)
   const seekTimeoutRef = useRef<number | null>(null)
+  const pausePlaybackRef = useRef<(synchronize?: boolean) => boolean>(() => false)
   const lastViewModeRef = useRef(values.viewMode)
   const mediaRef = useRef(media)
   const valuesRef = useRef(values)
@@ -133,6 +134,17 @@ export function ChromaKeyerPage() {
   const keyedVideoSeekInvalid = media?.kind === 'video'
     && values.samples.length > 0
     && !areKeyedPreviewInputsValid(values)
+  const videoTransportAvailable = media?.kind === 'video'
+    && Number.isFinite(media.durationSeconds)
+    && media.durationSeconds > 0
+    && Number.isFinite(media.fps)
+    && media.fps > 0
+  const canPlayVideo = Boolean(
+    videoTransportAvailable
+    && !disabled
+    && inspectingPathRef.current === null
+    && !keyedVideoSeekInvalid,
+  )
   const videoPreviewOutOfDate = media?.kind === 'video'
     && renderedTimestampSeconds !== values.timestampSeconds
   const showOutcome = kind === 'chroma_keyer' || kind === null
@@ -153,8 +165,10 @@ export function ChromaKeyerPage() {
   }
 
   const updateValues = (nextValues: ChromaKeyerValues) => {
-    const didChangePath = nextValues.inputPath !== values.inputPath
+    const currentValues = valuesRef.current
+    const didChangePath = nextValues.inputPath !== currentValues.inputPath
     if (didChangePath) {
+      pausePlaybackRef.current(false)
       invalidateRequests()
       if (seekTimeoutRef.current !== null) {
         window.clearTimeout(seekTimeoutRef.current)
@@ -177,9 +191,25 @@ export function ChromaKeyerPage() {
       setErrors({})
       return
     }
-    valuesRef.current = nextValues
-    setValues(nextValues)
-    const validationErrors = validateChromaKeyerValues(nextValues)
+    const didChangePlaybackInput = (
+      nextValues.samples !== currentValues.samples
+      || nextValues.viewMode !== currentValues.viewMode
+      || previewParameterFields.some(
+        (field) => nextValues[field] !== currentValues[field],
+      )
+    )
+    const didPausePlayback = didChangePlaybackInput
+      ? pausePlaybackRef.current()
+      : false
+    const resolvedNextValues = (
+      didPausePlayback
+      && renderedTimestampRef.current !== null
+    )
+      ? { ...nextValues, timestampSeconds: renderedTimestampRef.current }
+      : nextValues
+    valuesRef.current = resolvedNextValues
+    setValues(resolvedNextValues)
+    const validationErrors = validateChromaKeyerValues(resolvedNextValues)
     setErrors((current) => {
       const nextErrors = { ...current }
       for (const field of previewParameterFields) {
@@ -189,7 +219,7 @@ export function ChromaKeyerPage() {
     })
   }
 
-  const synchronizeRenderedVideoTimestamp = (
+  const setRenderedVideoTimestamp = (
     video: InspectedVideo,
     timestampSeconds: number,
   ) => {
@@ -199,6 +229,14 @@ export function ChromaKeyerPage() {
     )
     renderedTimestampRef.current = resolvedTimestamp
     setRenderedTimestampSeconds(resolvedTimestamp)
+    return resolvedTimestamp
+  }
+
+  const synchronizeRenderedVideoTimestamp = (
+    video: InspectedVideo,
+    timestampSeconds: number,
+  ) => {
+    const resolvedTimestamp = setRenderedVideoTimestamp(video, timestampSeconds)
     setValues((current) => {
       const resolvedValues = { ...current, timestampSeconds: resolvedTimestamp }
       valuesRef.current = resolvedValues
@@ -216,6 +254,87 @@ export function ChromaKeyerPage() {
       valuesRef.current = rolledBackValues
       return rolledBackValues
     })
+  }
+
+  const requestPlaybackFrame = async (timestampSeconds: number) => {
+    const playbackMedia = mediaRef.current
+    const playbackValues = valuesRef.current
+    if (!playbackMedia || playbackMedia.kind !== 'video') {
+      throw new Error('视频未加载')
+    }
+
+    const response = playbackValues.samples.length === 1
+      ? await createChromaVideoPreview({
+          ...toBasePayload(playbackValues),
+          timestampSeconds,
+          viewMode: playbackValues.viewMode,
+        })
+      : await createChromaVideoFrame({
+          inputPath: playbackMedia.inputPath,
+          timestampSeconds,
+        })
+
+    return {
+      previewUrl: response.preview_url,
+      timestampSeconds: response.timestamp_seconds,
+    }
+  }
+
+  const playback = useChromaVideoPlayback({
+    canPlay: canPlayVideo,
+    durationSeconds: media?.kind === 'video' ? media.durationSeconds : 0,
+    fps: media?.kind === 'video' ? media.fps : 0,
+    renderedTimestampSeconds,
+    requestFrame: requestPlaybackFrame,
+    onError: (error) => {
+      setErrors((current) => ({
+        ...current,
+        timestampSeconds: error instanceof Error && error.message
+          ? error.message
+          : '无法播放视频',
+      }))
+    },
+    onFrame: (frame) => {
+      const playbackMedia = mediaRef.current
+      if (!playbackMedia || playbackMedia.kind !== 'video') {
+        return
+      }
+
+      setPreviewUrl(frame.previewUrl)
+      setRenderedVideoTimestamp(playbackMedia, frame.timestampSeconds)
+      if (valuesRef.current.samples.length === 0) {
+        setMedia((current) => {
+          if (!current || current.kind !== 'video' || current.inputPath !== playbackMedia.inputPath) {
+            return current
+          }
+          const nextMedia = { ...current, previewUrl: frame.previewUrl }
+          mediaRef.current = nextMedia
+          return nextMedia
+        })
+      }
+    },
+    onPause: (timestampSeconds) => {
+      const playbackMedia = mediaRef.current
+      if (
+        playbackMedia
+        && playbackMedia.kind === 'video'
+        && timestampSeconds !== null
+      ) {
+        synchronizeRenderedVideoTimestamp(playbackMedia, timestampSeconds)
+      }
+    },
+    onTargetChange: (timestampSeconds) => {
+      setValues((current) => {
+        const nextValues = { ...current, timestampSeconds }
+        valuesRef.current = nextValues
+        return nextValues
+      })
+    },
+  })
+  pausePlaybackRef.current = (synchronize = true) => {
+    const wasPlaying = playback.isPlaying
+    playback.pause({ synchronize })
+    return wasPlaying
   }
 
   const requestPreview = async (
@@ -318,6 +437,7 @@ export function ChromaKeyerPage() {
       return
     }
 
+    playback.pause()
     const mediaKind = isVideoPath(inputPath) ? 'video' : 'image'
     const requestSequence = ++requestSequenceRef.current
     previewSequenceRef.current += 1
@@ -411,7 +531,10 @@ export function ChromaKeyerPage() {
     }
   }
 
-  const handleSeek = (timestampSeconds: number) => {
+  const requestVideoTimestamp = (
+    timestampSeconds: number,
+    delayMilliseconds: number,
+  ) => {
     const currentMedia = mediaRef.current
     const currentValues = valuesRef.current
     if (
@@ -442,7 +565,7 @@ export function ChromaKeyerPage() {
     if (seekTimeoutRef.current !== null) {
       window.clearTimeout(seekTimeoutRef.current)
     }
-    seekTimeoutRef.current = window.setTimeout(async () => {
+    const dispatchRequest = async () => {
       seekTimeoutRef.current = null
       if (requestSequence !== requestSequenceRef.current) {
         return
@@ -503,13 +626,59 @@ export function ChromaKeyerPage() {
           }))
         }
       }
-    }, 100)
+    }
+
+    if (delayMilliseconds === 0) {
+      void dispatchRequest()
+      return
+    }
+    seekTimeoutRef.current = window.setTimeout(
+      () => void dispatchRequest(),
+      delayMilliseconds,
+    )
+  }
+
+  const handleSeek = (timestampSeconds: number) => {
+    playback.pause()
+    requestVideoTimestamp(timestampSeconds, 100)
+  }
+
+  const handlePlayPause = () => {
+    if (!playback.isPlaying) {
+      if (seekTimeoutRef.current !== null) {
+        window.clearTimeout(seekTimeoutRef.current)
+        seekTimeoutRef.current = null
+      }
+      invalidateRequests()
+    }
+    playback.togglePlayback()
+  }
+
+  const handleRestart = () => {
+    playback.pause()
+    requestVideoTimestamp(0, 0)
+  }
+
+  const handleStep = (direction: -1 | 1) => {
+    const stepBase = playback.isPlaying
+      ? renderedTimestampRef.current ?? valuesRef.current.timestampSeconds
+      : valuesRef.current.timestampSeconds
+    playback.pause()
+    const currentMedia = mediaRef.current
+    if (!currentMedia || currentMedia.kind !== 'video') {
+      return
+    }
+    requestVideoTimestamp(
+      stepBase + direction / currentMedia.fps,
+      0,
+    )
   }
 
   const handleSample = async (point: { x: number; y: number; previewWidth: number; previewHeight: number }) => {
     if (!media || disabled) {
       return
     }
+    playback.pause()
 
     const renderedTimestamp = renderedTimestampRef.current
     if (
@@ -580,6 +749,7 @@ export function ChromaKeyerPage() {
   }
 
   const clearSamples = () => {
+    playback.pause()
     const currentMedia = mediaRef.current
     const requestSequence = ++requestSequenceRef.current
     previewSequenceRef.current += 1
@@ -728,13 +898,13 @@ export function ChromaKeyerPage() {
                     fps={media.fps}
                     height={media.height}
                     invalid={Boolean(errors.timestampSeconds)}
-                    isPlaying={false}
+                    isPlaying={playback.isPlaying}
                     onChange={handleSeek}
-                    onPlayPause={noOp}
-                    onRestart={noOp}
-                    onStepBackward={noOp}
-                    onStepForward={noOp}
-                    transportDisabled={true}
+                    onPlayPause={handlePlayPause}
+                    onRestart={handleRestart}
+                    onStepBackward={() => handleStep(-1)}
+                    onStepForward={() => handleStep(1)}
+                    transportDisabled={!canPlayVideo}
                     value={values.timestampSeconds}
                     width={media.width}
                   />
