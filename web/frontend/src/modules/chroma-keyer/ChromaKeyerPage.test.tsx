@@ -6,6 +6,12 @@ import { useLogStore } from '../../state/useLogStore'
 import { useTaskStore } from '../../state/useTaskStore'
 import { ChromaKeyerPage } from './ChromaKeyerPage'
 
+type PlaybackHook = typeof import('./useChromaVideoPlayback')['useChromaVideoPlayback']
+
+const playbackHookControl = vi.hoisted(() => ({
+  implementation: null as PlaybackHook | null,
+}))
+
 const pageMocks = vi.hoisted(() => ({
   createChromaKeyerTask: vi.fn(),
   createChromaPreview: vi.fn(),
@@ -38,6 +44,17 @@ vi.mock('../../services/apiClient', () => ({
   sampleChromaVideo: pageMocks.sampleChromaVideo,
 }))
 
+vi.mock('./useChromaVideoPlayback', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./useChromaVideoPlayback')>()
+  return {
+    ...actual,
+    useChromaVideoPlayback: (
+      options: Parameters<PlaybackHook>[0],
+    ) => playbackHookControl.implementation?.(options)
+      ?? actual.useChromaVideoPlayback(options),
+  }
+})
+
 const inspectResponse = {
   height: 400,
   input_path: 'E:\\media\\screen.png',
@@ -59,6 +76,16 @@ const videoInspectResponse = {
   timestamp_seconds: 0,
   width: 1920,
 }
+
+const playbackParameterCases = [
+  ['Screen Gain', 'screenGain', '1.4', 1.4],
+  ['Screen Balance', 'screenBalance', '0.35', 0.35],
+  ['Clip Black', 'clipBlack', '0.1', 0.1],
+  ['Clip White', 'clipWhite', '0.9', 0.9],
+  ['Shrink/Grow', 'shrinkGrow', '2', 2],
+  ['Feather', 'feather', '3', 3],
+  ['Despill Amount', 'despillAmount', '0.8', 0.8],
+] as const
 
 async function inspectImage() {
   const user = userEvent.setup()
@@ -93,6 +120,7 @@ async function inspectVideo() {
 }
 
 beforeEach(() => {
+  playbackHookControl.implementation = null
   pageMocks.createChromaKeyerTask.mockReset()
   pageMocks.createChromaPreview.mockReset()
   pageMocks.createChromaVideoFrame.mockReset()
@@ -1027,6 +1055,97 @@ describe('ChromaKeyerPage', () => {
     )
   })
 
+  it('pauses playback before refreshing the same video and ignores its stale response', async () => {
+    const playbackRequest = createDeferred<{ preview_url: string; timestamp_seconds: number }>()
+    const refreshRequest = createDeferred<typeof videoInspectResponse>()
+    render(<ChromaKeyerPage />)
+    await inspectVideo()
+    pageMocks.createChromaVideoFrame.mockClear()
+    pageMocks.createChromaVideoFrame.mockReturnValueOnce(playbackRequest.promise)
+    pageMocks.inspectChromaVideo.mockReturnValueOnce(refreshRequest.promise)
+    const clock = installPlaybackClock()
+
+    fireEvent.click(screen.getByRole('button', { name: '播放' }))
+    clock.runAnimationFrame(1000)
+    fireEvent.keyDown(screen.getByLabelText('输入图片或视频路径'), { key: 'Enter' })
+
+    expect(screen.getByRole('button', { name: '播放' })).toBeInTheDocument()
+    expect(screen.getByRole('slider', { name: '视频时间轴' })).toHaveValue('0')
+    await act(async () => {
+      refreshRequest.resolve({
+        ...videoInspectResponse,
+        preview_url: '/api/previews/video-refreshed.png',
+      })
+    })
+    await act(async () => {
+      playbackRequest.resolve({
+        preview_url: '/api/previews/video-stale-playback.png',
+        timestamp_seconds: 0,
+      })
+    })
+
+    expect(screen.getByRole('button', { name: '抠像预览' })).toHaveAttribute(
+      'src',
+      '/api/previews/video-refreshed.png',
+    )
+  })
+
+  it('pauses in-flight playback when switching media paths and keeps the new video state', async () => {
+    const playbackRequest = createDeferred<{ preview_url: string; timestamp_seconds: number }>()
+    const replacementInspectRequest = createDeferred<typeof videoInspectResponse>()
+    render(<ChromaKeyerPage />)
+    await inspectVideo()
+    pageMocks.createChromaVideoFrame.mockClear()
+    pageMocks.createChromaVideoFrame.mockReturnValueOnce(playbackRequest.promise)
+    pageMocks.inspectChromaVideo.mockReturnValueOnce(replacementInspectRequest.promise)
+    const clock = installPlaybackClock()
+
+    fireEvent.click(screen.getByRole('button', { name: '播放' }))
+    clock.runAnimationFrame(1000)
+    expect(screen.getByRole('slider', { name: '视频时间轴' })).toHaveValue('1')
+
+    const input = screen.getByLabelText('输入图片或视频路径')
+    fireEvent.change(input, { target: { value: 'E:\\media\\replacement.mp4' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+
+    expect(screen.queryByRole('slider', { name: '视频时间轴' })).not.toBeInTheDocument()
+    expect(pageMocks.inspectChromaVideo).toHaveBeenLastCalledWith({
+      inputPath: 'E:\\media\\replacement.mp4',
+    })
+
+    await act(async () => {
+      replacementInspectRequest.resolve({
+        ...videoInspectResponse,
+        duration_seconds: 5,
+        estimated_frame_count: 10,
+        fps: 2,
+        input_path: 'E:\\media\\replacement.mp4',
+        preview_url: '/api/previews/replacement-first.png',
+        timestamp_seconds: 1.5,
+      })
+    })
+
+    expect(screen.getByRole('button', { name: '播放' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '抠像预览' })).toHaveAttribute(
+      'src',
+      '/api/previews/replacement-first.png',
+    )
+    expect(screen.getByRole('slider', { name: '视频时间轴' })).toHaveValue('1.5')
+
+    await act(async () => {
+      playbackRequest.resolve({
+        preview_url: '/api/previews/video-stale-old-path.png',
+        timestamp_seconds: 0,
+      })
+    })
+
+    expect(screen.getByRole('button', { name: '抠像预览' })).toHaveAttribute(
+      'src',
+      '/api/previews/replacement-first.png',
+    )
+    expect(screen.getByRole('slider', { name: '视频时间轴' })).toHaveValue('1.5')
+  })
+
   it('disables and ignores seeks while a same-path video refresh is pending', async () => {
     const refreshRequest = createDeferred<typeof videoInspectResponse>()
     render(<ChromaKeyerPage />)
@@ -1265,6 +1384,135 @@ describe('ChromaKeyerPage', () => {
     expect(pageMocks.createChromaVideoFrame).toHaveBeenNthCalledWith(3, {
       inputPath: 'E:\\media\\screen.mp4',
       timestampSeconds: 0.25,
+    })
+  })
+
+  it('renders the 3-second final frame, stops at 2.75, and replays from zero', async () => {
+    const firstRequest = createDeferred<{ preview_url: string; timestamp_seconds: number }>()
+    const finalRequest = createDeferred<{ preview_url: string; timestamp_seconds: number }>()
+    const replayRequest = createDeferred<{ preview_url: string; timestamp_seconds: number }>()
+    pageMocks.inspectChromaVideo.mockResolvedValueOnce({
+      ...videoInspectResponse,
+      duration_seconds: 3,
+      estimated_frame_count: 12,
+      fps: 4,
+    })
+    render(<ChromaKeyerPage />)
+    await inspectVideo()
+    pageMocks.createChromaVideoFrame.mockClear()
+    pageMocks.createChromaVideoFrame
+      .mockReturnValueOnce(firstRequest.promise)
+      .mockReturnValueOnce(finalRequest.promise)
+      .mockReturnValueOnce(replayRequest.promise)
+    const clock = installPlaybackClock()
+
+    fireEvent.click(screen.getByRole('button', { name: '播放' }))
+    await act(async () => {
+      firstRequest.resolve({
+        preview_url: '/api/previews/video-zero.png',
+        timestamp_seconds: 0,
+      })
+    })
+    clock.runAnimationFrame(3000)
+
+    expect(pageMocks.createChromaVideoFrame).toHaveBeenNthCalledWith(2, {
+      inputPath: 'E:\\media\\screen.mp4',
+      timestampSeconds: 2.75,
+    })
+    await act(async () => {
+      finalRequest.resolve({
+        preview_url: '/api/previews/video-final-frame.png',
+        timestamp_seconds: 2.75,
+      })
+    })
+
+    expect(screen.getByRole('button', { name: '播放' })).toBeInTheDocument()
+    expect(screen.getByRole('slider', { name: '视频时间轴' })).toHaveValue('2.75')
+    expect(screen.getByRole('button', { name: '抠像预览' })).toHaveAttribute(
+      'src',
+      '/api/previews/video-final-frame.png',
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: '播放' }))
+
+    expect(pageMocks.createChromaVideoFrame).toHaveBeenNthCalledWith(3, {
+      inputPath: 'E:\\media\\screen.mp4',
+      timestampSeconds: 0,
+    })
+    expect(screen.getByRole('slider', { name: '视频时间轴' })).toHaveValue('0')
+    await act(async () => {
+      replayRequest.resolve({
+        preview_url: '/api/previews/video-replay-zero.png',
+        timestamp_seconds: 0,
+      })
+    })
+  })
+
+  it('preserves the rendered frame on playback failure and clears the error before retrying', async () => {
+    const firstRequest = createDeferred<{ preview_url: string; timestamp_seconds: number }>()
+    const failedRequest = createDeferred<{ preview_url: string; timestamp_seconds: number }>()
+    const retryRequest = createDeferred<{ preview_url: string; timestamp_seconds: number }>()
+    pageMocks.inspectChromaVideo.mockResolvedValueOnce({
+      ...videoInspectResponse,
+      duration_seconds: 3,
+      estimated_frame_count: 12,
+      fps: 4,
+    })
+    render(<ChromaKeyerPage />)
+    await inspectVideo()
+    pageMocks.createChromaVideoFrame.mockClear()
+    pageMocks.createChromaVideoFrame
+      .mockReturnValueOnce(firstRequest.promise)
+      .mockReturnValueOnce(failedRequest.promise)
+      .mockReturnValueOnce(retryRequest.promise)
+    const clock = installPlaybackClock()
+
+    fireEvent.click(screen.getByRole('button', { name: '播放' }))
+    await act(async () => {
+      firstRequest.resolve({
+        preview_url: '/api/previews/video-last-good.png',
+        timestamp_seconds: 0.25,
+      })
+    })
+
+    expect(screen.getByRole('button', { name: '抠像预览' })).toHaveAttribute(
+      'src',
+      '/api/previews/video-last-good.png',
+    )
+    expect(screen.getByRole('slider', { name: '视频时间轴' })).toHaveValue('0')
+
+    clock.runAnimationFrame(1250)
+
+    expect(pageMocks.createChromaVideoFrame).toHaveBeenNthCalledWith(2, {
+      inputPath: 'E:\\media\\screen.mp4',
+      timestampSeconds: 1.25,
+    })
+    expect(screen.getByRole('slider', { name: '视频时间轴' })).toHaveValue('1.25')
+
+    await act(async () => {
+      failedRequest.reject(new Error('后端解码失败'))
+    })
+
+    expect(screen.getByRole('alert')).toHaveTextContent('后端解码失败')
+    expect(screen.getByRole('button', { name: '播放' })).toBeInTheDocument()
+    expect(screen.getByRole('slider', { name: '视频时间轴' })).toHaveValue('0.25')
+    expect(screen.getByRole('button', { name: '抠像预览' })).toHaveAttribute(
+      'src',
+      '/api/previews/video-last-good.png',
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: '播放' }))
+
+    expect(screen.queryByText('后端解码失败')).not.toBeInTheDocument()
+    expect(pageMocks.createChromaVideoFrame).toHaveBeenLastCalledWith({
+      inputPath: 'E:\\media\\screen.mp4',
+      timestampSeconds: 0.25,
+    })
+    await act(async () => {
+      retryRequest.resolve({
+        preview_url: '/api/previews/video-retry.png',
+        timestamp_seconds: 0.25,
+      })
     })
   })
 
@@ -1540,7 +1788,9 @@ describe('ChromaKeyerPage', () => {
     )
   })
 
-  it('pauses playback for a parameter change and ignores the stale parameter response', async () => {
+  it.each(playbackParameterCases)(
+    'pauses playback for a %s change and ignores the stale parameter response',
+    async (label, field, inputValue, expectedValue) => {
     pageMocks.inspectChromaVideo.mockResolvedValueOnce({
       ...videoInspectResponse,
       duration_seconds: 3,
@@ -1567,7 +1817,7 @@ describe('ChromaKeyerPage', () => {
 
     fireEvent.click(screen.getByRole('button', { name: '播放' }))
     clock.runAnimationFrame(500)
-    fireEvent.change(screen.getByLabelText('Screen Gain'), { target: { value: '1.4' } })
+    fireEvent.change(screen.getByLabelText(label), { target: { value: inputValue } })
 
     expect(screen.getByRole('button', { name: '播放' })).toBeInTheDocument()
     await act(async () => {
@@ -1576,7 +1826,7 @@ describe('ChromaKeyerPage', () => {
     expect(pageMocks.createChromaVideoPreview).toHaveBeenNthCalledWith(
       2,
       expect.objectContaining({
-        params: expect.objectContaining({ screenGain: 1.4 }),
+        params: expect.objectContaining({ [field]: expectedValue }),
         timestampSeconds: 1.25,
       }),
     )
@@ -1599,18 +1849,14 @@ describe('ChromaKeyerPage', () => {
       '/api/previews/video-new-parameter.png',
     )
     expect(screen.getByRole('slider', { name: '视频时间轴' })).toHaveValue('1.25')
-  })
+    },
+  )
 
-  it('ignores stale unkeyed playback after adding a Screen Color', async () => {
+  it('disables canvas sampling while playback is active', async () => {
     const unkeyedPlaybackRequest = createDeferred<{
       preview_url: string
       timestamp_seconds: number
     }>()
-    pageMocks.createChromaVideoFrame.mockReturnValueOnce(unkeyedPlaybackRequest.promise)
-    pageMocks.createChromaVideoPreview.mockResolvedValueOnce({
-      preview_url: '/api/previews/video-new-keyed.png',
-      timestamp_seconds: 0,
-    })
     render(<ChromaKeyerPage />)
     await inspectVideo()
     pageMocks.createChromaVideoFrame.mockClear()
@@ -1630,37 +1876,37 @@ describe('ChromaKeyerPage', () => {
     installPlaybackClock()
 
     fireEvent.click(screen.getByRole('button', { name: '播放' }))
-    await act(async () => {
-      fireEvent.click(image, { clientX: 210, clientY: 120 })
-      await Promise.resolve()
-    })
-    await act(async () => {
-      vi.advanceTimersByTime(150)
-      await Promise.resolve()
-    })
-    expect(screen.getByRole('button', { name: '抠像预览' })).toHaveAttribute(
-      'src',
-      '/api/previews/video-new-keyed.png',
-    )
+    expect(image).toHaveAttribute('aria-disabled', 'true')
+    expect(image).toHaveAttribute('tabindex', '-1')
+
+    fireEvent.click(image, { clientX: 210, clientY: 120 })
+    fireEvent.keyDown(image, { key: 'Enter' })
+
+    expect(pageMocks.sampleChromaVideo).not.toHaveBeenCalled()
+    expect(screen.getByRole('button', { name: '暂停' })).toBeInTheDocument()
+
     await act(async () => {
       unkeyedPlaybackRequest.resolve({
-        preview_url: '/api/previews/video-stale-unkeyed.png',
+        preview_url: '/api/previews/video-playback.png',
         timestamp_seconds: 0,
       })
     })
-
-    expect(screen.getByRole('button', { name: '抠像预览' })).toHaveAttribute(
-      'src',
-      '/api/previews/video-new-keyed.png',
-    )
-    expect(screen.getByRole('button', { name: '播放' })).toBeInTheDocument()
   })
 
-  it('ignores stale keyed playback after removing the Screen Color', async () => {
+  it('removes the Screen Color at the rendered timestamp and ignores stale keyed playback', async () => {
+    pageMocks.createChromaVideoPreview.mockResolvedValueOnce({
+      preview_url: '/api/previews/video-keyed-zero.png',
+      timestamp_seconds: 0,
+    })
     render(<ChromaKeyerPage />)
     await inspectVideo()
     await sampleImage()
-    await waitFor(() => expect(pageMocks.createChromaVideoPreview).toHaveBeenCalled())
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: '抠像预览' })).toHaveAttribute(
+        'src',
+        '/api/previews/video-keyed-zero.png',
+      ),
+    )
     const keyedPlaybackRequest = createDeferred<{
       preview_url: string
       timestamp_seconds: number
@@ -1671,12 +1917,22 @@ describe('ChromaKeyerPage', () => {
       preview_url: '/api/previews/video-new-unkeyed.png',
       timestamp_seconds: 0,
     })
-    installPlaybackClock()
+    const clock = installPlaybackClock()
 
     fireEvent.click(screen.getByRole('button', { name: '播放' }))
+    clock.runAnimationFrame(1000)
+
+    expect(screen.getByRole('slider', { name: '视频时间轴' })).toHaveValue('1')
+
     await act(async () => {
       fireEvent.click(screen.getByRole('button', { name: '删除 Screen Color' }))
       await Promise.resolve()
+    })
+
+    expect(screen.getByRole('slider', { name: '视频时间轴' })).toHaveValue('0')
+    expect(pageMocks.createChromaVideoFrame).toHaveBeenCalledWith({
+      inputPath: 'E:\\media\\screen.mp4',
+      timestampSeconds: 0,
     })
     expect(screen.getByRole('button', { name: '抠像预览' })).toHaveAttribute(
       'src',
@@ -1715,6 +1971,71 @@ describe('ChromaKeyerPage', () => {
     expect(screen.getByRole('button', { name: '暂停' })).toBeInTheDocument()
   })
 
+  it.each(['queued', 'running'] as const)(
+    'pauses playback once when task state becomes %s',
+    async (status) => {
+      const playbackRequest = createDeferred<{ preview_url: string; timestamp_seconds: number }>()
+      render(<ChromaKeyerPage />)
+      await inspectVideo()
+      pageMocks.createChromaVideoFrame.mockClear()
+      pageMocks.createChromaVideoFrame.mockReturnValueOnce(playbackRequest.promise)
+      const clock = installPlaybackClock()
+
+      fireEvent.click(screen.getByRole('button', { name: '播放' }))
+      clock.runAnimationFrame(1000)
+      act(() => {
+        useTaskStore.getState().startTask({
+          kind: 'video_frames',
+          status,
+          taskId: `${status}-task`,
+        })
+      })
+
+      expect(screen.getByRole('button', { name: '播放' })).toBeDisabled()
+      expect(screen.getByRole('slider', { name: '视频时间轴' })).toHaveValue('0')
+      await act(async () => {
+        playbackRequest.resolve({
+          preview_url: '/api/previews/video-stale-task.png',
+          timestamp_seconds: 0,
+        })
+      })
+      expect(screen.getByRole('button', { name: '抠像预览' })).toHaveAttribute(
+        'src',
+        '/api/previews/video-first.png',
+      )
+    },
+  )
+
+  it('delegates task availability changes to the playback hook without pausing again', async () => {
+    const pause = vi.fn()
+    const canPlayStates: boolean[] = []
+    playbackHookControl.implementation = (options) => {
+      canPlayStates.push(options.canPlay)
+      return {
+        isPlaying: false,
+        pause,
+        play: vi.fn(),
+        togglePlayback: vi.fn(),
+      }
+    }
+    render(<ChromaKeyerPage />)
+    await inspectVideo()
+
+    expect(canPlayStates.at(-1)).toBe(true)
+    pause.mockClear()
+
+    act(() => {
+      useTaskStore.getState().startTask({
+        kind: 'video_frames',
+        status: 'queued',
+        taskId: 'queued-task',
+      })
+    })
+
+    expect(canPlayStates.at(-1)).toBe(false)
+    expect(pause).not.toHaveBeenCalled()
+  })
+
   it('steps active playback from the rendered frame then accumulates rapid clicks', async () => {
     pageMocks.inspectChromaVideo.mockResolvedValueOnce({
       ...videoInspectResponse,
@@ -1749,6 +2070,63 @@ describe('ChromaKeyerPage', () => {
       timestampSeconds: 0.5,
     })
   })
+
+  it.each([
+    ['回到开头', 0],
+    ['上一帧', 1],
+    ['下一帧', 1.5],
+  ] as const)(
+    'pauses playback before %s and ignores the stale playback response',
+    async (actionName, actionTimestamp) => {
+      const playbackRequest = createDeferred<{ preview_url: string; timestamp_seconds: number }>()
+      const actionRequest = createDeferred<{ preview_url: string; timestamp_seconds: number }>()
+      pageMocks.inspectChromaVideo.mockResolvedValueOnce({
+        ...videoInspectResponse,
+        duration_seconds: 3,
+        estimated_frame_count: 12,
+        fps: 4,
+        timestamp_seconds: 1.25,
+      })
+      render(<ChromaKeyerPage />)
+      await inspectVideo()
+      pageMocks.createChromaVideoFrame.mockClear()
+      pageMocks.createChromaVideoFrame
+        .mockReturnValueOnce(playbackRequest.promise)
+        .mockReturnValueOnce(actionRequest.promise)
+      const clock = installPlaybackClock()
+
+      fireEvent.click(screen.getByRole('button', { name: '播放' }))
+      clock.runAnimationFrame(500)
+      fireEvent.click(screen.getByRole('button', { name: actionName }))
+
+      expect(screen.getByRole('button', { name: '播放' })).toBeInTheDocument()
+      expect(pageMocks.createChromaVideoFrame).toHaveBeenNthCalledWith(2, {
+        inputPath: 'E:\\media\\screen.mp4',
+        timestampSeconds: actionTimestamp,
+      })
+
+      await act(async () => {
+        actionRequest.resolve({
+          preview_url: '/api/previews/video-action.png',
+          timestamp_seconds: actionTimestamp,
+        })
+      })
+      await act(async () => {
+        playbackRequest.resolve({
+          preview_url: '/api/previews/video-stale-playback.png',
+          timestamp_seconds: 1.25,
+        })
+      })
+
+      expect(screen.getByRole('button', { name: '抠像预览' })).toHaveAttribute(
+        'src',
+        '/api/previews/video-action.png',
+      )
+      expect(screen.getByRole('slider', { name: '视频时间轴' })).toHaveValue(
+        String(actionTimestamp),
+      )
+    },
+  )
 
   it('clamps immediate previous, next, and restart requests at video boundaries', async () => {
     pageMocks.inspectChromaVideo.mockResolvedValueOnce({
@@ -2236,6 +2614,48 @@ describe('ChromaKeyerPage', () => {
         '/api/previews/video-unkeyed-2.png',
       ),
     )
+  })
+
+  it('pauses playback before submitting video export', async () => {
+    const playbackRequest = createDeferred<{ preview_url: string; timestamp_seconds: number }>()
+    const exportRequest = createDeferred<{ status: 'queued'; task_id: string }>()
+    render(<ChromaKeyerPage />)
+    await inspectVideo()
+    await sampleImage()
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: '抠像预览' })).toHaveAttribute(
+        'src',
+        '/api/previews/video-keyed.png',
+      ),
+    )
+    pageMocks.createChromaVideoPreview.mockClear()
+    pageMocks.createChromaVideoPreview.mockReturnValueOnce(playbackRequest.promise)
+    pageMocks.createChromaVideoKeyerTask.mockReturnValueOnce(exportRequest.promise)
+    const clock = installPlaybackClock()
+
+    fireEvent.click(screen.getByRole('button', { name: '播放' }))
+    clock.runAnimationFrame(500)
+    fireEvent.click(screen.getByRole('button', { name: '导出 PNG 序列' }))
+
+    const cancelOrder = vi.mocked(cancelAnimationFrame).mock.invocationCallOrder[0]
+    const exportOrder = pageMocks.createChromaVideoKeyerTask.mock.invocationCallOrder[0]
+    expect(cancelOrder).toBeLessThan(exportOrder)
+    expect(screen.getByRole('button', { name: '播放' })).toBeDisabled()
+    expect(screen.getByRole('slider', { name: '视频时间轴' })).toHaveValue('1.25')
+    await act(async () => {
+      playbackRequest.resolve({
+        preview_url: '/api/previews/video-stale-export.png',
+        timestamp_seconds: 1.25,
+      })
+    })
+    expect(screen.getByRole('button', { name: '抠像预览' })).toHaveAttribute(
+      'src',
+      '/api/previews/video-keyed.png',
+    )
+
+    await act(async () => {
+      exportRequest.resolve({ status: 'queued', task_id: 'export-task' })
+    })
   })
 
   it('exports video to outputRoot without sending an image outputPath', async () => {

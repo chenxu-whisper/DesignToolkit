@@ -427,15 +427,15 @@ describe('useChromaVideoPlayback', () => {
     const finalRequest = createDeferred<PlaybackFrame>()
     const replayRequest = createDeferred<PlaybackFrame>()
     const requestFrame = vi.fn()
-      .mockResolvedValueOnce(createFrame(0.5))
+      .mockResolvedValueOnce(createFrame(2.5))
       .mockReturnValueOnce(finalRequest.promise)
       .mockReturnValueOnce(replayRequest.promise)
     const onFrame = vi.fn()
     const onPause = vi.fn()
     const { result } = renderHook(() =>
       useChromaVideoPlayback(createOptions({
-        durationSeconds: 1,
-        renderedTimestampSeconds: 0.5,
+        durationSeconds: 3,
+        renderedTimestampSeconds: 2.5,
         requestFrame,
         onFrame,
         onPause,
@@ -448,17 +448,17 @@ describe('useChromaVideoPlayback', () => {
     await settle()
     runAnimationFrame(300)
 
-    expect(requestFrame).toHaveBeenLastCalledWith(0.75)
+    expect(requestFrame).toHaveBeenLastCalledWith(2.75)
     expect(result.current.isPlaying).toBe(true)
     expect(onPause).not.toHaveBeenCalled()
 
-    finalRequest.resolve(createFrame(0.75))
+    finalRequest.resolve(createFrame(2.75))
     await settle()
 
-    expect(onFrame).toHaveBeenLastCalledWith(createFrame(0.75))
+    expect(onFrame).toHaveBeenLastCalledWith(createFrame(2.75))
     expect(result.current.isPlaying).toBe(false)
     expect(onPause).toHaveBeenCalledOnce()
-    expect(onPause).toHaveBeenCalledWith(0.75)
+    expect(onPause).toHaveBeenCalledWith(2.75)
 
     act(() => {
       result.current.play()
@@ -533,6 +533,11 @@ describe('useChromaVideoPlayback', () => {
     expect(onPause).toHaveBeenCalledOnce()
     expect(onPause).toHaveBeenCalledWith(0)
     expect(animationCallbacks.size).toBe(0)
+
+    rerender({ canPlay: false })
+    rerender({ canPlay: false })
+
+    expect(onPause).toHaveBeenCalledOnce()
 
     pendingRequest.resolve(createFrame(0))
     await settle()
