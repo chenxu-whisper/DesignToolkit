@@ -18,6 +18,7 @@ Desktop.ini
 venv/
 env/
 .worktrees/
+.superpowers/
 
 # Caches
 .cache/
