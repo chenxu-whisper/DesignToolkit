@@ -480,6 +480,11 @@ type VideoPreviewBody = {
   view_mode: 'alpha' | 'final'
 }
 
+type VideoFrameBody = {
+  input_path: string
+  timestamp_seconds: number
+}
+
 const videoInputPath = 'E:\\media\\moving-screen.mp4'
 const videoOutputRoot = 'E:\\exports'
 const videoInspectPreviewUrl = '/api/chroma-keyer/previews/video-inspect.svg'
@@ -509,11 +514,39 @@ test('runs the complete chroma video timeline and PNG sequence export workflow',
   await page.clock.install()
 
   const inspectBodies: unknown[] = []
-  const pendingFrameRoutes: Array<{ body: { input_path: string; timestamp_seconds: number }; route: Route }> = []
+  const pendingFrameRoutes: Array<{ body: VideoFrameBody; route: Route }> = []
   const sampleBodies: unknown[] = []
   const previewBodies: VideoPreviewBody[] = []
+  const pendingPreviewRoutes: Array<{ body: VideoPreviewBody; route: Route }> = []
   const directoryPickerBodies: unknown[] = []
   const taskBodies: Record<string, unknown>[] = []
+  let deferNextVideoPreview = false
+
+  const fulfillFrame = async (
+    request: { body: VideoFrameBody; route: Route },
+    previewName: string,
+  ) => {
+    await request.route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({
+        preview_url: `/api/chroma-keyer/previews/${previewName}.svg`,
+        timestamp_seconds: request.body.timestamp_seconds,
+      }),
+    })
+  }
+
+  const fulfillPreview = async (
+    request: { body: VideoPreviewBody; route: Route },
+    previewName: string,
+  ) => {
+    await request.route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({
+        preview_url: `/api/chroma-keyer/previews/${previewName}.svg`,
+        timestamp_seconds: request.body.timestamp_seconds,
+      }),
+    })
+  }
 
   await page.route('**/api/chroma-keyer/previews/*.svg', fulfillPreviewSvg)
   await page.route('**/api/chroma-keyer/videos/inspect', async (route) => {
@@ -536,12 +569,12 @@ test('runs the complete chroma video timeline and PNG sequence export workflow',
   })
   await page.route('**/api/chroma-keyer/videos/frame', async (route) => {
     pendingFrameRoutes.push({
-      body: route.request().postDataJSON() as { input_path: string; timestamp_seconds: number },
+      body: route.request().postDataJSON() as VideoFrameBody,
       route,
     })
   })
   await page.route('**/api/chroma-keyer/videos/sample', async (route) => {
-    const body = route.request().postDataJSON()
+    const body = route.request().postDataJSON() as VideoFrameBody
     sampleBodies.push(body)
     await route.fulfill({
       contentType: 'application/json',
@@ -550,20 +583,20 @@ test('runs the complete chroma video timeline and PNG sequence export workflow',
         hex: '#2AB448',
         source_x: 100,
         source_y: 50,
-        timestamp_seconds: 2,
+        timestamp_seconds: body.timestamp_seconds,
       }),
     })
   })
   await page.route('**/api/chroma-keyer/videos/preview', async (route) => {
     const body = route.request().postDataJSON() as VideoPreviewBody
     previewBodies.push(body)
-    await route.fulfill({
-      contentType: 'application/json',
-      body: JSON.stringify({
-        preview_url: `/api/chroma-keyer/previews/video-${body.view_mode}-${previewBodies.length}.svg`,
-        timestamp_seconds: body.timestamp_seconds,
-      }),
-    })
+    const request = { body, route }
+    if (deferNextVideoPreview) {
+      deferNextVideoPreview = false
+      pendingPreviewRoutes.push(request)
+      return
+    }
+    await fulfillPreview(request, `video-${body.view_mode}-${previewBodies.length}`)
   })
   await page.route('**/api/local-paths/pick-directory', async (route) => {
     directoryPickerBodies.push(route.request().postDataJSON())
@@ -631,29 +664,93 @@ test('runs the complete chroma video timeline and PNG sequence export workflow',
     { input_path: videoInputPath, timestamp_seconds: 2 },
   ])
 
-  await pendingFrameRoutes[1].route.fulfill({
-    contentType: 'application/json',
-    body: JSON.stringify({
-      preview_url: '/api/chroma-keyer/previews/video-frame-latest.svg',
-      timestamp_seconds: 2,
-    }),
-  })
+  await fulfillFrame(pendingFrameRoutes[1], 'video-frame-latest')
   await expect(canvas).toHaveAttribute('src', '/api/chroma-keyer/previews/video-frame-latest.svg')
-  await pendingFrameRoutes[0].route.fulfill({
-    contentType: 'application/json',
-    body: JSON.stringify({
-      preview_url: '/api/chroma-keyer/previews/video-frame-stale.svg',
-      timestamp_seconds: 1,
-    }),
-  })
+  await fulfillFrame(pendingFrameRoutes[0], 'video-frame-stale')
   await expect(canvas).toHaveAttribute('src', '/api/chroma-keyer/previews/video-frame-latest.svg')
   await expect(timeline).toHaveValue('2')
+
+  const transport = page.getByRole('group', { name: '视频播放控制' })
+  await expect(transport.getByRole('button')).toHaveCount(4)
+  for (const name of ['回到开头', '上一帧', '播放', '下一帧']) {
+    await expect(transport.getByRole('button', { name })).toBeVisible()
+  }
+
+  await transport.getByRole('button', { name: '播放' }).click()
+  await expect(transport.getByRole('button', { name: '暂停' })).toBeVisible()
+  await expect.poll(() => pendingFrameRoutes.length).toBe(3)
+  expect(pendingFrameRoutes[2].body).toEqual({
+    input_path: videoInputPath,
+    timestamp_seconds: 2,
+  })
+
+  await page.clock.fastForward(600)
+  await expect(timeline).toHaveValue('2.5')
+  expect(pendingFrameRoutes).toHaveLength(3)
+
+  await fulfillFrame(pendingFrameRoutes[2], 'video-playback-slow')
+  await expect(canvas).toHaveAttribute('src', '/api/chroma-keyer/previews/video-playback-slow.svg')
+  await expect.poll(() => pendingFrameRoutes.length).toBe(4)
+  expect(pendingFrameRoutes[3].body).toEqual({
+    input_path: videoInputPath,
+    timestamp_seconds: 2.5,
+  })
+
+  await transport.getByRole('button', { name: '暂停' }).click()
+  await expect(transport.getByRole('button', { name: '播放' })).toBeVisible()
+  await expect(timeline).toHaveValue('2')
+  await expect(canvas).toHaveAttribute('src', '/api/chroma-keyer/previews/video-playback-slow.svg')
+  await fulfillFrame(pendingFrameRoutes[3], 'video-playback-stale-after-pause')
+  await expect(timeline).toHaveValue('2')
+  await expect(canvas).toHaveAttribute('src', '/api/chroma-keyer/previews/video-playback-slow.svg')
+
+  await transport.getByRole('button', { name: '下一帧' }).click()
+  await expect.poll(() => pendingFrameRoutes.length).toBe(5)
+  expect(pendingFrameRoutes[4].body.timestamp_seconds).toBe(2.25)
+  await fulfillFrame(pendingFrameRoutes[4], 'video-step-forward')
+  await expect(timeline).toHaveValue('2.25')
+
+  await transport.getByRole('button', { name: '下一帧' }).click()
+  await expect.poll(() => pendingFrameRoutes.length).toBe(6)
+  expect(pendingFrameRoutes[5].body.timestamp_seconds).toBe(2.5)
+  await fulfillFrame(pendingFrameRoutes[5], 'video-step-forward-again')
+  await expect(timeline).toHaveValue('2.5')
+
+  await transport.getByRole('button', { name: '下一帧' }).click()
+  await expect.poll(() => pendingFrameRoutes.length).toBe(7)
+  expect(pendingFrameRoutes[6].body.timestamp_seconds).toBe(2.75)
+  await fulfillFrame(pendingFrameRoutes[6], 'video-step-final')
+  await expect(timeline).toHaveValue('2.75')
+
+  await transport.getByRole('button', { name: '下一帧' }).click()
+  await expect.poll(() => pendingFrameRoutes.length).toBe(8)
+  expect(pendingFrameRoutes[7].body.timestamp_seconds).toBe(2.75)
+  await fulfillFrame(pendingFrameRoutes[7], 'video-step-forward-clamped')
+  await expect(timeline).toHaveValue('2.75')
+
+  await transport.getByRole('button', { name: '上一帧' }).click()
+  await expect.poll(() => pendingFrameRoutes.length).toBe(9)
+  expect(pendingFrameRoutes[8].body.timestamp_seconds).toBe(2.5)
+  await fulfillFrame(pendingFrameRoutes[8], 'video-step-back')
+  await expect(timeline).toHaveValue('2.5')
+
+  await transport.getByRole('button', { name: '回到开头' }).click()
+  await expect.poll(() => pendingFrameRoutes.length).toBe(10)
+  expect(pendingFrameRoutes[9].body.timestamp_seconds).toBe(0)
+  await fulfillFrame(pendingFrameRoutes[9], 'video-restart')
+  await expect(timeline).toHaveValue('0')
+
+  await transport.getByRole('button', { name: '上一帧' }).click()
+  await expect.poll(() => pendingFrameRoutes.length).toBe(11)
+  expect(pendingFrameRoutes[10].body.timestamp_seconds).toBe(0)
+  await fulfillFrame(pendingFrameRoutes[10], 'video-step-back-clamped')
+  await expect(timeline).toHaveValue('0')
 
   await canvas.click({ position: { x: 100, y: 50 } })
   await expect.poll(() => sampleBodies.length).toBe(1)
   expect(sampleBodies[0]).toEqual({
     input_path: videoInputPath,
-    timestamp_seconds: 2,
+    timestamp_seconds: 0,
     x: 99,
     y: 49,
     preview_width: 400,
@@ -662,7 +759,7 @@ test('runs the complete chroma video timeline and PNG sequence export workflow',
   await expect(page.getByText('Screen Color', { exact: true })).toBeVisible()
   const defaultVideoPreviewBody: VideoPreviewBody = {
     input_path: videoInputPath,
-    timestamp_seconds: 2,
+    timestamp_seconds: 0,
     samples: [[42, 180, 72]],
     params: {
       screen_gain: 1,
@@ -678,13 +775,48 @@ test('runs the complete chroma video timeline and PNG sequence export workflow',
   await expect.poll(() => previewBodies.length).toBe(1)
   expect(previewBodies[0]).toEqual(defaultVideoPreviewBody)
 
-  await page.getByRole('radio', { name: 'Alpha' }).click()
+  const firstFinalPreviewUrl = '/api/chroma-keyer/previews/video-final-1.svg'
+  await expect(canvas).toHaveAttribute('src', firstFinalPreviewUrl)
+  const renderedFinalPreview = await canvas.getAttribute('src')
+  if (renderedFinalPreview === null) {
+    throw new Error('Expected rendered Final preview URL')
+  }
+  expect(renderedFinalPreview).toBe(firstFinalPreviewUrl)
+  deferNextVideoPreview = true
+  await transport.getByRole('button', { name: '播放' }).click()
+  await expect(transport.getByRole('button', { name: '暂停' })).toBeVisible()
   await expect.poll(() => previewBodies.length).toBe(2)
-  expect(previewBodies[1]).toEqual({ ...defaultVideoPreviewBody, view_mode: 'alpha' })
-  await expect(canvas).toHaveAttribute('src', /video-alpha-\d+\.svg/)
-  await page.getByRole('radio', { name: 'Final' }).click()
+  expect(previewBodies[1]).toEqual(defaultVideoPreviewBody)
+  await transport.getByRole('button', { name: '暂停' }).click()
+  await expect(timeline).toHaveValue('0')
+  await expect(canvas).toHaveAttribute('src', renderedFinalPreview)
+  await fulfillPreview(pendingPreviewRoutes[0], 'video-final-stale-playback')
+  await expect(canvas).toHaveAttribute('src', renderedFinalPreview)
+  await expect(timeline).toHaveValue('0')
+
+  await page.getByRole('radio', { name: 'Alpha' }).click()
   await expect.poll(() => previewBodies.length).toBe(3)
-  expect(previewBodies[2]).toEqual(defaultVideoPreviewBody)
+  expect(previewBodies[2]).toEqual({ ...defaultVideoPreviewBody, view_mode: 'alpha' })
+  await expect(canvas).toHaveAttribute('src', /video-alpha-\d+\.svg/)
+
+  const renderedAlphaPreview = await canvas.getAttribute('src')
+  if (renderedAlphaPreview === null) {
+    throw new Error('Expected rendered Alpha preview URL')
+  }
+  expect(renderedAlphaPreview).toMatch(/video-alpha-\d+\.svg/)
+  deferNextVideoPreview = true
+  await transport.getByRole('button', { name: '播放' }).click()
+  await expect.poll(() => previewBodies.length).toBe(4)
+  expect(previewBodies[3]).toEqual({ ...defaultVideoPreviewBody, view_mode: 'alpha' })
+  await transport.getByRole('button', { name: '暂停' }).click()
+  await expect(timeline).toHaveValue('0')
+  await fulfillPreview(pendingPreviewRoutes[1], 'video-alpha-stale-playback')
+  await expect(canvas).toHaveAttribute('src', renderedAlphaPreview)
+  await expect(timeline).toHaveValue('0')
+
+  await page.getByRole('radio', { name: 'Final' }).click()
+  await expect.poll(() => previewBodies.length).toBe(5)
+  expect(previewBodies[4]).toEqual(defaultVideoPreviewBody)
   await expect(canvas).toHaveAttribute('src', /video-final-\d+\.svg/)
 
   const parameterChanges: ReadonlyArray<{
@@ -701,7 +833,7 @@ test('runs the complete chroma video timeline and PNG sequence export workflow',
     { key: 'feather', name: 'Feather', sliderValue: 1, numberValue: 2 },
     { key: 'despill_amount', name: 'Despill Amount', sliderValue: 0.9, numberValue: 0.8 },
   ]
-  let expectedPreviewBody = defaultVideoPreviewBody
+  let expectedPreviewBody = previewBodies[4]
   for (const change of parameterChanges) {
     const previousCount = previewBodies.length
     const slider = page.getByRole('slider', { name: change.name })
@@ -719,6 +851,44 @@ test('runs the complete chroma video timeline and PNG sequence export workflow',
     await expect.poll(() => previewBodies.length).toBe(previousCount + 1)
     expect(previewBodies.slice(previousCount)).toEqual([expectedPreviewBody])
   }
+
+  const previewCountBeforeEndPlayback = previewBodies.length
+  deferNextVideoPreview = true
+  await transport.getByRole('button', { name: '播放' }).click()
+  await expect.poll(() => previewBodies.length).toBe(previewCountBeforeEndPlayback + 1)
+  expect(previewBodies.at(-1)).toEqual(expectedPreviewBody)
+  await page.clock.fastForward(3000)
+  expect(previewBodies).toHaveLength(previewCountBeforeEndPlayback + 1)
+
+  await fulfillPreview(pendingPreviewRoutes.at(-1)!, 'video-keyed-playback-zero')
+  await expect.poll(() => previewBodies.length).toBe(previewCountBeforeEndPlayback + 2)
+  expect(previewBodies.at(-1)).toEqual({
+    ...expectedPreviewBody,
+    timestamp_seconds: 2.75,
+  })
+  await expect(transport.getByRole('button', { name: '播放' })).toBeVisible()
+  await expect(timeline).toHaveValue('2.75')
+  await expect(canvas).toHaveAttribute(
+    'src',
+    `/api/chroma-keyer/previews/video-final-${previewCountBeforeEndPlayback + 2}.svg`,
+  )
+
+  deferNextVideoPreview = true
+  await transport.getByRole('button', { name: '播放' }).click()
+  await expect.poll(() => previewBodies.length).toBe(previewCountBeforeEndPlayback + 3)
+  expect(previewBodies.at(-1)).toEqual({
+    ...expectedPreviewBody,
+    timestamp_seconds: 0,
+  })
+  await expect(transport.getByRole('button', { name: '暂停' })).toBeVisible()
+  await transport.getByRole('button', { name: '暂停' }).click()
+  await expect(timeline).toHaveValue('2.75')
+  await fulfillPreview(pendingPreviewRoutes.at(-1)!, 'video-keyed-replay-stale')
+  await expect(timeline).toHaveValue('2.75')
+  await expect(canvas).toHaveAttribute(
+    'src',
+    `/api/chroma-keyer/previews/video-final-${previewCountBeforeEndPlayback + 2}.svg`,
+  )
 
   await page.getByRole('button', { name: '指定输出根目录（可选）' }).click()
   await expect(page.getByRole('textbox', { name: '输出根目录（可选）' })).toHaveValue(videoOutputRoot)
@@ -765,11 +935,29 @@ test('keeps the loaded video editor within desktop and 390px mobile layouts', as
       const main = editor.querySelector<HTMLElement>('.chroma-editor-main')
       const form = editor.querySelector<HTMLElement>('.chroma-keyer-form')
       const timeline = editor.querySelector<HTMLElement>('.chroma-video-timeline')
+      const controls = editor.querySelector<HTMLElement>('.chroma-video-timeline-controls')
+      const transport = editor.querySelector<HTMLElement>('.chroma-video-transport')
+      const range = editor.querySelector<HTMLElement>('.chroma-video-timeline-range')
+      const timecode = editor.querySelector<HTMLElement>('.chroma-video-timecode')
       const metadata = editor.querySelector<HTMLElement>('.chroma-video-metadata')
       const parameterHeaders = Array.from(
         editor.querySelectorAll<HTMLElement>('.chroma-parameter-header'),
       )
-      if (!main || !form || !timeline || !metadata || parameterHeaders.length !== 7) {
+      const transportButtons = Array.from(
+        transport?.querySelectorAll<HTMLElement>('button') ?? [],
+      )
+      if (
+        !main
+        || !form
+        || !timeline
+        || !controls
+        || !transport
+        || !range
+        || !timecode
+        || !metadata
+        || transportButtons.length !== 4
+        || parameterHeaders.length !== 7
+      ) {
         throw new Error('Expected loaded video editor geometry')
       }
       const toBox = (element: HTMLElement) => {
@@ -779,6 +967,8 @@ test('keeps the loaded video editor within desktop and 390px mobile layouts', as
       return {
         bodyClientWidth: document.body.clientWidth,
         bodyScrollWidth: document.body.scrollWidth,
+        buttons: transportButtons.map(toBox),
+        controls: toBox(controls),
         documentClientWidth: document.documentElement.clientWidth,
         documentScrollWidth: document.documentElement.scrollWidth,
         form: toBox(form),
@@ -807,14 +997,49 @@ test('keeps the loaded video editor within desktop and 390px mobile layouts', as
             whiteSpace: style.whiteSpace,
           }
         }),
+        range: toBox(range),
+        timecode: toBox(timecode),
         timeline: toBox(timeline),
+        transport: toBox(transport),
       }
     })
+
+    const expectContained = (
+      inner: { bottom: number; left: number; right: number; top: number },
+      outer: { bottom: number; left: number; right: number; top: number },
+    ) => {
+      expect(inner.left).toBeGreaterThanOrEqual(outer.left - 0.5)
+      expect(inner.right).toBeLessThanOrEqual(outer.right + 0.5)
+      expect(inner.top).toBeGreaterThanOrEqual(outer.top - 0.5)
+      expect(inner.bottom).toBeLessThanOrEqual(outer.bottom + 0.5)
+    }
+    const expectNoOverlap = (
+      first: { bottom: number; left: number; right: number; top: number },
+      second: { bottom: number; left: number; right: number; top: number },
+    ) => {
+      const overlaps = (
+        first.left < second.right - 0.5
+        && first.right > second.left + 0.5
+        && first.top < second.bottom - 0.5
+        && first.bottom > second.top + 0.5
+      )
+      expect(overlaps).toBe(false)
+    }
 
     expect(layout.documentScrollWidth).toBeLessThanOrEqual(layout.documentClientWidth)
     expect(layout.bodyScrollWidth).toBeLessThanOrEqual(layout.bodyClientWidth)
     expect(layout.timeline.left).toBeGreaterThanOrEqual(layout.main.left - 0.5)
     expect(layout.timeline.right).toBeLessThanOrEqual(layout.main.right + 0.5)
+    expectContained(layout.controls, layout.main)
+    expectContained(layout.transport, layout.main)
+    expect(layout.buttons).toHaveLength(4)
+    for (const button of layout.buttons) {
+      expectContained(button, layout.transport)
+      expect(button.width).toBeCloseTo(32, 0)
+      expect(button.height).toBeCloseTo(32, 0)
+      expectNoOverlap(button, layout.range)
+      expectNoOverlap(button, layout.timecode)
+    }
     expect(layout.metadata.left).toBeGreaterThanOrEqual(layout.main.left - 0.5)
     expect(layout.metadata.right).toBeLessThanOrEqual(layout.main.right + 0.5)
     expect(layout.parameters.map(({ name }) => name)).toEqual(chromaParameterNames)
