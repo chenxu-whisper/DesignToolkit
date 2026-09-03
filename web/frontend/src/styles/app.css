@@ -676,7 +676,6 @@ button {
 
 .chroma-parameter-header .field-label {
   line-height: 14px;
-  overflow-wrap: anywhere;
   white-space: normal;
 }
 

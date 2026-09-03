@@ -793,6 +793,7 @@ test('keeps the loaded video editor within desktop and 390px mobile layouts', as
             labelScrollWidth: label.scrollWidth,
             name: label.textContent?.trim() ?? '',
             number: toBox(number),
+            overflowWrap: style.overflowWrap,
             textOverflow: style.textOverflow,
             whiteSpace: style.whiteSpace,
           }
@@ -810,6 +811,7 @@ test('keeps the loaded video editor within desktop and 390px mobile layouts', as
     expect(layout.parameters.map(({ name }) => name)).toEqual(chromaParameterNames)
     for (const parameter of layout.parameters) {
       expect(parameter.labelScrollWidth).toBeLessThanOrEqual(parameter.labelClientWidth + 1)
+      expect(parameter.overflowWrap).toBe('normal')
       expect(parameter.textOverflow).not.toBe('ellipsis')
       expect(parameter.whiteSpace).not.toBe('nowrap')
       expect(parameter.header.height).toBeCloseTo(34, 0)
