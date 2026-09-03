@@ -189,11 +189,12 @@ export function useChromaVideoPlayback(options: UseChromaVideoPlaybackOptions) {
         durationSeconds,
       )
       const targetAdvanced = nextTarget > targetRef.current
-      targetRef.current = nextTarget
-      optionsRef.current.onTargetChange(nextTarget)
-
-      if (targetAdvanced && !requestInFlightRef.current) {
-        void dispatchLatestTarget(generation)
+      if (targetAdvanced) {
+        targetRef.current = nextTarget
+        optionsRef.current.onTargetChange(nextTarget)
+        if (!requestInFlightRef.current) {
+          void dispatchLatestTarget(generation)
+        }
       }
       schedule(generation)
     })

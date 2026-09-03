@@ -189,24 +189,30 @@ describe('useChromaVideoPlayback', () => {
 
   it('waits for the quantized target to advance before requesting another frame', async () => {
     const requestFrame = vi.fn(async (timestampSeconds) => createFrame(timestampSeconds))
+    const onTargetChange = vi.fn()
     const { result } = renderHook(() =>
-      useChromaVideoPlayback(createOptions({ requestFrame })),
+      useChromaVideoPlayback(createOptions({ requestFrame, onTargetChange })),
     )
 
     act(() => {
       result.current.play()
     })
+    expect(onTargetChange).toHaveBeenCalledOnce()
+    expect(onTargetChange).toHaveBeenLastCalledWith(0)
     await settle()
 
     for (const elapsedMilliseconds of [16, 100, 249]) {
       runAnimationFrame(elapsedMilliseconds)
       await settle()
+      expect(onTargetChange).toHaveBeenCalledOnce()
     }
 
     expect(requestFrame).toHaveBeenCalledOnce()
 
     runAnimationFrame(250)
 
+    expect(onTargetChange).toHaveBeenCalledTimes(2)
+    expect(onTargetChange).toHaveBeenLastCalledWith(0.25)
     expect(requestFrame).toHaveBeenCalledTimes(2)
     expect(requestFrame).toHaveBeenLastCalledWith(0.25)
   })
