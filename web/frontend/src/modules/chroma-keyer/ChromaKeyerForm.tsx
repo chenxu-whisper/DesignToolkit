@@ -29,6 +29,18 @@ const parameterFields = [
   { fallback: 1, id: 'despillAmount', label: 'Despill Amount', max: 1, min: 0, step: 0.01 },
 ] as const
 
+const chromaInputAllowedSuffixes = [
+  '.mp4',
+  '.webm',
+  '.mov',
+  '.mkv',
+  '.avi',
+  '.m4v',
+  '.png',
+  '.jpg',
+  '.jpeg',
+] as const
+
 function getSliderValue(value: number, min: number, max: number, fallback: number) {
   return Math.min(max, Math.max(min, Number.isFinite(value) ? value : fallback))
 }
@@ -66,6 +78,7 @@ export function ChromaKeyerForm({
           onCommit={onInputPathCommit}
           pickPaths={async () => {
             const response = await pickLocalFiles({
+              allowedSuffixes: chromaInputAllowedSuffixes,
               fileKind: 'media',
               multiple: false,
               title: '选择图片或视频文件',

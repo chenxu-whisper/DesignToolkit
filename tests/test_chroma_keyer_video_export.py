@@ -133,6 +133,92 @@ def assert_failed_export_is_clean(root: Path, stream: TrackedStream) -> None:
     assert stream.closed
 
 
+@pytest.mark.parametrize(
+    ("samples", "mean_rgb", "message"),
+    [
+        pytest.param((), (0.0, 255.0, 0.0), "samples must not be empty", id="zero"),
+        pytest.param(
+            ((0, 255, 0), (0, 0, 255)),
+            (0.0, 255.0, 0.0),
+            "samples must contain exactly one screen color",
+            id="multiple",
+        ),
+        pytest.param(
+            ((128, 128, 128),),
+            (128.0, 128.0, 128.0),
+            "请选择具有明显主色的纯色幕背景",
+            id="invalid-sample",
+        ),
+        pytest.param(
+            ((0, 255, 0),),
+            (0.0, 254.0, 0.0),
+            "mean_rgb must match the sole screen color sample",
+            id="inconsistent-mean",
+        ),
+    ],
+)
+def test_rejects_invalid_screen_color_model_before_probe_or_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    samples: tuple[tuple[int, int, int], ...],
+    mean_rgb: tuple[float, float, float],
+    message: str,
+) -> None:
+    input_path = make_input(tmp_path)
+    output_root = tmp_path / "exports"
+    output_root.mkdir()
+    stream = TrackedStream(frames())
+    decoder = FakeDecoder(stream)
+    model = screen_model()
+    object.__setattr__(model, "samples", samples)
+    object.__setattr__(model, "mean_rgb", mean_rgb)
+
+    def fail_path_query(path: Path, *args: object, **kwargs: object) -> None:
+        pytest.fail(f"filesystem queried before model validation: {path}")
+
+    with monkeypatch.context() as path_queries:
+        for method_name in ("exists", "is_dir", "is_file", "stat"):
+            path_queries.setattr(Path, method_name, fail_path_query)
+
+        with pytest.raises(KeyerError, match=f"^{message}$"):
+            key_video_to_png_sequence(
+                VideoKeyOptions(input_path=input_path, output_root=output_root),
+                decoder,
+                model,
+                KeyerParams(),
+            )
+
+    assert decoder.probe_calls == []
+    assert decoder.iteration_calls == []
+    assert list(output_root.iterdir()) == []
+    assert not (output_root / "clip_keyed_frames").exists()
+    assert temporary_directories(output_root) == []
+    assert not stream.closed
+
+
+def test_accepts_float_normalization_noise_in_screen_color_mean(
+    tmp_path: Path,
+) -> None:
+    input_path = make_input(tmp_path)
+    model = screen_model()
+    object.__setattr__(
+        model,
+        "mean_rgb",
+        tuple(np.nextafter(channel, np.inf) for channel in model.mean_rgb),
+    )
+    decoder = FakeDecoder(TrackedStream(frames()[:1]))
+
+    result = key_video_to_png_sequence(
+        VideoKeyOptions(input_path=input_path),
+        decoder,
+        model,
+        KeyerParams(),
+    )
+
+    assert result.frame_count == 1
+    assert decoder.probe_calls == [input_path]
+
+
 class FakeRenameAt2:
     def __init__(self, result: int) -> None:
         self.result = result

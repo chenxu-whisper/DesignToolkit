@@ -9,7 +9,7 @@ import pytest
 from pytest import raises
 
 from designtoolkit.chroma_keyer.models import KeyerError
-from designtoolkit.chroma_keyer.video_io import ImageioVideoDecoder
+from designtoolkit.chroma_keyer.video_io import ImageioVideoDecoder, _decode_frame
 from designtoolkit.chroma_keyer.video_models import VideoMetadata
 from designtoolkit.video_frames.ffmpeg_backend import FfmpegBackend
 
@@ -214,7 +214,9 @@ def test_probe_maps_lazy_startup_failure_to_open_error_and_closes(
     assert generator.closed
 
 
-def test_read_frame_seeks_once_and_returns_writable_rgb_copy(tmp_path: Path) -> None:
+def test_read_frame_seeks_once_and_returns_zero_copy_read_only_rgb_view(
+    tmp_path: Path,
+) -> None:
     path = make_video_path(tmp_path)
     read_frames = FakeReadFrames(
         [dict(VALID_METADATA)],
@@ -226,9 +228,13 @@ def test_read_frame_seeks_once_and_returns_writable_rgb_copy(tmp_path: Path) -> 
     assert frame.shape == (2, 4, 3)
     assert frame.dtype == np.uint8
     assert frame.flags.c_contiguous
-    assert frame.flags.writeable
+    assert not frame.flags.writeable
+    assert np.shares_memory(frame, np.frombuffer(FRAME_BYTES, dtype=np.uint8))
+    assert isinstance(frame.base, np.ndarray)
+    assert frame.base.base is FRAME_BYTES
     assert frame.tolist() == np.arange(24, dtype=np.uint8).reshape(2, 4, 3).tolist()
-    frame[0, 0, 0] = 255
+    with raises(ValueError, match="read-only"):
+        frame[0, 0, 0] = 255
     assert read_frames.calls[1] == (
         path,
         {
@@ -238,6 +244,135 @@ def test_read_frame_seeks_once_and_returns_writable_rgb_copy(tmp_path: Path) -> 
         },
     )
     assert all(generator.closed for generator in read_frames.generators)
+
+
+def test_decode_frame_keeps_an_immutable_backed_memoryview_zero_copy() -> None:
+    frame_bytes = memoryview(FRAME_BYTES)
+
+    frame = _decode_frame(frame_bytes, width=4, height=2)
+
+    assert not frame.flags.writeable
+    assert np.shares_memory(frame, np.frombuffer(frame_bytes, dtype=np.uint8))
+    assert isinstance(frame.base, np.ndarray)
+    assert isinstance(frame.base.base, memoryview)
+    assert frame.base.base.obj is FRAME_BYTES
+
+
+def test_decode_frame_accepts_exact_sized_multidimensional_immutable_view() -> None:
+    frame_bytes = memoryview(FRAME_BYTES).cast("B", shape=(2, 4, 3))
+
+    assert len(frame_bytes) == 2
+    assert frame_bytes.nbytes == len(FRAME_BYTES)
+    assert frame_bytes.format == "B"
+    assert frame_bytes.itemsize == 1
+    assert frame_bytes.c_contiguous
+    assert frame_bytes.readonly
+
+    frame = _decode_frame(frame_bytes, width=4, height=2)
+
+    assert frame.shape == (2, 4, 3)
+    assert not frame.flags.writeable
+    assert np.shares_memory(frame, np.frombuffer(FRAME_BYTES, dtype=np.uint8))
+    assert isinstance(frame.base, np.ndarray)
+    assert isinstance(frame.base.base, memoryview)
+    assert frame.base.base.obj is FRAME_BYTES
+
+
+@pytest.mark.parametrize("format_code", ["B", "b", "c"])
+def test_decode_frame_accepts_byte_oriented_memoryview_formats(
+    format_code: str,
+) -> None:
+    frame_bytes = memoryview(FRAME_BYTES).cast(format_code)
+
+    frame = _decode_frame(frame_bytes, width=4, height=2)
+
+    assert frame.tolist() == np.arange(24, dtype=np.uint8).reshape(2, 4, 3).tolist()
+    assert np.shares_memory(frame, np.frombuffer(FRAME_BYTES, dtype=np.uint8))
+
+
+def test_decode_frame_rejects_exact_sized_non_byte_format_memoryview() -> None:
+    frame_bytes = memoryview(np.ones(24, dtype=np.bool_))
+
+    assert frame_bytes.format == "?"
+    assert frame_bytes.itemsize == 1
+    assert frame_bytes.nbytes == len(FRAME_BYTES)
+    assert frame_bytes.c_contiguous
+
+    with raises(
+        KeyerError,
+        match="^Decoded video frame has an invalid byte length$",
+    ):
+        _decode_frame(frame_bytes, width=4, height=2)
+
+
+@pytest.mark.parametrize(
+    "frame_bytes",
+    [
+        pytest.param(
+            memoryview(np.arange(12, dtype=np.uint16)),
+            id="uint16",
+        ),
+        pytest.param(
+            memoryview(np.arange(6, dtype=np.uint32)),
+            id="uint32",
+        ),
+    ],
+)
+def test_decode_frame_rejects_exact_sized_memoryviews_with_large_items(
+    frame_bytes: memoryview,
+) -> None:
+    assert frame_bytes.nbytes == len(FRAME_BYTES)
+    assert frame_bytes.itemsize > 1
+    assert frame_bytes.c_contiguous
+
+    with raises(
+        KeyerError,
+        match="^Decoded video frame has an invalid byte length$",
+    ):
+        _decode_frame(frame_bytes, width=4, height=2)
+
+
+@pytest.mark.parametrize(
+    "frame_bytes",
+    [
+        pytest.param(bytes(23), id="bytes"),
+        pytest.param(bytearray(25), id="bytearray"),
+        pytest.param(memoryview(bytes(23)), id="memoryview"),
+        pytest.param(memoryview(bytes(48))[::2], id="non-contiguous-memoryview"),
+    ],
+)
+def test_decode_frame_rejects_malformed_buffers(
+    frame_bytes: bytes | bytearray | memoryview,
+) -> None:
+    with raises(
+        KeyerError,
+        match="^Decoded video frame has an invalid byte length$",
+    ):
+        _decode_frame(frame_bytes, width=4, height=2)
+
+
+@pytest.mark.parametrize(
+    "frame_bytes_factory",
+    [
+        pytest.param(lambda backing: backing, id="bytearray"),
+        pytest.param(lambda backing: memoryview(backing), id="writable-memoryview"),
+        pytest.param(
+            lambda backing: memoryview(backing).toreadonly(),
+            id="readonly-view-of-mutable-buffer",
+        ),
+    ],
+)
+def test_decode_frame_detaches_from_mutable_backing_storage(
+    frame_bytes_factory: Callable[[bytearray], bytearray | memoryview],
+) -> None:
+    backing = bytearray(FRAME_BYTES)
+    frame_bytes = frame_bytes_factory(backing)
+
+    frame = _decode_frame(frame_bytes, width=4, height=2)
+    backing[0] = 255
+
+    assert frame.flags.writeable
+    assert frame[0, 0, 0] == 0
 
 
 def test_read_frame_uses_preprobed_metadata_without_second_ffmpeg_probe(

@@ -310,7 +310,10 @@ export function ChromaKeyerPage() {
       setErrors((current) => ({ ...current, inputPath: '请输入图片路径' }))
       return
     }
-    if (media?.inputPath === inputPath || inspectingPathRef.current === inputPath) {
+    if (
+      (media?.kind === 'image' && media.inputPath === inputPath)
+      || inspectingPathRef.current === inputPath
+    ) {
       return
     }
 
@@ -320,15 +323,6 @@ export function ChromaKeyerPage() {
     inspectingPathRef.current = inputPath
     setIsRequestPending(true)
     setErrors({})
-    setValues((current) => {
-      const nextValues: ChromaKeyerValues = {
-        ...current,
-        mediaKind,
-        timestampSeconds: 0,
-      }
-      valuesRef.current = nextValues
-      return nextValues
-    })
     try {
       if (mediaKind === 'video') {
         const response = await inspectChromaVideo({ inputPath })
@@ -423,6 +417,7 @@ export function ChromaKeyerPage() {
       !currentMedia
       || currentMedia.kind !== 'video'
       || disabledByTask
+      || inspectingPathRef.current !== null
       || (
         currentValues.samples.length > 0
         && !areKeyedPreviewInputsValid(currentValues)
@@ -721,7 +716,11 @@ export function ChromaKeyerPage() {
               {media.kind === 'video' ? (
                 <>
                   <ChromaVideoTimeline
-                    disabled={disabledByTask || keyedVideoSeekInvalid}
+                    disabled={
+                      disabledByTask
+                      || inspectingPathRef.current !== null
+                      || keyedVideoSeekInvalid
+                    }
                     durationSeconds={media.durationSeconds}
                     errorId={videoTimestampErrorId}
                     estimatedFrameCount={media.estimatedFrameCount}

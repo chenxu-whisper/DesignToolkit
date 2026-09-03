@@ -326,4 +326,3 @@ Browser validation uses a generated short green-screen video and confirms:
 - sampling and seven sliders update the selected-frame preview;
 - export creates the expected transparent PNG sequence and manifest;
 - desktop and mobile layouts do not overlap or overflow.
-

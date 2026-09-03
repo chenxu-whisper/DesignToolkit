@@ -74,6 +74,7 @@ describe('ChromaKeyerForm', () => {
     expect(onInputPathCommit).toHaveBeenCalledOnce()
     expect(onInputPathCommit).toHaveBeenCalledWith('E:\\media\\screen.png')
     expect(apiMocks.pickLocalFiles).toHaveBeenCalledWith({
+      allowedSuffixes: ['.mp4', '.webm', '.mov', '.mkv', '.avi', '.m4v', '.png', '.jpg', '.jpeg'],
       fileKind: 'media',
       multiple: false,
       title: '选择图片或视频文件',

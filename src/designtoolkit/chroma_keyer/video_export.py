@@ -6,6 +6,7 @@ import json
 import os
 import sys
 from contextlib import closing
+from math import isclose
 from pathlib import Path
 from shutil import rmtree
 from time import sleep
@@ -14,6 +15,7 @@ from uuid import uuid4
 from . import core
 from .image_io import write_rgba_png
 from .models import KeyerError, KeyerParams, ScreenColorModel
+from .sampling import screen_model_from_samples
 from .video_models import (
     ProgressCallback,
     VideoDecoder,
@@ -26,12 +28,28 @@ _CLEANUP_RETRY_DELAYS = (0.01, 0.02)
 _WINDOWS_SHARING_VIOLATIONS = {5, 32, 33}
 _AT_FDCWD = -100
 _RENAME_NOREPLACE = 1
+_SCREEN_COLOR_ABS_TOLERANCE = 1e-9
+_SCREEN_COLOR_REL_TOLERANCE = 1e-9
 _UNSUPPORTED_RENAME_ERRNOS = {
     errno.EINVAL,
     errno.ENOSYS,
     errno.ENOTSUP,
     errno.EOPNOTSUPP,
 }
+
+
+def _validate_screen_color_model(model: ScreenColorModel) -> None:
+    normalized = screen_model_from_samples(model.samples)
+    if any(
+        not isclose(
+            actual,
+            expected,
+            rel_tol=_SCREEN_COLOR_REL_TOLERANCE,
+            abs_tol=_SCREEN_COLOR_ABS_TOLERANCE,
+        )
+        for actual, expected in zip(model.mean_rgb, normalized.mean_rgb, strict=True)
+    ):
+        raise KeyerError("mean_rgb must match the sole screen color sample")
 
 
 def _create_temporary_directory(output_root: Path, input_stem: str) -> Path:
@@ -157,6 +175,7 @@ def key_video_to_png_sequence(
     temporary_dir: Path | None = None
 
     try:
+        _validate_screen_color_model(model)
         decoder.probe(input_path)
 
         output_root = options.output_root or input_path.parent

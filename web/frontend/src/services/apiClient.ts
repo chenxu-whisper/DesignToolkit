@@ -344,15 +344,18 @@ export function resolveDroppedFilePaths(names: readonly string[]): Promise<Dropp
 }
 
 export function pickLocalFiles({
+  allowedSuffixes,
   fileKind,
   multiple,
   title,
 }: {
+  allowedSuffixes?: readonly string[]
   fileKind: LocalFileKind
   multiple: boolean
   title: string
 }): Promise<LocalPathPickResponse> {
   return request<LocalPathPickResponse>('/api/local-paths/pick-files', {
+    allowed_suffixes: allowedSuffixes,
     multiple,
     file_kind: fileKind,
     title,

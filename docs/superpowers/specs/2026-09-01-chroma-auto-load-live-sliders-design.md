@@ -127,4 +127,3 @@ Browser verification uses `assets/frame/test_frame_2.png` and confirms:
   visibly update Final or Alpha preview;
 - rapid dragging does not freeze controls or display an older response;
 - desktop and narrow viewports have no overlapping labels, values, or sliders.
-

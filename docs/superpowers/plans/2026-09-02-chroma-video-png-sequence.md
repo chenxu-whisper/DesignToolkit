@@ -536,4 +536,3 @@ Start the video worktree server on an unused port. Load the generated clip,
 seek between visibly different frames, sample green, adjust all seven controls,
 switch Final/Alpha, export, and inspect PNG/manifest output. Capture desktop and
 mobile screenshots and verify no overlap or horizontal overflow.
-

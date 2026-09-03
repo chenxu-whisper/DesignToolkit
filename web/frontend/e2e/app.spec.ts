@@ -207,7 +207,14 @@ test('auto-loads the image selected by the native picker exactly once', async ({
 
   await expect(page.getByRole('textbox', { name: '输入图片或视频路径' })).toHaveValue(inputPath)
   await expect(page.getByRole('button', { name: '抠像预览' })).toHaveAttribute('src', inspectPreviewUrl)
-  expect(pickerBodies).toEqual([{ multiple: false, file_kind: 'media', title: '选择图片或视频文件' }])
+  expect(pickerBodies).toEqual([
+    {
+      allowed_suffixes: ['.mp4', '.webm', '.mov', '.mkv', '.avi', '.m4v', '.png', '.jpg', '.jpeg'],
+      multiple: false,
+      file_kind: 'media',
+      title: '选择图片或视频文件',
+    },
+  ])
   expect(inspectBodies).toEqual([{ input_path: inputPath }])
 })
 

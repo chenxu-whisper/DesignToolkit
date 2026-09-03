@@ -7,6 +7,7 @@ from collections.abc import Callable, Hashable, Iterator
 from concurrent.futures import Future
 from dataclasses import dataclass
 from hashlib import sha256
+from inspect import Parameter, signature
 from io import BytesIO
 from os import stat_result
 from pathlib import Path
@@ -94,6 +95,7 @@ _KEYER_ERROR_CODES = {
     "Output path already exists": "output_exists",
     "Final output directory already exists": "output_exists",
 }
+
 
 class _BoundedSingleFlightCache[CacheKey: Hashable, CacheValue]:
     def __init__(self, maxsize: int) -> None:
@@ -577,6 +579,26 @@ def _is_terminal_event(event: LogEventResponse) -> bool:
     return event.phase in _TERMINAL_PHASES
 
 
+def _picker_accepts_allowed_suffixes(picker: LocalPathPicker) -> bool:
+    pick_files = getattr(picker, "pick_files", None)
+    if pick_files is None:
+        return False
+    try:
+        parameters = signature(pick_files).parameters
+    except (TypeError, ValueError):
+        return False
+
+    allowed_suffixes = parameters.get("allowed_suffixes")
+    if allowed_suffixes is not None and allowed_suffixes.kind in {
+        Parameter.POSITIONAL_OR_KEYWORD,
+        Parameter.KEYWORD_ONLY,
+    }:
+        return True
+    return any(
+        parameter.kind is Parameter.VAR_KEYWORD for parameter in parameters.values()
+    )
+
+
 def create_router(
     task_manager: TaskManager,
     *,
@@ -586,6 +608,7 @@ def create_router(
 ) -> APIRouter:
     router = APIRouter(prefix="/api")
     picker = local_path_picker or TkinterLocalPathPicker()
+    picker_accepts_allowed_suffixes = _picker_accepts_allowed_suffixes(picker)
     decoder = video_decoder if video_decoder is not None else ImageioVideoDecoder()
     read_video_frame = _select_video_frame_reader(
         decoder,
@@ -650,13 +673,24 @@ def create_router(
     @router.post("/local-paths/pick-files", response_model=LocalPathPickResponse)
     def pick_local_files(request: LocalFilePickRequest) -> LocalPathPickResponse:
         try:
-            paths = picker.pick_files(
-                title=request.title,
-                multiple=request.multiple,
-                file_kind=request.file_kind,
-            )
+            if request.allowed_suffixes is None or not picker_accepts_allowed_suffixes:
+                paths = picker.pick_files(
+                    title=request.title,
+                    multiple=request.multiple,
+                    file_kind=request.file_kind,
+                )
+            else:
+                paths = picker.pick_files(
+                    title=request.title,
+                    multiple=request.multiple,
+                    file_kind=request.file_kind,
+                    allowed_suffixes=request.allowed_suffixes,
+                )
         except LocalPathPickerError as exc:
             raise ApiError("local_picker_unavailable", str(exc), 503) from exc
+        if request.allowed_suffixes is not None:
+            allowed_suffixes = frozenset(request.allowed_suffixes)
+            paths = [path for path in paths if path.suffix.lower() in allowed_suffixes]
         return LocalPathPickResponse(
             paths=[str(path) for path in paths],
             cancelled=len(paths) == 0,

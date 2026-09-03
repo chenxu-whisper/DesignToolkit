@@ -987,6 +987,139 @@ describe('ChromaKeyerPage', () => {
     expect(screen.getByText('约 375 帧')).toBeInTheDocument()
   })
 
+  it('refreshes a loaded video when the same path is committed again', async () => {
+    render(<ChromaKeyerPage />)
+    await inspectVideo()
+    await sampleImage()
+    await waitFor(() => expect(screen.getByText('#2AB448')).toBeInTheDocument())
+    await waitFor(() =>
+      expect(screen.getByRole('slider', { name: '视频时间轴' })).toHaveValue('1.25'),
+    )
+    pageMocks.inspectChromaVideo.mockResolvedValueOnce({
+      ...videoInspectResponse,
+      duration_seconds: 20,
+      estimated_frame_count: 480,
+      fps: 24,
+      height: 720,
+      preview_url: '/api/previews/video-replaced.png',
+      timestamp_seconds: 0,
+      width: 1280,
+    })
+
+    fireEvent.keyDown(screen.getByLabelText('输入图片或视频路径'), { key: 'Enter' })
+
+    await waitFor(() => expect(pageMocks.inspectChromaVideo).toHaveBeenCalledTimes(2))
+    expect(screen.getByRole('button', { name: '抠像预览' })).toHaveAttribute(
+      'src',
+      '/api/previews/video-replaced.png',
+    )
+    expect(screen.getByText('24 FPS')).toBeInTheDocument()
+    expect(screen.getByText('1280 × 720')).toBeInTheDocument()
+    expect(screen.getByText('约 480 帧')).toBeInTheDocument()
+    expect(screen.getByRole('slider', { name: '视频时间轴' })).toHaveValue('0')
+    expect(screen.queryByText('#2AB448')).not.toBeInTheDocument()
+
+    await sampleImage()
+    expect(pageMocks.sampleChromaVideo).toHaveBeenLastCalledWith(
+      expect.objectContaining({ timestampSeconds: 0 }),
+    )
+  })
+
+  it('disables and ignores seeks while a same-path video refresh is pending', async () => {
+    const refreshRequest = createDeferred<typeof videoInspectResponse>()
+    render(<ChromaKeyerPage />)
+    await inspectVideo()
+    await sampleImage()
+    await waitFor(() =>
+      expect(screen.getByRole('slider', { name: '视频时间轴' })).toHaveValue('1.25'),
+    )
+    pageMocks.inspectChromaVideo.mockReturnValueOnce(refreshRequest.promise)
+    pageMocks.createChromaVideoFrame.mockClear()
+    const input = screen.getByLabelText('输入图片或视频路径')
+    const timeline = screen.getByRole('slider', { name: '视频时间轴' })
+
+    fireEvent.keyDown(input, { key: 'Enter' })
+
+    await waitFor(() => expect(pageMocks.inspectChromaVideo).toHaveBeenCalledTimes(2))
+    expect(timeline).toBeDisabled()
+    expect(timeline).toHaveValue('1.25')
+    expect(screen.getByRole('button', { name: '抠像预览' })).toHaveAttribute(
+      'src',
+      '/api/previews/video-keyed.png',
+    )
+
+    timeline.removeAttribute('disabled')
+    fireEvent.change(timeline, { target: { value: '2' } })
+
+    expect(timeline).toHaveValue('1.25')
+    expect(pageMocks.createChromaVideoFrame).not.toHaveBeenCalled()
+    await act(async () => {
+      refreshRequest.resolve({
+        ...videoInspectResponse,
+        duration_seconds: 20,
+        estimated_frame_count: 480,
+        fps: 24,
+        height: 720,
+        preview_url: '/api/previews/video-refreshed.png',
+        width: 1280,
+      })
+    })
+
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: '抠像预览' })).toHaveAttribute(
+        'src',
+        '/api/previews/video-refreshed.png',
+      ),
+    )
+    expect(screen.getByRole('slider', { name: '视频时间轴' })).toHaveValue('0')
+  })
+
+  it('preserves the loaded video session when a same-path refresh fails', async () => {
+    const refreshRequest = createDeferred<typeof videoInspectResponse>()
+    render(<ChromaKeyerPage />)
+    await inspectVideo()
+    await sampleImage()
+    await waitFor(() => expect(screen.getByText('#2AB448')).toBeInTheDocument())
+    await waitFor(() =>
+      expect(screen.getByRole('slider', { name: '视频时间轴' })).toHaveValue('1.25'),
+    )
+    pageMocks.inspectChromaVideo.mockReturnValueOnce(refreshRequest.promise)
+
+    fireEvent.keyDown(screen.getByLabelText('输入图片或视频路径'), { key: 'Enter' })
+
+    await waitFor(() => expect(pageMocks.inspectChromaVideo).toHaveBeenCalledTimes(2))
+    expect(screen.getByRole('button', { name: '抠像预览' })).toHaveAttribute(
+      'src',
+      '/api/previews/video-keyed.png',
+    )
+    expect(screen.getByText('30 FPS')).toBeInTheDocument()
+    expect(screen.getByText('1920 × 1080')).toBeInTheDocument()
+    expect(screen.getByText('约 375 帧')).toBeInTheDocument()
+    expect(screen.getByRole('slider', { name: '视频时间轴' })).toHaveValue('1.25')
+    expect(screen.getByText('#2AB448')).toBeInTheDocument()
+
+    await act(async () => {
+      refreshRequest.reject(new Error('视频刷新失败'))
+    })
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('视频刷新失败')
+    expect(screen.getByRole('button', { name: '抠像预览' })).toHaveAttribute(
+      'src',
+      '/api/previews/video-keyed.png',
+    )
+    expect(screen.getByText('30 FPS')).toBeInTheDocument()
+    expect(screen.getByText('1920 × 1080')).toBeInTheDocument()
+    expect(screen.getByText('约 375 帧')).toBeInTheDocument()
+    expect(screen.getByRole('slider', { name: '视频时间轴' })).toHaveValue('1.25')
+    expect(screen.getByText('#2AB448')).toBeInTheDocument()
+
+    pageMocks.sampleChromaVideo.mockClear()
+    await sampleImage()
+    expect(pageMocks.sampleChromaVideo).toHaveBeenCalledWith(
+      expect.objectContaining({ timestampSeconds: 1.25 }),
+    )
+  })
+
   it('renders the video timeline and its error directly below the canvas', async () => {
     pageMocks.createChromaVideoFrame.mockRejectedValueOnce(new Error('视频帧无法读取'))
     render(<ChromaKeyerPage />)

@@ -23,6 +23,22 @@ ReadFrames = Callable[..., Iterator[object]]
 AvailabilityValidator = Callable[[], object]
 
 
+def _has_immutable_backing(frame_bytes: bytes | bytearray | memoryview) -> bool:
+    if isinstance(frame_bytes, bytes):
+        return True
+    if isinstance(frame_bytes, bytearray):
+        return False
+    if not frame_bytes.readonly:
+        return False
+
+    owner = frame_bytes.obj
+    while isinstance(owner, memoryview):
+        if not owner.readonly:
+            return False
+        owner = owner.obj
+    return isinstance(owner, bytes)
+
+
 def _close_frames(frames: Iterator[object]) -> None:
     close = getattr(frames, "close", None)
     if callable(close):
@@ -87,14 +103,24 @@ def _decode_frame(
     expected = width * height * 3
     if not isinstance(frame_bytes, (bytes, bytearray, memoryview)):
         raise KeyerError("Decoded video frame has an invalid byte length")
-    if len(frame_bytes) != expected:
+    if isinstance(frame_bytes, memoryview):
+        format_code = frame_bytes.format
+        if format_code[:1] in "@=<>!":
+            format_code = format_code[1:]
+        if (
+            frame_bytes.itemsize != 1
+            or format_code not in {"B", "b", "c"}
+            or not frame_bytes.c_contiguous
+        ):
+            raise KeyerError("Decoded video frame has an invalid byte length")
+    byte_length = (
+        frame_bytes.nbytes if isinstance(frame_bytes, memoryview) else len(frame_bytes)
+    )
+    if byte_length != expected:
         raise KeyerError("Decoded video frame has an invalid byte length")
     try:
-        return (
-            np.frombuffer(frame_bytes, dtype=np.uint8)
-            .reshape(height, width, 3)
-            .copy()
-        )
+        frame = np.frombuffer(frame_bytes, dtype=np.uint8).reshape(height, width, 3)
+        return frame if _has_immutable_backing(frame_bytes) else frame.copy()
     except (BufferError, TypeError, ValueError) as error:
         raise KeyerError("Decoded video frame has an invalid byte length") from error
 

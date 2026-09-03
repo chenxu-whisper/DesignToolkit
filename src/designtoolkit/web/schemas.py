@@ -6,6 +6,12 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from designtoolkit.web.native_picker import (
+    NATIVE_PICKER_IMAGE_SUFFIXES,
+    NATIVE_PICKER_MEDIA_SUFFIXES,
+    NATIVE_PICKER_VIDEO_SUFFIXES,
+)
+
 PositiveInt = Annotated[int, Field(strict=True, gt=0)]
 RgbChannel = Annotated[int, Field(strict=True, ge=0, le=255)]
 UnitIntervalFloat = Annotated[
@@ -325,7 +331,48 @@ class DroppedFilePathResolveResponse(BaseModel):
 class LocalFilePickRequest(BaseModel):
     multiple: bool = False
     file_kind: Literal["video", "media", "image", "any"] = "any"
+    allowed_suffixes: list[str] | None = None
     title: str = "Select file"
+
+    @field_validator("allowed_suffixes")
+    @classmethod
+    def validate_allowed_suffixes(
+        cls,
+        value: list[str] | None,
+    ) -> list[str] | None:
+        if value is None:
+            return None
+        if not value:
+            raise ValueError("allowed_suffixes must contain at least one suffix")
+
+        normalized: list[str] = []
+        for suffix in value:
+            canonical_suffix = suffix.lower()
+            if (
+                not canonical_suffix.startswith(".")
+                or not canonical_suffix[1:].isalnum()
+            ):
+                raise ValueError("allowed_suffixes must use canonical suffixes")
+            if canonical_suffix not in NATIVE_PICKER_MEDIA_SUFFIXES:
+                raise ValueError("allowed_suffixes contains an unsupported suffix")
+            if canonical_suffix not in normalized:
+                normalized.append(canonical_suffix)
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_allowed_suffixes_for_file_kind(self) -> LocalFilePickRequest:
+        if self.allowed_suffixes is None:
+            return self
+
+        allowed_for_kind = {
+            "video": NATIVE_PICKER_VIDEO_SUFFIXES,
+            "image": NATIVE_PICKER_IMAGE_SUFFIXES,
+            "media": (NATIVE_PICKER_VIDEO_SUFFIXES | NATIVE_PICKER_IMAGE_SUFFIXES),
+            "any": NATIVE_PICKER_MEDIA_SUFFIXES,
+        }[self.file_kind]
+        if not set(self.allowed_suffixes) <= allowed_for_kind:
+            raise ValueError("allowed_suffixes contains a suffix invalid for file_kind")
+        return self
 
 
 class LocalDirectoryPickRequest(BaseModel):

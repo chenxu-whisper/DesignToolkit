@@ -500,6 +500,31 @@ describe('apiClient', () => {
     })
   })
 
+  it('serializes optional local file suffix constraints for the native backend picker', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ paths: [], cancelled: true })),
+    )
+    const allowedSuffixes = ['.mp4', '.webm', '.png'] as const
+
+    await pickLocalFiles({
+      allowedSuffixes,
+      multiple: false,
+      fileKind: 'media',
+      title: '选择受支持的媒体',
+    })
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/local-paths/pick-files', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        allowed_suffixes: allowedSuffixes,
+        multiple: false,
+        file_kind: 'media',
+        title: '选择受支持的媒体',
+      }),
+    })
+  })
+
   it('picks local directories through the native backend picker', async () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
       new Response(
