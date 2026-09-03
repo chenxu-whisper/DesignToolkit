@@ -1,4 +1,12 @@
 import type { KeyboardEvent } from 'react'
+import {
+  Pause,
+  Play,
+  RotateCcw,
+  StepBack,
+  StepForward,
+  type LucideIcon,
+} from 'lucide-react'
 
 type ChromaVideoTimelineProps = {
   disabled?: boolean
@@ -8,7 +16,13 @@ type ChromaVideoTimelineProps = {
   fps: number
   height: number
   invalid?: boolean
+  isPlaying: boolean
   onChange: (timestampSeconds: number) => void
+  onPlayPause: () => void
+  onRestart: () => void
+  onStepBackward: () => void
+  onStepForward: () => void
+  transportDisabled: boolean
   value: number
   width: number
 }
@@ -29,7 +43,13 @@ export function ChromaVideoTimeline({
   fps,
   height,
   invalid = false,
+  isPlaying,
   onChange,
+  onPlayPause,
+  onRestart,
+  onStepBackward,
+  onStepForward,
+  transportDisabled,
   value,
   width,
 }: ChromaVideoTimelineProps) {
@@ -69,6 +89,37 @@ export function ChromaVideoTimeline({
         className="chroma-video-timeline-controls"
         data-testid="chroma-video-timeline-controls"
       >
+        <div
+          aria-label="视频播放控制"
+          className="chroma-video-transport"
+          data-testid="chroma-video-transport"
+          role="group"
+        >
+          <TransportButton
+            disabled={disabled || transportDisabled}
+            icon={RotateCcw}
+            label="回到开头"
+            onClick={onRestart}
+          />
+          <TransportButton
+            disabled={disabled || transportDisabled}
+            icon={StepBack}
+            label="上一帧"
+            onClick={onStepBackward}
+          />
+          <TransportButton
+            disabled={disabled || transportDisabled}
+            icon={isPlaying ? Pause : Play}
+            label={isPlaying ? '暂停' : '播放'}
+            onClick={onPlayPause}
+          />
+          <TransportButton
+            disabled={disabled || transportDisabled}
+            icon={StepForward}
+            label="下一帧"
+            onClick={onStepForward}
+          />
+        </div>
         <input
           aria-describedby={invalid ? errorId : undefined}
           aria-invalid={invalid || undefined}
@@ -101,6 +152,31 @@ export function ChromaVideoTimeline({
         </div>
       </dl>
     </div>
+  )
+}
+
+function TransportButton({
+  disabled,
+  icon: Icon,
+  label,
+  onClick,
+}: {
+  disabled: boolean
+  icon: LucideIcon
+  label: string
+  onClick: () => void
+}) {
+  return (
+    <button
+      aria-label={label}
+      className="icon-button"
+      disabled={disabled}
+      onClick={onClick}
+      title={label}
+      type="button"
+    >
+      <Icon aria-hidden="true" size={18} />
+    </button>
   )
 }
 

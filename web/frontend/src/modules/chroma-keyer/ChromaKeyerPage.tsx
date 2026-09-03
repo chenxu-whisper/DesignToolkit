@@ -60,6 +60,7 @@ const previewParameterFields = [
 
 const keyedPreviewFields = ['samples', ...previewParameterFields] as const
 const videoTimestampErrorId = 'chroma-video-timestamp-error'
+const noOp = () => {}
 
 function toBasePayload(values: ChromaKeyerValues): Omit<ChromaKeyerPayload, 'outputPath'> {
   if (values.samples.length !== 1) {
@@ -727,7 +728,13 @@ export function ChromaKeyerPage() {
                     fps={media.fps}
                     height={media.height}
                     invalid={Boolean(errors.timestampSeconds)}
+                    isPlaying={false}
                     onChange={handleSeek}
+                    onPlayPause={noOp}
+                    onRestart={noOp}
+                    onStepBackward={noOp}
+                    onStepForward={noOp}
+                    transportDisabled={true}
                     value={values.timestampSeconds}
                     width={media.width}
                   />

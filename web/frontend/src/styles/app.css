@@ -511,10 +511,23 @@ button {
   align-items: center;
   display: grid;
   gap: 10px;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 176px);
+  grid-template-columns: auto minmax(0, 1fr) minmax(0, 176px);
   max-inline-size: 100%;
-  min-height: 28px;
+  min-height: 32px;
   min-inline-size: 0;
+}
+
+.chroma-video-transport {
+  display: flex;
+  flex-shrink: 0;
+  gap: 4px;
+}
+
+.chroma-video-transport .icon-button {
+  block-size: 32px;
+  inline-size: 32px;
+  min-block-size: 32px;
+  min-inline-size: 32px;
 }
 
 .chroma-video-timeline-range {
@@ -792,11 +805,23 @@ button {
   }
 
   .chroma-video-timeline-controls {
-    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas:
+      "transport timecode"
+      "range range";
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .chroma-video-transport {
+    grid-area: transport;
+  }
+
+  .chroma-video-timeline-range {
+    grid-area: range;
   }
 
   .chroma-video-timecode {
-    text-align: left;
+    grid-area: timecode;
+    text-align: right;
   }
 
   .chroma-empty-preview {
