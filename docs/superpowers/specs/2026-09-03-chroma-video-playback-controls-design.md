@@ -118,8 +118,8 @@ If a playback request fails:
 - the timeline returns to the last successfully rendered timestamp;
 - the last successful preview remains visible;
 - the existing timeline error region displays the API error;
-- Play remains available for retry after the error is cleared by the next
-  successful request.
+- Play remains available and clears the stale timestamp error before
+  dispatching the retry request.
 
 Invalid media metadata or keyer parameters never start playback. Existing image
 behavior is unchanged.

@@ -183,14 +183,16 @@ export function useChromaVideoPlayback(options: UseChromaVideoPlaybackOptions) {
       }
 
       const { durationSeconds, fps } = optionsRef.current
-      targetRef.current = quantizePlaybackTimestamp(
+      const nextTarget = quantizePlaybackTimestamp(
         startTimestampRef.current + (now - startWallTimeRef.current) / 1000,
         fps,
         durationSeconds,
       )
-      optionsRef.current.onTargetChange(targetRef.current)
+      const targetAdvanced = nextTarget > targetRef.current
+      targetRef.current = nextTarget
+      optionsRef.current.onTargetChange(nextTarget)
 
-      if (!requestInFlightRef.current) {
+      if (targetAdvanced && !requestInFlightRef.current) {
         void dispatchLatestTarget(generation)
       }
       schedule(generation)
