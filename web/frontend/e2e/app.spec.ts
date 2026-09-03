@@ -789,7 +789,9 @@ test('keeps the loaded video editor within desktop and 390px mobile layouts', as
             card: toBox(card),
             header: toBox(header),
             label: toBox(label),
+            labelClientHeight: label.clientHeight,
             labelClientWidth: label.clientWidth,
+            labelScrollHeight: label.scrollHeight,
             labelScrollWidth: label.scrollWidth,
             name: label.textContent?.trim() ?? '',
             number: toBox(number),
@@ -810,12 +812,25 @@ test('keeps the loaded video editor within desktop and 390px mobile layouts', as
     expect(layout.metadata.right).toBeLessThanOrEqual(layout.main.right + 0.5)
     expect(layout.parameters.map(({ name }) => name)).toEqual(chromaParameterNames)
     for (const parameter of layout.parameters) {
+      expect(parameter.labelScrollHeight).toBeLessThanOrEqual(parameter.labelClientHeight + 1)
       expect(parameter.labelScrollWidth).toBeLessThanOrEqual(parameter.labelClientWidth + 1)
       expect(parameter.overflowWrap).toBe('normal')
       expect(parameter.textOverflow).not.toBe('ellipsis')
       expect(parameter.whiteSpace).not.toBe('nowrap')
       expect(parameter.header.height).toBeCloseTo(34, 0)
-      expect(parameter.number.width).toBeCloseTo(76, 0)
+      expect(parameter.number.width).toBeCloseTo(68, 0)
+      expect(parameter.number.left).toBeGreaterThanOrEqual(parameter.header.left - 0.5)
+      expect(
+        parameter.number.right,
+        `${parameter.name} numeric input must stay within its header at ${viewport.width}px`,
+      ).toBeLessThanOrEqual(parameter.header.right + 0.5)
+      expect(parameter.number.top).toBeGreaterThanOrEqual(parameter.header.top - 0.5)
+      expect(parameter.number.bottom).toBeLessThanOrEqual(parameter.header.bottom + 0.5)
+      expect(parameter.number.left).toBeGreaterThanOrEqual(parameter.card.left - 0.5)
+      expect(parameter.number.right).toBeLessThanOrEqual(parameter.card.right + 0.5)
+      expect(parameter.number.top).toBeGreaterThanOrEqual(parameter.card.top - 0.5)
+      expect(parameter.number.bottom).toBeLessThanOrEqual(parameter.card.bottom + 0.5)
+      expect(parameter.label.right).toBeLessThanOrEqual(parameter.number.left + 0.5)
       expect(parameter.label.left).toBeGreaterThanOrEqual(parameter.header.left - 0.5)
       expect(parameter.label.right).toBeLessThanOrEqual(parameter.header.right + 0.5)
       expect(parameter.label.top).toBeGreaterThanOrEqual(parameter.header.top - 0.5)

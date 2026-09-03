@@ -685,12 +685,12 @@ button {
 }
 
 .chroma-parameter-number {
-  flex: 0 0 76px;
+  flex: 0 0 68px;
   font-variant-numeric: tabular-nums;
   min-height: 34px;
   padding: 5px 8px;
   text-align: right;
-  width: 76px;
+  width: 68px;
 }
 
 .chroma-parameter-range {
