@@ -7,7 +7,7 @@ from os import path as os_path
 from os import utime
 from pathlib import Path
 from queue import Empty
-from threading import Event, Thread
+from threading import Barrier, Event, Thread
 from uuid import UUID
 
 import numpy as np
@@ -24,7 +24,11 @@ from designtoolkit.chroma_keyer.image_io import (
 from designtoolkit.chroma_keyer.matte import generate_alpha, refine_alpha
 from designtoolkit.chroma_keyer.models import KeyerError, KeyerParams, KeyImageResult
 from designtoolkit.chroma_keyer.sampling import screen_model_from_samples
-from designtoolkit.chroma_keyer.video_models import VideoKeyResult, VideoMetadata
+from designtoolkit.chroma_keyer.video_models import (
+    VideoDecoder,
+    VideoKeyResult,
+    VideoMetadata,
+)
 from designtoolkit.web import routes as web_routes
 from designtoolkit.web.adapters import (
     chroma_keyer_options_from_request,
@@ -106,29 +110,76 @@ class FakeVideoDecoder:
         self,
         path: Path,
         timestamp_seconds: float,
-        *,
-        metadata: VideoMetadata | None = None,
     ) -> np.ndarray:
         self.calls.append(("read_frame", path, timestamp_seconds))
-        self.read_metadata.append(metadata)
         return self.full_frame.copy()
 
     def read_preview_frame(
         self,
         path: Path,
         timestamp_seconds: float,
-        *,
-        metadata: VideoMetadata | None = None,
     ) -> np.ndarray:
         self.calls.append(("read_preview_frame", path, timestamp_seconds))
-        self.read_metadata.append(metadata)
         return self.preview_frame.copy()
+
+    def read_frame_with_metadata(
+        self,
+        path: Path,
+        timestamp_seconds: float,
+        *,
+        metadata: VideoMetadata,
+    ) -> np.ndarray:
+        self.read_metadata.append(metadata)
+        return self.read_frame(path, timestamp_seconds)
+
+    def read_preview_frame_with_metadata(
+        self,
+        path: Path,
+        timestamp_seconds: float,
+        *,
+        metadata: VideoMetadata,
+    ) -> np.ndarray:
+        self.read_metadata.append(metadata)
+        return self.read_preview_frame(path, timestamp_seconds)
 
     def iter_frames(self, path: Path):
         raise AssertionError(f"iter_frames must not be called for previews: {path}")
 
 
-def _video_client(tmp_path: Path, decoder: FakeVideoDecoder) -> TestClient:
+class LegacyVideoDecoder:
+    def __init__(self) -> None:
+        self.metadata = VideoMetadata(
+            width=4,
+            height=2,
+            fps=2.0,
+            duration_seconds=3.0,
+            estimated_frame_count=6,
+            codec="legacy",
+        )
+        self.frame = np.full((2, 4, 3), [42, 180, 72], dtype=np.uint8)
+        self.calls: list[tuple[str, Path, float | None]] = []
+
+    def probe(self, path: Path) -> VideoMetadata:
+        self.calls.append(("probe", path, None))
+        return self.metadata
+
+    def read_frame(self, path: Path, timestamp_seconds: float) -> np.ndarray:
+        self.calls.append(("read_frame", path, timestamp_seconds))
+        return self.frame.copy()
+
+    def read_preview_frame(
+        self,
+        path: Path,
+        timestamp_seconds: float,
+    ) -> np.ndarray:
+        self.calls.append(("read_preview_frame", path, timestamp_seconds))
+        return self.frame[:, ::2].copy()
+
+    def iter_frames(self, path: Path):
+        raise AssertionError(f"iter_frames must not be called for previews: {path}")
+
+
+def _video_client(tmp_path: Path, decoder: VideoDecoder) -> TestClient:
     return TestClient(
         create_app(
             local_path_roots=[tmp_path],
@@ -1703,6 +1754,139 @@ def test_video_inspect_returns_metadata_and_first_bounded_frame(
     assert np.array_equal(_decode_rgb_png(preview.content), preview_frame)
 
 
+@mark.parametrize(
+    ("url", "payload", "read_method"),
+    [
+        ("/api/chroma-keyer/videos/inspect", {}, "read_preview_frame"),
+        (
+            "/api/chroma-keyer/videos/frame",
+            {"timestamp_seconds": 0.5},
+            "read_preview_frame",
+        ),
+        (
+            "/api/chroma-keyer/videos/sample",
+            {
+                "timestamp_seconds": 0.5,
+                "x": 0.0,
+                "y": 0.0,
+                "preview_width": 2.0,
+                "preview_height": 1.0,
+            },
+            "read_frame",
+        ),
+        (
+            "/api/chroma-keyer/videos/preview",
+            {
+                "timestamp_seconds": 0.5,
+                "samples": [[42, 180, 72]],
+                "params": {},
+            },
+            "read_preview_frame",
+        ),
+    ],
+)
+def test_video_routes_support_legacy_two_argument_decoder(
+    tmp_path: Path,
+    url: str,
+    payload: dict[str, object],
+    read_method: str,
+) -> None:
+    input_path = tmp_path / "clip.mp4"
+    input_path.write_bytes(b"fake video source")
+    decoder = LegacyVideoDecoder()
+
+    response = _video_client(tmp_path, decoder).post(
+        url,
+        json={"input_path": str(input_path), **payload},
+    )
+
+    assert response.status_code == 200
+    assert decoder.calls == [
+        ("probe", input_path, None),
+        (read_method, input_path, payload.get("timestamp_seconds", 0.0)),
+    ]
+
+
+@mark.parametrize(
+    ("url", "payload", "capability_method"),
+    [
+        (
+            "/api/chroma-keyer/videos/frame",
+            {"timestamp_seconds": 0.5},
+            "read_preview_frame_with_metadata",
+        ),
+        (
+            "/api/chroma-keyer/videos/sample",
+            {
+                "timestamp_seconds": 0.5,
+                "x": 0.0,
+                "y": 0.0,
+                "preview_width": 2.0,
+                "preview_height": 1.0,
+            },
+            "read_frame_with_metadata",
+        ),
+    ],
+)
+def test_video_routes_use_preprobed_decoder_capability(
+    tmp_path: Path,
+    url: str,
+    payload: dict[str, object],
+    capability_method: str,
+) -> None:
+    input_path = tmp_path / "clip.mp4"
+    input_path.write_bytes(b"fake video source")
+
+    class OptimizedVideoDecoder(LegacyVideoDecoder):
+        def read_frame(self, path: Path, timestamp_seconds: float) -> np.ndarray:
+            raise AssertionError("legacy full-frame read must not be used")
+
+        def read_preview_frame(
+            self,
+            path: Path,
+            timestamp_seconds: float,
+        ) -> np.ndarray:
+            raise AssertionError("legacy preview read must not be used")
+
+        def read_frame_with_metadata(
+            self,
+            path: Path,
+            timestamp_seconds: float,
+            *,
+            metadata: VideoMetadata,
+        ) -> np.ndarray:
+            assert metadata is self.metadata
+            self.calls.append(
+                ("read_frame_with_metadata", path, timestamp_seconds)
+            )
+            return self.frame.copy()
+
+        def read_preview_frame_with_metadata(
+            self,
+            path: Path,
+            timestamp_seconds: float,
+            *,
+            metadata: VideoMetadata,
+        ) -> np.ndarray:
+            assert metadata is self.metadata
+            self.calls.append(
+                ("read_preview_frame_with_metadata", path, timestamp_seconds)
+            )
+            return self.frame[:, ::2].copy()
+
+    decoder = OptimizedVideoDecoder()
+    response = _video_client(tmp_path, decoder).post(
+        url,
+        json={"input_path": str(input_path), **payload},
+    )
+
+    assert response.status_code == 200
+    assert decoder.calls == [
+        ("probe", input_path, None),
+        (capability_method, input_path, 0.5),
+    ]
+
+
 def test_video_fingerprint_streams_sparse_file_in_bounded_chunks(
     tmp_path: Path,
     monkeypatch,
@@ -1775,6 +1959,196 @@ def test_video_cache_miss_hashes_source_once_across_stability_checks(
         ("probe", input_path, None),
         ("read_preview_frame", input_path, 0.0),
     ]
+
+
+def test_video_hash_cache_deduplicates_concurrent_miss_for_same_key(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    input_path = tmp_path / "clip.mp4"
+    input_path.write_bytes(b"fake video source")
+    resolved_path = input_path.resolve()
+    source_version = web_routes._video_source_version(
+        resolved_path,
+        resolved_path.stat(),
+    )
+    start_together = Barrier(2)
+    hash_started = Event()
+    duplicate_hash_started = Event()
+    release_hash = Event()
+    hash_calls: list[Path] = []
+    results: list[tuple[int, str]] = []
+    errors: list[BaseException] = []
+
+    def blocked_hash(path: Path) -> tuple[int, str]:
+        hash_calls.append(path)
+        if len(hash_calls) == 1:
+            hash_started.set()
+        else:
+            duplicate_hash_started.set()
+        assert release_hash.wait(timeout=5)
+        return 17, "shared-hash"
+
+    def request_hash() -> None:
+        try:
+            start_together.wait(timeout=5)
+            results.append(
+                web_routes._cached_video_content_hash(
+                    resolved_path,
+                    source_version,
+                )
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(web_routes, "_hash_file_chunks", blocked_hash)
+    threads = [Thread(target=request_hash) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    try:
+        assert hash_started.wait(timeout=1)
+        assert not duplicate_hash_started.wait(timeout=0.25)
+    finally:
+        release_hash.set()
+        for thread in threads:
+            thread.join(timeout=5)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert errors == []
+    assert hash_calls == [resolved_path]
+    assert results == [(17, "shared-hash")] * 2
+
+
+def test_video_hash_cache_allows_independent_key_while_miss_is_blocked(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    blocked_path = tmp_path / "blocked.mp4"
+    independent_path = tmp_path / "independent.mp4"
+    blocked_path.write_bytes(b"blocked")
+    independent_path.write_bytes(b"independent")
+    blocked_path = blocked_path.resolve()
+    independent_path = independent_path.resolve()
+    blocked_version = web_routes._video_source_version(
+        blocked_path,
+        blocked_path.stat(),
+    )
+    independent_version = web_routes._video_source_version(
+        independent_path,
+        independent_path.stat(),
+    )
+    blocked_started = Event()
+    release_blocked = Event()
+    independent_complete = Event()
+    results: dict[Path, tuple[int, str]] = {}
+    errors: list[BaseException] = []
+
+    def tracked_hash(path: Path) -> tuple[int, str]:
+        if path == blocked_path:
+            blocked_started.set()
+            assert release_blocked.wait(timeout=5)
+        return len(path.read_bytes()), path.name
+
+    def request_hash(
+        path: Path,
+        source_version: tuple[int, int, int, int, int, int],
+    ) -> None:
+        try:
+            results[path] = web_routes._cached_video_content_hash(
+                path,
+                source_version,
+            )
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            if path == independent_path:
+                independent_complete.set()
+
+    monkeypatch.setattr(web_routes, "_hash_file_chunks", tracked_hash)
+    blocked_thread = Thread(
+        target=request_hash,
+        args=(blocked_path, blocked_version),
+    )
+    independent_thread = Thread(
+        target=request_hash,
+        args=(independent_path, independent_version),
+    )
+    blocked_thread.start()
+    assert blocked_started.wait(timeout=1)
+    independent_thread.start()
+    try:
+        assert independent_complete.wait(timeout=1)
+    finally:
+        release_blocked.set()
+        blocked_thread.join(timeout=5)
+        independent_thread.join(timeout=5)
+
+    assert not blocked_thread.is_alive()
+    assert not independent_thread.is_alive()
+    assert errors == []
+    assert results[independent_path] == (11, "independent.mp4")
+
+
+def test_video_hash_cache_shares_failure_and_retries_same_key(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    input_path = (tmp_path / "clip.mp4").resolve()
+    input_path.write_bytes(b"fake video source")
+    source_version = web_routes._video_source_version(
+        input_path,
+        input_path.stat(),
+    )
+    start_together = Barrier(2)
+    hash_started = Event()
+    duplicate_hash_started = Event()
+    release_hash = Event()
+    hash_calls = 0
+    errors: list[BaseException] = []
+
+    def failing_hash(_path: Path) -> tuple[int, str]:
+        nonlocal hash_calls
+        hash_calls += 1
+        if hash_calls == 1:
+            hash_started.set()
+        else:
+            duplicate_hash_started.set()
+        assert release_hash.wait(timeout=5)
+        raise OSError("hash failed")
+
+    def request_hash() -> None:
+        try:
+            start_together.wait(timeout=5)
+            web_routes._cached_video_content_hash(input_path, source_version)
+        except BaseException as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(web_routes, "_hash_file_chunks", failing_hash)
+    threads = [Thread(target=request_hash) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    try:
+        assert hash_started.wait(timeout=1)
+        assert not duplicate_hash_started.wait(timeout=0.25)
+    finally:
+        release_hash.set()
+        for thread in threads:
+            thread.join(timeout=5)
+
+    monkeypatch.setattr(
+        web_routes,
+        "_hash_file_chunks",
+        lambda _path: (17, "retry-hash"),
+    )
+    retry_result = web_routes._cached_video_content_hash(
+        input_path,
+        source_version,
+    )
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert [str(error) for error in errors] == ["hash failed", "hash failed"]
+    assert hash_calls == 1
+    assert retry_result == (17, "retry-hash")
 
 
 def test_video_interactions_reuse_source_hash_and_metadata_until_replacement(
@@ -1870,6 +2244,68 @@ def test_direct_first_video_frame_request_probes_once(tmp_path: Path) -> None:
         ("read_preview_frame", input_path, 0.5),
     ]
     assert decoder.read_metadata == [decoder.metadata]
+
+
+def test_video_metadata_cache_deduplicates_concurrent_probe_for_same_key(
+    tmp_path: Path,
+) -> None:
+    input_path = tmp_path / "clip.mp4"
+    input_path.write_bytes(b"fake video source")
+    web_routes._video_source_snapshot(input_path)
+    start_together = Barrier(2)
+    probe_started = Event()
+    duplicate_probe_started = Event()
+    release_probe = Event()
+
+    class BlockingProbeDecoder(LegacyVideoDecoder):
+        def probe(self, path: Path) -> VideoMetadata:
+            self.calls.append(("probe", path, None))
+            if sum(call[0] == "probe" for call in self.calls) == 1:
+                probe_started.set()
+            else:
+                duplicate_probe_started.set()
+            assert release_probe.wait(timeout=5)
+            return self.metadata
+
+    decoder = BlockingProbeDecoder()
+    client = _video_client(tmp_path, decoder)
+    responses = []
+    errors: list[BaseException] = []
+
+    def request_frame(timestamp_seconds: float) -> None:
+        try:
+            start_together.wait(timeout=5)
+            responses.append(
+                client.post(
+                    "/api/chroma-keyer/videos/frame",
+                    json={
+                        "input_path": str(input_path),
+                        "timestamp_seconds": timestamp_seconds,
+                    },
+                )
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [
+        Thread(target=request_frame, args=(timestamp_seconds,))
+        for timestamp_seconds in (0.5, 1.0)
+    ]
+    for thread in threads:
+        thread.start()
+    try:
+        assert probe_started.wait(timeout=1)
+        assert not duplicate_probe_started.wait(timeout=0.25)
+    finally:
+        release_probe.set()
+        for thread in threads:
+            thread.join(timeout=5)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert errors == []
+    assert len(responses) == 2
+    assert all(response.status_code == 200 for response in responses)
+    assert sum(call[0] == "probe" for call in decoder.calls) == 1
 
 
 def test_video_metadata_cache_is_scoped_to_each_app(tmp_path: Path) -> None:

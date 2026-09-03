@@ -95,25 +95,33 @@ class VideoDecoder(Protocol):
     def probe(self, path: Path) -> VideoMetadata:
         raise NotImplementedError
 
-    def read_frame(
-        self,
-        path: Path,
-        timestamp_seconds: float,
-        *,
-        metadata: VideoMetadata | None = None,
-    ) -> np.ndarray:
+    def read_frame(self, path: Path, timestamp_seconds: float) -> np.ndarray:
         raise NotImplementedError
 
-    def read_preview_frame(
-        self,
-        path: Path,
-        timestamp_seconds: float,
-        *,
-        metadata: VideoMetadata | None = None,
-    ) -> np.ndarray:
+    def read_preview_frame(self, path: Path, timestamp_seconds: float) -> np.ndarray:
         raise NotImplementedError
 
     def iter_frames(self, path: Path) -> tuple[VideoMetadata, VideoFrameStream]:
+        raise NotImplementedError
+
+
+class PreprobedVideoDecoder(Protocol):
+    def read_frame_with_metadata(
+        self,
+        path: Path,
+        timestamp_seconds: float,
+        *,
+        metadata: VideoMetadata,
+    ) -> np.ndarray:
+        raise NotImplementedError
+
+    def read_preview_frame_with_metadata(
+        self,
+        path: Path,
+        timestamp_seconds: float,
+        *,
+        metadata: VideoMetadata,
+    ) -> np.ndarray:
         raise NotImplementedError
 
 

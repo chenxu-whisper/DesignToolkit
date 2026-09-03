@@ -254,7 +254,7 @@ def test_read_frame_uses_preprobed_metadata_without_second_ffmpeg_probe(
     )
     read_frames = FakeReadFrames([dict(VALID_METADATA), FRAME_BYTES])
 
-    frame = make_decoder(read_frames).read_frame(
+    frame = make_decoder(read_frames).read_frame_with_metadata(
         path,
         1.99,
         metadata=metadata,
@@ -274,6 +274,36 @@ def test_read_frame_uses_preprobed_metadata_without_second_ffmpeg_probe(
     assert read_frames.generators[0].closed
 
 
+def test_preprobed_read_rejects_transposed_stream_dimensions_and_closes(
+    tmp_path: Path,
+) -> None:
+    path = make_video_path(tmp_path)
+    supplied_metadata = VideoMetadata(
+        width=4,
+        height=2,
+        fps=25.0,
+        duration_seconds=2.0,
+        estimated_frame_count=50,
+        codec="h264",
+    )
+    stream_metadata = {
+        **VALID_METADATA,
+        "source_size": (2, 4),
+        "size": (2, 4),
+    }
+    read_frames = FakeReadFrames([stream_metadata, FRAME_BYTES])
+
+    with raises(KeyerError, match="^Video stream dimensions changed$"):
+        make_decoder(read_frames).read_frame_with_metadata(
+            path,
+            0.5,
+            metadata=supplied_metadata,
+        )
+
+    assert read_frames.generators[0].next_count == 1
+    assert read_frames.generators[0].closed
+
+
 def test_read_frame_rejects_invalid_timestamp_before_open_with_preprobed_metadata(
     tmp_path: Path,
 ) -> None:
@@ -289,7 +319,11 @@ def test_read_frame_rejects_invalid_timestamp_before_open_with_preprobed_metadat
     read_frames = FakeReadFrames()
 
     with raises(KeyerError, match="timestamp"):
-        make_decoder(read_frames).read_frame(path, 2.0, metadata=metadata)
+        make_decoder(read_frames).read_frame_with_metadata(
+            path,
+            2.0,
+            metadata=metadata,
+        )
 
     assert read_frames.calls == []
 

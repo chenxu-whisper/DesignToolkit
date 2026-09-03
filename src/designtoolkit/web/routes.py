@@ -2,15 +2,17 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Callable, Iterator
+from collections import OrderedDict
+from collections.abc import Callable, Hashable, Iterator
+from concurrent.futures import Future
 from dataclasses import dataclass
-from functools import lru_cache
 from hashlib import sha256
 from io import BytesIO
 from os import stat_result
 from pathlib import Path
 from queue import Empty
 from stat import S_ISREG
+from threading import Lock
 
 import numpy as np
 from fastapi import APIRouter, Request
@@ -92,6 +94,57 @@ _KEYER_ERROR_CODES = {
     "Output path already exists": "output_exists",
     "Final output directory already exists": "output_exists",
 }
+
+class _BoundedSingleFlightCache[CacheKey: Hashable, CacheValue]:
+    def __init__(self, maxsize: int) -> None:
+        self._maxsize = maxsize
+        self._values: OrderedDict[CacheKey, CacheValue] = OrderedDict()
+        self._in_flight: dict[CacheKey, Future[CacheValue]] = {}
+        self._lock = Lock()
+
+    def get_or_compute(
+        self,
+        key: CacheKey,
+        compute: Callable[[], CacheValue],
+    ) -> CacheValue:
+        with self._lock:
+            try:
+                value = self._values.pop(key)
+            except KeyError:
+                pass
+            else:
+                self._values[key] = value
+                return value
+
+            future = self._in_flight.get(key)
+            if future is None:
+                future = Future()
+                self._in_flight[key] = future
+                owns_computation = True
+            else:
+                owns_computation = False
+
+        if not owns_computation:
+            return future.result()
+
+        try:
+            value = compute()
+        except BaseException as exc:
+            with self._lock:
+                if self._in_flight.get(key) is future:
+                    del self._in_flight[key]
+            future.set_exception(exc)
+            raise
+
+        with self._lock:
+            self._values[key] = value
+            self._values.move_to_end(key)
+            while len(self._values) > self._maxsize:
+                self._values.popitem(last=False)
+            if self._in_flight.get(key) is future:
+                del self._in_flight[key]
+        future.set_result(value)
+        return value
 
 
 class ApiError(Exception):
@@ -269,12 +322,20 @@ def _video_source_version(
     )
 
 
-@lru_cache(maxsize=_CHROMA_VIDEO_HASH_CACHE_SIZE)
+_video_content_hash_cache = _BoundedSingleFlightCache[
+    tuple[Path, tuple[int, int, int, int, int, int]],
+    tuple[int, str],
+](_CHROMA_VIDEO_HASH_CACHE_SIZE)
+
+
 def _cached_video_content_hash(
     resolved_path: Path,
     source_version: tuple[int, int, int, int, int, int],
 ) -> tuple[int, str]:
-    return _hash_file_chunks(resolved_path)
+    return _video_content_hash_cache.get_or_compute(
+        (resolved_path, source_version),
+        lambda: _hash_file_chunks(resolved_path),
+    )
 
 
 @dataclass(frozen=True)
@@ -362,6 +423,40 @@ class _VideoSourceChangedError(Exception):
     pass
 
 
+_PreprobedFrameReader = Callable[[Path, float, VideoMetadata], np.ndarray]
+
+
+def _select_video_frame_reader(
+    decoder: VideoDecoder,
+    capability_name: str,
+    legacy_reader: Callable[[Path, float], np.ndarray],
+) -> _PreprobedFrameReader:
+    capability_reader = getattr(decoder, capability_name, None)
+    if callable(capability_reader):
+
+        def read_with_metadata(
+            path: Path,
+            timestamp_seconds: float,
+            metadata: VideoMetadata,
+        ) -> np.ndarray:
+            return capability_reader(
+                path,
+                timestamp_seconds,
+                metadata=metadata,
+            )
+
+        return read_with_metadata
+
+    def read_legacy(
+        path: Path,
+        timestamp_seconds: float,
+        _metadata: VideoMetadata,
+    ) -> np.ndarray:
+        return legacy_reader(path, timestamp_seconds)
+
+    return read_legacy
+
+
 def _resolve_video_timestamp(
     requested_timestamp: float,
     metadata: VideoMetadata,
@@ -379,7 +474,7 @@ def _read_stable_video_frame(
         [Path, _VideoSourceSnapshot],
         VideoMetadata,
     ],
-    read_frame: Callable[..., np.ndarray],
+    read_frame: _PreprobedFrameReader,
 ) -> tuple[VideoMetadata, float, np.ndarray]:
     for _ in range(_CHROMA_SNAPSHOT_READ_ATTEMPTS):
         source_snapshot = _video_source_snapshot(input_path)
@@ -392,7 +487,7 @@ def _read_stable_video_frame(
             rgb = read_frame(
                 input_path,
                 timestamp_seconds,
-                metadata=metadata,
+                metadata,
             )
         except KeyerError:
             if _video_source_snapshot(input_path) != source_snapshot:
@@ -412,7 +507,7 @@ def _get_stable_video_preview_entry(
         [Path, _VideoSourceSnapshot],
         VideoMetadata,
     ],
-    read_frame: Callable[..., np.ndarray],
+    read_frame: _PreprobedFrameReader,
     create_png_bytes: Callable[[np.ndarray], bytes],
     *,
     samples: list[list[int]] | None = None,
@@ -447,7 +542,7 @@ def _get_stable_video_preview_entry(
                 rgb = read_frame(
                     input_path,
                     expected_timestamp,
-                    metadata=expected_metadata,
+                    expected_metadata,
                 )
                 png_bytes = create_png_bytes(rgb)
                 if _video_source_snapshot(input_path) != expected_snapshot:
@@ -492,15 +587,35 @@ def create_router(
     router = APIRouter(prefix="/api")
     picker = local_path_picker or TkinterLocalPathPicker()
     decoder = video_decoder if video_decoder is not None else ImageioVideoDecoder()
+    read_video_frame = _select_video_frame_reader(
+        decoder,
+        "read_frame_with_metadata",
+        decoder.read_frame,
+    )
+    read_video_preview_frame = _select_video_frame_reader(
+        decoder,
+        "read_preview_frame_with_metadata",
+        decoder.read_preview_frame,
+    )
     chroma_preview_store = ChromaPreviewStore()
+    video_metadata_cache = _BoundedSingleFlightCache[
+        tuple[
+            Path,
+            tuple[tuple[str, str | int], ...],
+            tuple[int, int, int, int, int, int],
+        ],
+        VideoMetadata,
+    ](_CHROMA_VIDEO_METADATA_CACHE_SIZE)
 
-    @lru_cache(maxsize=_CHROMA_VIDEO_METADATA_CACHE_SIZE)
     def get_cached_video_metadata(
         input_path: Path,
-        _fingerprint_items: tuple[tuple[str, str | int], ...],
-        _source_version: tuple[int, int, int, int, int, int],
+        fingerprint_items: tuple[tuple[str, str | int], ...],
+        source_version: tuple[int, int, int, int, int, int],
     ) -> VideoMetadata:
-        return decoder.probe(input_path)
+        return video_metadata_cache.get_or_compute(
+            (input_path, fingerprint_items, source_version),
+            lambda: decoder.probe(input_path),
+        )
 
     def get_video_metadata(
         input_path: Path,
@@ -670,7 +785,7 @@ def create_router(
                     "video_inspect",
                     0.0,
                     get_video_metadata,
-                    decoder.read_preview_frame,
+                    read_video_preview_frame,
                     make_preview_png,
                 )
             )
@@ -708,7 +823,7 @@ def create_router(
                     "video_frame",
                     request.timestamp_seconds,
                     get_video_metadata,
-                    decoder.read_preview_frame,
+                    read_video_preview_frame,
                     make_preview_png,
                 )
             )
@@ -733,7 +848,7 @@ def create_router(
                 input_path,
                 request.timestamp_seconds,
                 get_video_metadata,
-                decoder.read_frame,
+                read_video_frame,
             )
         except KeyerError as exc:
             raise _chroma_video_error_response(exc) from exc
@@ -793,7 +908,7 @@ def create_router(
                     "video_generated",
                     request.timestamp_seconds,
                     get_video_metadata,
-                    decoder.read_preview_frame,
+                    read_video_preview_frame,
                     create_preview_png,
                     samples=request.samples,
                     params=params_data,

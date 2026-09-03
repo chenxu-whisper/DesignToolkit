@@ -9,6 +9,7 @@ from pytest import mark, raises
 
 from designtoolkit.chroma_keyer import (
     SUPPORTED_VIDEO_SUFFIXES,
+    PreprobedVideoDecoder,
     ProgressCallback,
     VideoDecoder,
     VideoFrameStream,
@@ -238,13 +239,11 @@ def test_video_decoder_protocol_declares_required_methods() -> None:
         "self",
         "path",
         "timestamp_seconds",
-        "metadata",
     ]
     assert list(signature(VideoDecoder.read_preview_frame).parameters) == [
         "self",
         "path",
         "timestamp_seconds",
-        "metadata",
     ]
     assert list(signature(VideoDecoder.iter_frames).parameters) == [
         "self",
@@ -275,13 +274,11 @@ def test_protocol_annotations_include_numpy_frames_and_iterator_result() -> None
     assert VideoDecoder.read_frame.__annotations__ == {
         "path": Path,
         "timestamp_seconds": float,
-        "metadata": VideoMetadata | None,
         "return": np.ndarray,
     }
     assert VideoDecoder.read_preview_frame.__annotations__ == {
         "path": Path,
         "timestamp_seconds": float,
-        "metadata": VideoMetadata | None,
         "return": np.ndarray,
     }
     assert VideoDecoder.iter_frames.__annotations__["path"] is Path
@@ -296,4 +293,29 @@ def test_protocol_annotations_include_numpy_frames_and_iterator_result() -> None
         "estimated_total": int | None,
         "current_path": Path,
         "return": None,
+    }
+
+
+def test_preprobed_video_decoder_declares_optional_optimized_capability() -> None:
+    assert set(PreprobedVideoDecoder.__dict__) >= {
+        "read_frame_with_metadata",
+        "read_preview_frame_with_metadata",
+    }
+    assert list(
+        signature(PreprobedVideoDecoder.read_frame_with_metadata).parameters
+    ) == ["self", "path", "timestamp_seconds", "metadata"]
+    assert list(
+        signature(PreprobedVideoDecoder.read_preview_frame_with_metadata).parameters
+    ) == ["self", "path", "timestamp_seconds", "metadata"]
+    assert PreprobedVideoDecoder.read_frame_with_metadata.__annotations__ == {
+        "path": Path,
+        "timestamp_seconds": float,
+        "metadata": VideoMetadata,
+        "return": np.ndarray,
+    }
+    assert PreprobedVideoDecoder.read_preview_frame_with_metadata.__annotations__ == {
+        "path": Path,
+        "timestamp_seconds": float,
+        "metadata": VideoMetadata,
+        "return": np.ndarray,
     }

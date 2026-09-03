@@ -8,6 +8,7 @@ from .models import (
 from .video_export import key_video_to_png_sequence
 from .video_models import (
     SUPPORTED_VIDEO_SUFFIXES,
+    PreprobedVideoDecoder,
     ProgressCallback,
     VideoDecoder,
     VideoFrameStream,
@@ -25,6 +26,7 @@ __all__ = [
     "KeyImageResult",
     "KeyerError",
     "KeyerParams",
+    "PreprobedVideoDecoder",
     "ProgressCallback",
     "ScreenColorModel",
     "SUPPORTED_VIDEO_SUFFIXES",

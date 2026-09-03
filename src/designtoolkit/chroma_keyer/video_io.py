@@ -180,15 +180,20 @@ class ImageioVideoDecoder:
         finally:
             _close_frames(frames)
 
-    def read_frame(
+    def read_frame(self, path: Path, timestamp_seconds: float) -> np.ndarray:
+        return self.read_frame_with_metadata(
+            path,
+            timestamp_seconds,
+            metadata=self.probe(path),
+        )
+
+    def read_frame_with_metadata(
         self,
         path: Path,
         timestamp_seconds: float,
         *,
-        metadata: VideoMetadata | None = None,
+        metadata: VideoMetadata,
     ) -> np.ndarray:
-        if metadata is None:
-            metadata = self.probe(path)
         timestamp = clamp_timeline_timestamp(
             validate_timestamp(timestamp_seconds, metadata),
             metadata,
@@ -199,7 +204,12 @@ class ImageioVideoDecoder:
             output_params=["-frames:v", "1"],
         )
         try:
-            _read_metadata(frames)
+            stream_metadata = _read_metadata(frames)
+            if (stream_metadata.width, stream_metadata.height) != (
+                metadata.width,
+                metadata.height,
+            ):
+                raise KeyerError("Video stream dimensions changed")
             try:
                 frame_bytes = next(frames)
             except StopIteration as error:
@@ -208,21 +218,24 @@ class ImageioVideoDecoder:
                 raise KeyerError("Video frame could not be decoded") from error
             return _decode_frame(
                 frame_bytes,
-                width=metadata.width,
-                height=metadata.height,
+                width=stream_metadata.width,
+                height=stream_metadata.height,
             )
         finally:
             _close_frames(frames)
 
-    def read_preview_frame(
+    def read_preview_frame(self, path: Path, timestamp_seconds: float) -> np.ndarray:
+        return resize_preview_rgb(self.read_frame(path, timestamp_seconds))
+
+    def read_preview_frame_with_metadata(
         self,
         path: Path,
         timestamp_seconds: float,
         *,
-        metadata: VideoMetadata | None = None,
+        metadata: VideoMetadata,
     ) -> np.ndarray:
         return resize_preview_rgb(
-            self.read_frame(
+            self.read_frame_with_metadata(
                 path,
                 timestamp_seconds,
                 metadata=metadata,
