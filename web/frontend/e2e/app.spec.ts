@@ -602,7 +602,10 @@ test('runs the complete chroma video timeline and PNG sequence export workflow',
   await input.press('Enter')
 
   await expect.poll(() => inspectBodies).toEqual([{ input_path: videoInputPath }])
+  const canvas = page.getByRole('button', { name: '抠像预览' })
+  await expect(canvas).toHaveAttribute('src', videoInspectPreviewUrl)
   await expect(page.getByRole('slider', { name: '视频时间轴' })).toBeVisible()
+  await expect(page.getByText('00:00:00.000 / 00:00:03.000', { exact: true })).toBeVisible()
   await expect(page.getByText('4 FPS')).toBeVisible()
   await expect(page.getByText('400 × 200')).toBeVisible()
   await expect(page.getByText('约 12 帧')).toBeVisible()
@@ -624,7 +627,6 @@ test('runs the complete chroma video timeline and PNG sequence export workflow',
       timestamp_seconds: 2,
     }),
   })
-  const canvas = page.getByRole('button', { name: '抠像预览' })
   await expect(canvas).toHaveAttribute('src', '/api/chroma-keyer/previews/video-frame-latest.svg')
   await pendingFrameRoutes[0].route.fulfill({
     contentType: 'application/json',
@@ -638,18 +640,40 @@ test('runs the complete chroma video timeline and PNG sequence export workflow',
 
   await canvas.click({ position: { x: 100, y: 50 } })
   await expect.poll(() => sampleBodies.length).toBe(1)
-  expect(sampleBodies[0]).toMatchObject({
+  expect(sampleBodies[0]).toEqual({
     input_path: videoInputPath,
     timestamp_seconds: 2,
+    x: 99,
+    y: 49,
+    preview_width: 400,
+    preview_height: 200,
   })
   await expect(page.getByText('Screen Color', { exact: true })).toBeVisible()
-  await expect.poll(() => previewBodies.length).toBeGreaterThan(0)
+  const defaultVideoPreviewBody: VideoPreviewBody = {
+    input_path: videoInputPath,
+    timestamp_seconds: 2,
+    samples: [[42, 180, 72]],
+    params: {
+      screen_gain: 1,
+      screen_balance: 0.5,
+      clip_black: 0,
+      clip_white: 1,
+      shrink_grow: 0,
+      feather: 0,
+      despill_amount: 1,
+    },
+    view_mode: 'final',
+  }
+  await expect.poll(() => previewBodies.length).toBe(1)
+  expect(previewBodies[0]).toEqual(defaultVideoPreviewBody)
 
   await page.getByRole('radio', { name: 'Alpha' }).click()
-  await expect.poll(() => previewBodies.at(-1)?.view_mode).toBe('alpha')
+  await expect.poll(() => previewBodies.length).toBe(2)
+  expect(previewBodies[1]).toEqual({ ...defaultVideoPreviewBody, view_mode: 'alpha' })
   await expect(canvas).toHaveAttribute('src', /video-alpha-\d+\.svg/)
   await page.getByRole('radio', { name: 'Final' }).click()
-  await expect.poll(() => previewBodies.at(-1)?.view_mode).toBe('final')
+  await expect.poll(() => previewBodies.length).toBe(3)
+  expect(previewBodies[2]).toEqual(defaultVideoPreviewBody)
   await expect(canvas).toHaveAttribute('src', /video-final-\d+\.svg/)
 
   const parameterChanges: ReadonlyArray<{
@@ -666,14 +690,21 @@ test('runs the complete chroma video timeline and PNG sequence export workflow',
     { key: 'feather', name: 'Feather', sliderValue: 1, numberValue: 2 },
     { key: 'despill_amount', name: 'Despill Amount', sliderValue: 0.9, numberValue: 0.8 },
   ]
+  let expectedPreviewBody = defaultVideoPreviewBody
   for (const change of parameterChanges) {
+    const previousCount = previewBodies.length
     const slider = page.getByRole('slider', { name: change.name })
     const number = page.getByRole('spinbutton', { name: `${change.name} 数值` })
     await slider.fill(String(change.sliderValue))
     await expect(number).toHaveValue(String(change.sliderValue))
     await number.fill(String(change.numberValue))
     await expect(slider).toHaveValue(String(change.numberValue))
-    await expect.poll(() => previewBodies.at(-1)?.params[change.key]).toBe(change.numberValue)
+    expectedPreviewBody = {
+      ...expectedPreviewBody,
+      params: { ...expectedPreviewBody.params, [change.key]: change.numberValue },
+    }
+    await expect.poll(() => previewBodies.length).toBe(previousCount + 1)
+    expect(previewBodies.at(-1)).toEqual(expectedPreviewBody)
   }
 
   await page.getByRole('button', { name: '指定输出根目录（可选）' }).click()
@@ -682,7 +713,7 @@ test('runs the complete chroma video timeline and PNG sequence export workflow',
 
   await page.getByRole('button', { name: '导出 PNG 序列' }).click()
   await expect.poll(() => taskBodies.length).toBe(1)
-  expect(taskBodies[0]).toMatchObject({
+  expect(taskBodies[0]).toEqual({
     input_path: videoInputPath,
     output_root: videoOutputRoot,
     samples: [[42, 180, 72]],

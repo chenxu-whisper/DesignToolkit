@@ -177,6 +177,13 @@ def test_real_video_export_preserves_keyed_pixels_manifest_and_atomic_cleanup(
 
         assert background[3] <= 5
         assert foreground[3] >= 250
+        # Allow only minor per-channel rounding from fixture encoding/decoding.
+        np.testing.assert_allclose(
+            foreground[:3],
+            [255, 0, 0],
+            rtol=0,
+            atol=2,
+        )
         assert foreground[0] > foreground[1] + 200
         assert foreground[0] > foreground[2] + 200
         assert 32 <= blended_edge[3] <= 223
