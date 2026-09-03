@@ -499,6 +499,8 @@ async function installVideoPreviewRoutes(page: Page) {
 }
 
 test('runs the complete chroma video timeline and PNG sequence export workflow', async ({ page }) => {
+  await page.clock.install()
+
   const inspectBodies: unknown[] = []
   const pendingFrameRoutes: Array<{ body: { input_path: string; timestamp_seconds: number }; route: Route }> = []
   const sampleBodies: unknown[] = []
@@ -612,8 +614,10 @@ test('runs the complete chroma video timeline and PNG sequence export workflow',
 
   const timeline = page.getByRole('slider', { name: '视频时间轴' })
   await timeline.fill('1')
+  await page.clock.fastForward(100)
   await expect.poll(() => pendingFrameRoutes.length).toBe(1)
   await timeline.fill('2')
+  await page.clock.fastForward(100)
   await expect.poll(() => pendingFrameRoutes.length).toBe(2)
   expect(pendingFrameRoutes.map(({ body }) => body)).toEqual([
     { input_path: videoInputPath, timestamp_seconds: 1 },
@@ -699,12 +703,14 @@ test('runs the complete chroma video timeline and PNG sequence export workflow',
     await expect(number).toHaveValue(String(change.sliderValue))
     await number.fill(String(change.numberValue))
     await expect(slider).toHaveValue(String(change.numberValue))
+    expect(previewBodies).toHaveLength(previousCount)
     expectedPreviewBody = {
       ...expectedPreviewBody,
       params: { ...expectedPreviewBody.params, [change.key]: change.numberValue },
     }
+    await page.clock.fastForward(150)
     await expect.poll(() => previewBodies.length).toBe(previousCount + 1)
-    expect(previewBodies.at(-1)).toEqual(expectedPreviewBody)
+    expect(previewBodies.slice(previousCount)).toEqual([expectedPreviewBody])
   }
 
   await page.getByRole('button', { name: '指定输出根目录（可选）' }).click()

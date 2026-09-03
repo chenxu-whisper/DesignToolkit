@@ -144,13 +144,35 @@ def test_real_video_export_preserves_keyed_pixels_manifest_and_atomic_cleanup(
     input_path = tmp_path / "moving-red-screen.mkv"
     output_root = tmp_path / "exports"
     output_root.mkdir()
+    final_dir = output_root / "moving-red-screen_keyed_frames"
+    progress_observations: list[
+        tuple[int, int | None, Path, bool, bool, bool]
+    ] = []
     _generate_green_screen_fixture(input_path)
+
+    def observe_progress(
+        processed_frames: int,
+        estimated_total: int | None,
+        current_path: Path,
+    ) -> None:
+        temporary_dir = current_path.parent
+        progress_observations.append(
+            (
+                processed_frames,
+                estimated_total,
+                temporary_dir,
+                temporary_dir.is_dir(),
+                current_path.is_file(),
+                final_dir.exists(),
+            )
+        )
 
     result = key_video_to_png_sequence(
         VideoKeyOptions(input_path=input_path, output_root=output_root),
         ImageioVideoDecoder(),
         _screen_model(),
         PARAMS,
+        observe_progress,
     )
 
     expected_names = [
@@ -158,9 +180,26 @@ def test_real_video_export_preserves_keyed_pixels_manifest_and_atomic_cleanup(
         for index in range(1, FRAME_COUNT + 1)
     ]
     png_paths = sorted(result.output_dir.glob("*.png"))
+    assert result.output_dir == final_dir
     assert result.frame_count == FRAME_COUNT
     assert result.metadata.estimated_frame_count == FRAME_COUNT
     assert [path.name for path in png_paths] == expected_names
+    assert progress_observations[0][:2] == (1, FRAME_COUNT)
+    assert progress_observations[-1][:2] == (FRAME_COUNT, FRAME_COUNT)
+    assert [observation[0] for observation in progress_observations] == list(
+        range(1, FRAME_COUNT + 1)
+    )
+    for _, _, temporary_dir, temp_exists, frame_exists, final_exists in (
+        progress_observations
+    ):
+        assert temporary_dir.parent == output_root
+        assert temporary_dir.name.startswith(
+            ".moving-red-screen_keyed_frames."
+        )
+        assert temporary_dir.name.endswith(".tmp")
+        assert temp_exists
+        assert frame_exists
+        assert not final_exists
 
     frames: list[np.ndarray] = []
     for png_path in png_paths:
@@ -173,10 +212,23 @@ def test_real_video_export_preserves_keyed_pixels_manifest_and_atomic_cleanup(
         moving_x = 4 + frame_index * 2
         background = rgba[0, 0]
         foreground = rgba[11, moving_x + 5]
+        leading_edge = rgba[11, moving_x + 10]
         blended_edge = rgba[7, moving_x]
 
         assert background[3] <= 5
         assert foreground[3] >= 250
+        assert leading_edge[3] >= 250
+        np.testing.assert_allclose(
+            leading_edge[:3],
+            [255, 0, 0],
+            rtol=0,
+            atol=2,
+        )
+        if frame_index > 0:
+            previous_frame_at_leading_edge = frames[frame_index - 1][
+                11, moving_x + 10
+            ]
+            assert previous_frame_at_leading_edge[3] <= 5
         # Allow only minor per-channel rounding from fixture encoding/decoding.
         np.testing.assert_allclose(
             foreground[:3],
@@ -211,4 +263,5 @@ def test_real_video_export_preserves_keyed_pixels_manifest_and_atomic_cleanup(
             "despill_amount": 1.0,
         },
     }
+    assert final_dir.is_dir()
     assert list(output_root.glob(".moving-red-screen_keyed_frames.*.tmp")) == []
