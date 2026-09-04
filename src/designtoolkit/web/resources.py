@@ -26,6 +26,7 @@ _CLEANUP_PREFIX = "dt:resource:cleanup:"
 _CLEANUP_GENERATION_PREFIX = "dt:resource:cleanup-generation:"
 _LEGACY_CLEANUP_PREFIX = "dt:resource:legacy-cleanup:"
 _TASK_RESOURCE_PREFIX = "dt:resource:task:"
+_TASK_PIN_PREFIX = "dt:resource:task-pin:"
 _SESSION_PATTERN = re.compile(r"^[a-f0-9]{32}$")
 _ASSET_PATTERN = re.compile(r"^[a-f0-9]{32}$")
 _TOKEN_PATTERN = re.compile(r"^[a-f0-9]{32}$")
@@ -775,13 +776,34 @@ end
 return 1
 """
 
+_RELEASE_TASK_PIN_SCRIPT = """-- release_task_pin
+if redis.call("EXISTS", KEYS[1]) == 0 then
+    return 0
+end
+if redis.call("HGET", KEYS[1], "session_id") ~= ARGV[1] then
+    return 2
+end
+if redis.call("HGET", KEYS[1], "task_id") ~= ARGV[2] then
+    return 2
+end
+redis.call("DEL", KEYS[1])
+redis.call("SREM", KEYS[2], ARGV[2])
+if redis.call("SCARD", KEYS[2]) == 0 then
+    redis.call("DEL", KEYS[2])
+end
+return 1
+"""
+
 _CLAIM_CLEANUP_SCRIPT = """-- claim_cleanup
 local state_key = KEYS[1]
 local leases_key = KEYS[2]
 local cleanup_key = KEYS[3]
+local task_pins_key = KEYS[4]
 local token = ARGV[1]
 local lease_prefix = ARGV[3]
 local cleanup_prefix = ARGV[4]
+local task_pin_prefix = ARGV[5]
+local session_id = ARGV[6]
 
 local lease_tokens = redis.call("SMEMBERS", leases_key)
 for _, lease_token in ipairs(lease_tokens) do
@@ -806,6 +828,19 @@ if deleting then
     redis.call("HDEL", state_key, "deleting")
 end
 if tonumber(redis.call("HGET", state_key, "active_count") or "0") ~= 0 then
+    return 1
+end
+
+local task_ids = redis.call("SMEMBERS", task_pins_key)
+for _, task_id in ipairs(task_ids) do
+    local pin_key = task_pin_prefix .. task_id
+    if redis.call("EXISTS", pin_key) == 0 then
+        redis.call("SREM", task_pins_key, task_id)
+    elseif redis.call("HGET", pin_key, "session_id") ~= session_id then
+        redis.call("SREM", task_pins_key, task_id)
+    end
+end
+if redis.call("SCARD", task_pins_key) ~= 0 then
     return 1
 end
 
@@ -1036,6 +1071,9 @@ class RedisResourceCoordinator:
         self._release_session_script = self._redis.register_script(
             _RELEASE_SESSION_SCRIPT
         )
+        self._release_task_pin_script = self._redis.register_script(
+            _RELEASE_TASK_PIN_SCRIPT
+        )
         self._claim_cleanup_script = self._redis.register_script(_CLAIM_CLEANUP_SCRIPT)
         self._refresh_cleanup_script = self._redis.register_script(
             _REFRESH_CLEANUP_SCRIPT
@@ -1180,12 +1218,15 @@ class RedisResourceCoordinator:
                     _session_state_key(session_id),
                     _session_leases_key(session_id),
                     _cleanup_key(token),
+                    _session_task_pins_key(session_id),
                 ],
                 args=[
                     token,
                     self._lease_ttl_ms,
                     _LEASE_PREFIX,
                     _CLEANUP_PREFIX,
+                    _TASK_PIN_PREFIX,
+                    session_id,
                 ],
             )
         )
@@ -1465,6 +1506,31 @@ class RedisResourceCoordinator:
                 task_id=task_id,
             )
         self.reconcile_reservations()
+        self.release_task_pin(task_id)
+
+    def release_task_pin(self, task_id: str) -> bool:
+        pin_key = _task_pin_key(task_id)
+        session_id = _decoded_hash_value(
+            self._redis.hgetall(pin_key),
+            "session_id",
+        )
+        if session_id is None:
+            return False
+        result = int(
+            self._release_task_pin_script(
+                keys=[
+                    pin_key,
+                    _session_task_pins_key(session_id),
+                ],
+                args=[
+                    session_id,
+                    task_id,
+                ],
+            )
+        )
+        if result == 2:
+            raise ResourceUnavailableError("Task pin ownership is invalid")
+        return result == 1
 
     def output_reserved_bytes(self) -> int:
         value = self._redis.hget(_STATE_KEY, "output_reserved_bytes")
@@ -1636,6 +1702,10 @@ def _task_resource_key(task_id: str) -> str:
     return f"{_TASK_RESOURCE_PREFIX}{task_id}"
 
 
+def _task_pin_key(task_id: str) -> str:
+    return f"{_TASK_PIN_PREFIX}{task_id}"
+
+
 def _decoded_hash_value(
     metadata: dict[bytes | str, bytes | str],
     field: str,
@@ -1652,6 +1722,10 @@ def _session_state_key(session_id: str) -> str:
 
 def _session_leases_key(session_id: str) -> str:
     return f"dt:resource:session:{session_id}:leases"
+
+
+def _session_task_pins_key(session_id: str) -> str:
+    return f"dt:resource:session:{session_id}:task-pins"
 
 
 def _session_released_assets_key(session_id: str) -> str:

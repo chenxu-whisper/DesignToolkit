@@ -563,9 +563,31 @@ class DeterministicRedis(fakeredis.FakeRedis):
             self._decrement(state_key, "active_count", 1)
         return 1
 
+    def _eval_release_task_pin(self, keys, args):  # noqa: ANN001, ANN202
+        pin_key, task_pins_key = keys
+        session_id, task_id = args
+        if not self.exists(pin_key):
+            return 0
+        if self._text(self.hget(pin_key, "session_id")) != session_id:
+            return 2
+        if self._text(self.hget(pin_key, "task_id")) != task_id:
+            return 2
+        self.delete(pin_key)
+        self.srem(task_pins_key, task_id)
+        if not self.scard(task_pins_key):
+            self.delete(task_pins_key)
+        return 1
+
     def _eval_claim_cleanup(self, keys, args):  # noqa: ANN001, ANN202
-        state_key, leases_key, cleanup_key = keys
-        token, ttl_ms, lease_prefix, cleanup_prefix = args
+        state_key, leases_key, cleanup_key, task_pins_key = keys
+        (
+            token,
+            ttl_ms,
+            lease_prefix,
+            cleanup_prefix,
+            task_pin_prefix,
+            session_id,
+        ) = args
         self._reconcile_leases(state_key, leases_key, str(lease_prefix))
         deleting = self.hget(state_key, "deleting")
         if deleting is not None:
@@ -574,6 +596,17 @@ class DeterministicRedis(fakeredis.FakeRedis):
                 return 1
             self.hdel(state_key, "deleting")
         if self._number(state_key, "active_count") != 0:
+            return 1
+        for raw_task_id in self.smembers(task_pins_key):
+            task_id = self._text(raw_task_id)
+            pin_key = f"{task_pin_prefix}{task_id}"
+            pin_session = self.hget(pin_key, "session_id")
+            if (
+                not self.exists(pin_key)
+                or self._text(pin_session) != session_id
+            ):
+                self.srem(task_pins_key, task_id)
+        if self.scard(task_pins_key):
             return 1
         self.hset(state_key, "deleting", token)
         self.set(cleanup_key, "1")

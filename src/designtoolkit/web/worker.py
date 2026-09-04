@@ -477,6 +477,7 @@ def run_task(task_id: str, job_kind: str, payload: dict[str, object]) -> None:
             output.release()
         if lease is not None:
             lease.release()
+        resources.release_task_pin(task_id)
 
 
 def _task_request(

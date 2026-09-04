@@ -6,7 +6,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from threading import Barrier
+from threading import Barrier, Event, Lock
 
 import fakeredis
 import pytest
@@ -35,6 +35,10 @@ from designtoolkit.web.redis_tasks import (
     TerminalTransitionResult,
     handle_job_failure,
     handle_job_stopped,
+)
+from designtoolkit.web.resources import (
+    RedisResourceCoordinator,
+    SessionDeletingError,
 )
 from designtoolkit.web.schemas import (
     ChromaKeyerTaskRequest,
@@ -100,6 +104,9 @@ class TrackingTaskResources:
     def release_task_resources(self, task_id: str) -> None:
         self.events.append(f"release-task:{task_id}")
 
+    def release_task_pin(self, _task_id: str) -> None:
+        pass
+
 
 def _manager(
     redis_connection,
@@ -125,6 +132,17 @@ def _hosted_settings(tmp_path: Path) -> HostedSettings:
         redis_url="redis://unused/0",
         max_output_bytes=10,
         min_free_bytes=5,
+    )
+
+
+def _resources(redis_connection: Redis) -> RedisResourceCoordinator:
+    return RedisResourceCoordinator(
+        redis_connection=redis_connection,
+        max_upload_concurrency=4,
+        max_session_bytes=2 * 1024 * 1024 * 1024,
+        min_free_bytes=0,
+        reservation_ttl=60,
+        lease_ttl=60,
     )
 
 
@@ -283,6 +301,165 @@ def test_queue_cap_holds_under_concurrent_submissions(tmp_path: Path) -> None:
 
     assert sum(accepted) == 20
     assert manager.queue.count == 20
+
+
+def test_real_redis_queue_reconcile_cannot_release_inflight_enqueue_slot(
+    real_redis_connection: Redis,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(
+        real_redis_connection,
+        tmp_path,
+        max_queued_tasks=20,
+    )
+    request = VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4"))
+    save_entered = Event()
+    continue_save = Event()
+    selection_lock = Lock()
+    first_save = True
+    original_save = manager._save_task
+
+    def block_first_save(task: TaskRecord) -> None:
+        nonlocal first_save
+        with selection_lock:
+            should_block = first_save
+            first_save = False
+        if should_block:
+            save_entered.set()
+            assert continue_save.wait(timeout=5)
+        original_save(task)
+
+    def submit() -> bool:
+        try:
+            manager.create_video_frames_task(
+                request,
+                owner_id="a" * 32,
+            )
+        except TaskConflictError:
+            return False
+        return True
+
+    monkeypatch.setattr(manager, "_save_task", block_first_save)
+    with ThreadPoolExecutor(max_workers=21) as executor:
+        first = executor.submit(submit)
+        assert save_entered.wait(timeout=5)
+        assert manager.reconcile_tasks() == 0
+        manager.reconcile_queue_slots()
+        remaining = [executor.submit(submit) for _index in range(20)]
+        accepted = [future.result(timeout=5) for future in remaining]
+        continue_save.set()
+        accepted.append(first.result(timeout=5))
+
+    job_ids = manager.queue.get_job_ids()
+    slot_ids = [
+        value.decode()
+        for value in real_redis_connection.lrange(
+            "dt:queue:reservations",
+            0,
+            -1,
+        )
+    ]
+    assert sum(accepted) == len(job_ids)
+    assert len(job_ids) <= 20
+    assert len(slot_ids) <= 20
+    assert set(slot_ids) == set(job_ids)
+
+
+def test_expired_queued_session_is_pinned_until_terminal_cleanup(
+    real_redis_connection: Redis,
+    tmp_path: Path,
+) -> None:
+    session_id = "a" * 32
+    session_dir = tmp_path / "sessions" / session_id
+    session_dir.mkdir(parents=True)
+    input_path = session_dir / "clip.mp4"
+    input_path.write_bytes(b"input")
+    os.utime(input_path, (1, 1))
+    os.utime(session_dir, (1, 1))
+    resources = _resources(real_redis_connection)
+    manager = _manager(
+        real_redis_connection,
+        tmp_path,
+        resource_coordinator=resources,
+    )
+    storage = HostedStorage(tmp_path, max_upload_bytes=1024)
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(input_path)),
+        owner_id=session_id,
+    )
+
+    assert storage.cleanup_expired(
+        retention_seconds=1,
+        coordinator=resources,
+    ) == 0
+    assert session_dir.is_dir()
+
+    assert manager._finalize_external_failure(task.task_id, "worker stopped")
+    assert storage.cleanup_expired(
+        retention_seconds=1,
+        coordinator=resources,
+    ) == 1
+    assert not session_dir.exists()
+
+
+def test_cleanup_claim_blocks_atomic_task_pin_and_enqueue(
+    real_redis_connection: Redis,
+    tmp_path: Path,
+) -> None:
+    session_id = "a" * 32
+    resources = _resources(real_redis_connection)
+    manager = _manager(
+        real_redis_connection,
+        tmp_path,
+        resource_coordinator=resources,
+    )
+    claim = resources.claim_session_cleanup(session_id)
+    assert claim is not None
+
+    with pytest.raises(SessionDeletingError):
+        manager.create_video_frames_task(
+            VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+            owner_id=session_id,
+        )
+
+    assert real_redis_connection.llen("dt:queue:reservations") == 0
+    assert manager.queue.get_job_ids() == []
+    resources.release_cleanup_claim(session_id, claim)
+
+
+def test_reconcile_releases_task_pin_after_crash_during_enqueue(
+    real_redis_connection: Redis,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = "a" * 32
+    resources = _resources(real_redis_connection)
+    manager = _manager(
+        real_redis_connection,
+        tmp_path,
+        resource_coordinator=resources,
+    )
+
+    class SimulatedProcessCrash(BaseException):
+        pass
+
+    def crash_before_task_save(_task: TaskRecord) -> None:
+        raise SimulatedProcessCrash("injected process crash")
+
+    monkeypatch.setattr(manager, "_save_task", crash_before_task_save)
+    with pytest.raises(SimulatedProcessCrash, match="injected process crash"):
+        manager.create_video_frames_task(
+            VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+            owner_id=session_id,
+        )
+
+    assert resources.claim_session_cleanup(session_id) is None
+    assert manager.reconcile_tasks(grace_seconds=0) == 1
+    claim = resources.claim_session_cleanup(session_id)
+    assert claim is not None
+    assert real_redis_connection.llen("dt:queue:reservations") == 0
+    resources.release_cleanup_claim(session_id, claim)
 
 
 def test_run_task_reserves_refreshes_and_releases_worker_resources(
@@ -1552,7 +1729,12 @@ def test_real_redis_recovers_committed_enqueue_after_acknowledgement_loss(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    manager = _manager(real_redis_connection, tmp_path)
+    resources = _resources(real_redis_connection)
+    manager = _manager(
+        real_redis_connection,
+        tmp_path,
+        resource_coordinator=resources,
+    )
     original_enqueue = manager.queue.enqueue
     original_confirmation = manager._enqueue_has_authoritative_evidence
     confirmation_calls = 0
@@ -1580,14 +1762,18 @@ def test_real_redis_recovers_committed_enqueue_after_acknowledgement_loss(
         owner_id="a" * 32,
     )
 
-    assert real_redis_connection.hgetall(
+    intent = real_redis_connection.hgetall(
         f"dt:enqueue-intent:{task.task_id}"
-    ) == {
+    )
+    assert intent == {
         b"task_id": task.task_id.encode(),
         b"job_id": task.task_id.encode(),
         b"slot_reserved": b"1",
         b"state": b"uncertain",
+        b"owner_id": b"a" * 32,
+        b"created_at": intent[b"created_at"],
     }
+    assert float(intent[b"created_at"]) > 0
     assert manager.reconcile_tasks(grace_seconds=60) == 0
     assert manager.get_task(task.task_id) == task
     assert manager.task_work(task.task_id) is not None
@@ -1599,6 +1785,7 @@ def test_real_redis_recovers_committed_enqueue_after_acknowledgement_loss(
     assert real_redis_connection.lrange("dt:queue:reservations", 0, -1) == [
         task.task_id.encode()
     ]
+    assert resources.claim_session_cleanup("a" * 32) is None
 
 
 def test_real_redis_reconcile_fails_uncommitted_ambiguous_enqueue(
@@ -1606,7 +1793,12 @@ def test_real_redis_reconcile_fails_uncommitted_ambiguous_enqueue(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    manager = _manager(real_redis_connection, tmp_path)
+    resources = _resources(real_redis_connection)
+    manager = _manager(
+        real_redis_connection,
+        tmp_path,
+        resource_coordinator=resources,
+    )
     original_confirmation = manager._enqueue_has_authoritative_evidence
     confirmation_calls = 0
 
@@ -1633,14 +1825,18 @@ def test_real_redis_reconcile_fails_uncommitted_ambiguous_enqueue(
     )
 
     assert task.status is TaskStatus.QUEUED
-    assert real_redis_connection.hgetall(
+    intent = real_redis_connection.hgetall(
         f"dt:enqueue-intent:{task.task_id}"
-    ) == {
+    )
+    assert intent == {
         b"task_id": task.task_id.encode(),
         b"job_id": task.task_id.encode(),
         b"slot_reserved": b"1",
         b"state": b"uncertain",
+        b"owner_id": b"a" * 32,
+        b"created_at": intent[b"created_at"],
     }
+    assert float(intent[b"created_at"]) > 0
     assert manager.reconcile_tasks(grace_seconds=60) == 1
     failed = manager.get_task(task.task_id)
     assert failed is not None
@@ -1651,6 +1847,9 @@ def test_real_redis_reconcile_fails_uncommitted_ambiguous_enqueue(
     assert real_redis_connection.exists(
         f"dt:enqueue-intent:{task.task_id}"
     ) == 0
+    claim = resources.claim_session_cleanup("a" * 32)
+    assert claim is not None
+    resources.release_cleanup_claim("a" * 32, claim)
 
 
 def test_cleanup_once_reclaims_orphaned_real_redis_queue_slot(
