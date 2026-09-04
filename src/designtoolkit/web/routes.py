@@ -55,6 +55,11 @@ from designtoolkit.web.hosted import (
     _safe_filename,
 )
 from designtoolkit.web.local_paths import resolve_dropped_file_paths
+from designtoolkit.web.media_limits import (
+    HostedMediaLimits,
+    HostedMediaValidator,
+    MediaLimitError,
+)
 from designtoolkit.web.native_picker import (
     LocalPathPicker,
     LocalPathPickerError,
@@ -679,13 +684,80 @@ def create_router(
             source_snapshot.version,
         )
 
-    def resolve_input_path(http_request: Request, reference: str) -> Path:
+    media_validator = (
+        HostedMediaValidator(
+            HostedMediaLimits(
+                max_image_pixels=settings.max_image_pixels,
+                max_video_width=settings.max_video_width,
+                max_video_height=settings.max_video_height,
+                max_video_duration_seconds=settings.max_video_duration_seconds,
+            ),
+            video_probe=decoder.probe,
+        )
+        if storage is not None
+        else None
+    )
+
+    def resolve_hosted_asset(http_request: Request, reference: str) -> Path:
         if storage is None:
             return Path(reference)
         try:
             return storage.resolve(http_request.state.session_id, reference)
         except UploadRejectedError as exc:
             raise ApiError("asset_not_found", str(exc), 404) from exc
+
+    def record_validated_video_metadata(
+        http_request: Request,
+        path: Path,
+        metadata: VideoMetadata | None,
+    ) -> None:
+        if metadata is None:
+            return
+        request_metadata = getattr(
+            http_request.state,
+            "validated_video_metadata",
+            None,
+        )
+        if request_metadata is None:
+            request_metadata = {}
+            http_request.state.validated_video_metadata = request_metadata
+        request_metadata[path] = metadata
+
+    def validate_hosted_paths(
+        http_request: Request,
+        paths: list[Path],
+    ) -> None:
+        if media_validator is None:
+            return
+        try:
+            metadata_items = media_validator.validate_many(paths)
+        except MediaLimitError as exc:
+            raise ApiError("media_limit_exceeded", str(exc), 422) from exc
+        for path, metadata in zip(paths, metadata_items, strict=True):
+            record_validated_video_metadata(http_request, path, metadata)
+
+    def resolve_input_path(http_request: Request, reference: str) -> Path:
+        path = resolve_hosted_asset(http_request, reference)
+        validate_hosted_paths(http_request, [path])
+        return path
+
+    def video_metadata_for_request(
+        http_request: Request,
+    ) -> Callable[[Path, _VideoSourceSnapshot], VideoMetadata]:
+        def request_metadata(
+            input_path: Path,
+            source_snapshot: _VideoSourceSnapshot,
+        ) -> VideoMetadata:
+            validated = getattr(
+                http_request.state,
+                "validated_video_metadata",
+                {},
+            ).get(input_path)
+            if validated is not None:
+                return validated
+            return get_video_metadata(input_path, source_snapshot)
+
+        return request_metadata
 
     def owned_preview_url(http_request: Request, preview_id: str) -> str:
         if storage is not None:
@@ -715,10 +787,12 @@ def create_router(
         http_request: Request,
         references: list[str],
     ) -> list[str]:
-        return [
-            str(resolve_input_path(http_request, reference))
+        paths = [
+            resolve_hosted_asset(http_request, reference)
             for reference in references
         ]
+        validate_hosted_paths(http_request, paths)
+        return [str(path) for path in paths]
 
     def hosted_video_frames_request(
         http_request: Request,
@@ -1176,7 +1250,7 @@ def create_router(
                     input_path,
                     "video_inspect",
                     0.0,
-                    get_video_metadata,
+                    video_metadata_for_request(http_request),
                     read_video_preview_frame,
                     make_preview_png,
                 )
@@ -1216,7 +1290,7 @@ def create_router(
                     input_path,
                     "video_frame",
                     payload.timestamp_seconds,
-                    get_video_metadata,
+                    video_metadata_for_request(http_request),
                     read_video_preview_frame,
                     make_preview_png,
                 )
@@ -1243,7 +1317,7 @@ def create_router(
             metadata, timestamp_seconds, rgb = _read_stable_video_frame(
                 input_path,
                 payload.timestamp_seconds,
-                get_video_metadata,
+                video_metadata_for_request(http_request),
                 read_video_frame,
             )
         except KeyerError as exc:
@@ -1305,7 +1379,7 @@ def create_router(
                     input_path,
                     "video_generated",
                     payload.timestamp_seconds,
-                    get_video_metadata,
+                    video_metadata_for_request(http_request),
                     read_video_preview_frame,
                     create_preview_png,
                     samples=payload.samples,

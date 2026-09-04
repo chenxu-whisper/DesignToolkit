@@ -6,6 +6,7 @@ import re
 import shutil
 from collections.abc import AsyncIterable, Mapping
 from dataclasses import dataclass
+from math import isfinite
 from pathlib import Path
 from threading import RLock
 from time import time
@@ -16,6 +17,7 @@ from zipfile import ZIP_DEFLATED, ZipFile
 
 from redis.exceptions import RedisError
 
+from designtoolkit.web.media_limits import HostedMediaLimits
 from designtoolkit.web.resources import (
     RedisReservation,
     RedisSessionLease,
@@ -32,6 +34,7 @@ _DEFAULT_RETENTION_SECONDS = 2 * 60 * 60
 _UPLOAD_CHUNK_BYTES = 1024 * 1024
 _RESOURCE_RECOVERY_ATTEMPTS = 3
 _DELETION_METADATA_NAME = ".deletion.json"
+_DEFAULT_MEDIA_LIMITS = HostedMediaLimits()
 _ALLOWED_SUFFIXES = frozenset(
     {
         ".avi",
@@ -74,6 +77,12 @@ class HostedSettings:
     max_output_bytes: int = _DEFAULT_MAX_OUTPUT_BYTES
     min_free_bytes: int = _DEFAULT_MIN_FREE_BYTES
     max_queued_tasks: int = _DEFAULT_MAX_QUEUED_TASKS
+    max_image_pixels: int = _DEFAULT_MEDIA_LIMITS.max_image_pixels
+    max_video_width: int = _DEFAULT_MEDIA_LIMITS.max_video_width
+    max_video_height: int = _DEFAULT_MEDIA_LIMITS.max_video_height
+    max_video_duration_seconds: float = (
+        _DEFAULT_MEDIA_LIMITS.max_video_duration_seconds
+    )
     max_preview_concurrency: int = 2
     max_upload_concurrency: int = 4
     reservation_ttl_seconds: float = 60.0
@@ -116,6 +125,26 @@ class HostedSettings:
                 values,
                 "DESIGNTOOLKIT_MAX_QUEUED_TASKS",
                 _DEFAULT_MAX_QUEUED_TASKS,
+            ),
+            max_image_pixels=_read_clamped_positive_int(
+                values,
+                "DESIGNTOOLKIT_MAX_IMAGE_PIXELS",
+                _DEFAULT_MEDIA_LIMITS.max_image_pixels,
+            ),
+            max_video_width=_read_clamped_positive_int(
+                values,
+                "DESIGNTOOLKIT_MAX_VIDEO_WIDTH",
+                _DEFAULT_MEDIA_LIMITS.max_video_width,
+            ),
+            max_video_height=_read_clamped_positive_int(
+                values,
+                "DESIGNTOOLKIT_MAX_VIDEO_HEIGHT",
+                _DEFAULT_MEDIA_LIMITS.max_video_height,
+            ),
+            max_video_duration_seconds=_read_clamped_positive_float(
+                values,
+                "DESIGNTOOLKIT_MAX_VIDEO_DURATION_SECONDS",
+                _DEFAULT_MEDIA_LIMITS.max_video_duration_seconds,
             ),
             max_preview_concurrency=_read_positive_int(
                 values,
@@ -611,6 +640,14 @@ def _read_positive_int(
     return value
 
 
+def _read_clamped_positive_int(
+    env: Mapping[str, str],
+    key: str,
+    ceiling: int,
+) -> int:
+    return min(_read_positive_int(env, key, ceiling), ceiling)
+
+
 def _read_non_negative_int(
     env: Mapping[str, str],
     key: str,
@@ -637,6 +674,17 @@ def _read_positive_float(
     if value <= 0:
         raise ValueError(f"{key} must be positive")
     return value
+
+
+def _read_clamped_positive_float(
+    env: Mapping[str, str],
+    key: str,
+    ceiling: float,
+) -> float:
+    value = _read_positive_float(env, key, ceiling)
+    if not isfinite(value):
+        raise ValueError(f"{key} must be positive")
+    return min(value, ceiling)
 
 
 def _directory_modified_at(path: Path) -> float:

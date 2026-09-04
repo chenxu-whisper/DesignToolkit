@@ -4,15 +4,18 @@ import shutil
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from pathlib import Path
+from unittest.mock import Mock
 from urllib.parse import quote
 
 import fakeredis
+import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
 from redis.exceptions import ConnectionError as RedisConnectionError
 from rq import Queue
 
+from designtoolkit.chroma_keyer.video_models import VideoMetadata
 from designtoolkit.web.app import create_app
 from designtoolkit.web.hosted import HostedSettings, HostedStorage
 from designtoolkit.web.redis_tasks import RedisTaskManager
@@ -163,9 +166,56 @@ class StubCoordinator:
             self.finalized_assets.add((session_id, asset_id))
 
 
-def _png_bytes() -> bytes:
+class StubHostedVideoDecoder:
+    def __init__(self, metadata: VideoMetadata | None = None) -> None:
+        self.metadata = metadata or VideoMetadata(
+            width=2,
+            height=2,
+            fps=1.0,
+            duration_seconds=1.0,
+            estimated_frame_count=1,
+            codec="stub",
+        )
+        self.probe_calls = 0
+        self.decode_calls = 0
+
+    def probe(self, _path: Path) -> VideoMetadata:
+        self.probe_calls += 1
+        return self.metadata
+
+    def read_frame(self, _path: Path, _timestamp_seconds: float) -> np.ndarray:
+        self.decode_calls += 1
+        return np.zeros((2, 2, 3), dtype=np.uint8)
+
+    def read_preview_frame(
+        self,
+        path: Path,
+        timestamp_seconds: float,
+    ) -> np.ndarray:
+        return self.read_frame(path, timestamp_seconds)
+
+    def read_frame_with_metadata(
+        self,
+        path: Path,
+        timestamp_seconds: float,
+        *,
+        metadata: VideoMetadata,
+    ) -> np.ndarray:
+        return self.read_frame(path, timestamp_seconds)
+
+    def read_preview_frame_with_metadata(
+        self,
+        path: Path,
+        timestamp_seconds: float,
+        *,
+        metadata: VideoMetadata,
+    ) -> np.ndarray:
+        return self.read_frame(path, timestamp_seconds)
+
+
+def _png_bytes(size: tuple[int, int] = (2, 1)) -> bytes:
     output = BytesIO()
-    Image.new("RGB", (2, 1), (0, 255, 0)).save(output, format="PNG")
+    Image.new("RGB", size, (0, 255, 0)).save(output, format="PNG")
     return output.getvalue()
 
 
@@ -180,6 +230,11 @@ def _client(
     upload_requests_per_hour: int = 30,
     resource_coordinator: StubCoordinator | None = None,
     hosted_storage: HostedStorage | None = None,
+    max_image_pixels: int = 100_000_000,
+    max_video_width: int = 3840,
+    max_video_height: int = 2160,
+    max_video_duration_seconds: float = 1800.0,
+    video_decoder: StubHostedVideoDecoder | None = None,
 ) -> TestClient:
     if task_manager is None:
         redis_connection = fakeredis.FakeRedis(decode_responses=False)
@@ -198,6 +253,10 @@ def _client(
         max_session_bytes=max_session_bytes,
         max_upload_concurrency=max_upload_concurrency,
         min_free_bytes=min_free_bytes,
+        max_image_pixels=max_image_pixels,
+        max_video_width=max_video_width,
+        max_video_height=max_video_height,
+        max_video_duration_seconds=max_video_duration_seconds,
         secure_cookies=False,
         upload_requests_per_hour=upload_requests_per_hour,
     )
@@ -213,6 +272,7 @@ def _client(
             hosted_storage=hosted_storage
             or HostedStorage(tmp_path, max_upload_bytes=max_bytes),
             resource_coordinator=coordinator,
+            video_decoder=video_decoder or StubHostedVideoDecoder(),
         )
     )
 
@@ -872,7 +932,7 @@ def test_hosted_batch_resize_uses_unique_managed_output_directory(
     )
     with _client(tmp_path, task_manager=manager) as client:
         references = [
-            _upload(client, name, b"image").json()["reference"]
+            _upload(client, name, _png_bytes((1, 1))).json()["reference"]
             for name in ("first.png", "second.png")
         ]
         task_id = client.post(
@@ -911,3 +971,279 @@ def test_hosted_queue_rejection_removes_empty_task_directory(
 
     assert response.status_code == 409
     assert list(tmp_path.glob("sessions/*/tasks/*")) == []
+
+
+def test_hosted_batch_rejects_all_inputs_before_output_or_enqueue(
+    tmp_path: Path,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = RedisTaskManager(
+        redis_connection=redis_connection,
+        queue=Queue("designtoolkit", connection=redis_connection),
+        data_dir=tmp_path,
+        max_queued_tasks=20,
+        retention_seconds=7200,
+    )
+    enqueue = Mock(side_effect=AssertionError("queue must not be called"))
+    manager.queue.enqueue = enqueue
+    with _client(
+        tmp_path,
+        task_manager=manager,
+        max_image_pixels=1,
+    ) as client:
+        references = [
+            _upload(client, "exact.png", _png_bytes((1, 1))).json()["reference"],
+            _upload(client, "large.png", _png_bytes((2, 1))).json()["reference"],
+        ]
+        response = client.post(
+            "/api/tasks/media-resize",
+            json={"input_paths": references, "size": "100x100"},
+        )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "media_limit_exceeded"
+    assert "1 pixels" in response.json()["error"]["message"]
+    enqueue.assert_not_called()
+    assert list(tmp_path.glob("sessions/*/tasks/*")) == []
+
+
+@pytest.mark.parametrize(
+    ("route", "payload"),
+    [
+        (
+            "/api/tasks/chroma-keyer",
+            {"samples": [[0, 255, 0]], "params": {}},
+        ),
+        (
+            "/api/tasks/media-resize",
+            {"size": "100x100"},
+        ),
+    ],
+)
+def test_hosted_image_tasks_reject_oversized_media_before_enqueue(
+    tmp_path: Path,
+    route: str,
+    payload: dict[str, object],
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = RedisTaskManager(
+        redis_connection=redis_connection,
+        queue=Queue("designtoolkit", connection=redis_connection),
+        data_dir=tmp_path,
+        max_queued_tasks=20,
+        retention_seconds=7200,
+    )
+    enqueue = Mock(side_effect=AssertionError("queue must not be called"))
+    manager.queue.enqueue = enqueue
+    with _client(
+        tmp_path,
+        task_manager=manager,
+        max_image_pixels=1,
+    ) as client:
+        reference = _upload(
+            client,
+            "large.png",
+            _png_bytes((2, 1)),
+        ).json()["reference"]
+        response = client.post(route, json={"input_path": reference, **payload})
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "media_limit_exceeded"
+    enqueue.assert_not_called()
+    assert list(tmp_path.glob("sessions/*/tasks/*")) == []
+
+
+@pytest.mark.parametrize(
+    ("route", "payload"),
+    [
+        (
+            "/api/tasks/video-frames",
+            {"image_format": "png", "overwrite": False},
+        ),
+        (
+            "/api/tasks/chroma-keyer-video",
+            {"samples": [[0, 255, 0]], "params": {}},
+        ),
+    ],
+)
+def test_hosted_video_tasks_reject_oversized_media_before_enqueue(
+    tmp_path: Path,
+    route: str,
+    payload: dict[str, object],
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = RedisTaskManager(
+        redis_connection=redis_connection,
+        queue=Queue("designtoolkit", connection=redis_connection),
+        data_dir=tmp_path,
+        max_queued_tasks=20,
+        retention_seconds=7200,
+    )
+    enqueue = Mock(side_effect=AssertionError("queue must not be called"))
+    manager.queue.enqueue = enqueue
+    decoder = StubHostedVideoDecoder(
+        VideoMetadata(
+            width=3841,
+            height=2160,
+            fps=30.0,
+            duration_seconds=1.0,
+            estimated_frame_count=30,
+            codec="stub",
+        )
+    )
+    with _client(
+        tmp_path,
+        task_manager=manager,
+        video_decoder=decoder,
+    ) as client:
+        reference = _upload(client, "large.mp4", b"video").json()["reference"]
+        response = client.post(route, json={"input_path": reference, **payload})
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "media_limit_exceeded"
+    assert decoder.decode_calls == 0
+    enqueue.assert_not_called()
+    assert list(tmp_path.glob("sessions/*/tasks/*")) == []
+
+
+@pytest.mark.parametrize(
+    ("route", "payload"),
+    [
+        ("/api/chroma-keyer/images/inspect", {}),
+        (
+            "/api/chroma-keyer/images/sample",
+            {
+                "x": 0.0,
+                "y": 0.0,
+                "preview_width": 2.0,
+                "preview_height": 1.0,
+            },
+        ),
+        (
+            "/api/chroma-keyer/preview",
+            {"samples": [[0, 255, 0]], "params": {}},
+        ),
+        (
+            "/api/chroma-keyer/previews",
+            {"samples": [[0, 255, 0]], "params": {}},
+        ),
+    ],
+)
+def test_hosted_image_preview_endpoints_reject_before_decode(
+    tmp_path: Path,
+    route: str,
+    payload: dict[str, object],
+) -> None:
+    with _client(tmp_path, max_image_pixels=1) as client:
+        reference = _upload(
+            client,
+            "large.png",
+            _png_bytes((2, 1)),
+        ).json()["reference"]
+        response = client.post(route, json={"input_path": reference, **payload})
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "media_limit_exceeded"
+
+
+@pytest.mark.parametrize(
+    ("route", "payload"),
+    [
+        ("/api/chroma-keyer/videos/inspect", {}),
+        ("/api/chroma-keyer/videos/frame", {"timestamp_seconds": 0.0}),
+        (
+            "/api/chroma-keyer/videos/sample",
+            {
+                "timestamp_seconds": 0.0,
+                "x": 0.0,
+                "y": 0.0,
+                "preview_width": 2.0,
+                "preview_height": 2.0,
+            },
+        ),
+        (
+            "/api/chroma-keyer/videos/preview",
+            {
+                "timestamp_seconds": 0.0,
+                "samples": [[0, 255, 0]],
+                "params": {},
+            },
+        ),
+    ],
+)
+def test_hosted_video_preview_endpoints_reject_before_decode(
+    tmp_path: Path,
+    route: str,
+    payload: dict[str, object],
+) -> None:
+    decoder = StubHostedVideoDecoder(
+        VideoMetadata(
+            width=3840,
+            height=2161,
+            fps=30.0,
+            duration_seconds=1.0,
+            estimated_frame_count=30,
+            codec="stub",
+        )
+    )
+    with _client(tmp_path, video_decoder=decoder) as client:
+        reference = _upload(client, "large.mp4", b"video").json()["reference"]
+        response = client.post(route, json={"input_path": reference, **payload})
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "media_limit_exceeded"
+    assert decoder.decode_calls == 0
+
+
+def test_hosted_unreadable_media_returns_clear_422(tmp_path: Path) -> None:
+    with _client(tmp_path) as client:
+        reference = _upload(client, "broken.png", b"not an image").json()["reference"]
+        response = client.post(
+            "/api/chroma-keyer/images/inspect",
+            json={"input_path": reference},
+        )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "error": {
+            "code": "media_limit_exceeded",
+            "message": "Image could not be read",
+        }
+    }
+
+
+def test_hosted_video_inspection_reuses_validation_probe(tmp_path: Path) -> None:
+    decoder = StubHostedVideoDecoder()
+    with _client(tmp_path, video_decoder=decoder) as client:
+        reference = _upload(client, "clip.mp4", b"video").json()["reference"]
+        response = client.post(
+            "/api/chroma-keyer/videos/inspect",
+            json={"input_path": reference},
+        )
+
+    assert response.status_code == 200
+    assert decoder.probe_calls == 1
+    assert decoder.decode_calls == 1
+
+
+def test_local_mode_does_not_apply_hosted_media_limits(tmp_path: Path) -> None:
+    image_path = tmp_path / "local.png"
+    image_path.write_bytes(_png_bytes((2, 1)))
+    settings = HostedSettings(
+        enabled=False,
+        data_dir=tmp_path,
+        redis_url="redis://unused",
+        max_image_pixels=1,
+    )
+    with TestClient(
+        create_app(
+            hosted_settings=settings,
+        )
+    ) as client:
+        response = client.post(
+            "/api/chroma-keyer/images/inspect",
+            json={"input_path": str(image_path)},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["width"] == 2
