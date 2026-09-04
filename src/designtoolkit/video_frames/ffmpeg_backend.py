@@ -145,9 +145,20 @@ class FfmpegBackend:
             )
 
     def _stop_process(self, process: subprocess.Popen[str]) -> None:
-        process.terminate()
+        try:
+            process.terminate()
+        except ProcessLookupError:
+            return
         try:
             process.wait(timeout=self._poll_interval)
+        except ProcessLookupError:
+            return
         except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait()
+            try:
+                process.kill()
+            except ProcessLookupError:
+                return
+            try:
+                process.wait()
+            except ProcessLookupError:
+                return

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import subprocess
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -710,6 +712,37 @@ def test_directory_result_is_packaged_as_a_zip(tmp_path: Path) -> None:
     assert artifact == tmp_path / "task-1.zip"
     assert artifact.is_file()
     assert not output_dir.exists()
+
+
+def test_download_artifact_rejects_linked_directory_child(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "frames"
+    output_dir.mkdir()
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    outside_file = outside_dir / "secret.txt"
+    outside_file.write_text("secret", encoding="utf-8")
+    link = output_dir / "linked"
+    try:
+        link.symlink_to(outside_dir, target_is_directory=True)
+    except OSError as exc:
+        if os.name != "nt":
+            pytest.skip(f"directory links are unavailable: {exc}")
+        result = subprocess.run(
+            ["cmd.exe", "/c", "mklink", "/J", str(link), str(outside_dir)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode:
+            pytest.skip(f"directory links are unavailable: {result.stderr}")
+
+    with pytest.raises(UploadRejectedError, match="link|junction"):
+        prepare_download_artifact("task-1", str(output_dir))
+
+    assert outside_file.read_text(encoding="utf-8") == "secret"
+    assert not (tmp_path / "task-1.zip").exists()
 
 
 @pytest.mark.parametrize("failure_mode", ["write", "close"])

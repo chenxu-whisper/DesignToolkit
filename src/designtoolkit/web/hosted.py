@@ -8,6 +8,7 @@ from collections.abc import AsyncIterable, Mapping
 from dataclasses import dataclass
 from math import isfinite
 from pathlib import Path
+from stat import S_ISDIR, S_ISLNK, S_ISREG
 from threading import RLock
 from time import time
 from unicodedata import category
@@ -502,9 +503,9 @@ def prepare_download_artifact(
     paths = [Path(value) for value in output_value.split("; ") if value]
     if not paths or any(not path.exists() for path in paths):
         raise FileNotFoundError("Task output is not available")
+    output_files = {path: _collect_download_files(path) for path in paths}
     output_size = sum(
-        path.stat().st_size if path.is_file() else _directory_size(path)
-        for path in paths
+        child.lstat().st_size for files in output_files.values() for child in files
     )
     if output_size > max_output_bytes:
         for path in paths:
@@ -520,22 +521,57 @@ def prepare_download_artifact(
     try:
         with ZipFile(archive_path, "w", compression=ZIP_DEFLATED) as archive:
             for path in paths:
-                if path.is_file():
+                files = output_files[path]
+                if S_ISREG(path.lstat().st_mode):
                     archive.write(path, arcname=path.name)
                     path.unlink()
                     continue
-                for child in sorted(path.rglob("*")):
-                    if child.is_file():
-                        archive.write(
-                            child,
-                            arcname=str(Path(path.name) / child.relative_to(path)),
-                        )
-                        child.unlink()
+                for child in files:
+                    archive.write(
+                        child,
+                        arcname=str(Path(path.name) / child.relative_to(path)),
+                    )
+                    child.unlink()
                 shutil.rmtree(path, ignore_errors=True)
     except Exception:
         archive_path.unlink(missing_ok=True)
         raise
     return archive_path
+
+
+def _collect_download_files(path: Path) -> tuple[Path, ...]:
+    root_stat = path.lstat()
+    if _is_link_or_junction(path, root_stat.st_mode):
+        raise UploadRejectedError("Task output contains a link or junction")
+    if S_ISREG(root_stat.st_mode):
+        return (path,)
+    if not S_ISDIR(root_stat.st_mode):
+        return ()
+
+    root = path.resolve(strict=True)
+    files: list[Path] = []
+    pending = [path]
+    while pending:
+        directory = pending.pop()
+        for child in directory.iterdir():
+            child_stat = child.lstat()
+            if _is_link_or_junction(child, child_stat.st_mode):
+                raise UploadRejectedError("Task output contains a link or junction")
+            try:
+                child.resolve(strict=True).relative_to(root)
+            except ValueError as exc:
+                raise UploadRejectedError(
+                    "Task output contains a path outside its output directory"
+                ) from exc
+            if S_ISREG(child_stat.st_mode):
+                files.append(child)
+            elif S_ISDIR(child_stat.st_mode):
+                pending.append(child)
+    return tuple(sorted(files))
+
+
+def _is_link_or_junction(path: Path, mode: int) -> bool:
+    return S_ISLNK(mode) or path.is_junction()
 
 
 def is_valid_session_id(value: str | None) -> bool:
@@ -695,16 +731,6 @@ def _directory_modified_at(path: Path) -> float:
     return max(
         (entry.stat().st_mtime for entry in path.rglob("*")),
         default=path.stat().st_mtime,
-    )
-
-
-def _directory_size(path: Path) -> int:
-    if not path.is_dir():
-        return 0
-    return sum(
-        entry.stat().st_size
-        for entry in path.rglob("*")
-        if entry.is_file()
     )
 
 

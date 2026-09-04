@@ -107,7 +107,7 @@ class OutputTargetMonitor:
         self._guard = guard
         self._target = Path(target)
         self._sequence = _parse_sequential_pattern(str(target))
-        self._next_index = 1
+        self._tail_index = 1
 
     def poll(self) -> None:
         if self._sequence is None:
@@ -115,13 +115,14 @@ class OutputTargetMonitor:
             return
 
         prefix, width, suffix = self._sequence
+        tail = Path(f"{prefix}{self._tail_index:0{width}d}{suffix}")
+        if not self._account_if_present(tail):
+            return
         while True:
-            candidate = Path(
-                f"{prefix}{self._next_index:0{width}d}{suffix}"
-            )
-            if not self._account_if_present(candidate):
+            successor = Path(f"{prefix}{self._tail_index + 1:0{width}d}{suffix}")
+            if not self._account_if_present(successor):
                 return
-            self._next_index += 1
+            self._tail_index += 1
 
     def finish(self) -> None:
         self._guard.check_tree()

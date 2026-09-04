@@ -191,7 +191,7 @@ def test_single_output_monitor_accounts_only_target(
     assert guard.used_bytes == 6
 
 
-def test_sequence_monitor_only_accounts_new_contiguous_frames(
+def test_sequence_monitor_rechecks_only_tail_and_new_contiguous_frames(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -217,8 +217,46 @@ def test_sequence_monitor_only_accounts_new_contiguous_frames(
     third.write_bytes(b"333")
     monitor.poll()
 
-    assert accounted == [first, second, third]
+    assert accounted == [first, second, second, second, third]
     assert guard.used_bytes == 6
+
+
+def test_sequence_monitor_stats_only_tail_and_new_successors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    guard = OutputBudgetGuard(tmp_path, max_bytes=100)
+    pattern = tmp_path / "clip_%06d.png"
+    frames = [tmp_path / f"clip_{index:06d}.png" for index in range(1, 6)]
+    frames[0].write_bytes(b"1")
+    attempted: list[Path] = []
+    original_account = guard.account
+
+    def account(path: Path) -> None:
+        attempted.append(path)
+        original_account(path)
+
+    monkeypatch.setattr(guard, "account", account)
+    monitor = OutputTargetMonitor(guard, pattern)
+
+    monitor.poll()
+    frames[1].write_bytes(b"2")
+    frames[2].write_bytes(b"3")
+    frames[3].write_bytes(b"4")
+    monitor.poll()
+    monitor.poll()
+
+    assert attempted == [
+        frames[0],
+        frames[1],
+        frames[0],
+        frames[1],
+        frames[2],
+        frames[3],
+        frames[4],
+        frames[3],
+        frames[4],
+    ]
 
 
 def test_sequence_monitor_leaves_gap_for_final_tree_check(tmp_path: Path) -> None:
@@ -284,6 +322,44 @@ def _popen_factory(
         return process
 
     return create
+
+
+def test_ffmpeg_backend_stops_when_active_sequence_tail_grows(
+    tmp_path: Path,
+) -> None:
+    first = tmp_path / "frame_000001.png"
+    first.write_bytes(b"1")
+
+    class GrowingSequencePopen(FakePopen):
+        def __init__(self) -> None:
+            super().__init__([])
+            self.communicate_calls = 0
+
+        def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+            del timeout
+            self.communicate_calls += 1
+            if self.communicate_calls == 2:
+                first.write_bytes(b"x" * 80)
+            if self.communicate_calls <= 2:
+                raise subprocess.TimeoutExpired("ffmpeg", 0.01)
+            raise AssertionError("FFmpeg was allowed to exit before rejection")
+
+    process = GrowingSequencePopen()
+    backend = FfmpegBackend(
+        output_guard=OutputBudgetGuard(
+            tmp_path,
+            max_bytes=80,
+            safety_bytes=1,
+        ),
+        poll_interval=0.01,
+        popen=_popen_factory(process, []),
+    )
+
+    with pytest.raises(OutputLimitExceeded, match="80-byte limit"):
+        backend.run(["ffmpeg", str(tmp_path / "frame_%06d.png")])
+
+    assert process.terminate_called
+    assert process.communicate_calls == 2
 
 
 def test_ffmpeg_backend_preserves_captured_stderr_on_success() -> None:
@@ -393,6 +469,51 @@ def test_ffmpeg_backend_kills_process_that_ignores_termination() -> None:
 
     assert process.terminate_called
     assert process.kill_called
+
+
+@pytest.mark.parametrize(
+    "race_at",
+    ["terminate", "wait", "kill", "final_wait"],
+)
+def test_ffmpeg_backend_preserves_limit_error_during_exit_race(
+    race_at: str,
+) -> None:
+    class RacingPopen(FakePopen):
+        def __init__(self) -> None:
+            super().__init__([subprocess.TimeoutExpired("ffmpeg", 0.01)])
+            self.wait_calls = 0
+
+        def terminate(self) -> None:
+            super().terminate()
+            if race_at == "terminate":
+                raise ProcessLookupError
+
+        def kill(self) -> None:
+            super().kill()
+            if race_at == "kill":
+                raise ProcessLookupError
+
+        def wait(self, timeout: float | None = None) -> int:
+            self.wait_calls += 1
+            if race_at == "wait":
+                raise ProcessLookupError
+            if self.wait_calls == 1 and race_at in {"kill", "final_wait"}:
+                raise subprocess.TimeoutExpired("ffmpeg", timeout)
+            if race_at == "final_wait":
+                raise ProcessLookupError
+            return super().wait(timeout)
+
+    process = RacingPopen()
+    backend = FfmpegBackend(
+        output_guard=lambda: (_ for _ in ()).throw(
+            OutputLimitExceeded("primary output limit error")
+        ),
+        poll_interval=0.01,
+        popen=_popen_factory(process, []),
+    )
+
+    with pytest.raises(OutputLimitExceeded, match="primary output limit error"):
+        backend.run(["ffmpeg", "out.mp4"])
 
 
 def test_file_size_limit_preexec_is_disabled_on_windows() -> None:
