@@ -16,7 +16,7 @@ from pathlib import Path
 from queue import Empty
 from shutil import disk_usage
 from stat import S_ISREG
-from threading import BoundedSemaphore, Event, Lock, Thread
+from threading import BoundedSemaphore, Event, Lock, RLock, Thread
 from urllib.parse import unquote
 
 import numpy as np
@@ -130,7 +130,7 @@ class _SessionLeaseHeartbeat:
         self._interval = interval
         self._stopped = Event()
         self._failure: BaseException | None = None
-        self._lock = Lock()
+        self._lock = RLock()
         self._thread = Thread(target=self._run, daemon=True)
 
     def start(self) -> None:
@@ -151,8 +151,10 @@ class _SessionLeaseHeartbeat:
             self._raise_if_failed()
 
     def commit[T](self, action: Callable[[], T]) -> T:
-        self.barrier()
-        return action()
+        with self._lock:
+            self.barrier()
+            self._raise_if_failed()
+            return action()
 
     def _raise_if_failed(self) -> None:
         if self._failure is not None:
@@ -160,14 +162,14 @@ class _SessionLeaseHeartbeat:
 
     def _run(self) -> None:
         while not self._stopped.wait(self._interval):
-            with self._lock:
-                if self._stopped.is_set():
-                    return
-                try:
-                    self._lease.refresh()
-                except BaseException as exc:
+            if self._stopped.is_set():
+                return
+            try:
+                self._lease.refresh()
+            except BaseException as exc:
+                with self._lock:
                     self._failure = exc
-                    return
+                return
 
 
 @dataclass
@@ -182,12 +184,14 @@ class _HostedSessionOperation:
         self.heartbeat.barrier()
 
     def commit[T](self, action: Callable[[], T]) -> T:
-        if self.heartbeat is None:
+        def commit_action() -> T:
             result = action()
-        else:
-            result = self.heartbeat.commit(action)
-        self.mark_committed()
-        return result
+            self.mark_committed()
+            return result
+
+        if self.heartbeat is None:
+            return commit_action()
+        return self.heartbeat.commit(commit_action)
 
     def mark_committed(self) -> None:
         self.committed = True
@@ -925,10 +929,9 @@ def create_router(
             )
             operation.mark_committed()
             return task
-        operation.barrier()
-        task = create_task(payload, owner_id=owner_id)
-        operation.mark_committed()
-        return task
+        return operation.commit(
+            lambda: create_task(payload, owner_id=owner_id)
+        )
 
     def resolve_input_references(
         http_request: Request,
@@ -1153,7 +1156,6 @@ def create_router(
                     asset_id,
                 )
             )
-            operation.barrier()
             if asset_was_absent:
                 try:
                     operation.commit(
@@ -1276,6 +1278,7 @@ def create_router(
 
     @router.post(
         "/tasks/video-frames",
+        status_code=202,
         response_model=TaskCreateResponse,
         dependencies=[Depends(hosted_session_operation, scope="function")],
     )
@@ -1303,6 +1306,7 @@ def create_router(
 
     @router.post(
         "/tasks/media-resize",
+        status_code=202,
         response_model=TaskCreateResponse,
         dependencies=[Depends(hosted_session_operation, scope="function")],
     )
@@ -1330,6 +1334,7 @@ def create_router(
 
     @router.post(
         "/tasks/chroma-keyer",
+        status_code=202,
         response_model=TaskCreateResponse,
         dependencies=[Depends(hosted_session_operation, scope="function")],
     )
@@ -1357,6 +1362,7 @@ def create_router(
 
     @router.post(
         "/tasks/chroma-keyer-video",
+        status_code=202,
         response_model=TaskCreateResponse,
         dependencies=[Depends(hosted_session_operation, scope="function")],
     )

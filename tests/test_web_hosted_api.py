@@ -18,6 +18,7 @@ from redis.exceptions import ConnectionError as RedisConnectionError
 from rq import Queue
 
 from designtoolkit.chroma_keyer.video_models import VideoMetadata
+from designtoolkit.web import routes as routes_module
 from designtoolkit.web.app import create_app
 from designtoolkit.web.hosted import (
     HostedSettings,
@@ -561,6 +562,44 @@ def test_delete_upload_heartbeat_failure_before_start_preserves_asset_and_usage(
     assert not tombstone.exists()
 
 
+def test_delete_upload_heartbeat_failure_after_barrier_blocks_rename(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=5)
+    with _client(
+        tmp_path,
+        max_session_bytes=5,
+        hosted_storage=storage,
+    ) as owner:
+        uploaded = _upload(owner, "screen.png", b"image")
+        reference = uploaded.json()["reference"]
+        asset_id = reference.split(":", 2)[1]
+        session_id = owner.cookies["dt_session"]
+        asset_path = storage.resolve(session_id, reference)
+        coordinator = owner.app.state.resource_coordinator
+        original_barrier = routes_module._SessionLeaseHeartbeat.barrier
+
+        def barrier_then_fail(heartbeat) -> None:
+            original_barrier(heartbeat)
+            heartbeat._failure = ResourceUnavailableError(
+                "Session lease heartbeat failed after barrier"
+            )
+
+        monkeypatch.setattr(
+            routes_module._SessionLeaseHeartbeat,
+            "barrier",
+            barrier_then_fail,
+        )
+
+        response = owner.delete(f"/api/uploads/{asset_id}")
+
+    assert response.status_code == 503
+    assert asset_path.read_bytes() == b"image"
+    assert coordinator.committed[session_id] == 5
+    assert coordinator.release_calls == 0
+
+
 def test_delete_upload_surfaces_heartbeat_failure_during_slow_removal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1062,7 +1101,7 @@ def test_hosted_task_uses_uploaded_asset_and_is_session_isolated(
     with _client(tmp_path, task_manager=manager) as stranger:
         stranger_status = stranger.get(f"/api/tasks/{task_id}")
 
-    assert created.status_code == 200
+    assert created.status_code == 202
     assert own_status.status_code == 200
     assert own_status.json()["input_path"] == "clip.mp4"
     assert stranger_status.status_code == 404
@@ -1108,7 +1147,7 @@ def test_hosted_task_holds_session_lease_through_queue_creation(
             json={"input_path": reference, "image_format": "png"},
         )
 
-    assert response.status_code == 200
+    assert response.status_code == 202
     assert coordinator.lease_acquisitions == 1
     assert coordinator.active_leases == 0
 
@@ -1159,7 +1198,7 @@ def test_hosted_task_returns_success_after_enqueue_when_late_heartbeat_fails(
             json={"input_path": reference, "image_format": "png"},
         )
 
-    assert response.status_code == 200
+    assert response.status_code == 202
     assert manager.queue.count == 1
     assert coordinator.active_leases == 0
 
@@ -1252,6 +1291,55 @@ def test_hosted_task_heartbeat_failure_after_barrier_rolls_back_before_enqueue(
     assert coordinator.active_leases == 0
 
 
+def test_hosted_task_failure_injected_after_barrier_blocks_enqueue(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = RedisTaskManager(
+        redis_connection=redis_connection,
+        queue=Queue("designtoolkit", connection=redis_connection),
+        data_dir=tmp_path,
+        max_queued_tasks=20,
+        retention_seconds=7200,
+    )
+    coordinator = StubCoordinator(
+        max_upload_concurrency=4,
+        max_session_bytes=1024,
+        min_free_bytes=0,
+    )
+    original_barrier = routes_module._SessionLeaseHeartbeat.barrier
+
+    def barrier_then_fail(heartbeat) -> None:
+        original_barrier(heartbeat)
+        heartbeat._failure = ResourceUnavailableError(
+            "Session lease heartbeat failed after barrier"
+        )
+
+    monkeypatch.setattr(
+        routes_module._SessionLeaseHeartbeat,
+        "barrier",
+        barrier_then_fail,
+    )
+    with _client(
+        tmp_path,
+        task_manager=manager,
+        resource_coordinator=coordinator,
+    ) as client:
+        reference = _upload(client, "clip.mp4", b"video").json()["reference"]
+        response = client.post(
+            "/api/tasks/video-frames",
+            json={"input_path": reference, "image_format": "png"},
+        )
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "storage_unavailable"
+    assert manager.queue.count == 0
+    assert redis_connection.llen("dt:queue:reservations") == 0
+    assert list(redis_connection.scan_iter(match="dt:task:*")) == []
+    assert list(redis_connection.scan_iter(match="dt:task-work:*")) == []
+
+
 def test_hosted_task_recovers_enqueue_acknowledgement_loss_without_orphan(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1300,7 +1388,7 @@ def test_hosted_task_recovers_enqueue_acknowledgement_loss_without_orphan(
         task_id = response.json()["task_id"]
         task_response = client.get(f"/api/tasks/{task_id}")
 
-    assert response.status_code == 200
+    assert response.status_code == 202
     assert task_response.status_code == 200
     assert task_response.json()["status"] == TaskStatus.QUEUED
     assert manager.queue.get_job_ids() == [task_id]
@@ -1309,6 +1397,51 @@ def test_hosted_task_recovers_enqueue_acknowledgement_loss_without_orphan(
     assert redis_connection.lrange("dt:queue:reservations", 0, -1) == [
         task_id.encode()
     ]
+
+
+def test_hosted_task_returns_handle_when_enqueue_and_confirmation_disconnect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = RedisTaskManager(
+        redis_connection=redis_connection,
+        queue=Queue("designtoolkit", connection=redis_connection),
+        data_dir=tmp_path,
+        max_queued_tasks=20,
+        retention_seconds=7200,
+    )
+    original_enqueue = manager.queue.enqueue
+
+    def enqueue_then_lose_ack(*args, **kwargs):
+        original_enqueue(*args, **kwargs)
+        raise RedisConnectionError("enqueue acknowledgement lost")
+
+    def confirmation_disconnect(_task_id: str) -> bool:
+        raise RedisConnectionError("enqueue confirmation unavailable")
+
+    monkeypatch.setattr(manager.queue, "enqueue", enqueue_then_lose_ack)
+    monkeypatch.setattr(
+        manager,
+        "_enqueue_has_authoritative_evidence",
+        confirmation_disconnect,
+    )
+    with _client(tmp_path, task_manager=manager) as client:
+        reference = _upload(client, "clip.mp4", b"video").json()["reference"]
+        response = client.post(
+            "/api/tasks/video-frames",
+            json={"input_path": reference, "image_format": "png"},
+        )
+
+    assert response.status_code == 202
+    task_id = response.json()["task_id"]
+    assert manager.queue.get_job_ids() == [task_id]
+    assert manager.get_task(task_id) is not None
+    assert manager.task_work(task_id) is not None
+    assert redis_connection.lrange("dt:queue:reservations", 0, -1) == [
+        task_id.encode()
+    ]
+    assert manager.reconcile_tasks(grace_seconds=60) == 0
 
 
 def test_hosted_task_heartbeats_session_during_slow_enqueue(
@@ -1355,7 +1488,7 @@ def test_hosted_task_heartbeats_session_during_slow_enqueue(
             json={"input_path": reference, "image_format": "png"},
         )
 
-    assert response.status_code == 200
+    assert response.status_code == 202
     assert manager.queue.count == 1
     assert coordinator.lease_refresh_calls >= 2
     assert coordinator.active_leases == 0

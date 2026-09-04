@@ -5,7 +5,7 @@ import logging
 import os
 import re
 import shutil
-from collections.abc import AsyncIterable, Mapping
+from collections.abc import AsyncIterable, Callable, Mapping
 from dataclasses import dataclass
 from math import isfinite
 from pathlib import Path
@@ -89,6 +89,8 @@ class _CleanupClaimHeartbeat:
         self._interval = coordinator.cleanup_claim_heartbeat_interval
         self._stopped = Event()
         self._failure: BaseException | None = None
+        self._committed = False
+        self._lock = RLock()
         self._thread = Thread(target=self._run, daemon=True)
 
     def __enter__(self) -> _CleanupClaimHeartbeat:
@@ -107,6 +109,16 @@ class _CleanupClaimHeartbeat:
         try:
             self.raise_if_failed()
         except BaseException as heartbeat_error:
+            if exc_value is None and self._committed:
+                _LOGGER.warning(
+                    "Cleanup claim heartbeat failed after committed cleanup",
+                    exc_info=(
+                        type(heartbeat_error),
+                        heartbeat_error,
+                        heartbeat_error.__traceback__,
+                    ),
+                )
+                return
             if exc_value is None:
                 raise
             exc_value.add_note(
@@ -122,18 +134,33 @@ class _CleanupClaimHeartbeat:
             )
 
     def raise_if_failed(self) -> None:
+        with self._lock:
+            self._raise_if_failed()
+
+    def commit[T](self, action: Callable[[], T]) -> T:
+        with self._lock:
+            self.raise_if_failed()
+            self._raise_if_failed()
+            result = action()
+            self._committed = True
+            return result
+
+    def _raise_if_failed(self) -> None:
         if self._failure is not None:
             raise self._failure
 
     def _run(self) -> None:
         while not self._stopped.wait(self._interval):
+            if self._stopped.is_set():
+                return
             try:
                 self._coordinator.refresh_cleanup_claim(
                     self._session_id,
                     self._token,
                 )
             except BaseException as exc:
-                self._failure = exc
+                with self._lock:
+                    self._failure = exc
                 return
 
 
@@ -593,8 +620,12 @@ class HostedStorage:
                         token,
                     )
                     _write_session_usage_generation(session_dir, generation)
-                    heartbeat.raise_if_failed()
-                    os.replace(session_dir, quarantine)
+                    heartbeat.commit(
+                        lambda source=session_dir, destination=quarantine: os.replace(
+                            source,
+                            destination,
+                        )
+                    )
                     heartbeat.raise_if_failed()
                     coordinator.clear_session_usage_generation(
                         session_id,

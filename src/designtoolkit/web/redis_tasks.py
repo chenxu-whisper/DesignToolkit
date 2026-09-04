@@ -559,9 +559,12 @@ class RedisTaskManager:
                 enqueue_error.add_note(
                     "Enqueue recovery could not confirm whether the RQ job committed"
                 )
-                raise enqueue_error from recovery_error
+                enqueue_error.add_note(
+                    f"Enqueue recovery failed with: {recovery_error}"
+                )
+                return task
             if enqueue_committed:
-                return self.get_task(task.task_id) or task
+                return task
             self._redis.delete(
                 _task_key(task.task_id),
                 _event_key(task.task_id),
