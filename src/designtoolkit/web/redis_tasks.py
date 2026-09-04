@@ -45,6 +45,26 @@ if TYPE_CHECKING:
 
 _QUEUE_NAME = "designtoolkit"
 _TERMINAL_TTL_SECONDS = 2 * 60 * 60
+_MARK_RUNNING_SCRIPT = """-- mark_task_running
+local value = redis.call("GET", KEYS[1])
+if not value then
+    return {0, ""}
+end
+
+local task = cjson.decode(value)
+if task.status ~= "queued" then
+    return {2, value}
+end
+
+task.status = "running"
+task.started_at = ARGV[2]
+local encoded = cjson.encode(task)
+redis.call("SET", KEYS[1], encoded, "EX", ARGV[3])
+redis.call("LREM", KEYS[2], 0, ARGV[1])
+redis.call("RPUSH", KEYS[3], ARGV[4])
+redis.call("EXPIRE", KEYS[3], ARGV[3])
+return {1, encoded}
+"""
 _TERMINAL_TRANSITION_SCRIPT = """-- transition_task_terminal
 local value = redis.call("GET", KEYS[1])
 if not value then
@@ -81,6 +101,11 @@ if ARGV[10] == "1" then
 end
 return {1, encoded}
 """
+
+
+class RunningTransitionResult(StrEnum):
+    APPLIED = "applied"
+    REJECTED = "rejected"
 
 
 class TerminalTransitionResult(StrEnum):
@@ -182,6 +207,9 @@ class RedisTaskManager:
         self.retention_seconds = retention_seconds
         self.resource_coordinator = resource_coordinator
         self.live_task_ttl = max(retention_seconds * 2, 24 * 60 * 60)
+        self._mark_running_script = self._redis.register_script(
+            _MARK_RUNNING_SCRIPT
+        )
         self._terminal_transition_script = self._redis.register_script(
             _TERMINAL_TRANSITION_SCRIPT
         )
@@ -272,21 +300,50 @@ class RedisTaskManager:
             return None
         return task
 
-    def mark_running(self, task_id: str) -> TaskRecord:
-        task = self._required_task(task_id)
-        if task.status is not TaskStatus.QUEUED:
-            return task
-        self._release_queue_slot(task_id)
-        task.status = TaskStatus.RUNNING
-        task.started_at = datetime.now(UTC)
-        self._save_task(task)
-        self.log_store.append(
+    def mark_running(
+        self,
+        task_id: str,
+    ) -> tuple[TaskRecord, RunningTransitionResult]:
+        started_at = datetime.now(UTC)
+        event = LogEventResponse(
             task_id=task_id,
+            timestamp=started_at,
             level=LogLevel.PROGRESS,
             phase=LogPhase.RUNNING,
             message="Task is running",
+            details={},
         )
-        return task
+        try:
+            result = self._mark_running_script(
+                keys=[
+                    _task_key(task_id),
+                    _queue_reservations_key(),
+                    _event_key(task_id),
+                ],
+                args=[
+                    task_id,
+                    started_at.isoformat(),
+                    self.live_task_ttl,
+                    event.model_dump_json(),
+                ],
+            )
+        except ResponseError as error_response:
+            if "unknown command" not in str(error_response).lower():
+                raise
+            return self._mark_running_without_lua(
+                task_id,
+                started_at=started_at,
+                event=event,
+            )
+        code = int(result[0])
+        if code == 0:
+            raise KeyError(task_id)
+        transition = (
+            RunningTransitionResult.APPLIED
+            if code == 1
+            else RunningTransitionResult.REJECTED
+        )
+        return _decode_task(result[1]), transition
 
     def mark_finished(
         self,
@@ -330,6 +387,10 @@ class RedisTaskManager:
             ).get_job_ids()
         )
         reconciled = 0
+        for task in self._tasks_requiring_failure_cleanup():
+            message = task.error or "Task failed"
+            if self._finalize_external_failure(task.task_id, message):
+                reconciled += 1
         for task in self._active_tasks():
             job = self.queue.fetch_job(task.task_id)
             status = job.get_status(refresh=True) if job is not None else None
@@ -492,6 +553,41 @@ class RedisTaskManager:
             raise KeyError(task_id)
         return task
 
+    def _mark_running_without_lua(
+        self,
+        task_id: str,
+        *,
+        started_at: datetime,
+        event: LogEventResponse,
+    ) -> tuple[TaskRecord, RunningTransitionResult]:
+        key = _task_key(task_id)
+        while True:
+            with self._redis.pipeline() as pipeline:
+                try:
+                    pipeline.watch(key)
+                    value = pipeline.get(key)
+                    if value is None:
+                        raise KeyError(task_id)
+                    task = _decode_task(value)
+                    if task.status is not TaskStatus.QUEUED:
+                        pipeline.unwatch()
+                        return task, RunningTransitionResult.REJECTED
+                    task.status = TaskStatus.RUNNING
+                    task.started_at = started_at
+                    pipeline.multi()
+                    pipeline.set(
+                        key,
+                        _encode_task(task),
+                        ex=self.live_task_ttl,
+                    )
+                    pipeline.lrem(_queue_reservations_key(), 0, task_id)
+                    pipeline.rpush(_event_key(task_id), event.model_dump_json())
+                    pipeline.expire(_event_key(task_id), self.live_task_ttl)
+                    pipeline.execute()
+                    return task, RunningTransitionResult.APPLIED
+                except WatchError:
+                    continue
+
     def _transition_finished(
         self,
         task_id: str,
@@ -614,7 +710,7 @@ class RedisTaskManager:
             details={},
         )
         try:
-            _task, transition = self._transition_finished(
+            task, transition = self._transition_finished(
                 task_id,
                 status=TaskStatus.FAILED,
                 error=message,
@@ -622,7 +718,14 @@ class RedisTaskManager:
             )
         except KeyError:
             return False
-        if transition is not TerminalTransitionResult.APPLIED:
+        if task.status is TaskStatus.SUCCEEDED:
+            return False
+        cleaned = self._cleanup_failed_task(task_id)
+        return transition is TerminalTransitionResult.APPLIED or cleaned
+
+    def _cleanup_failed_task(self, task_id: str) -> bool:
+        cleanup_key = _failure_cleanup_key(task_id)
+        if self._redis.exists(cleanup_key):
             return False
         self._release_queue_slot(task_id)
         from designtoolkit.web.worker import discard_failed_task_output
@@ -632,7 +735,25 @@ class RedisTaskManager:
                 self.resource_coordinator.release_task_resources(task_id)
         finally:
             discard_failed_task_output(task_id, self)
+        self._redis.set(cleanup_key, "1", ex=_TERMINAL_TTL_SECONDS)
         return True
+
+    def _tasks_requiring_failure_cleanup(self) -> list[TaskRecord]:
+        tasks: list[TaskRecord] = []
+        for key in self._redis.scan_iter(match="dt:task:*"):
+            key_text = key.decode() if isinstance(key, bytes) else key
+            if key_text.endswith(":events"):
+                continue
+            value = self._redis.get(key)
+            if value is None:
+                continue
+            task = _decode_task(value)
+            if (
+                task.status is TaskStatus.FAILED
+                and not self._redis.exists(_failure_cleanup_key(task.task_id))
+            ):
+                tasks.append(task)
+        return tasks
 
     def _active_tasks(self) -> list[TaskRecord]:
         tasks: list[TaskRecord] = []
@@ -718,6 +839,10 @@ def _task_resources_key(task_id: str) -> str:
 
 def _task_work_key(task_id: str) -> str:
     return f"dt:task-work:{task_id}"
+
+
+def _failure_cleanup_key(task_id: str) -> str:
+    return f"dt:failure-cleanup:{task_id}"
 
 
 def handle_job_failure(

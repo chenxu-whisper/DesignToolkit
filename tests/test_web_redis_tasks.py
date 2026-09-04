@@ -28,6 +28,7 @@ from designtoolkit.web.hosted import HostedSettings
 from designtoolkit.web.redis_tasks import (
     RedisLogStore,
     RedisTaskManager,
+    RunningTransitionResult,
     TerminalTransitionResult,
     handle_job_failure,
     handle_job_stopped,
@@ -42,7 +43,7 @@ from designtoolkit.web.schemas import (
     TaskStatus,
     VideoFramesTaskRequest,
 )
-from designtoolkit.web.tasks import TaskConflictError
+from designtoolkit.web.tasks import TaskConflictError, TaskRecord
 from designtoolkit.web.worker import RedisTaskExecutor
 
 
@@ -119,6 +120,28 @@ def _hosted_settings(tmp_path: Path) -> HostedSettings:
         redis_url="redis://unused/0",
         max_output_bytes=10,
         min_free_bytes=5,
+    )
+
+
+def _race_mark_running(
+    manager: RedisTaskManager,
+    task_id: str,
+    barrier: Barrier,
+) -> tuple[TaskRecord, RunningTransitionResult]:
+    barrier.wait()
+    return manager.mark_running(task_id)
+
+
+def _race_mark_failed(
+    manager: RedisTaskManager,
+    task_id: str,
+    barrier: Barrier,
+) -> tuple[TaskRecord, TerminalTransitionResult]:
+    barrier.wait()
+    return manager._transition_finished(
+        task_id,
+        status=TaskStatus.FAILED,
+        error="worker timeout",
     )
 
 
@@ -290,6 +313,59 @@ def test_run_task_reserves_refreshes_and_releases_worker_resources(
     assert manager.get_task(task.task_id).status is TaskStatus.SUCCEEDED
 
 
+def test_run_task_stops_before_resource_mutation_when_start_is_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    settings = _hosted_settings(tmp_path)
+    manager = _manager(redis_connection, tmp_path)
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+        owner_id="a" * 32,
+    )
+    manager.mark_finished(
+        task.task_id,
+        status=TaskStatus.FAILED,
+        error="worker timeout",
+    )
+    resources = TrackingTaskResources()
+    monkeypatch.setattr(worker_module.HostedSettings, "from_env", lambda: settings)
+    monkeypatch.setattr(
+        worker_module.Redis,
+        "from_url",
+        lambda _url: redis_connection,
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "_build_resource_coordinator",
+        lambda _settings, _connection: resources,
+    )
+
+    def unexpected_execution(*_args, **_kwargs) -> None:
+        raise AssertionError("terminal task must not execute")
+
+    monkeypatch.setattr(
+        worker_module.RedisTaskExecutor,
+        "execute_reserved_task",
+        unexpected_execution,
+    )
+
+    worker_module.run_task(
+        task.task_id,
+        "video_frames",
+        VideoFramesTaskRequest(
+            input_path=str(tmp_path / "clip.mp4")
+        ).model_dump(mode="json"),
+    )
+
+    assert resources.events == []
+    failed = manager.get_task(task.task_id)
+    assert failed is not None
+    assert failed.status is TaskStatus.FAILED
+    assert failed.started_at is None
+
+
 def test_run_task_failure_cleans_output_terminalizes_and_releases_resources(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -446,6 +522,32 @@ def test_terminal_cas_returns_explicit_transition_result(tmp_path: Path) -> None
 
     assert first is TerminalTransitionResult.APPLIED
     assert second is TerminalTransitionResult.ALREADY_TERMINAL
+
+
+def test_mark_running_returns_explicit_transition_result(tmp_path: Path) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = _manager(redis_connection, tmp_path)
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+        owner_id="a" * 32,
+    )
+
+    running, first = manager.mark_running(task.task_id)
+    unchanged, second = manager.mark_running(task.task_id)
+
+    assert running.status is TaskStatus.RUNNING
+    assert running.started_at is not None
+    assert first is RunningTransitionResult.APPLIED
+    assert unchanged.status is TaskStatus.RUNNING
+    assert second is RunningTransitionResult.REJECTED
+    assert redis_connection.llen("dt:queue:reservations") == 0
+    running_events = [
+        event
+        for event in manager.log_store.history(task.task_id)
+        if event.phase is LogPhase.RUNNING
+        and event.message == "Task is running"
+    ]
+    assert len(running_events) == 1
 
 
 @pytest.mark.parametrize(
@@ -646,6 +748,124 @@ def test_external_rq_callback_is_idempotent_and_releases_resources(
     assert redis_connection.llen("dt:queue:reservations") == 0
     assert 7190 <= redis_connection.ttl(f"dt:task:{task.task_id}") <= 7200
     assert not output_root.exists()
+
+
+def test_external_failure_retries_cleanup_after_crash_following_terminal_cas(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    resources = StubTaskResources()
+    manager = _manager(
+        redis_connection,
+        tmp_path,
+        resource_coordinator=resources,
+    )
+    output_root = tmp_path / "interrupted-output"
+    output_root.mkdir()
+    (output_root / "partial.bin").write_bytes(b"partial")
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(
+            input_path=str(tmp_path / "clip.mp4"),
+            output_dir=str(output_root),
+        ),
+        owner_id="a" * 32,
+    )
+    job = manager.queue.fetch_job(task.task_id)
+    assert job is not None
+    monkeypatch.setattr(
+        "designtoolkit.web.redis_tasks._callback_manager",
+        lambda _connection: manager,
+    )
+    original_release = manager._release_queue_slot
+    calls = 0
+
+    def crash_once(task_id: str) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("injected cleanup crash")
+        original_release(task_id)
+
+    monkeypatch.setattr(manager, "_release_queue_slot", crash_once)
+
+    with pytest.raises(RuntimeError, match="injected cleanup crash"):
+        handle_job_failure(
+            job,
+            redis_connection,
+            RuntimeError,
+            RuntimeError("worker timeout"),
+            None,
+        )
+
+    failed = manager.get_task(task.task_id)
+    assert failed is not None
+    assert failed.status is TaskStatus.FAILED
+    assert redis_connection.llen("dt:queue:reservations") == 1
+    assert output_root.exists()
+    assert resources.released == []
+
+    handle_job_failure(
+        job,
+        redis_connection,
+        RuntimeError,
+        RuntimeError("worker timeout"),
+        None,
+    )
+
+    terminal_events = [
+        event
+        for event in manager.log_store.history(task.task_id)
+        if event.phase is LogPhase.FAILED
+    ]
+    assert len(terminal_events) == 1
+    assert resources.released == [task.task_id]
+    assert redis_connection.llen("dt:queue:reservations") == 0
+    assert not output_root.exists()
+
+
+def test_reconciler_retries_cleanup_after_crash_following_terminal_cas(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    resources = StubTaskResources()
+    manager = _manager(
+        redis_connection,
+        tmp_path,
+        resource_coordinator=resources,
+    )
+    output_root = tmp_path / "reconciled-output"
+    output_root.mkdir()
+    (output_root / "partial.bin").write_bytes(b"partial")
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(
+            input_path=str(tmp_path / "clip.mp4"),
+            output_dir=str(output_root),
+        ),
+        owner_id="a" * 32,
+    )
+    original_release = manager._release_queue_slot
+
+    def crash(_task_id: str) -> None:
+        raise RuntimeError("injected cleanup crash")
+
+    monkeypatch.setattr(manager, "_release_queue_slot", crash)
+    with pytest.raises(RuntimeError, match="injected cleanup crash"):
+        manager._finalize_external_failure(task.task_id, "worker timeout")
+    monkeypatch.setattr(manager, "_release_queue_slot", original_release)
+
+    assert manager.reconcile_tasks(grace_seconds=60) == 1
+    assert manager.reconcile_tasks(grace_seconds=60) == 0
+    assert resources.released == [task.task_id]
+    assert redis_connection.llen("dt:queue:reservations") == 0
+    assert not output_root.exists()
+    terminal_events = [
+        event
+        for event in manager.log_store.history(task.task_id)
+        if event.phase is LogPhase.FAILED
+    ]
+    assert len(terminal_events) == 1
 
 
 def test_active_owner_ids_include_only_queued_or_running_tasks(
@@ -964,6 +1184,55 @@ def test_real_redis_terminal_cas_and_reconciliation(
     )
     assert resources.released == [abandoned.task_id]
     assert not abandoned_root.exists()
+
+
+def test_real_redis_failure_cas_races_mark_running_without_resurrection(
+    real_redis_connection: Redis,
+    tmp_path: Path,
+) -> None:
+    manager = _manager(real_redis_connection, tmp_path)
+
+    for index in range(20):
+        task = manager.create_video_frames_task(
+            VideoFramesTaskRequest(
+                input_path=str(tmp_path / f"race-{index}.mp4")
+            ),
+            owner_id="a" * 32,
+        )
+        barrier = Barrier(2)
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            start_future = executor.submit(
+                _race_mark_running,
+                manager,
+                task.task_id,
+                barrier,
+            )
+            fail_future = executor.submit(
+                _race_mark_failed,
+                manager,
+                task.task_id,
+                barrier,
+            )
+            _started_task, start_result = start_future.result()
+            failed_task, failure_result = fail_future.result()
+
+        terminal = manager.get_task(task.task_id)
+        assert terminal is not None
+        assert terminal.status is TaskStatus.FAILED
+        assert failed_task.status is TaskStatus.FAILED
+        assert failure_result is TerminalTransitionResult.APPLIED
+        assert start_result in {
+            RunningTransitionResult.APPLIED,
+            RunningTransitionResult.REJECTED,
+        }
+        if start_result is RunningTransitionResult.REJECTED:
+            assert terminal.started_at is None
+        else:
+            assert terminal.started_at is not None
+        _unchanged, retry_result = manager.mark_running(task.task_id)
+        assert retry_result is RunningTransitionResult.REJECTED
+        assert manager.get_task(task.task_id).status is TaskStatus.FAILED
 
 
 def test_rate_limit_is_atomic_per_bucket(tmp_path: Path) -> None:

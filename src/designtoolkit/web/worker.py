@@ -16,6 +16,7 @@ from designtoolkit.web.hosted import (
 from designtoolkit.web.output_limits import OutputBudgetGuard, OutputLimitExceeded
 from designtoolkit.web.redis_tasks import (
     RedisTaskManager,
+    RunningTransitionResult,
     TerminalTransitionResult,
 )
 from designtoolkit.web.resources import (
@@ -43,6 +44,7 @@ class RedisTaskExecutor(TaskManager):
         *,
         max_output_bytes: int = 5 * 1024 * 1024 * 1024,
         resource_heartbeat: Callable[[], None] | None = None,
+        task_already_running: bool = False,
     ) -> None:
         super().__init__(log_store=state.log_store, run_async=False)
         self._state = state
@@ -51,6 +53,7 @@ class RedisTaskExecutor(TaskManager):
         self._output_root: Path | None = None
         self._input_paths: set[Path] = set()
         self._resource_heartbeat = resource_heartbeat
+        self._task_already_running = task_already_running
         self._backend_factory = self._guarded_backend
 
     def execute_reserved_task(
@@ -103,7 +106,11 @@ class RedisTaskExecutor(TaskManager):
         )
 
     def _mark_running(self, task_id: str) -> None:
-        self._state.mark_running(task_id)
+        if self._task_already_running:
+            return
+        _task, transition = self._state.mark_running(task_id)
+        if transition is not RunningTransitionResult.APPLIED:
+            raise RuntimeError("Task is no longer queued")
 
     def _account_output(self, path: Path) -> None:
         if self._output_guard is None:
@@ -343,6 +350,9 @@ def run_task(task_id: str, job_kind: str, payload: dict[str, object]) -> None:
     if task.owner_id is None:
         state._finalize_external_failure(task_id, "Task has no session owner")
         return
+    _running, transition = state.mark_running(task_id)
+    if transition is not RunningTransitionResult.APPLIED:
+        return
     lease: RedisSessionLease | None = None
     output: RedisReservation | None = None
 
@@ -357,6 +367,7 @@ def run_task(task_id: str, job_kind: str, payload: dict[str, object]) -> None:
         state,
         max_output_bytes=settings.max_output_bytes,
         resource_heartbeat=heartbeat,
+        task_already_running=True,
     )
     try:
         lease = resources.acquire_session(task.owner_id, task_id=task_id)
@@ -367,7 +378,6 @@ def run_task(task_id: str, job_kind: str, payload: dict[str, object]) -> None:
             free_bytes=disk_usage(settings.data_dir).free,
             min_free_bytes=settings.min_free_bytes,
         )
-        state.mark_running(task_id)
         request = _task_request(job_kind, payload)
         executor.execute_reserved_task(task, request)
     except Exception as exc:
