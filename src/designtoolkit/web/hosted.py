@@ -149,13 +149,15 @@ class _UploadResourceHeartbeat:
 
     def __exit__(
         self,
-        exc_type: type[BaseException] | None,
+        _exc_type: type[BaseException] | None,
         *_args: object,
     ) -> None:
+        self.seal()
+
+    def seal(self) -> None:
         self._stopped.set()
         self._thread.join()
-        if exc_type is None:
-            self.raise_if_failed()
+        self.raise_if_failed()
 
     def raise_if_failed(self) -> None:
         if self._failure is not None:
@@ -402,12 +404,10 @@ class HostedStorage:
                         "Upload size does not match declared Content-Length"
                     )
                 os.utime(self._session_dir(session_id), None)
-                heartbeat.raise_if_failed()
+                heartbeat.seal()
                 _commit_with_recovery(reservation)
                 committed = True
-                heartbeat.raise_if_failed()
                 temporary_path.replace(final_path)
-                heartbeat.raise_if_failed()
         except _AmbiguousCommitError:
             raise
         except Exception:
@@ -618,11 +618,7 @@ class HostedStorage:
                         quarantine,
                         expected_generation_id=generation_id,
                     )
-                    if generation is None:
-                        if self._session_dir(session_id).is_dir():
-                            continue
-                        coordinator.clear_session_usage(session_id)
-                    else:
+                    if generation is not None:
                         coordinator.clear_session_usage_generation(
                             session_id,
                             claim_token,
@@ -983,10 +979,12 @@ def _read_clamped_positive_float(
 
 
 def _directory_modified_at(path: Path) -> float:
-    return max(
+    root_modified_at = path.stat().st_mtime
+    descendant_modified_at = max(
         (entry.stat().st_mtime for entry in path.rglob("*")),
-        default=path.stat().st_mtime,
+        default=root_modified_at,
     )
+    return max(root_modified_at, descendant_modified_at)
 
 
 class _AmbiguousCommitError(ResourceUnavailableError):

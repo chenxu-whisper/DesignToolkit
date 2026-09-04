@@ -119,6 +119,12 @@ class RecordingReservation:
         self.released = True
 
 
+class SlowCommitReservation(RecordingReservation):
+    def commit(self) -> None:
+        sleep(0.04)
+        super().commit()
+
+
 class RecordingLease:
     def __init__(self) -> None:
         self.coordinator = SimpleNamespace(session_lease_heartbeat_interval=0.01)
@@ -210,6 +216,12 @@ async def _slow_chunks(*values: bytes) -> AsyncIterator[bytes]:
     for value in values:
         yield value
         await asyncio.sleep(0.04)
+
+
+async def _failing_chunks() -> AsyncIterator[bytes]:
+    yield b"im"
+    await asyncio.sleep(0.04)
+    raise UploadRejectedError("upload stream failed")
 
 
 def test_hosted_settings_use_public_deployment_defaults(tmp_path: Path) -> None:
@@ -318,6 +330,51 @@ async def test_upload_aborts_before_commit_after_background_heartbeat_failure(
     assert reservation.committed is False
     assert reservation.released is True
     assert list(tmp_path.rglob("screen.png")) == []
+    assert list(tmp_path.rglob(".uploading")) == []
+
+
+@pytest.mark.anyio
+async def test_upload_stops_heartbeat_before_commit_and_publish(
+    tmp_path: Path,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    reservation = SlowCommitReservation(fail_refresh_after=2)
+
+    asset = await storage.store_stream(
+        "a" * 32,
+        filename="screen.png",
+        content_length=4,
+        chunks=_chunks(b"data"),
+        reservation=reservation,
+    )
+
+    assert storage.resolve("a" * 32, asset.reference).read_bytes() == b"data"
+    assert reservation.committed is True
+    assert reservation.rolled_back is False
+
+
+@pytest.mark.anyio
+async def test_upload_surfaces_heartbeat_failure_alongside_stream_error(
+    tmp_path: Path,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    reservation = RecordingReservation(fail_refresh_after=2)
+
+    with pytest.raises(
+        ResourceUnavailableError,
+        match="Upload reservation expired",
+    ) as error:
+        await storage.store_stream(
+            "a" * 32,
+            filename="screen.png",
+            content_length=4,
+            chunks=_failing_chunks(),
+            reservation=reservation,
+        )
+
+    assert isinstance(error.value.__context__, UploadRejectedError)
+    assert str(error.value.__context__) == "upload stream failed"
+    assert reservation.released is True
     assert list(tmp_path.rglob(".uploading")) == []
 
 
@@ -852,6 +909,31 @@ def test_cleanup_preserves_expired_session_with_active_lease(
     assert coordinator.claim_calls == ["a" * 32]
 
 
+def test_cleanup_uses_session_root_mtime_when_descendants_are_older(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    session_id = "a" * 32
+    session_dir = tmp_path / "sessions" / session_id
+    session_dir.mkdir(parents=True)
+    child = session_dir / "asset.bin"
+    child.write_bytes(b"old")
+    os.utime(child, (1_000.0, 1_000.0))
+    os.utime(session_dir, (9_500.0, 9_500.0))
+    coordinator = RecordingCleanupCoordinator()
+    monkeypatch.setattr("designtoolkit.web.hosted.time", lambda: 10_000.0)
+
+    removed = storage.cleanup_expired(
+        retention_seconds=2_000,
+        coordinator=coordinator,
+    )
+
+    assert removed == 0
+    assert child.read_bytes() == b"old"
+    assert coordinator.claim_calls == []
+
+
 def test_cleanup_rechecks_recursive_mtime_after_claim(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1038,6 +1120,32 @@ def test_cleanup_preserves_orphaned_quarantine_while_new_lease_is_active(
     assert removed == 0
     assert orphan.is_dir()
     assert coordinator.claim_calls == [session_id]
+    assert coordinator.cleared_sessions == []
+
+
+def test_cleanup_deletes_legacy_orphan_without_clearing_recreated_session_usage(
+    tmp_path: Path,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    session_id = "a" * 32
+    orphan = tmp_path / ".trash" / f"{session_id}-{'1' * 32}"
+    orphan.mkdir(parents=True)
+    (orphan / "old.bin").write_bytes(b"old")
+    recreated = tmp_path / "sessions" / session_id
+    recreated.mkdir(parents=True)
+    (recreated / "new.bin").write_bytes(b"new")
+    committed_bytes = {session_id: 3}
+    coordinator = RecordingCleanupCoordinator(committed_bytes=committed_bytes)
+
+    removed = storage.cleanup_expired(
+        retention_seconds=2_000,
+        coordinator=coordinator,
+    )
+
+    assert removed == 1
+    assert not orphan.exists()
+    assert (recreated / "new.bin").read_bytes() == b"new"
+    assert committed_bytes == {session_id: 3}
     assert coordinator.cleared_sessions == []
 
 

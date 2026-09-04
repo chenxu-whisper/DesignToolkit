@@ -170,9 +170,18 @@ class _LeaseProtectedFileResponse(FileResponse):
 
         try:
             await super().__call__(scope, receive, send_while_leased)
-            self._heartbeat.raise_if_failed()
+        except BaseException:
+            _stop_session_lease_heartbeat(
+                self._heartbeat,
+                failure_context=(
+                    "download session lease heartbeat failed during response "
+                    "send error"
+                ),
+            )
+            raise
+        else:
+            _stop_session_lease_heartbeat(self._heartbeat)
         finally:
-            self._heartbeat.stop()
             _release_redis_resource_best_effort(
                 self._lease.release,
                 "download session lease",
@@ -829,20 +838,16 @@ def create_router(
         try:
             yield lease
         except BaseException:
-            heartbeat.stop()
-            try:
-                heartbeat.raise_if_failed()
-            except BaseException:
-                _LOGGER.error(
-                    "storage_unavailable: hosted session lease heartbeat failed "
-                    "during endpoint error",
-                    exc_info=True,
-                )
+            _stop_session_lease_heartbeat(
+                heartbeat,
+                failure_context=(
+                    "hosted session lease heartbeat failed during endpoint error"
+                ),
+            )
             raise
         else:
-            heartbeat.stop()
             try:
-                heartbeat.raise_if_failed()
+                _stop_session_lease_heartbeat(heartbeat)
             except (RedisError, ResourceUnavailableError) as exc:
                 raise ApiError("storage_unavailable", str(exc), 503) from exc
         finally:
@@ -1034,13 +1039,15 @@ def create_router(
             size=asset.size,
         )
 
-    @router.delete("/uploads/{asset_id}", status_code=204)
+    @router.delete(
+        "/uploads/{asset_id}",
+        status_code=204,
+        dependencies=[Depends(hosted_session_operation, scope="function")],
+    )
     def delete_upload(http_request: Request, asset_id: str) -> Response:
         if storage is None or resources is None:
             raise ApiError("hosted_mode_disabled", "Uploads are unavailable", 404)
-        lease = None
         try:
-            lease = resources.acquire_session(http_request.state.session_id)
             try:
                 deletion = storage.delete_asset(
                     http_request.state.session_id,
@@ -1096,12 +1103,6 @@ def create_router(
                 "Server storage is temporarily unavailable",
                 503,
             ) from exc
-        finally:
-            if lease is not None:
-                _release_redis_resource_best_effort(
-                    lease.release,
-                    "upload deletion session lease",
-                )
         return Response(status_code=204)
 
     @router.post(
@@ -1640,14 +1641,26 @@ def create_router(
         try:
             result_path = storage.validated_result_path(task.result_path)
         except UploadRejectedError as exc:
-            heartbeat.stop()
+            _stop_session_lease_heartbeat(
+                heartbeat,
+                failure_context=(
+                    "download session lease heartbeat failed during result "
+                    "validation error"
+                ),
+            )
             _release_redis_resource_best_effort(
                 lease.release,
                 "download session lease",
             )
             raise ApiError("result_not_found", str(exc), 404) from exc
         except BaseException:
-            heartbeat.stop()
+            _stop_session_lease_heartbeat(
+                heartbeat,
+                failure_context=(
+                    "download session lease heartbeat failed during result "
+                    "validation error"
+                ),
+            )
             _release_redis_resource_best_effort(
                 lease.release,
                 "download session lease",
@@ -1717,6 +1730,24 @@ def _release_redis_resource_best_effort(
         _LOGGER.warning(
             "Failed to release %s; expiry will reconcile it",
             resource_name,
+            exc_info=True,
+        )
+
+
+def _stop_session_lease_heartbeat(
+    heartbeat: _SessionLeaseHeartbeat,
+    *,
+    failure_context: str | None = None,
+) -> None:
+    heartbeat.stop()
+    try:
+        heartbeat.raise_if_failed()
+    except BaseException:
+        if failure_context is None:
+            raise
+        _LOGGER.error(
+            "storage_unavailable: %s",
+            failure_context,
             exc_info=True,
         )
 

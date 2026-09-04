@@ -19,7 +19,11 @@ from rq import Queue
 
 from designtoolkit.chroma_keyer.video_models import VideoMetadata
 from designtoolkit.web.app import create_app
-from designtoolkit.web.hosted import HostedSettings, HostedStorage
+from designtoolkit.web.hosted import (
+    HostedSettings,
+    HostedStorage,
+    UploadRejectedError,
+)
 from designtoolkit.web.redis_tasks import RedisTaskManager
 from designtoolkit.web.resources import (
     AssetReleaseMismatchError,
@@ -526,6 +530,53 @@ def test_delete_upload_is_owner_scoped_idempotent_and_reclaims_quota(
     assert coordinator.finalized_assets == {
         (owner.cookies["dt_session"], asset_id)
     }
+
+
+def test_delete_upload_surfaces_heartbeat_failure_during_slow_removal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=5)
+    original_rmtree = shutil.rmtree
+    with _client(
+        tmp_path,
+        max_session_bytes=5,
+        hosted_storage=storage,
+    ) as owner:
+        uploaded = _upload(owner, "screen.png", b"image")
+        asset_id = uploaded.json()["reference"].split(":", 2)[1]
+        session_id = owner.cookies["dt_session"]
+        tombstone = tmp_path / "sessions" / session_id / ".trash" / asset_id
+        coordinator = owner.app.state.resource_coordinator
+        coordinator.session_lease_heartbeat_interval = 0.001
+        coordinator.lease_acquisitions = 0
+        coordinator.lease_refresh_calls = 0
+        coordinator.lease_release_calls = 0
+        coordinator.fail_lease_refresh = True
+
+        def slow_rmtree(
+            path: Path,
+            *args: object,
+            **kwargs: object,
+        ) -> None:
+            if Path(path) == tombstone:
+                sleep(0.04)
+            original_rmtree(path, *args, **kwargs)
+
+        monkeypatch.setattr(
+            "designtoolkit.web.hosted.shutil.rmtree",
+            slow_rmtree,
+        )
+
+        response = owner.delete(f"/api/uploads/{asset_id}")
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "storage_unavailable"
+    assert coordinator.lease_acquisitions == 1
+    assert coordinator.lease_refresh_calls >= 1
+    assert coordinator.lease_release_calls == 1
+    assert coordinator.active_leases == 0
+    assert not tombstone.exists()
 
 
 def test_delete_absent_upload_best_effort_finalizes_known_release_marker(
@@ -1191,9 +1242,75 @@ def test_hosted_download_releases_lease_after_response_body(
     assert coordinator.lease_refresh_calls == refreshes_after_response
 
 
+def test_hosted_download_logs_heartbeat_failure_during_validation_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = RedisTaskManager(
+        redis_connection=redis_connection,
+        queue=Queue("designtoolkit", connection=redis_connection),
+        data_dir=tmp_path,
+        max_queued_tasks=20,
+        retention_seconds=7200,
+    )
+    coordinator = StubCoordinator(
+        max_upload_concurrency=4,
+        max_session_bytes=1024,
+        min_free_bytes=0,
+    )
+    storage = HostedStorage(tmp_path, max_upload_bytes=1024)
+    with _client(
+        tmp_path,
+        task_manager=manager,
+        resource_coordinator=coordinator,
+        hosted_storage=storage,
+    ) as client:
+        reference = _upload(client, "clip.mp4", b"video").json()["reference"]
+        task_id = client.post(
+            "/api/tasks/video-frames",
+            json={"input_path": reference, "image_format": "png"},
+        ).json()["task_id"]
+        manager.mark_finished(
+            task_id,
+            status=TaskStatus.SUCCEEDED,
+            output_path=f"/api/tasks/{task_id}/download",
+            result_path=str(tmp_path / "missing.png"),
+        )
+        coordinator.session_lease_heartbeat_interval = 0.001
+        coordinator.lease_acquisitions = 0
+        coordinator.lease_refresh_calls = 0
+        coordinator.lease_release_calls = 0
+        coordinator.fail_lease_refresh = True
+
+        def fail_validation(_value: str | None) -> Path:
+            deadline = monotonic() + 1
+            while coordinator.lease_refresh_calls == 0 and monotonic() < deadline:
+                sleep(0.001)
+            assert coordinator.lease_refresh_calls > 0
+            raise UploadRejectedError("Task result is not available")
+
+        monkeypatch.setattr(storage, "validated_result_path", fail_validation)
+        caplog.set_level("ERROR", logger="designtoolkit.web.routes")
+
+        response = client.get(f"/api/tasks/{task_id}/download")
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "result_not_found"
+    assert (
+        "download session lease heartbeat failed during result validation error"
+        in caplog.text
+    )
+    assert "Session lease heartbeat failed" in caplog.text
+    assert coordinator.lease_release_calls == 1
+    assert coordinator.active_leases == 0
+
+
 def test_hosted_download_releases_lease_when_response_send_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     redis_connection = fakeredis.FakeRedis(decode_responses=False)
     manager = RedisTaskManager(
@@ -1230,6 +1347,8 @@ def test_hosted_download_releases_lease_when_response_send_fails(
         coordinator.lease_acquisitions = 0
         coordinator.lease_refresh_calls = 0
         coordinator.lease_release_calls = 0
+        coordinator.fail_lease_refresh = True
+        caplog.set_level("ERROR", logger="designtoolkit.web.routes")
 
         async def fail_send(
             _response,
@@ -1252,6 +1371,11 @@ def test_hosted_download_releases_lease_when_response_send_fails(
     assert coordinator.lease_release_calls == 1
     assert coordinator.active_leases == 0
     assert coordinator.lease_refresh_calls == refreshes_after_failure
+    assert (
+        "download session lease heartbeat failed during response send error"
+        in caplog.text
+    )
+    assert "Session lease heartbeat failed" in caplog.text
 
 
 def test_hosted_batch_resize_uses_unique_managed_output_directory(
