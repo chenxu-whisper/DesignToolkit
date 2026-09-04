@@ -114,7 +114,7 @@ class DeterministicRedis(fakeredis.FakeRedis):
         return 0
 
     def _eval_reserve_output(self, keys, args):  # noqa: ANN001, ANN202
-        state_key, index_key, token_key = keys
+        state_key, index_key, token_key, task_key = keys
         (
             token,
             task_id,
@@ -123,6 +123,7 @@ class DeterministicRedis(fakeredis.FakeRedis):
             free_bytes,
             min_free_bytes,
             ttl_ms,
+            heartbeat_at,
         ) = args
         requested = int(requested)
         free_bytes = int(free_bytes)
@@ -162,8 +163,18 @@ class DeterministicRedis(fakeredis.FakeRedis):
             f"output|{session_id}|{requested}|{free_bytes}|{min_free_bytes}",
         )
         self.hincrby(state_key, "reserved_bytes", requested)
+        self.hincrby(state_key, "output_reserved_bytes", requested)
         self.hset(state_key, "observed_free_bytes", effective_free)
         self.hset(state_key, "min_free_bytes", effective_min_free)
+        self.hset(
+            task_key,
+            mapping={
+                "session_id": session_id,
+                "output_token": token,
+                "heartbeat_at": heartbeat_at,
+            },
+        )
+        self.pexpire(task_key, int(ttl_ms))
         return 0
 
     def _eval_refresh_token(self, keys, args):  # noqa: ANN001, ANN202
@@ -173,7 +184,12 @@ class DeterministicRedis(fakeredis.FakeRedis):
         return 1
 
     def _eval_release_reservation(self, keys, _args):  # noqa: ANN001, ANN202
-        state_key, index_key, token_key = keys
+        state_key, index_key, token_key, task_key = keys
+        token = token_key.rsplit(":", 1)[-1]
+        if self.hget(task_key, "output_token") == token.encode():
+            self.hdel(task_key, "output_token")
+            if not self.hexists(task_key, "lease_token"):
+                self.delete(task_key)
         if not self.exists(token_key):
             return 0
         kind = self._text(self.hget(token_key, "kind"))
@@ -187,6 +203,12 @@ class DeterministicRedis(fakeredis.FakeRedis):
             self._decrement(
                 state_key,
                 f"session:{session_id}:reserved_bytes",
+                reserved_bytes,
+            )
+        elif kind == "output":
+            self._decrement(
+                state_key,
+                "output_reserved_bytes",
                 reserved_bytes,
             )
         self._recompute_capacity(state_key, index_key)
@@ -280,6 +302,12 @@ class DeterministicRedis(fakeredis.FakeRedis):
                     f"session:{session_id}:reserved_bytes",
                     reserved_bytes,
                 )
+            elif kind == "output":
+                self._decrement(
+                    state_key,
+                    "output_reserved_bytes",
+                    reserved_bytes,
+                )
             removed += 1
         self._recompute_capacity(state_key, index_key)
         return removed
@@ -365,8 +393,16 @@ class DeterministicRedis(fakeredis.FakeRedis):
         return 1
 
     def _eval_acquire_session(self, keys, args):  # noqa: ANN001, ANN202
-        state_key, leases_key, lease_key = keys
-        token, session_id, ttl_ms, lease_prefix, cleanup_prefix = args
+        state_key, leases_key, lease_key, task_key = keys
+        (
+            token,
+            session_id,
+            ttl_ms,
+            lease_prefix,
+            cleanup_prefix,
+            task_id,
+            heartbeat_at,
+        ) = args
         self._reconcile_leases(state_key, leases_key, str(lease_prefix))
         deleting = self.hget(state_key, "deleting")
         if deleting is not None:
@@ -378,13 +414,25 @@ class DeterministicRedis(fakeredis.FakeRedis):
         self.pexpire(lease_key, int(ttl_ms))
         self.sadd(leases_key, token)
         self.hincrby(state_key, "active_count", 1)
+        if task_id:
+            self.hset(
+                task_key,
+                mapping={
+                    "session_id": session_id,
+                    "lease_token": token,
+                    "heartbeat_at": heartbeat_at,
+                },
+            )
+            self.pexpire(task_key, int(ttl_ms))
         return 0
 
     def _eval_release_session(self, keys, _args):  # noqa: ANN001, ANN202
-        state_key, leases_key, lease_key = keys
-        if not self.exists(lease_key):
-            return 0
+        state_key, leases_key, lease_key, task_key = keys
         token = lease_key.rsplit(":", 1)[-1]
+        if self.hget(task_key, "lease_token") == token.encode():
+            self.hdel(task_key, "lease_token")
+            if not self.hexists(task_key, "output_token"):
+                self.delete(task_key)
         self.delete(lease_key)
         if self.srem(leases_key, token):
             self._decrement(state_key, "active_count", 1)
@@ -466,7 +514,11 @@ class DeterministicRedis(fakeredis.FakeRedis):
 
     def _decrement(self, key: str, field: str, amount: int) -> None:
         current = self._number(key, field)
-        self.hset(key, field, max(0, current - amount))
+        remaining = current - amount
+        if remaining > 0:
+            self.hset(key, field, remaining)
+        else:
+            self.hdel(key, field)
 
     @staticmethod
     def _text(value: bytes | str) -> str:
@@ -981,6 +1033,60 @@ def test_output_reservations_preserve_effective_minimum_free_bytes(
         )
 
     first.release()
+
+
+def test_two_workers_cannot_concurrently_overreserve_output_capacity(
+    redis_connection: DeterministicRedis,
+) -> None:
+    resources = coordinator(redis_connection, min_free_bytes=5)
+    start = Barrier(2)
+
+    def reserve(index: int):
+        start.wait()
+        try:
+            return resources.reserve_output(
+                f"task-{index}",
+                f"{index:032x}",
+                6,
+                free_bytes=15,
+            )
+        except ResourceUnavailableError:
+            return None
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        reservations = list(executor.map(reserve, range(2)))
+
+    accepted = [reservation for reservation in reservations if reservation]
+    assert len(accepted) == 1
+    accepted[0].release()
+
+
+def test_task_resources_can_be_released_by_task_idempotently(
+    redis_connection: DeterministicRedis,
+) -> None:
+    resources = coordinator(redis_connection)
+    resources.acquire_session(SESSION_A, task_id="task-1")
+    resources.reserve_output(
+        "task-1",
+        SESSION_A,
+        5,
+        free_bytes=100,
+    )
+    assert resources.output_reserved_bytes() == 5
+
+    resources.release_task_resources("task-1")
+    resources.release_task_resources("task-1")
+
+    assert resources.output_reserved_bytes() == 0
+    assert redis_connection.hget("dt:resource:state", "reserved_bytes") is None
+    assert (
+        redis_connection.hget(
+            f"dt:resource:session:{SESSION_A}",
+            "active_count",
+        )
+        is None
+    )
+    assert not redis_connection.exists("dt:resource:task:task-1")
 
 
 def test_mixed_reservations_preserve_strictest_capacity_observation(

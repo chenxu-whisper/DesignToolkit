@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 from shutil import disk_usage, rmtree
 
@@ -13,9 +15,15 @@ from designtoolkit.web.hosted import (
 )
 from designtoolkit.web.output_limits import OutputBudgetGuard, OutputLimitExceeded
 from designtoolkit.web.redis_tasks import RedisTaskManager
+from designtoolkit.web.resources import (
+    RedisReservation,
+    RedisResourceCoordinator,
+    RedisSessionLease,
+)
 from designtoolkit.web.schemas import (
     ChromaKeyerTaskRequest,
     ChromaVideoKeyerTaskRequest,
+    LogEventResponse,
     LogLevel,
     LogPhase,
     MediaResizeTaskRequest,
@@ -31,6 +39,7 @@ class RedisTaskExecutor(TaskManager):
         state: RedisTaskManager,
         *,
         max_output_bytes: int = 5 * 1024 * 1024 * 1024,
+        resource_heartbeat: Callable[[], None] | None = None,
     ) -> None:
         super().__init__(log_store=state.log_store, run_async=False)
         self._state = state
@@ -38,6 +47,7 @@ class RedisTaskExecutor(TaskManager):
         self._output_guard: OutputBudgetGuard | None = None
         self._output_root: Path | None = None
         self._input_paths: set[Path] = set()
+        self._resource_heartbeat = resource_heartbeat
         self._backend_factory = self._guarded_backend
 
     def execute_reserved_task(
@@ -54,7 +64,11 @@ class RedisTaskExecutor(TaskManager):
         self._output_root = output_root.resolve() if output_root is not None else None
         self._input_paths = _request_input_paths(request)
         self._output_guard = (
-            OutputBudgetGuard(self._output_root, self._max_output_bytes)
+            _HeartbeatOutputBudgetGuard(
+                self._output_root,
+                self._max_output_bytes,
+                heartbeat=self._heartbeat_resources,
+            )
             if self._output_root is not None
             else None
         )
@@ -89,12 +103,16 @@ class RedisTaskExecutor(TaskManager):
         self._state.mark_running(task_id)
 
     def _account_output(self, path: Path) -> None:
-        if self._output_guard is not None:
-            self._output_guard.account(path)
+        if self._output_guard is None:
+            self._heartbeat_resources()
+            return
+        self._output_guard.account(path)
 
     def _check_output_tree(self) -> None:
-        if self._output_guard is not None:
-            self._output_guard.check_tree()
+        if self._output_guard is None:
+            self._heartbeat_resources()
+            return
+        self._output_guard.check_tree()
 
     def _handle_task_failure(self, task_id: str, exc: Exception) -> None:
         self._discard_partial_output()
@@ -103,6 +121,9 @@ class RedisTaskExecutor(TaskManager):
             self._mark_failed(task_id, str(output_limit_error))
             return
         super()._handle_task_failure(task_id, exc)
+
+    def _mark_failed(self, task_id: str, message: str) -> None:
+        self._state._finalize_external_failure(task_id, message)
 
     def _mark_succeeded(
         self,
@@ -147,19 +168,29 @@ class RedisTaskExecutor(TaskManager):
             details["elapsed_seconds"] = elapsed_seconds
         if frame_count is not None:
             details["frame_count"] = frame_count
-        self._state.mark_finished(
-            task_id,
-            status=TaskStatus.SUCCEEDED,
-            output_path=download_url,
-            result_path=str(artifact),
-        )
-        self.log_store.append(
+        terminal_event = LogEventResponse(
             task_id=task_id,
+            timestamp=datetime.now(UTC),
             level=LogLevel.SUCCESS,
             phase=LogPhase.COMPLETED,
             message="Task completed",
             details=details,
         )
+        completed, transitioned = self._state._transition_finished(
+            task_id,
+            status=TaskStatus.SUCCEEDED,
+            output_path=download_url,
+            result_path=str(artifact),
+            terminal_event=terminal_event,
+        )
+        if not transitioned:
+            if completed.result_path != str(artifact):
+                artifact.unlink(missing_ok=True)
+            return
+
+    def _heartbeat_resources(self) -> None:
+        if self._resource_heartbeat is not None:
+            self._resource_heartbeat()
 
     def _guarded_backend(self):
         from designtoolkit.video_frames.ffmpeg_backend import FfmpegBackend
@@ -231,44 +262,119 @@ def _request_input_paths(
     return {Path(input_path).resolve()}
 
 
+class _HeartbeatOutputBudgetGuard(OutputBudgetGuard):
+    def __init__(
+        self,
+        root: Path,
+        max_bytes: int,
+        *,
+        heartbeat: Callable[[], None],
+    ) -> None:
+        super().__init__(root, max_bytes)
+        self._heartbeat = heartbeat
+
+    def account(self, path: Path) -> None:
+        self._heartbeat()
+        super().account(path)
+
+    def check_tree(self) -> None:
+        self._heartbeat()
+        super().check_tree()
+
+
+def _build_resource_coordinator(
+    settings: HostedSettings,
+    redis_connection: Redis,
+) -> RedisResourceCoordinator:
+    return RedisResourceCoordinator(
+        redis_connection=redis_connection,
+        max_upload_concurrency=settings.max_upload_concurrency,
+        max_session_bytes=settings.max_session_bytes,
+        min_free_bytes=settings.min_free_bytes,
+        reservation_ttl=settings.reservation_ttl_seconds,
+        lease_ttl=settings.lease_ttl_seconds,
+        reservation_heartbeat_interval=settings.reservation_heartbeat_seconds,
+        lease_heartbeat_interval=settings.lease_heartbeat_seconds,
+        release_marker_ttl=max(
+            settings.retention_seconds,
+            settings.reservation_ttl_seconds,
+            settings.lease_ttl_seconds,
+        ),
+    )
+
+
+def discard_failed_task_output(
+    task_id: str,
+    state: RedisTaskManager,
+) -> None:
+    work = state.task_work(task_id)
+    if work is None:
+        return
+    job_kind, payload = work
+    try:
+        request = _task_request(job_kind, payload)
+    except (TypeError, ValueError):
+        return
+    executor = RedisTaskExecutor(state)
+    output_root = _request_output_root(request)
+    executor._output_root = output_root.resolve() if output_root is not None else None
+    executor._input_paths = _request_input_paths(request)
+    executor._discard_partial_output()
+
+
 def run_task(task_id: str, job_kind: str, payload: dict[str, object]) -> None:
     settings = HostedSettings.from_env()
     redis_connection = Redis.from_url(settings.redis_url)
+    resources = _build_resource_coordinator(settings, redis_connection)
     state = RedisTaskManager(
         redis_connection=redis_connection,
         queue=Queue("designtoolkit", connection=redis_connection),
         data_dir=settings.data_dir,
         max_queued_tasks=settings.max_queued_tasks,
         retention_seconds=settings.retention_seconds,
+        resource_coordinator=resources,
     )
     task = state.get_task(task_id)
     if task is None:
         return
+    if task.owner_id is None:
+        state._finalize_external_failure(task_id, "Task has no session owner")
+        return
+    lease: RedisSessionLease | None = None
+    output: RedisReservation | None = None
+
+    def heartbeat() -> None:
+        if output is not None:
+            output.refresh()
+        if lease is not None:
+            lease.refresh()
+        state.record_heartbeat(task_id)
+
     executor = RedisTaskExecutor(
         state,
         max_output_bytes=settings.max_output_bytes,
+        resource_heartbeat=heartbeat,
     )
     try:
-        state.mark_running(task_id)
-        required_free_bytes = (
-            settings.min_free_bytes + 2 * settings.max_output_bytes
+        lease = resources.acquire_session(task.owner_id, task_id=task_id)
+        output = resources.reserve_output(
+            task_id,
+            task.owner_id,
+            settings.max_output_bytes,
+            free_bytes=disk_usage(settings.data_dir).free,
+            min_free_bytes=settings.min_free_bytes,
         )
-        if disk_usage(settings.data_dir).free < required_free_bytes:
-            raise RuntimeError("Server storage capacity is temporarily unavailable")
+        state.mark_running(task_id)
         request = _task_request(job_kind, payload)
         executor.execute_reserved_task(task, request)
     except Exception as exc:
-        state.mark_finished(
-            task_id,
-            status=TaskStatus.FAILED,
-            error=str(exc),
-        )
-        state.log_store.append(
-            task_id=task_id,
-            level=LogLevel.ERROR,
-            phase=LogPhase.FAILED,
-            message=str(exc),
-        )
+        executor._discard_partial_output()
+        state._finalize_external_failure(task_id, str(exc))
+    finally:
+        if output is not None:
+            output.release()
+        if lease is not None:
+            lease.release()
 
 
 def _task_request(

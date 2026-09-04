@@ -5,11 +5,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 from queue import Empty
 from time import monotonic, sleep, time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from redis import Redis
+from redis.exceptions import WatchError
 from rq import Queue
+from rq.job import Callback, Job, JobStatus
+from rq.registry import FailedJobRegistry, StartedJobRegistry
 
 from designtoolkit.chroma_keyer.image_io import (
     default_output_path,
@@ -36,7 +39,11 @@ from designtoolkit.web.schemas import (
 )
 from designtoolkit.web.tasks import TaskConflictError, TaskRecord
 
+if TYPE_CHECKING:
+    from designtoolkit.web.resources import RedisResourceCoordinator
+
 _QUEUE_NAME = "designtoolkit"
+_TERMINAL_TTL_SECONDS = 2 * 60 * 60
 
 
 class RedisEventSubscriber:
@@ -124,12 +131,14 @@ class RedisTaskManager:
         data_dir: Path,
         max_queued_tasks: int,
         retention_seconds: int,
+        resource_coordinator: RedisResourceCoordinator | None = None,
     ) -> None:
         self._redis = redis_connection
         self.queue = queue or Queue(_QUEUE_NAME, connection=redis_connection)
         self.data_dir = data_dir
         self.max_queued_tasks = max_queued_tasks
         self.retention_seconds = retention_seconds
+        self.resource_coordinator = resource_coordinator
         self.live_task_ttl = max(retention_seconds * 2, 24 * 60 * 60)
         self.log_store = RedisLogStore(
             redis_connection,
@@ -243,14 +252,73 @@ class RedisTaskManager:
         error: str | None = None,
         result_path: str | None = None,
     ) -> TaskRecord:
-        task = self._required_task(task_id)
-        task.status = status
-        task.output_path = output_path if output_path is not None else task.output_path
-        task.error = error
-        task.result_path = result_path if result_path is not None else task.result_path
-        task.finished_at = datetime.now(UTC)
-        self._save_task(task)
+        task, _transitioned = self._transition_finished(
+            task_id,
+            status=status,
+            output_path=output_path,
+            error=error,
+            result_path=result_path,
+        )
         return task
+
+    def record_heartbeat(self, task_id: str) -> None:
+        key = _task_resources_key(task_id)
+        pipeline = self._redis.pipeline()
+        pipeline.hset(key, "heartbeat_at", time())
+        pipeline.expire(key, self.live_task_ttl)
+        pipeline.execute()
+
+    def reconcile_tasks(self, *, grace_seconds: float = 60) -> int:
+        now = datetime.now(UTC)
+        started_ids = set(
+            StartedJobRegistry(
+                self.queue.name,
+                connection=self._redis,
+                queue=self.queue,
+            ).get_job_ids()
+        )
+        failed_ids = set(
+            FailedJobRegistry(
+                self.queue.name,
+                connection=self._redis,
+                queue=self.queue,
+            ).get_job_ids()
+        )
+        reconciled = 0
+        for task in self._active_tasks():
+            job = self.queue.fetch_job(task.task_id)
+            status = job.get_status(refresh=True) if job is not None else None
+            if task.status is TaskStatus.QUEUED:
+                stale = (now - task.created_at).total_seconds() > grace_seconds
+                abandoned = job is None or status in {
+                    JobStatus.FAILED,
+                    JobStatus.STOPPED,
+                    JobStatus.CANCELED,
+                }
+                if not stale or not abandoned:
+                    continue
+                message = "Queued task was abandoned before execution"
+            else:
+                if status is JobStatus.STARTED or task.task_id in started_ids:
+                    continue
+                if not self._heartbeat_is_stale(task, now, grace_seconds):
+                    continue
+                terminal_evidence = (
+                    job is None
+                    or task.task_id in failed_ids
+                    or status
+                    in {
+                        JobStatus.FAILED,
+                        JobStatus.STOPPED,
+                        JobStatus.CANCELED,
+                    }
+                )
+                if not terminal_evidence:
+                    continue
+                message = "Running task was abandoned by its worker"
+            if self._finalize_external_failure(task.task_id, message):
+                reconciled += 1
+        return reconciled
 
     def active_owner_ids(self) -> set[str]:
         owners: set[str] = set()
@@ -328,6 +396,7 @@ class RedisTaskManager:
             owner_id=owner_id,
         )
         self._save_task(task)
+        self._save_work(task.task_id, job_kind, request.model_dump(mode="json"))
         self.log_store.append(
             task_id=task.task_id,
             level=LogLevel.INFO,
@@ -345,9 +414,16 @@ class RedisTaskManager:
                 job_timeout=self.retention_seconds,
                 result_ttl=self.retention_seconds,
                 failure_ttl=self.retention_seconds,
+                meta={"owner_id": owner_id},
+                on_failure=Callback(handle_job_failure),
+                on_stopped=Callback(handle_job_stopped),
             )
         except Exception:
-            self._redis.delete(_task_key(task.task_id), _event_key(task.task_id))
+            self._redis.delete(
+                _task_key(task.task_id),
+                _event_key(task.task_id),
+                _task_work_key(task.task_id),
+            )
             self._release_queue_slot(task.task_id)
             raise
         return task
@@ -361,6 +437,117 @@ class RedisTaskManager:
             raise KeyError(task_id)
         return task
 
+    def _transition_finished(
+        self,
+        task_id: str,
+        *,
+        status: TaskStatus,
+        output_path: str | None = None,
+        error: str | None = None,
+        result_path: str | None = None,
+        terminal_event: LogEventResponse | None = None,
+    ) -> tuple[TaskRecord, bool]:
+        key = _task_key(task_id)
+        while True:
+            with self._redis.pipeline() as pipeline:
+                try:
+                    pipeline.watch(key)
+                    value = pipeline.get(key)
+                    if value is None:
+                        raise KeyError(task_id)
+                    task = _decode_task(value)
+                    if task.status in {TaskStatus.SUCCEEDED, TaskStatus.FAILED}:
+                        pipeline.unwatch()
+                        return task, False
+                    task.status = status
+                    if output_path is not None:
+                        task.output_path = output_path
+                    task.error = error
+                    if result_path is not None:
+                        task.result_path = result_path
+                    task.finished_at = datetime.now(UTC)
+                    pipeline.multi()
+                    pipeline.set(
+                        key,
+                        _encode_task(task),
+                        ex=_TERMINAL_TTL_SECONDS,
+                    )
+                    pipeline.expire(
+                        _task_work_key(task_id),
+                        _TERMINAL_TTL_SECONDS,
+                    )
+                    if terminal_event is not None:
+                        pipeline.rpush(
+                            _event_key(task_id),
+                            terminal_event.model_dump_json(),
+                        )
+                        pipeline.expire(
+                            _event_key(task_id),
+                            _TERMINAL_TTL_SECONDS,
+                        )
+                    pipeline.execute()
+                    return task, True
+                except WatchError:
+                    continue
+
+    def _finalize_external_failure(self, task_id: str, message: str) -> bool:
+        terminal_event = LogEventResponse(
+            task_id=task_id,
+            timestamp=datetime.now(UTC),
+            level=LogLevel.ERROR,
+            phase=LogPhase.FAILED,
+            message=message,
+            details={},
+        )
+        try:
+            _task, transitioned = self._transition_finished(
+                task_id,
+                status=TaskStatus.FAILED,
+                error=message,
+                terminal_event=terminal_event,
+            )
+        except KeyError:
+            transitioned = False
+        self._release_queue_slot(task_id)
+        from designtoolkit.web.worker import discard_failed_task_output
+
+        try:
+            if self.resource_coordinator is not None:
+                self.resource_coordinator.release_task_resources(task_id)
+        finally:
+            discard_failed_task_output(task_id, self)
+        return transitioned
+
+    def _active_tasks(self) -> list[TaskRecord]:
+        tasks: list[TaskRecord] = []
+        for key in self._redis.scan_iter(match="dt:task:*"):
+            key_text = key.decode() if isinstance(key, bytes) else key
+            if key_text.endswith(":events"):
+                continue
+            value = self._redis.get(key)
+            if value is None:
+                continue
+            task = _decode_task(value)
+            if task.status in {TaskStatus.QUEUED, TaskStatus.RUNNING}:
+                tasks.append(task)
+        return tasks
+
+    def _heartbeat_is_stale(
+        self,
+        task: TaskRecord,
+        now: datetime,
+        grace_seconds: float,
+    ) -> bool:
+        value = self._redis.hget(_task_resources_key(task.task_id), "heartbeat_at")
+        heartbeat_at = float(value) if value is not None else None
+        fallback = task.started_at or task.created_at
+        last_seen = (
+            datetime.fromtimestamp(heartbeat_at, UTC)
+            if heartbeat_at is not None
+            else fallback
+        )
+        return (now - last_seen).total_seconds() > grace_seconds
+
     def _save_task(self, task: TaskRecord) -> None:
         key = _task_key(task.task_id)
         value = _encode_task(task)
@@ -368,6 +555,29 @@ class RedisTaskManager:
             self._redis.set(key, value, ex=self.retention_seconds)
         else:
             self._redis.set(key, value, ex=self.live_task_ttl)
+
+    def _save_work(
+        self,
+        task_id: str,
+        job_kind: str,
+        payload: dict[str, object],
+    ) -> None:
+        value = json.dumps(
+            {"job_kind": job_kind, "payload": payload},
+            separators=(",", ":"),
+        )
+        self._redis.set(
+            _task_work_key(task_id),
+            value,
+            ex=self.live_task_ttl,
+        )
+
+    def task_work(self, task_id: str) -> tuple[str, dict[str, object]] | None:
+        value = self._redis.get(_task_work_key(task_id))
+        if value is None:
+            return None
+        data = json.loads(value)
+        return data["job_kind"], data["payload"]
 
 
 def _joined_input_names(options: list[VideoFrameOptions]) -> str:
@@ -384,6 +594,64 @@ def _event_key(task_id: str) -> str:
 
 def _queue_reservations_key() -> str:
     return "dt:queue:reservations"
+
+
+def _task_resources_key(task_id: str) -> str:
+    return f"dt:resource:task:{task_id}"
+
+
+def _task_work_key(task_id: str) -> str:
+    return f"dt:task-work:{task_id}"
+
+
+def handle_job_failure(
+    job: Job,
+    connection: Redis,
+    exc_type: type[BaseException],
+    exc_value: BaseException,
+    traceback: object,
+) -> None:
+    del exc_type, traceback
+    _handle_external_job_failure(job, connection, str(exc_value))
+
+
+def handle_job_stopped(job: Job, connection: Redis) -> None:
+    _handle_external_job_failure(job, connection, "Task was stopped")
+
+
+def _handle_external_job_failure(
+    job: Job,
+    connection: Redis,
+    message: str,
+) -> None:
+    manager = _callback_manager(connection)
+    manager._finalize_external_failure(job.id, message)
+
+
+def _callback_manager(connection: Redis) -> RedisTaskManager:
+    from designtoolkit.web.hosted import HostedSettings
+    from designtoolkit.web.resources import RedisResourceCoordinator
+
+    settings = HostedSettings.from_env()
+    resources = RedisResourceCoordinator(
+        redis_connection=connection,
+        max_upload_concurrency=settings.max_upload_concurrency,
+        max_session_bytes=settings.max_session_bytes,
+        min_free_bytes=settings.min_free_bytes,
+        reservation_ttl=settings.reservation_ttl_seconds,
+        lease_ttl=settings.lease_ttl_seconds,
+        reservation_heartbeat_interval=settings.reservation_heartbeat_seconds,
+        lease_heartbeat_interval=settings.lease_heartbeat_seconds,
+        release_marker_ttl=_TERMINAL_TTL_SECONDS,
+    )
+    return RedisTaskManager(
+        redis_connection=connection,
+        queue=Queue(_QUEUE_NAME, connection=connection),
+        data_dir=settings.data_dir,
+        max_queued_tasks=settings.max_queued_tasks,
+        retention_seconds=_TERMINAL_TTL_SECONDS,
+        resource_coordinator=resources,
+    )
 
 
 def _encode_task(task: TaskRecord) -> str:

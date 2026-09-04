@@ -10,6 +10,7 @@ import math
 import re
 from dataclasses import dataclass
 from enum import StrEnum
+from time import time
 from typing import Literal
 from uuid import uuid4
 
@@ -22,6 +23,7 @@ _COMMITTED_PREFIX = "dt:resource:committed:"
 _RELEASED_ASSET_PREFIX = "dt:resource:asset-released:"
 _LEASE_PREFIX = "dt:resource:lease:"
 _CLEANUP_PREFIX = "dt:resource:cleanup:"
+_TASK_RESOURCE_PREFIX = "dt:resource:task:"
 _SESSION_PATTERN = re.compile(r"^[a-f0-9]{32}$")
 _ASSET_PATTERN = re.compile(r"^[a-f0-9]{32}$")
 _DEFAULT_HEARTBEAT_INTERVAL = 5.0
@@ -114,6 +116,7 @@ local requested = tonumber(ARGV[4])
 local free_bytes = tonumber(ARGV[5])
 local min_free_bytes = tonumber(ARGV[6])
 local ttl_ms = tonumber(ARGV[7])
+local heartbeat_at = ARGV[8]
 
 local reserved_bytes = tonumber(
     redis.call("HGET", state_key, "reserved_bytes") or "0"
@@ -155,8 +158,20 @@ redis.call(
         "|" .. free_bytes .. "|" .. min_free_bytes
 )
 redis.call("HINCRBY", state_key, "reserved_bytes", requested)
+redis.call("HINCRBY", state_key, "output_reserved_bytes", requested)
 redis.call("HSET", state_key, "observed_free_bytes", effective_free)
 redis.call("HSET", state_key, "min_free_bytes", effective_min_free)
+redis.call(
+    "HMSET",
+    KEYS[4],
+    "session_id",
+    session_id,
+    "output_token",
+    token,
+    "heartbeat_at",
+    heartbeat_at
+)
+redis.call("PEXPIRE", KEYS[4], ttl_ms)
 return 0
 """
 
@@ -172,6 +187,13 @@ _RELEASE_RESERVATION_SCRIPT = """-- release_reservation
 local state_key = KEYS[1]
 local index_key = KEYS[2]
 local token_key = KEYS[3]
+local task_key = KEYS[4]
+if redis.call("HGET", task_key, "output_token") == ARGV[1] then
+    redis.call("HDEL", task_key, "output_token")
+    if redis.call("HEXISTS", task_key, "lease_token") == 0 then
+        redis.call("DEL", task_key)
+    end
+end
 if redis.call("EXISTS", token_key) == 0 then
     return 0
 end
@@ -232,6 +254,8 @@ if kind == "upload" then
         "session:" .. session_id .. ":reserved_bytes",
         reserved_bytes
     )
+elseif kind == "output" then
+    decrement("output_reserved_bytes", reserved_bytes)
 end
 recompute_capacity()
 return 1
@@ -405,6 +429,8 @@ for index = 1, #entries, 2 do
                     "session:" .. session_id .. ":reserved_bytes",
                     reserved_bytes
                 )
+            elseif kind == "output" then
+                decrement("output_reserved_bytes", reserved_bytes)
             end
         end
         redis.call("HDEL", index_key, token)
@@ -546,6 +572,8 @@ local session_id = ARGV[2]
 local ttl_ms = tonumber(ARGV[3])
 local lease_prefix = ARGV[4]
 local cleanup_prefix = ARGV[5]
+local task_id = ARGV[6]
+local heartbeat_at = ARGV[7]
 
 local lease_tokens = redis.call("SMEMBERS", leases_key)
 for _, lease_token in ipairs(lease_tokens) do
@@ -574,6 +602,19 @@ redis.call("HSET", lease_key, "session_id", session_id)
 redis.call("PEXPIRE", lease_key, ttl_ms)
 redis.call("SADD", leases_key, token)
 redis.call("HINCRBY", state_key, "active_count", 1)
+if task_id ~= "" then
+    redis.call(
+        "HMSET",
+        KEYS[4],
+        "session_id",
+        session_id,
+        "lease_token",
+        token,
+        "heartbeat_at",
+        heartbeat_at
+    )
+    redis.call("PEXPIRE", KEYS[4], ttl_ms)
+end
 return 0
 """
 
@@ -581,8 +622,12 @@ _RELEASE_SESSION_SCRIPT = """-- release_session
 local state_key = KEYS[1]
 local leases_key = KEYS[2]
 local lease_key = KEYS[3]
-if redis.call("EXISTS", lease_key) == 0 then
-    return 0
+local task_key = KEYS[4]
+if redis.call("HGET", task_key, "lease_token") == ARGV[1] then
+    redis.call("HDEL", task_key, "lease_token")
+    if redis.call("HEXISTS", task_key, "output_token") == 0 then
+        redis.call("DEL", task_key)
+    end
 end
 
 redis.call("DEL", lease_key)
@@ -725,6 +770,7 @@ class RedisSessionLease:
     coordinator: RedisResourceCoordinator
     session_id: str
     token: str
+    task_id: str | None = None
 
     def refresh(self) -> None:
         self.coordinator._refresh_session(self)
@@ -909,6 +955,7 @@ class RedisResourceCoordinator:
                     _STATE_KEY,
                     _RESERVATION_INDEX_KEY,
                     _reservation_key(token),
+                    _task_resource_key(task_id),
                 ],
                 args=[
                     token,
@@ -918,6 +965,7 @@ class RedisResourceCoordinator:
                     free_bytes,
                     min_free_bytes,
                     self._reservation_ttl_ms,
+                    time(),
                 ],
             )
         )
@@ -931,15 +979,26 @@ class RedisResourceCoordinator:
             reserved_bytes=requested_bytes,
         )
 
-    def acquire_session(self, session_id: str) -> RedisSessionLease:
+    def acquire_session(
+        self,
+        session_id: str,
+        *,
+        task_id: str | None = None,
+    ) -> RedisSessionLease:
         _validate_session_id(session_id)
         token = uuid4().hex
+        task_key = (
+            _task_resource_key(task_id)
+            if task_id is not None
+            else _lease_key(token)
+        )
         result = int(
             self._acquire_session_script(
                 keys=[
                     _session_state_key(session_id),
                     _session_leases_key(session_id),
                     _lease_key(token),
+                    task_key,
                 ],
                 args=[
                     token,
@@ -947,12 +1006,14 @@ class RedisResourceCoordinator:
                     self._lease_ttl_ms,
                     _LEASE_PREFIX,
                     _CLEANUP_PREFIX,
+                    task_id or "",
+                    time(),
                 ],
             )
         )
         if result != 0:
             raise SessionDeletingError("Session is being deleted")
-        return RedisSessionLease(self, session_id, token)
+        return RedisSessionLease(self, session_id, token, task_id)
 
     def claim_session_cleanup(self, session_id: str) -> str | None:
         _validate_session_id(session_id)
@@ -1094,6 +1155,30 @@ class RedisResourceCoordinator:
             )
         )
 
+    def release_task_resources(self, task_id: str) -> None:
+        metadata = self._redis.hgetall(_task_resource_key(task_id))
+        session_id = _decoded_hash_value(metadata, "session_id")
+        output_token = _decoded_hash_value(metadata, "output_token")
+        lease_token = _decoded_hash_value(metadata, "lease_token")
+        if output_token is not None:
+            self._release_reservation(
+                RedisReservation(self, "output", output_token, task_id, 0)
+            )
+        if lease_token is not None and session_id is not None:
+            self._release_session(
+                RedisSessionLease(self, session_id, lease_token, task_id),
+                task_id=task_id,
+            )
+        self.reconcile_reservations()
+
+    def output_reserved_bytes(self) -> int:
+        value = self._redis.hget(_STATE_KEY, "output_reserved_bytes")
+        return int(value) if value is not None else 0
+
+    def task_heartbeat_at(self, task_id: str) -> float | None:
+        value = self._redis.hget(_task_resource_key(task_id), "heartbeat_at")
+        return float(value) if value is not None else None
+
     def _refresh_reservation(self, reservation: RedisReservation) -> None:
         refreshed = self._refresh_token_script(
             keys=[_reservation_key(reservation.token)],
@@ -1103,6 +1188,8 @@ class RedisResourceCoordinator:
             raise ResourceUnavailableError(
                 f"{reservation.kind.capitalize()} reservation expired"
             )
+        if reservation.kind == "output":
+            self._touch_task_resources(reservation.owner_id)
 
     def _release_reservation(self, reservation: RedisReservation) -> None:
         self._release_reservation_script(
@@ -1110,6 +1197,7 @@ class RedisResourceCoordinator:
                 _STATE_KEY,
                 _RESERVATION_INDEX_KEY,
                 _reservation_key(reservation.token),
+                _task_resource_key(reservation.owner_id),
             ],
             args=[reservation.token],
         )
@@ -1177,16 +1265,52 @@ class RedisResourceCoordinator:
         )
         if not refreshed:
             raise ResourceUnavailableError("Session lease expired")
+        task_id = lease.task_id or self._task_id_for_lease(lease.token)
+        if task_id is not None:
+            self._touch_task_resources(task_id)
 
-    def _release_session(self, lease: RedisSessionLease) -> None:
+    def _release_session(
+        self,
+        lease: RedisSessionLease,
+        *,
+        task_id: str | None = None,
+    ) -> None:
+        if task_id is None:
+            task_id = lease.task_id or self._task_id_for_lease(lease.token)
         self._release_session_script(
             keys=[
                 _session_state_key(lease.session_id),
                 _session_leases_key(lease.session_id),
                 _lease_key(lease.token),
+                (
+                    _task_resource_key(task_id)
+                    if task_id is not None
+                    else _lease_key(lease.token)
+                ),
             ],
             args=[lease.token],
         )
+
+    def _touch_task_resources(self, task_id: str) -> None:
+        key = _task_resource_key(task_id)
+        pipeline = self._redis.pipeline()
+        pipeline.hset(key, "heartbeat_at", time())
+        pipeline.pexpire(
+            key,
+            max(self._reservation_ttl_ms, self._lease_ttl_ms),
+        )
+        pipeline.execute()
+
+    def _task_id_for_lease(self, token: str) -> str | None:
+        for key in self._redis.scan_iter(match=f"{_TASK_RESOURCE_PREFIX}*"):
+            value = self._redis.hget(key, "lease_token")
+            if value is None:
+                continue
+            value_text = value.decode() if isinstance(value, bytes) else value
+            if value_text == token:
+                key_text = key.decode() if isinstance(key, bytes) else key
+                return key_text.removeprefix(_TASK_RESOURCE_PREFIX)
+        return None
 
 
 def _reservation_key(token: str) -> str:
@@ -1203,6 +1327,20 @@ def _lease_key(token: str) -> str:
 
 def _cleanup_key(token: str) -> str:
     return f"{_CLEANUP_PREFIX}{token}"
+
+
+def _task_resource_key(task_id: str) -> str:
+    return f"{_TASK_RESOURCE_PREFIX}{task_id}"
+
+
+def _decoded_hash_value(
+    metadata: dict[bytes | str, bytes | str],
+    field: str,
+) -> str | None:
+    value = metadata.get(field) or metadata.get(field.encode())
+    if value is None:
+        return None
+    return value.decode() if isinstance(value, bytes) else value
 
 
 def _session_state_key(session_id: str) -> str:

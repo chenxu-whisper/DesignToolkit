@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import inspect
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import fakeredis
 import pytest
 from rq import Queue
+from rq.job import JobStatus
+from rq.registry import FailedJobRegistry, StartedJobRegistry
 
 from designtoolkit.chroma_keyer.models import KeyerError, KeyImageResult
 from designtoolkit.media_resize import (
@@ -14,8 +18,15 @@ from designtoolkit.media_resize import (
     resize_media,
 )
 from designtoolkit.video_frames import ExportResult
+from designtoolkit.web import worker as worker_module
 from designtoolkit.web.adapters import media_resize_options_list_from_request
-from designtoolkit.web.redis_tasks import RedisLogStore, RedisTaskManager
+from designtoolkit.web.hosted import HostedSettings
+from designtoolkit.web.redis_tasks import (
+    RedisLogStore,
+    RedisTaskManager,
+    handle_job_failure,
+    handle_job_stopped,
+)
 from designtoolkit.web.schemas import (
     ChromaKeyerTaskRequest,
     ChromaVideoKeyerTaskRequest,
@@ -30,11 +41,61 @@ from designtoolkit.web.tasks import TaskConflictError
 from designtoolkit.web.worker import RedisTaskExecutor
 
 
+class StubTaskResources:
+    def __init__(self) -> None:
+        self.released: list[str] = []
+
+    def release_task_resources(self, task_id: str) -> None:
+        self.released.append(task_id)
+
+
+class TrackingHandle:
+    def __init__(self, name: str, events: list[str]) -> None:
+        self.name = name
+        self.events = events
+
+    def refresh(self) -> None:
+        self.events.append(f"refresh:{self.name}")
+
+    def release(self) -> None:
+        self.events.append(f"release:{self.name}")
+
+
+class TrackingTaskResources:
+    def __init__(self) -> None:
+        self.events: list[str] = []
+        self.lease = TrackingHandle("lease", self.events)
+        self.output = TrackingHandle("output", self.events)
+
+    def acquire_session(self, session_id: str, *, task_id: str):
+        self.events.append(f"acquire:{task_id}:{session_id}")
+        return self.lease
+
+    def reserve_output(
+        self,
+        task_id: str,
+        session_id: str,
+        requested_bytes: int,
+        *,
+        free_bytes: int,
+        min_free_bytes: int,
+    ):
+        self.events.append(
+            f"reserve:{task_id}:{session_id}:{requested_bytes}:"
+            f"{free_bytes}:{min_free_bytes}"
+        )
+        return self.output
+
+    def release_task_resources(self, task_id: str) -> None:
+        self.events.append(f"release-task:{task_id}")
+
+
 def _manager(
     redis_connection,
     tmp_path: Path,
     *,
     max_queued_tasks: int = 20,
+    resource_coordinator=None,
 ) -> RedisTaskManager:
     return RedisTaskManager(
         redis_connection=redis_connection,
@@ -42,6 +103,17 @@ def _manager(
         data_dir=tmp_path,
         max_queued_tasks=max_queued_tasks,
         retention_seconds=7200,
+        resource_coordinator=resource_coordinator,
+    )
+
+
+def _hosted_settings(tmp_path: Path) -> HostedSettings:
+    return HostedSettings(
+        enabled=True,
+        data_dir=tmp_path,
+        redis_url="redis://unused/0",
+        max_output_bytes=10,
+        min_free_bytes=5,
     )
 
 
@@ -62,6 +134,38 @@ def test_redis_manager_enqueues_and_isolates_task_records(tmp_path: Path) -> Non
     job = manager.queue.fetch_job(task.task_id)
     assert job is not None
     assert job.func_name == "designtoolkit.web.worker.run_task"
+
+
+def test_enqueue_registers_importable_rq_failure_and_stopped_callbacks(
+    tmp_path: Path,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = _manager(redis_connection, tmp_path)
+
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+        owner_id="a" * 32,
+    )
+
+    job = manager.queue.fetch_job(task.task_id)
+    assert job is not None
+    assert job.failure_callback is not None
+    assert job.failure_callback.__module__ == "designtoolkit.web.redis_tasks"
+    assert job.failure_callback.__name__ == "handle_job_failure"
+    assert job.stopped_callback is not None
+    assert job.stopped_callback.__module__ == "designtoolkit.web.redis_tasks"
+    assert job.stopped_callback.__name__ == "handle_job_stopped"
+    assert list(inspect.signature(handle_job_failure).parameters) == [
+        "job",
+        "connection",
+        "exc_type",
+        "exc_value",
+        "traceback",
+    ]
+    assert list(inspect.signature(handle_job_stopped).parameters) == [
+        "job",
+        "connection",
+    ]
 
 
 def test_redis_manager_rejects_when_waiting_queue_is_full(tmp_path: Path) -> None:
@@ -91,6 +195,133 @@ def test_queue_cap_holds_under_concurrent_submissions(tmp_path: Path) -> None:
 
     assert sum(accepted) == 20
     assert manager.queue.count == 20
+
+
+def test_run_task_reserves_refreshes_and_releases_worker_resources(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    settings = _hosted_settings(tmp_path)
+    manager = _manager(redis_connection, tmp_path)
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+        owner_id="a" * 32,
+    )
+    resources = TrackingTaskResources()
+    monkeypatch.setattr(worker_module.HostedSettings, "from_env", lambda: settings)
+    monkeypatch.setattr(
+        worker_module.Redis,
+        "from_url",
+        lambda _url: redis_connection,
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "_build_resource_coordinator",
+        lambda _settings, _connection: resources,
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "disk_usage",
+        lambda _path: type("Usage", (), {"free": 20})(),
+    )
+
+    def execute(executor, reserved_task, _request) -> None:
+        running = executor.get_task(reserved_task.task_id)
+        assert running is not None
+        assert running.status is TaskStatus.RUNNING
+        executor._heartbeat_resources()
+        executor.mark_finished(
+            reserved_task.task_id,
+            status=TaskStatus.SUCCEEDED,
+        )
+
+    monkeypatch.setattr(
+        worker_module.RedisTaskExecutor,
+        "execute_reserved_task",
+        execute,
+    )
+
+    worker_module.run_task(
+        task.task_id,
+        "video_frames",
+        VideoFramesTaskRequest(
+            input_path=str(tmp_path / "clip.mp4")
+        ).model_dump(mode="json"),
+    )
+
+    assert resources.events == [
+        f"acquire:{task.task_id}:{'a' * 32}",
+        f"reserve:{task.task_id}:{'a' * 32}:10:20:5",
+        "refresh:output",
+        "refresh:lease",
+        "release:output",
+        "release:lease",
+    ]
+    assert manager.get_task(task.task_id).status is TaskStatus.SUCCEEDED
+
+
+def test_run_task_failure_cleans_output_terminalizes_and_releases_resources(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    settings = _hosted_settings(tmp_path)
+    manager = _manager(redis_connection, tmp_path)
+    output_root = tmp_path / "output"
+    request = VideoFramesTaskRequest(
+        input_path=str(tmp_path / "clip.mp4"),
+        output_dir=str(output_root),
+    )
+    task = manager.create_video_frames_task(request, owner_id="a" * 32)
+    resources = TrackingTaskResources()
+    monkeypatch.setattr(worker_module.HostedSettings, "from_env", lambda: settings)
+    monkeypatch.setattr(
+        worker_module.Redis,
+        "from_url",
+        lambda _url: redis_connection,
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "_build_resource_coordinator",
+        lambda _settings, _connection: resources,
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "disk_usage",
+        lambda _path: type("Usage", (), {"free": 20})(),
+    )
+
+    def fail(executor, _reserved_task, _request) -> None:
+        executor._output_root = output_root
+        output_root.mkdir()
+        (output_root / "partial.bin").write_bytes(b"partial")
+        raise RuntimeError("worker crashed")
+
+    monkeypatch.setattr(
+        worker_module.RedisTaskExecutor,
+        "execute_reserved_task",
+        fail,
+    )
+
+    worker_module.run_task(
+        task.task_id,
+        "video_frames",
+        request.model_dump(mode="json"),
+    )
+
+    failed = manager.get_task(task.task_id)
+    assert failed is not None
+    assert failed.status is TaskStatus.FAILED
+    assert failed.error == "worker crashed"
+    assert not output_root.exists()
+    terminal_events = [
+        event
+        for event in manager.log_store.history(task.task_id)
+        if event.phase is LogPhase.FAILED
+    ]
+    assert len(terminal_events) == 1
+    assert resources.events[-2:] == ["release:output", "release:lease"]
 
 
 def test_redis_log_store_persists_events_for_other_processes() -> None:
@@ -139,6 +370,93 @@ def test_worker_status_updates_are_visible_to_api_manager(tmp_path: Path) -> Non
     assert redis_connection.ttl(f"dt:task:{task.task_id}") > 0
 
 
+def test_terminal_success_cannot_be_overwritten_by_late_failure(
+    tmp_path: Path,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = _manager(redis_connection, tmp_path)
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+        owner_id="a" * 32,
+    )
+    manager.mark_finished(
+        task.task_id,
+        status=TaskStatus.SUCCEEDED,
+        output_path="/api/tasks/task/download",
+    )
+
+    result = manager.mark_finished(
+        task.task_id,
+        status=TaskStatus.FAILED,
+        error="late timeout",
+    )
+
+    assert result.status is TaskStatus.SUCCEEDED
+    assert result.error is None
+    assert result.output_path == "/api/tasks/task/download"
+
+
+@pytest.mark.parametrize(
+    ("callback", "expected_error"),
+    [
+        (handle_job_failure, "worker timeout"),
+        (handle_job_stopped, "Task was stopped"),
+    ],
+)
+def test_external_rq_callback_is_idempotent_and_releases_resources(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    callback,
+    expected_error: str,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    resources = StubTaskResources()
+    manager = _manager(
+        redis_connection,
+        tmp_path,
+        resource_coordinator=resources,
+    )
+    output_root = tmp_path / "partial-output"
+    output_root.mkdir()
+    (output_root / "partial.bin").write_bytes(b"partial")
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(
+            input_path=str(tmp_path / "clip.mp4"),
+            output_dir=str(output_root),
+        ),
+        owner_id="a" * 32,
+    )
+    job = manager.queue.fetch_job(task.task_id)
+    assert job is not None
+    monkeypatch.setattr(
+        "designtoolkit.web.redis_tasks._callback_manager",
+        lambda _connection: manager,
+    )
+
+    if callback is handle_job_failure:
+        args = (job, redis_connection, RuntimeError, RuntimeError(expected_error), None)
+    else:
+        args = (job, redis_connection)
+    callback(*args)
+    callback(*args)
+
+    failed = manager.get_task(task.task_id)
+    assert failed is not None
+    assert failed.status is TaskStatus.FAILED
+    assert failed.error == expected_error
+    terminal_events = [
+        event
+        for event in manager.log_store.history(task.task_id)
+        if event.phase is LogPhase.FAILED
+    ]
+    assert len(terminal_events) == 1
+    assert terminal_events[0].message == expected_error
+    assert resources.released == [task.task_id, task.task_id]
+    assert redis_connection.llen("dt:queue:reservations") == 0
+    assert 7190 <= redis_connection.ttl(f"dt:task:{task.task_id}") <= 7200
+    assert not output_root.exists()
+
+
 def test_active_owner_ids_include_only_queued_or_running_tasks(
     tmp_path: Path,
 ) -> None:
@@ -151,6 +469,146 @@ def test_active_owner_ids_include_only_queued_or_running_tasks(
 
     manager.mark_finished(queued.task_id, status=TaskStatus.FAILED, error="failed")
     assert manager.active_owner_ids() == set()
+
+
+def test_reconcile_fails_old_queued_task_when_rq_job_is_missing(
+    tmp_path: Path,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    resources = StubTaskResources()
+    manager = _manager(
+        redis_connection,
+        tmp_path,
+        resource_coordinator=resources,
+    )
+    output_root = tmp_path / "abandoned-output"
+    output_root.mkdir()
+    (output_root / "partial.bin").write_bytes(b"partial")
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(
+            input_path=str(tmp_path / "clip.mp4"),
+            output_dir=str(output_root),
+        ),
+        owner_id="a" * 32,
+    )
+    task.created_at = datetime.now(UTC) - timedelta(minutes=5)
+    manager._save_task(task)
+    job = manager.queue.fetch_job(task.task_id)
+    assert job is not None
+    redis_connection.delete(job.key)
+
+    assert manager.reconcile_tasks(grace_seconds=60) == 1
+
+    failed = manager.get_task(task.task_id)
+    assert failed is not None
+    assert failed.status is TaskStatus.FAILED
+    assert resources.released == [task.task_id]
+    assert redis_connection.llen("dt:queue:reservations") == 0
+    assert not output_root.exists()
+
+
+def test_reconcile_preserves_running_task_with_recent_heartbeat(
+    tmp_path: Path,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    resources = StubTaskResources()
+    manager = _manager(
+        redis_connection,
+        tmp_path,
+        resource_coordinator=resources,
+    )
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+        owner_id="a" * 32,
+    )
+    manager.mark_running(task.task_id)
+    running = manager.get_task(task.task_id)
+    assert running is not None
+    running.started_at = datetime.now(UTC) - timedelta(hours=3)
+    manager._save_task(running)
+    manager.record_heartbeat(task.task_id)
+    job = manager.queue.fetch_job(task.task_id)
+    assert job is not None
+    redis_connection.delete(job.key)
+
+    assert manager.reconcile_tasks(grace_seconds=60) == 0
+    assert manager.get_task(task.task_id).status is TaskStatus.RUNNING
+    assert resources.released == []
+
+
+def test_reconcile_preserves_long_running_job_with_started_registry_evidence(
+    tmp_path: Path,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    resources = StubTaskResources()
+    manager = _manager(
+        redis_connection,
+        tmp_path,
+        resource_coordinator=resources,
+    )
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+        owner_id="a" * 32,
+    )
+    manager.mark_running(task.task_id)
+    running = manager.get_task(task.task_id)
+    assert running is not None
+    running.started_at = datetime.now(UTC) - timedelta(hours=3)
+    manager._save_task(running)
+    job = manager.queue.fetch_job(task.task_id)
+    assert job is not None
+    job.set_status(JobStatus.QUEUED)
+    started_registry = StartedJobRegistry(
+        "designtoolkit",
+        connection=redis_connection,
+    )
+    redis_connection.zadd(
+        started_registry.key,
+        {f"{job.id}:execution-1": datetime.now(UTC).timestamp() + 3600},
+    )
+
+    assert manager.reconcile_tasks(grace_seconds=60) == 0
+    assert manager.get_task(task.task_id).status is TaskStatus.RUNNING
+    assert resources.released == []
+
+
+@pytest.mark.parametrize("evidence", ["missing", "failed", "stopped"])
+def test_reconcile_fails_stale_running_task_with_terminal_or_missing_rq_job(
+    tmp_path: Path,
+    evidence: str,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    resources = StubTaskResources()
+    manager = _manager(
+        redis_connection,
+        tmp_path,
+        resource_coordinator=resources,
+    )
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+        owner_id="a" * 32,
+    )
+    manager.mark_running(task.task_id)
+    running = manager.get_task(task.task_id)
+    assert running is not None
+    running.started_at = datetime.now(UTC) - timedelta(minutes=5)
+    manager._save_task(running)
+    job = manager.queue.fetch_job(task.task_id)
+    assert job is not None
+    if evidence == "missing":
+        redis_connection.delete(job.key)
+    else:
+        status = JobStatus.FAILED if evidence == "failed" else JobStatus.STOPPED
+        job.set_status(status)
+        if evidence == "failed":
+            FailedJobRegistry(
+                "designtoolkit",
+                connection=redis_connection,
+            ).add(job, ttl=3600, exc_string="timeout")
+
+    assert manager.reconcile_tasks(grace_seconds=60) == 1
+    assert manager.get_task(task.task_id).status is TaskStatus.FAILED
+    assert resources.released == [task.task_id]
 
 
 def test_rate_limit_is_atomic_per_bucket(tmp_path: Path) -> None:
