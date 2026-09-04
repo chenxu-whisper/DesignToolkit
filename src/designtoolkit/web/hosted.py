@@ -54,7 +54,9 @@ _ALLOWED_SUFFIXES = frozenset(
     }
 )
 _SESSION_PATTERN = re.compile(r"^[a-f0-9]{32}$")
-_QUARANTINE_PATTERN = re.compile(r"^[a-f0-9]{32}-[a-f0-9]{32}$")
+_QUARANTINE_PATTERN = re.compile(
+    r"^(?P<session_id>[a-f0-9]{32})-(?P<token>[a-f0-9]{32})$"
+)
 _ASSET_REFERENCE_PATTERN = re.compile(
     r"^asset:(?P<asset_id>[a-f0-9]{32})(?::[^:]*)?$"
 )
@@ -105,6 +107,67 @@ class _CleanupClaimHeartbeat:
                     self._session_id,
                     self._token,
                 )
+            except BaseException as exc:
+                self._failure = exc
+                return
+
+
+class _UploadResourceHeartbeat:
+    def __init__(
+        self,
+        reservation: RedisReservation,
+        lease: RedisSessionLease | None,
+    ) -> None:
+        self._reservation = reservation
+        self._lease = lease
+        intervals = [
+            getattr(
+                getattr(reservation, "coordinator", None),
+                "reservation_heartbeat_interval",
+                5.0,
+            )
+        ]
+        if lease is not None:
+            intervals.append(
+                getattr(
+                    getattr(lease, "coordinator", None),
+                    "session_lease_heartbeat_interval",
+                    5.0,
+                )
+            )
+        self._interval = min(intervals)
+        self._stopped = Event()
+        self._failure: BaseException | None = None
+        self._thread = Thread(target=self._run, daemon=True)
+
+    def __enter__(self) -> _UploadResourceHeartbeat:
+        self._refresh()
+        self._thread.start()
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        *_args: object,
+    ) -> None:
+        self._stopped.set()
+        self._thread.join()
+        if exc_type is None:
+            self.raise_if_failed()
+
+    def raise_if_failed(self) -> None:
+        if self._failure is not None:
+            raise self._failure
+
+    def _refresh(self) -> None:
+        self._reservation.refresh()
+        if self._lease is not None:
+            self._lease.refresh()
+
+    def _run(self) -> None:
+        while not self._stopped.wait(self._interval):
+            try:
+                self._refresh()
             except BaseException as exc:
                 self._failure = exc
                 return
@@ -312,48 +375,45 @@ class HostedStorage:
         temporary_path = asset_dir / ".uploading"
         final_path = asset_dir / filename
         size = 0
+        committed = False
         try:
-            asset_dir.mkdir(parents=True, exist_ok=False)
-            with temporary_path.open("xb") as destination:
-                async for chunk in chunks:
-                    if not chunk:
-                        continue
-                    size += len(chunk)
-                    if size > content_length:
-                        raise UploadRejectedError(
-                            "Upload exceeds declared Content-Length"
-                        )
-                    if size > self.max_upload_bytes:
-                        raise UploadRejectedError(
-                            "File exceeds the configured file limit"
-                        )
-                    destination.write(chunk)
-                    reservation.refresh()
-                    if lease is not None:
-                        lease.refresh()
-            if size != content_length:
-                raise UploadRejectedError(
-                    "Upload size does not match declared Content-Length"
-                )
-            os.utime(self._session_dir(session_id), None)
-        except Exception:
-            _release_best_effort(reservation)
-            self._discard_asset(session_id, asset_dir)
-            raise
-
-        try:
-            _commit_with_recovery(reservation)
+            with _UploadResourceHeartbeat(reservation, lease) as heartbeat:
+                asset_dir.mkdir(parents=True, exist_ok=False)
+                with temporary_path.open("xb") as destination:
+                    async for chunk in chunks:
+                        heartbeat.raise_if_failed()
+                        if not chunk:
+                            continue
+                        size += len(chunk)
+                        if size > content_length:
+                            raise UploadRejectedError(
+                                "Upload exceeds declared Content-Length"
+                            )
+                        if size > self.max_upload_bytes:
+                            raise UploadRejectedError(
+                                "File exceeds the configured file limit"
+                            )
+                        destination.write(chunk)
+                heartbeat.raise_if_failed()
+                if size != content_length:
+                    raise UploadRejectedError(
+                        "Upload size does not match declared Content-Length"
+                    )
+                os.utime(self._session_dir(session_id), None)
+                heartbeat.raise_if_failed()
+                _commit_with_recovery(reservation)
+                committed = True
+                heartbeat.raise_if_failed()
+                temporary_path.replace(final_path)
+                heartbeat.raise_if_failed()
         except _AmbiguousCommitError:
             raise
         except Exception:
-            _release_best_effort(reservation)
-            self._discard_asset(session_id, asset_dir)
-            raise
-
-        try:
-            temporary_path.replace(final_path)
-        except Exception:
-            if _rollback_with_recovery(reservation):
+            if committed:
+                if _rollback_with_recovery(reservation):
+                    self._discard_asset(session_id, asset_dir)
+            else:
+                _release_best_effort(reservation)
                 self._discard_asset(session_id, asset_dir)
             raise
 
@@ -475,7 +535,7 @@ class HostedStorage:
         retention_seconds: int,
         coordinator: RedisResourceCoordinator,
     ) -> int:
-        removed = self._cleanup_orphaned_quarantine()
+        removed = self._cleanup_orphaned_quarantine(coordinator)
         sessions_dir = self.root / "sessions"
         if not sessions_dir.is_dir():
             return removed
@@ -492,18 +552,22 @@ class HostedStorage:
             if token is None:
                 continue
             try:
-                if _directory_modified_at(session_dir) >= cutoff:
-                    continue
-                trash_dir = self.root / ".trash"
-                trash_dir.mkdir(parents=True, exist_ok=True)
-                quarantine = trash_dir / f"{session_id}-{token}"
-                os.replace(session_dir, quarantine)
                 with _CleanupClaimHeartbeat(
                     coordinator,
                     session_id,
                     token,
                 ) as heartbeat:
+                    if _directory_modified_at(session_dir) >= cutoff:
+                        continue
+                    heartbeat.raise_if_failed()
+                    trash_dir = self.root / ".trash"
+                    trash_dir.mkdir(parents=True, exist_ok=True)
+                    quarantine = trash_dir / f"{session_id}-{token}"
+                    heartbeat.raise_if_failed()
+                    os.replace(session_dir, quarantine)
+                    heartbeat.raise_if_failed()
                     coordinator.clear_session_usage(session_id)
+                    heartbeat.raise_if_failed()
                     quarantine_removed = self._delete_quarantine(quarantine)
                     heartbeat.raise_if_failed()
                 if quarantine_removed:
@@ -513,18 +577,21 @@ class HostedStorage:
         self._remove_empty_trash()
         return removed
 
-    def _cleanup_orphaned_quarantine(self) -> int:
+    def _cleanup_orphaned_quarantine(
+        self,
+        coordinator: RedisResourceCoordinator,
+    ) -> int:
         trash_dir = self.root / ".trash"
         if not trash_dir.is_dir():
             return 0
         removed = 0
         for quarantine in trash_dir.iterdir():
-            if (
-                quarantine.is_dir()
-                and _QUARANTINE_PATTERN.fullmatch(quarantine.name)
-            ):
-                if self._delete_quarantine(quarantine):
-                    removed += 1
+            match = _QUARANTINE_PATTERN.fullmatch(quarantine.name)
+            if not quarantine.is_dir() or match is None:
+                continue
+            coordinator.clear_session_usage(match.group("session_id"))
+            if self._delete_quarantine(quarantine):
+                removed += 1
         self._remove_empty_trash()
         return removed
 

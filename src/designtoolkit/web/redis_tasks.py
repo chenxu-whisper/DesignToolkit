@@ -731,10 +731,10 @@ class RedisTaskManager:
         from designtoolkit.web.worker import discard_failed_task_output
 
         try:
+            discard_failed_task_output(task_id, self)
+        finally:
             if self.resource_coordinator is not None:
                 self.resource_coordinator.release_task_resources(task_id)
-        finally:
-            discard_failed_task_output(task_id, self)
         self._redis.set(cleanup_key, "1", ex=_TERMINAL_TTL_SECONDS)
         return True
 

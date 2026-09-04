@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import shutil
 import subprocess
 from collections.abc import AsyncIterator
 from pathlib import Path
 from time import sleep
+from types import SimpleNamespace
 
 import pytest
 from redis.exceptions import ConnectionError as RedisConnectionError
@@ -35,7 +37,9 @@ class RecordingReservation:
         finalize_transport_errors: int = 0,
         state_transport_errors: int = 0,
         resolved_state: ReservationState | None = None,
+        fail_refresh_after: int | None = None,
     ) -> None:
+        self.coordinator = SimpleNamespace(reservation_heartbeat_interval=0.01)
         self.root = root
         self.committed = False
         self.rolled_back = False
@@ -48,6 +52,7 @@ class RecordingReservation:
         self.finalize_transport_errors = finalize_transport_errors
         self.state_transport_errors = state_transport_errors
         self.resolved_state = resolved_state
+        self.fail_refresh_after = fail_refresh_after
         self.charge_count = 0
         self.operations: list[str] = []
         self.hidden_at_commit: list[Path] = []
@@ -55,6 +60,11 @@ class RecordingReservation:
 
     def refresh(self) -> None:
         self.refresh_count += 1
+        if (
+            self.fail_refresh_after is not None
+            and self.refresh_count >= self.fail_refresh_after
+        ):
+            raise ResourceUnavailableError("Upload reservation expired")
 
     def commit(self) -> None:
         self.operations.append("commit")
@@ -111,6 +121,7 @@ class RecordingReservation:
 
 class RecordingLease:
     def __init__(self) -> None:
+        self.coordinator = SimpleNamespace(session_lease_heartbeat_interval=0.01)
         self.refresh_count = 0
 
     def refresh(self) -> None:
@@ -151,6 +162,12 @@ class RecordingCleanupCoordinator:
 async def _chunks(*values: bytes) -> AsyncIterator[bytes]:
     for value in values:
         yield value
+
+
+async def _slow_chunks(*values: bytes) -> AsyncIterator[bytes]:
+    for value in values:
+        yield value
+        await asyncio.sleep(0.04)
 
 
 def test_hosted_settings_use_public_deployment_defaults(tmp_path: Path) -> None:
@@ -204,8 +221,8 @@ async def test_upload_is_streamed_to_an_opaque_session_asset(
     assert asset.filename == "screen.PNG"
     assert asset.size == 5
     assert storage.resolve("a" * 32, asset.reference).read_bytes() == b"image"
-    assert reservation.refresh_count == 2
-    assert lease.refresh_count == 2
+    assert reservation.refresh_count >= 1
+    assert lease.refresh_count >= 1
     assert reservation.committed is True
     assert reservation.finalized is True
     assert reservation.operations == ["commit", "rename", "finalize"]
@@ -214,6 +231,52 @@ async def test_upload_is_streamed_to_an_opaque_session_asset(
     assert reservation.released is False
     with pytest.raises(UploadRejectedError, match="not available"):
         storage.resolve("b" * 32, asset.reference)
+
+
+@pytest.mark.anyio
+async def test_upload_heartbeats_resources_while_waiting_for_next_chunk(
+    tmp_path: Path,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    reservation = RecordingReservation()
+    lease = RecordingLease()
+
+    asset = await storage.store_stream(
+        "a" * 32,
+        filename="screen.png",
+        content_length=4,
+        chunks=_slow_chunks(b"im", b"ag"),
+        reservation=reservation,
+        lease=lease,
+    )
+
+    assert storage.resolve("a" * 32, asset.reference).read_bytes() == b"imag"
+    assert reservation.refresh_count >= 4
+    assert lease.refresh_count >= 4
+
+
+@pytest.mark.anyio
+async def test_upload_aborts_before_commit_after_background_heartbeat_failure(
+    tmp_path: Path,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    reservation = RecordingReservation(fail_refresh_after=2)
+    lease = RecordingLease()
+
+    with pytest.raises(ResourceUnavailableError, match="reservation expired"):
+        await storage.store_stream(
+            "a" * 32,
+            filename="screen.png",
+            content_length=4,
+            chunks=_slow_chunks(b"data"),
+            reservation=reservation,
+            lease=lease,
+        )
+
+    assert reservation.committed is False
+    assert reservation.released is True
+    assert list(tmp_path.rglob("screen.png")) == []
+    assert list(tmp_path.rglob(".uploading")) == []
 
 
 @pytest.mark.anyio
@@ -774,6 +837,96 @@ def test_cleanup_rechecks_recursive_mtime_after_claim(
     assert coordinator.cleared_sessions == []
 
 
+def test_cleanup_heartbeats_claim_during_slow_recursive_mtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    session_id = "a" * 32
+    session_dir = tmp_path / "sessions" / session_id
+    session_dir.mkdir(parents=True)
+    coordinator = RecordingCleanupCoordinator()
+    original_replace = os.replace
+    mtime_calls = 0
+    monkeypatch.setattr("designtoolkit.web.hosted.time", lambda: 10_000.0)
+
+    def slow_second_mtime(_path: Path) -> float:
+        nonlocal mtime_calls
+        mtime_calls += 1
+        if mtime_calls == 2:
+            sleep(0.04)
+        return 1_000.0
+
+    def replace_while_claim_is_fresh(source: Path, destination: Path) -> None:
+        assert coordinator.refresh_calls
+        original_replace(source, destination)
+
+    monkeypatch.setattr(
+        "designtoolkit.web.hosted._directory_modified_at",
+        slow_second_mtime,
+    )
+    monkeypatch.setattr(
+        "designtoolkit.web.hosted.os.replace",
+        replace_while_claim_is_fresh,
+    )
+
+    removed = storage.cleanup_expired(
+        retention_seconds=2_000,
+        coordinator=coordinator,
+    )
+
+    assert removed == 1
+    assert mtime_calls == 2
+
+
+def test_cleanup_aborts_before_rename_when_claim_heartbeat_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    session_id = "a" * 32
+    session_dir = tmp_path / "sessions" / session_id
+    session_dir.mkdir(parents=True)
+
+    class FailingHeartbeatCoordinator(RecordingCleanupCoordinator):
+        def refresh_cleanup_claim(self, session_id: str, token: str) -> None:
+            super().refresh_cleanup_claim(session_id, token)
+            if len(self.refresh_calls) >= 2:
+                raise ResourceUnavailableError("Cleanup claim expired")
+
+    coordinator = FailingHeartbeatCoordinator()
+    mtime_calls = 0
+    rename_called = False
+    monkeypatch.setattr("designtoolkit.web.hosted.time", lambda: 10_000.0)
+
+    def slow_second_mtime(_path: Path) -> float:
+        nonlocal mtime_calls
+        mtime_calls += 1
+        if mtime_calls == 2:
+            sleep(0.04)
+        return 1_000.0
+
+    def record_replace(_source: Path, _destination: Path) -> None:
+        nonlocal rename_called
+        rename_called = True
+
+    monkeypatch.setattr(
+        "designtoolkit.web.hosted._directory_modified_at",
+        slow_second_mtime,
+    )
+    monkeypatch.setattr("designtoolkit.web.hosted.os.replace", record_replace)
+
+    with pytest.raises(ResourceUnavailableError, match="Cleanup claim expired"):
+        storage.cleanup_expired(
+            retention_seconds=2_000,
+            coordinator=coordinator,
+        )
+
+    assert rename_called is False
+    assert session_dir.is_dir()
+    assert coordinator.claims == {}
+
+
 def test_cleanup_rename_failure_releases_claim(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -902,9 +1055,17 @@ def test_cleanup_recovers_trash_after_crash_following_rename(
     session_dir = tmp_path / "sessions" / session_id
     session_dir.mkdir(parents=True)
 
-    class CrashingCoordinator(RecordingCleanupCoordinator):
+    committed_bytes = {session_id: 4}
+    release_markers = {session_id: {"asset-marker"}}
+
+    class StatefulCoordinator(RecordingCleanupCoordinator):
         def clear_session_usage(self, session_id: str) -> None:
             super().clear_session_usage(session_id)
+            committed_bytes.pop(session_id, None)
+            release_markers.pop(session_id, None)
+
+    class CrashingCoordinator(StatefulCoordinator):
+        def clear_session_usage(self, session_id: str) -> None:
             raise RuntimeError("cleanup process crashed")
 
     coordinator = CrashingCoordinator()
@@ -923,14 +1084,25 @@ def test_cleanup_recovers_trash_after_crash_following_rename(
     assert not session_dir.exists()
     assert len(list((tmp_path / ".trash").iterdir())) == 1
     assert coordinator.claims == {}
+    assert committed_bytes == {session_id: 4}
+    assert release_markers == {session_id: {"asset-marker"}}
 
+    recovery = StatefulCoordinator()
     removed = storage.cleanup_expired(
         retention_seconds=2_000,
-        coordinator=RecordingCleanupCoordinator(),
+        coordinator=recovery,
     )
 
     assert removed == 1
+    assert recovery.cleared_sessions == [session_id]
+    assert committed_bytes == {}
+    assert release_markers == {}
     assert not (tmp_path / ".trash").exists()
+
+    assert storage.cleanup_expired(
+        retention_seconds=2_000,
+        coordinator=recovery,
+    ) == 0
 
 
 def test_directory_result_is_packaged_as_a_zip(tmp_path: Path) -> None:

@@ -24,7 +24,6 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from PIL import Image
 from redis.exceptions import RedisError
-from starlette.background import BackgroundTask
 
 from designtoolkit.chroma_keyer.core import key_rgb
 from designtoolkit.chroma_keyer.image_io import (
@@ -129,6 +128,7 @@ class _SessionLeaseHeartbeat:
         self._lease = lease
         self._interval = interval
         self._stopped = Event()
+        self._failure: BaseException | None = None
         self._thread = Thread(target=self._run, daemon=True)
 
     def start(self) -> None:
@@ -138,12 +138,45 @@ class _SessionLeaseHeartbeat:
         self._stopped.set()
         self._thread.join()
 
+    def raise_if_failed(self) -> None:
+        if self._failure is not None:
+            raise self._failure
+
     def _run(self) -> None:
         while not self._stopped.wait(self._interval):
             try:
                 self._lease.refresh()
-            except ResourceUnavailableError:
+            except BaseException as exc:
+                self._failure = exc
                 return
+
+
+class _LeaseProtectedFileResponse(FileResponse):
+    def __init__(
+        self,
+        *args: object,
+        lease: RedisSessionLease,
+        heartbeat: _SessionLeaseHeartbeat,
+        **kwargs: object,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._lease = lease
+        self._heartbeat = heartbeat
+
+    async def __call__(self, scope, receive, send) -> None:  # noqa: ANN001
+        async def send_while_leased(message) -> None:  # noqa: ANN001
+            self._heartbeat.raise_if_failed()
+            await send(message)
+
+        try:
+            await super().__call__(scope, receive, send_while_leased)
+            self._heartbeat.raise_if_failed()
+        finally:
+            self._heartbeat.stop()
+            _release_redis_resource_best_effort(
+                self._lease.release,
+                "download session lease",
+            )
 
 
 class _BoundedSingleFlightCache[CacheKey: Hashable, CacheValue]:
@@ -793,24 +826,22 @@ def create_router(
             getattr(resources, "session_lease_heartbeat_interval", 5.0),
         )
         heartbeat.start()
+        operation_completed = False
         try:
             yield lease
+            operation_completed = True
         finally:
             heartbeat.stop()
-            _release_redis_resource_best_effort(
-                lease.release,
-                "hosted session lease",
-            )
-
-    def release_response_lease(
-        lease: RedisSessionLease,
-        heartbeat: _SessionLeaseHeartbeat,
-    ) -> None:
-        heartbeat.stop()
-        _release_redis_resource_best_effort(
-            lease.release,
-            "download session lease",
-        )
+            try:
+                if operation_completed:
+                    heartbeat.raise_if_failed()
+            except (RedisError, ResourceUnavailableError) as exc:
+                raise ApiError("storage_unavailable", str(exc), 503) from exc
+            finally:
+                _release_redis_resource_best_effort(
+                    lease.release,
+                    "hosted session lease",
+                )
 
     def resolve_input_references(
         http_request: Request,
@@ -1150,7 +1181,7 @@ def create_router(
     @router.post(
         "/tasks/video-frames",
         response_model=TaskCreateResponse,
-        dependencies=[Depends(hosted_session_operation)],
+        dependencies=[Depends(hosted_session_operation, scope="function")],
     )
     def create_video_frames(
         payload: VideoFramesTaskRequest,
@@ -1174,7 +1205,7 @@ def create_router(
     @router.post(
         "/tasks/media-resize",
         response_model=TaskCreateResponse,
-        dependencies=[Depends(hosted_session_operation)],
+        dependencies=[Depends(hosted_session_operation, scope="function")],
     )
     def create_media_resize(
         payload: MediaResizeTaskRequest,
@@ -1198,7 +1229,7 @@ def create_router(
     @router.post(
         "/tasks/chroma-keyer",
         response_model=TaskCreateResponse,
-        dependencies=[Depends(hosted_session_operation)],
+        dependencies=[Depends(hosted_session_operation, scope="function")],
     )
     def create_chroma_keyer(
         payload: ChromaKeyerTaskRequest,
@@ -1222,7 +1253,7 @@ def create_router(
     @router.post(
         "/tasks/chroma-keyer-video",
         response_model=TaskCreateResponse,
-        dependencies=[Depends(hosted_session_operation)],
+        dependencies=[Depends(hosted_session_operation, scope="function")],
     )
     def create_chroma_video_keyer(
         payload: ChromaVideoKeyerTaskRequest,
@@ -1248,7 +1279,7 @@ def create_router(
         response_model=ChromaImageInspectResponse,
         dependencies=[
             Depends(preview_capacity),
-            Depends(hosted_session_operation),
+            Depends(hosted_session_operation, scope="function"),
         ],
     )
     def inspect_chroma_image(
@@ -1286,7 +1317,7 @@ def create_router(
         response_model=ChromaVideoInspectResponse,
         dependencies=[
             Depends(preview_capacity),
-            Depends(hosted_session_operation),
+            Depends(hosted_session_operation, scope="function"),
         ],
     )
     def inspect_chroma_video(
@@ -1329,7 +1360,7 @@ def create_router(
         response_model=ChromaVideoFrameResponse,
         dependencies=[
             Depends(preview_capacity),
-            Depends(hosted_session_operation),
+            Depends(hosted_session_operation, scope="function"),
         ],
     )
     def create_chroma_video_frame(
@@ -1362,7 +1393,7 @@ def create_router(
         response_model=ChromaVideoSampleResponse,
         dependencies=[
             Depends(preview_capacity),
-            Depends(hosted_session_operation),
+            Depends(hosted_session_operation, scope="function"),
         ],
     )
     def sample_chroma_video(
@@ -1413,7 +1444,7 @@ def create_router(
         response_model=ChromaVideoPreviewResponse,
         dependencies=[
             Depends(preview_capacity),
-            Depends(hosted_session_operation),
+            Depends(hosted_session_operation, scope="function"),
         ],
     )
     def create_chroma_video_preview(
@@ -1460,7 +1491,7 @@ def create_router(
         response_model=ChromaSampleResponse,
         dependencies=[
             Depends(preview_capacity),
-            Depends(hosted_session_operation),
+            Depends(hosted_session_operation, scope="function"),
         ],
     )
     def sample_chroma_image(
@@ -1504,7 +1535,7 @@ def create_router(
         response_model=ChromaPreviewResponse,
         dependencies=[
             Depends(preview_capacity),
-            Depends(hosted_session_operation),
+            Depends(hosted_session_operation, scope="function"),
         ],
     )
     @router.post(
@@ -1512,7 +1543,7 @@ def create_router(
         response_model=ChromaPreviewResponse,
         dependencies=[
             Depends(preview_capacity),
-            Depends(hosted_session_operation),
+            Depends(hosted_session_operation, scope="function"),
         ],
     )
     def create_chroma_preview(
@@ -1601,20 +1632,25 @@ def create_router(
         try:
             result_path = storage.validated_result_path(task.result_path)
         except UploadRejectedError as exc:
-            release_response_lease(lease, heartbeat)
+            heartbeat.stop()
+            _release_redis_resource_best_effort(
+                lease.release,
+                "download session lease",
+            )
             raise ApiError("result_not_found", str(exc), 404) from exc
         except BaseException:
-            release_response_lease(lease, heartbeat)
+            heartbeat.stop()
+            _release_redis_resource_best_effort(
+                lease.release,
+                "download session lease",
+            )
             raise
-        return FileResponse(
+        return _LeaseProtectedFileResponse(
             result_path,
             filename=result_path.name,
             media_type="application/octet-stream",
-            background=BackgroundTask(
-                release_response_lease,
-                lease,
-                heartbeat,
-            ),
+            lease=lease,
+            heartbeat=heartbeat,
         )
 
     @router.get("/tasks/{task_id}/events")

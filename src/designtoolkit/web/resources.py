@@ -839,6 +839,7 @@ class RedisResourceCoordinator:
             self._reservation_ttl_ms,
             self._lease_ttl_ms,
         )
+        self.reservation_heartbeat_interval = reservation_heartbeat_interval
         self._reserve_upload_script = self._redis.register_script(
             _RESERVE_UPLOAD_SCRIPT
         )

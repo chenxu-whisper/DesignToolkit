@@ -4,6 +4,7 @@ import shutil
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from pathlib import Path
+from time import sleep
 from unittest.mock import Mock
 from urllib.parse import quote
 
@@ -84,10 +85,14 @@ class StubLease:
         self.active = True
 
     def refresh(self) -> None:
+        self.coordinator.lease_refresh_calls += 1
         if not self.active:
             raise ResourceUnavailableError("Session lease expired")
+        if self.coordinator.fail_lease_refresh:
+            raise ResourceUnavailableError("Session lease heartbeat failed")
 
     def release(self) -> None:
+        self.coordinator.lease_release_calls += 1
         if self.active:
             self.active = False
             self.coordinator.active_leases -= 1
@@ -114,6 +119,11 @@ class StubCoordinator:
         self.reserve_calls = 0
         self.active_leases = 0
         self.lease_acquisitions = 0
+        self.lease_refresh_calls = 0
+        self.lease_release_calls = 0
+        self.fail_lease_refresh = False
+        self.session_lease_heartbeat_interval = 5.0
+        self.reservation_heartbeat_interval = 5.0
 
     def reserve_upload(
         self,
@@ -1008,6 +1018,48 @@ def test_hosted_task_holds_session_lease_through_queue_creation(
     assert coordinator.active_leases == 0
 
 
+def test_hosted_task_observes_session_heartbeat_failure_before_return(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = RedisTaskManager(
+        redis_connection=redis_connection,
+        queue=Queue("designtoolkit", connection=redis_connection),
+        data_dir=tmp_path,
+        max_queued_tasks=20,
+        retention_seconds=7200,
+    )
+    coordinator = StubCoordinator(
+        max_upload_concurrency=4,
+        max_session_bytes=1024,
+        min_free_bytes=0,
+    )
+    original_create = manager.create_video_frames_task
+
+    def slow_create(*args, **kwargs):
+        sleep(0.04)
+        return original_create(*args, **kwargs)
+
+    monkeypatch.setattr(manager, "create_video_frames_task", slow_create)
+    with _client(
+        tmp_path,
+        task_manager=manager,
+        resource_coordinator=coordinator,
+    ) as client:
+        reference = _upload(client, "clip.mp4", b"video").json()["reference"]
+        coordinator.session_lease_heartbeat_interval = 0.01
+        coordinator.fail_lease_refresh = True
+        response = client.post(
+            "/api/tasks/video-frames",
+            json={"input_path": reference, "image_format": "png"},
+        )
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "storage_unavailable"
+    assert coordinator.active_leases == 0
+
+
 def test_hosted_task_download_is_session_isolated(tmp_path: Path) -> None:
     redis_connection = fakeredis.FakeRedis(decode_responses=False)
     manager = RedisTaskManager(
@@ -1043,7 +1095,6 @@ def test_hosted_task_download_is_session_isolated(tmp_path: Path) -> None:
 
 def test_hosted_download_releases_lease_after_response_body(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     redis_connection = fakeredis.FakeRedis(decode_responses=False)
     manager = RedisTaskManager(
@@ -1058,15 +1109,7 @@ def test_hosted_download_releases_lease_after_response_body(
         max_session_bytes=1024,
         min_free_bytes=0,
     )
-    observed: list[tuple[str, int]] = []
-    original_call = FileResponse.__call__
-
-    async def call_while_leased(response, scope, receive, send):
-        observed.append(("before", coordinator.active_leases))
-        await original_call(response, scope, receive, send)
-        observed.append(("after", coordinator.active_leases))
-
-    monkeypatch.setattr(FileResponse, "__call__", call_while_leased)
+    coordinator.session_lease_heartbeat_interval = 0.01
     result = tmp_path / "result.png"
     result.write_bytes(b"result")
     with _client(
@@ -1086,12 +1129,80 @@ def test_hosted_download_releases_lease_after_response_body(
             result_path=str(result),
         )
         coordinator.lease_acquisitions = 0
+        coordinator.lease_refresh_calls = 0
+        coordinator.lease_release_calls = 0
         response = client.get(f"/api/tasks/{task_id}/download")
+        refreshes_after_response = coordinator.lease_refresh_calls
+        sleep(0.03)
 
     assert response.status_code == 200
-    assert observed == [("before", 1), ("after", 0)]
     assert coordinator.lease_acquisitions == 1
+    assert coordinator.lease_release_calls == 1
     assert coordinator.active_leases == 0
+    assert coordinator.lease_refresh_calls == refreshes_after_response
+
+
+def test_hosted_download_releases_lease_when_response_send_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = RedisTaskManager(
+        redis_connection=redis_connection,
+        queue=Queue("designtoolkit", connection=redis_connection),
+        data_dir=tmp_path,
+        max_queued_tasks=20,
+        retention_seconds=7200,
+    )
+    coordinator = StubCoordinator(
+        max_upload_concurrency=4,
+        max_session_bytes=1024,
+        min_free_bytes=0,
+    )
+    coordinator.session_lease_heartbeat_interval = 0.01
+    result = tmp_path / "result.png"
+    result.write_bytes(b"result")
+    with _client(
+        tmp_path,
+        task_manager=manager,
+        resource_coordinator=coordinator,
+    ) as client:
+        reference = _upload(client, "clip.mp4", b"video").json()["reference"]
+        task_id = client.post(
+            "/api/tasks/video-frames",
+            json={"input_path": reference, "image_format": "png"},
+        ).json()["task_id"]
+        manager.mark_finished(
+            task_id,
+            status=TaskStatus.SUCCEEDED,
+            output_path=f"/api/tasks/{task_id}/download",
+            result_path=str(result),
+        )
+        coordinator.lease_acquisitions = 0
+        coordinator.lease_refresh_calls = 0
+        coordinator.lease_release_calls = 0
+
+        async def fail_send(
+            _response,
+            _scope,
+            _receive,
+            _send,
+        ) -> None:
+            sleep(0.03)
+            raise RuntimeError("send failed")
+
+        monkeypatch.setattr(FileResponse, "__call__", fail_send)
+
+        with pytest.raises(RuntimeError, match="send failed"):
+            client.get(f"/api/tasks/{task_id}/download")
+
+        refreshes_after_failure = coordinator.lease_refresh_calls
+        sleep(0.03)
+
+    assert coordinator.lease_acquisitions == 1
+    assert coordinator.lease_release_calls == 1
+    assert coordinator.active_leases == 0
+    assert coordinator.lease_refresh_calls == refreshes_after_failure
 
 
 def test_hosted_batch_resize_uses_unique_managed_output_directory(

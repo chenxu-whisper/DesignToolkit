@@ -25,7 +25,7 @@ from designtoolkit.media_resize import (
 from designtoolkit.video_frames import ExportResult
 from designtoolkit.web import worker as worker_module
 from designtoolkit.web.adapters import media_resize_options_list_from_request
-from designtoolkit.web.hosted import HostedSettings
+from designtoolkit.web.hosted import HostedSettings, HostedStorage
 from designtoolkit.web.redis_tasks import (
     RedisLogStore,
     RedisTaskManager,
@@ -74,6 +74,7 @@ class TrackingTaskResources:
         self.lease = TrackingHandle("lease", self.events)
         self.output = TrackingHandle("output", self.events)
         self.session_lease_heartbeat_interval = 5.0
+        self.reservation_heartbeat_interval = 5.0
 
     def acquire_session(self, session_id: str, *, task_id: str):
         self.events.append(f"acquire:{task_id}:{session_id}")
@@ -327,7 +328,8 @@ def test_run_task_heartbeats_resources_during_slow_processing(
         owner_id="a" * 32,
     )
     resources = TrackingTaskResources()
-    resources.session_lease_heartbeat_interval = 0.01
+    resources.session_lease_heartbeat_interval = 0.05
+    resources.reservation_heartbeat_interval = 0.01
     monkeypatch.setattr(worker_module.HostedSettings, "from_env", lambda: settings)
     monkeypatch.setattr(
         worker_module.Redis,
@@ -368,6 +370,75 @@ def test_run_task_heartbeats_resources_during_slow_processing(
 
     assert resources.events.count("refresh:lease") >= 2
     assert resources.events.count("refresh:output") >= 2
+    assert resources.events[-2:] == ["release:output", "release:lease"]
+
+
+def test_run_task_surfaces_background_heartbeat_failure_before_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    settings = _hosted_settings(tmp_path)
+    manager = _manager(redis_connection, tmp_path)
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+        owner_id="a" * 32,
+    )
+    resources = TrackingTaskResources()
+    resources.session_lease_heartbeat_interval = 0.01
+    refresh_calls = 0
+
+    def fail_once() -> None:
+        nonlocal refresh_calls
+        refresh_calls += 1
+        resources.events.append("refresh:output")
+        if refresh_calls == 1:
+            raise RuntimeError("output heartbeat failed")
+
+    resources.output.refresh = fail_once
+    monkeypatch.setattr(worker_module.HostedSettings, "from_env", lambda: settings)
+    monkeypatch.setattr(
+        worker_module.Redis,
+        "from_url",
+        lambda _url: redis_connection,
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "_build_resource_coordinator",
+        lambda _settings, _connection: resources,
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "disk_usage",
+        lambda _path: type("Usage", (), {"free": 20})(),
+    )
+
+    def execute(executor, reserved_task, _request) -> None:
+        time.sleep(0.04)
+        executor._heartbeat_resources()
+        executor.mark_finished(
+            reserved_task.task_id,
+            status=TaskStatus.SUCCEEDED,
+        )
+
+    monkeypatch.setattr(
+        worker_module.RedisTaskExecutor,
+        "execute_reserved_task",
+        execute,
+    )
+
+    worker_module.run_task(
+        task.task_id,
+        "video_frames",
+        VideoFramesTaskRequest(
+            input_path=str(tmp_path / "clip.mp4")
+        ).model_dump(mode="json"),
+    )
+
+    failed = manager.get_task(task.task_id)
+    assert failed is not None
+    assert failed.status is TaskStatus.FAILED
+    assert failed.error == "output heartbeat failed"
     assert resources.events[-2:] == ["release:output", "release:lease"]
 
 
@@ -882,6 +953,50 @@ def test_external_failure_retries_cleanup_after_crash_following_terminal_cas(
     assert not output_root.exists()
 
 
+def test_external_failure_discards_output_before_releasing_task_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    events: list[str] = []
+
+    class OrderedResources:
+        def release_task_resources(self, _task_id: str) -> None:
+            events.append("release")
+
+    manager = _manager(
+        redis_connection,
+        tmp_path,
+        resource_coordinator=OrderedResources(),
+    )
+    output_root = tmp_path / "partial-output"
+    output_root.mkdir()
+    (output_root / "partial.bin").write_bytes(b"partial")
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(
+            input_path=str(tmp_path / "clip.mp4"),
+            output_dir=str(output_root),
+        ),
+        owner_id="a" * 32,
+    )
+    original_discard = worker_module.discard_failed_task_output
+
+    def record_discard(task_id: str, state: RedisTaskManager) -> None:
+        events.append("discard")
+        original_discard(task_id, state)
+
+    monkeypatch.setattr(
+        worker_module,
+        "discard_failed_task_output",
+        record_discard,
+    )
+
+    assert manager._finalize_external_failure(task.task_id, "worker failed")
+
+    assert events == ["discard", "release"]
+    assert not output_root.exists()
+
+
 def test_reconciler_retries_cleanup_after_crash_following_terminal_cas(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1345,6 +1460,44 @@ def test_worker_executor_runs_reserved_task_and_persists_success(
     assert completed.output_path == f"/api/tasks/{task.task_id}/download"
     assert completed.result_path is not None
     assert Path(completed.result_path).is_file()
+
+
+def test_worker_heartbeat_failure_after_packaging_blocks_session_touch_and_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    state = _manager(redis_connection, tmp_path)
+    task = state.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+        owner_id="a" * 32,
+    )
+    artifact = tmp_path / "result.png"
+    artifact.write_bytes(b"result")
+    heartbeat_calls = 0
+    touched_sessions: list[str] = []
+
+    def heartbeat() -> None:
+        nonlocal heartbeat_calls
+        heartbeat_calls += 1
+        if heartbeat_calls == 2:
+            raise RuntimeError("session heartbeat failed")
+
+    monkeypatch.setattr(
+        HostedStorage,
+        "touch_session",
+        lambda _storage, session_id: touched_sessions.append(session_id),
+    )
+    executor = RedisTaskExecutor(state, resource_heartbeat=heartbeat)
+
+    executor._mark_succeeded(task.task_id, str(artifact))
+
+    failed = state.get_task(task.task_id)
+    assert failed is not None
+    assert failed.status is TaskStatus.FAILED
+    assert failed.error == "session heartbeat failed"
+    assert touched_sessions == []
+    assert not artifact.exists()
 
 
 def test_worker_rejects_zip_larger_than_budget_after_packaging(

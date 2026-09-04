@@ -156,6 +156,7 @@ class RedisTaskExecutor(TaskManager):
                 max_output_bytes=self._max_output_bytes,
             )
             self._validate_artifact(artifact)
+            self._heartbeat_resources()
         except Exception as exc:
             if artifact is not None:
                 artifact.unlink(missing_ok=True)
@@ -174,6 +175,7 @@ class RedisTaskExecutor(TaskManager):
                 Path(self._state.data_dir),
                 max_upload_bytes=1,
             ).touch_session(task.owner_id)
+        self._heartbeat_resources()
         details: dict[str, object] = {"output_path": download_url}
         if elapsed_seconds is not None:
             details["elapsed_seconds"] = elapsed_seconds
@@ -298,6 +300,7 @@ class _PeriodicResourceHeartbeat:
         self._heartbeat = heartbeat
         self._interval = interval
         self._stopped = Event()
+        self._failure: BaseException | None = None
         self._thread = Thread(target=self._run, daemon=True)
 
     def start(self) -> None:
@@ -307,11 +310,16 @@ class _PeriodicResourceHeartbeat:
         self._stopped.set()
         self._thread.join()
 
+    def raise_if_failed(self) -> None:
+        if self._failure is not None:
+            raise self._failure
+
     def _run(self) -> None:
         while not self._stopped.wait(self._interval):
             try:
                 self._heartbeat()
-            except Exception:
+            except BaseException as exc:
+                self._failure = exc
                 return
 
 
@@ -387,10 +395,15 @@ def run_task(task_id: str, job_kind: str, payload: dict[str, object]) -> None:
             lease.refresh()
         state.record_heartbeat(task_id)
 
+    def checked_heartbeat() -> None:
+        if periodic_heartbeat is not None:
+            periodic_heartbeat.raise_if_failed()
+        heartbeat()
+
     executor = RedisTaskExecutor(
         state,
         max_output_bytes=settings.max_output_bytes,
-        resource_heartbeat=heartbeat,
+        resource_heartbeat=checked_heartbeat,
         task_already_running=True,
     )
     try:
@@ -404,11 +417,19 @@ def run_task(task_id: str, job_kind: str, payload: dict[str, object]) -> None:
         )
         periodic_heartbeat = _PeriodicResourceHeartbeat(
             heartbeat,
-            resources.session_lease_heartbeat_interval,
+            min(
+                resources.session_lease_heartbeat_interval,
+                getattr(
+                    resources,
+                    "reservation_heartbeat_interval",
+                    resources.session_lease_heartbeat_interval,
+                ),
+            ),
         )
         periodic_heartbeat.start()
         request = _task_request(job_kind, payload)
         executor.execute_reserved_task(task, request)
+        periodic_heartbeat.raise_if_failed()
     except Exception as exc:
         executor._discard_partial_output()
         state._finalize_external_failure(task_id, str(exc))
