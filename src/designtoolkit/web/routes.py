@@ -151,6 +151,23 @@ class _SessionLeaseHeartbeat:
                 return
 
 
+@dataclass
+class _HostedSessionOperation:
+    lease: RedisSessionLease | None = None
+    heartbeat: _SessionLeaseHeartbeat | None = None
+    committed: bool = False
+
+    def barrier(self) -> None:
+        if self.lease is None or self.heartbeat is None:
+            return
+        self.heartbeat.raise_if_failed()
+        self.lease.refresh()
+        self.heartbeat.raise_if_failed()
+
+    def mark_committed(self) -> None:
+        self.committed = True
+
+
 class _LeaseProtectedFileResponse(FileResponse):
     def __init__(
         self,
@@ -822,9 +839,11 @@ def create_router(
 
     def hosted_session_operation(
         http_request: Request,
-    ) -> Iterator[RedisSessionLease | None]:
+    ) -> Iterator[_HostedSessionOperation]:
         if storage is None or resources is None:
-            yield None
+            operation = _HostedSessionOperation()
+            http_request.state.hosted_session_operation = operation
+            yield operation
             return
         try:
             lease = resources.acquire_session(http_request.state.session_id)
@@ -835,8 +854,10 @@ def create_router(
             getattr(resources, "session_lease_heartbeat_interval", 5.0),
         )
         heartbeat.start()
+        operation = _HostedSessionOperation(lease=lease, heartbeat=heartbeat)
+        http_request.state.hosted_session_operation = operation
         try:
-            yield lease
+            yield operation
         except BaseException:
             _stop_session_lease_heartbeat(
                 heartbeat,
@@ -846,10 +867,18 @@ def create_router(
             )
             raise
         else:
-            try:
-                _stop_session_lease_heartbeat(heartbeat)
-            except (RedisError, ResourceUnavailableError) as exc:
-                raise ApiError("storage_unavailable", str(exc), 503) from exc
+            if operation.committed:
+                _stop_session_lease_heartbeat(
+                    heartbeat,
+                    failure_context=(
+                        "hosted session lease heartbeat failed after task enqueue"
+                    ),
+                )
+            else:
+                try:
+                    _stop_session_lease_heartbeat(heartbeat)
+                except (RedisError, ResourceUnavailableError) as exc:
+                    raise ApiError("storage_unavailable", str(exc), 503) from exc
         finally:
             _release_redis_resource_best_effort(
                 lease.release,
@@ -1197,15 +1226,20 @@ def create_router(
         http_request: Request,
     ) -> TaskCreateResponse:
         hosted_payload = hosted_video_frames_request(http_request, payload)
+        operation = http_request.state.hosted_session_operation
         try:
+            operation.barrier()
             task = task_manager.create_video_frames_task(
                 hosted_payload,
                 owner_id=getattr(http_request.state, "session_id", None),
             )
+            operation.mark_committed()
         except Exception as exc:
             discard_failed_hosted_task_dir(http_request, hosted_payload)
             if isinstance(exc, TaskConflictError):
                 raise ApiError("task_conflict", str(exc), 409) from exc
+            if isinstance(exc, (RedisError, ResourceUnavailableError)):
+                raise ApiError("storage_unavailable", str(exc), 503) from exc
             if isinstance(exc, _INVALID_REQUEST_ERRORS):
                 raise ApiError("invalid_request", str(exc), 400) from exc
             raise
@@ -1221,15 +1255,20 @@ def create_router(
         http_request: Request,
     ) -> TaskCreateResponse:
         hosted_payload = hosted_media_resize_request(http_request, payload)
+        operation = http_request.state.hosted_session_operation
         try:
+            operation.barrier()
             task = task_manager.create_media_resize_task(
                 hosted_payload,
                 owner_id=getattr(http_request.state, "session_id", None),
             )
+            operation.mark_committed()
         except Exception as exc:
             discard_failed_hosted_task_dir(http_request, hosted_payload)
             if isinstance(exc, TaskConflictError):
                 raise ApiError("task_conflict", str(exc), 409) from exc
+            if isinstance(exc, (RedisError, ResourceUnavailableError)):
+                raise ApiError("storage_unavailable", str(exc), 503) from exc
             if isinstance(exc, _INVALID_REQUEST_ERRORS):
                 raise ApiError("invalid_request", str(exc), 400) from exc
             raise
@@ -1245,15 +1284,20 @@ def create_router(
         http_request: Request,
     ) -> TaskCreateResponse:
         hosted_payload = hosted_chroma_keyer_request(http_request, payload)
+        operation = http_request.state.hosted_session_operation
         try:
+            operation.barrier()
             task = task_manager.create_chroma_keyer_task(
                 hosted_payload,
                 owner_id=getattr(http_request.state, "session_id", None),
             )
+            operation.mark_committed()
         except Exception as exc:
             discard_failed_hosted_task_dir(http_request, hosted_payload)
             if isinstance(exc, TaskConflictError):
                 raise ApiError("task_conflict", str(exc), 409) from exc
+            if isinstance(exc, (RedisError, ResourceUnavailableError)):
+                raise ApiError("storage_unavailable", str(exc), 503) from exc
             if isinstance(exc, KeyerError):
                 raise _chroma_keyer_error_response(exc) from exc
             raise
@@ -1269,15 +1313,20 @@ def create_router(
         http_request: Request,
     ) -> TaskCreateResponse:
         hosted_payload = hosted_chroma_video_request(http_request, payload)
+        operation = http_request.state.hosted_session_operation
         try:
+            operation.barrier()
             task = task_manager.create_chroma_video_keyer_task(
                 hosted_payload,
                 owner_id=getattr(http_request.state, "session_id", None),
             )
+            operation.mark_committed()
         except Exception as exc:
             discard_failed_hosted_task_dir(http_request, hosted_payload)
             if isinstance(exc, TaskConflictError):
                 raise ApiError("task_conflict", str(exc), 409) from exc
+            if isinstance(exc, (RedisError, ResourceUnavailableError)):
+                raise ApiError("storage_unavailable", str(exc), 503) from exc
             if isinstance(exc, KeyerError):
                 raise _chroma_video_error_response(exc) from exc
             raise

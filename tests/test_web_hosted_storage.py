@@ -6,6 +6,7 @@ import shutil
 import subprocess
 from collections.abc import AsyncIterator
 from pathlib import Path
+from threading import Event
 from time import sleep
 from types import SimpleNamespace
 
@@ -16,6 +17,7 @@ from designtoolkit.web.hosted import (
     HostedSettings,
     HostedStorage,
     UploadRejectedError,
+    _CleanupClaimHeartbeat,
     prepare_download_artifact,
 )
 from designtoolkit.web.resources import ReservationState, ResourceUnavailableError
@@ -150,6 +152,7 @@ class RecordingCleanupCoordinator:
         self.release_calls: list[tuple[str, str]] = []
         self.cleared_sessions: list[str] = []
         self.cleared_generations: set[str] = set()
+        self.reconciled_legacy: dict[str, int] = {}
 
     def claim_session_cleanup(self, session_id: str) -> str | None:
         self.claim_calls.append(session_id)
@@ -205,6 +208,33 @@ class RecordingCleanupCoordinator:
 
     def finalize_session_usage_generation(self, generation_id: str) -> None:
         assert generation_id in self.cleared_generations
+
+    def reconcile_legacy_session_usage(
+        self,
+        session_id: str,
+        claim_token: str,
+        generation_id: str,
+        *,
+        current_committed_bytes: int,
+        legacy_physical_bytes: int,
+    ) -> int:
+        assert self.claims.get(session_id) == claim_token
+        if generation_id in self.reconciled_legacy:
+            return self.reconciled_legacy[generation_id]
+        committed = self.committed_bytes.get(session_id, 0)
+        legacy_bytes = committed - current_committed_bytes
+        if legacy_bytes < 0 or legacy_bytes > legacy_physical_bytes:
+            raise ResourceUnavailableError("Legacy session usage cannot be reconciled")
+        if current_committed_bytes:
+            self.committed_bytes[session_id] = current_committed_bytes
+        else:
+            self.committed_bytes.pop(session_id, None)
+        self.reconciled_legacy[generation_id] = legacy_bytes
+        self.cleared_sessions.append(session_id)
+        return legacy_bytes
+
+    def finalize_legacy_session_usage(self, generation_id: str) -> None:
+        assert generation_id in self.reconciled_legacy
 
 
 async def _chunks(*values: bytes) -> AsyncIterator[bytes]:
@@ -1051,6 +1081,68 @@ def test_cleanup_aborts_before_rename_when_claim_heartbeat_fails(
     assert coordinator.claims == {}
 
 
+def test_cleanup_raises_heartbeat_failure_recorded_during_context_exit() -> None:
+    entered_refresh = Event()
+    allow_failure = Event()
+
+    class FinalRefreshFailureCoordinator(RecordingCleanupCoordinator):
+        cleanup_claim_heartbeat_interval = 0.001
+
+        def refresh_cleanup_claim(self, session_id: str, token: str) -> None:
+            super().refresh_cleanup_claim(session_id, token)
+            if len(self.refresh_calls) == 2:
+                entered_refresh.set()
+                assert allow_failure.wait(timeout=1)
+                raise ResourceUnavailableError("Cleanup claim expired at exit")
+
+    session_id = "a" * 32
+    coordinator = FinalRefreshFailureCoordinator()
+    token = coordinator.claim_session_cleanup(session_id)
+    assert token is not None
+
+    with pytest.raises(ResourceUnavailableError, match="expired at exit"):
+        with _CleanupClaimHeartbeat(coordinator, session_id, token) as heartbeat:
+            assert entered_refresh.wait(timeout=1)
+            heartbeat.raise_if_failed()
+            allow_failure.set()
+
+
+def test_cleanup_preserves_body_error_and_records_exit_heartbeat_failure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    entered_refresh = Event()
+    allow_failure = Event()
+
+    class FinalRefreshFailureCoordinator(RecordingCleanupCoordinator):
+        cleanup_claim_heartbeat_interval = 0.001
+
+        def refresh_cleanup_claim(self, session_id: str, token: str) -> None:
+            super().refresh_cleanup_claim(session_id, token)
+            if len(self.refresh_calls) == 2:
+                entered_refresh.set()
+                assert allow_failure.wait(timeout=1)
+                raise ResourceUnavailableError("Cleanup claim expired at exit")
+
+    session_id = "a" * 32
+    coordinator = FinalRefreshFailureCoordinator()
+    token = coordinator.claim_session_cleanup(session_id)
+    assert token is not None
+    caplog.set_level("ERROR", logger="designtoolkit.web.hosted")
+
+    with pytest.raises(ValueError, match="primary cleanup failure") as raised:
+        with _CleanupClaimHeartbeat(coordinator, session_id, token) as heartbeat:
+            assert entered_refresh.wait(timeout=1)
+            heartbeat.raise_if_failed()
+            allow_failure.set()
+            raise ValueError("primary cleanup failure")
+
+    assert any(
+        "Cleanup claim heartbeat also failed" in note
+        for note in raised.value.__notes__
+    )
+    assert "Cleanup claim heartbeat failed during cleanup error" in caplog.text
+
+
 def test_cleanup_rename_failure_releases_claim(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1131,7 +1223,9 @@ def test_cleanup_deletes_legacy_orphan_without_clearing_recreated_session_usage(
     orphan = tmp_path / ".trash" / f"{session_id}-{'1' * 32}"
     orphan.mkdir(parents=True)
     (orphan / "old.bin").write_bytes(b"old")
-    recreated = tmp_path / "sessions" / session_id
+    recreated = (
+        tmp_path / "sessions" / session_id / "assets" / ("2" * 32)
+    )
     recreated.mkdir(parents=True)
     (recreated / "new.bin").write_bytes(b"new")
     committed_bytes = {session_id: 3}
@@ -1146,7 +1240,61 @@ def test_cleanup_deletes_legacy_orphan_without_clearing_recreated_session_usage(
     assert not orphan.exists()
     assert (recreated / "new.bin").read_bytes() == b"new"
     assert committed_bytes == {session_id: 3}
-    assert coordinator.cleared_sessions == []
+    assert coordinator.reconciled_legacy == {"1" * 32: 0}
+
+
+def test_cleanup_reconciles_legacy_usage_after_crash_without_recreated_session(
+    tmp_path: Path,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    session_id = "a" * 32
+    generation_id = "1" * 32
+    orphan_asset = (
+        tmp_path / ".trash" / f"{session_id}-{generation_id}" / "assets" / ("2" * 32)
+    )
+    orphan_asset.mkdir(parents=True)
+    (orphan_asset / "old.bin").write_bytes(b"old!")
+    committed_bytes = {session_id: 4}
+    coordinator = RecordingCleanupCoordinator(committed_bytes=committed_bytes)
+
+    removed = storage.cleanup_expired(
+        retention_seconds=2_000,
+        coordinator=coordinator,
+    )
+
+    assert removed == 1
+    assert committed_bytes == {}
+    assert coordinator.reconciled_legacy == {generation_id: 4}
+
+
+def test_cleanup_reconciles_legacy_usage_without_clearing_recreated_usage(
+    tmp_path: Path,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    session_id = "a" * 32
+    generation_id = "1" * 32
+    orphan_asset = (
+        tmp_path / ".trash" / f"{session_id}-{generation_id}" / "assets" / ("2" * 32)
+    )
+    orphan_asset.mkdir(parents=True)
+    (orphan_asset / "old.bin").write_bytes(b"old!")
+    recreated_asset = (
+        tmp_path / "sessions" / session_id / "assets" / ("3" * 32)
+    )
+    recreated_asset.mkdir(parents=True)
+    (recreated_asset / "new.bin").write_bytes(b"new")
+    committed_bytes = {session_id: 7}
+    coordinator = RecordingCleanupCoordinator(committed_bytes=committed_bytes)
+
+    removed = storage.cleanup_expired(
+        retention_seconds=2_000,
+        coordinator=coordinator,
+    )
+
+    assert removed == 1
+    assert committed_bytes == {session_id: 3}
+    assert coordinator.reconciled_legacy == {generation_id: 4}
+    assert (recreated_asset / "new.bin").read_bytes() == b"new"
 
 
 def test_cleanup_retries_quarantine_after_transient_delete_failure(

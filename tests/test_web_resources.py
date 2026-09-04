@@ -402,6 +402,54 @@ class DeterministicRedis(fakeredis.FakeRedis):
         self.pexpire(keys[0], int(args[0]))
         return 1
 
+    def _eval_reconcile_legacy_session_usage(  # noqa: ANN001, ANN202
+        self,
+        keys,
+        args,
+    ):
+        state_key, session_state_key, cleanup_key, tombstone_key = keys
+        (
+            session_id,
+            claim_token,
+            current_committed_bytes,
+            legacy_physical_bytes,
+        ) = (str(value) for value in args)
+        deleting = self.hget(session_state_key, "deleting")
+        if (
+            deleting is None
+            or self._text(deleting) != claim_token
+            or not self.exists(cleanup_key)
+        ):
+            return [3]
+        if self.exists(tombstone_key):
+            return [0, int(self.hget(tombstone_key, "legacy_bytes"))]
+        current_committed_bytes = int(current_committed_bytes)
+        legacy_physical_bytes = int(legacy_physical_bytes)
+        field = f"session:{session_id}:committed_bytes"
+        committed = self._number(state_key, field)
+        legacy_bytes = committed - current_committed_bytes
+        if legacy_bytes < 0 or legacy_bytes > legacy_physical_bytes:
+            return [2]
+        if current_committed_bytes:
+            self.hset(state_key, field, current_committed_bytes)
+        else:
+            self.hdel(state_key, field)
+        self.hset(
+            tombstone_key,
+            mapping={
+                "session_id": session_id,
+                "current_bytes": current_committed_bytes,
+                "legacy_bytes": legacy_bytes,
+            },
+        )
+        return [1, legacy_bytes]
+
+    def _eval_finalize_legacy_session_usage(self, keys, args):  # noqa: ANN001, ANN202
+        if not self.exists(keys[0]):
+            return 0
+        self.pexpire(keys[0], int(args[0]))
+        return 1
+
     def _eval_release_committed_asset(self, keys, args):  # noqa: ANN001, ANN202
         state_key, marker_key, marker_index_key = keys
         session_id, asset_id, released_bytes = args
@@ -1641,6 +1689,120 @@ def test_cleanup_claim_refresh_is_token_scoped(
     with pytest.raises(ResourceUnavailableError, match="expired"):
         resources.refresh_cleanup_claim(SESSION_A, "0" * 32)
 
+    resources.release_cleanup_claim(SESSION_A, claim)
+
+
+@pytest.mark.parametrize(
+    ("committed_bytes", "current_bytes", "legacy_bytes"),
+    [(4, 0, 4), (7, 3, 4)],
+)
+def test_legacy_session_usage_reconcile_is_atomic_and_preserves_current_usage(
+    redis_connection: DeterministicRedis,
+    committed_bytes: int,
+    current_bytes: int,
+    legacy_bytes: int,
+) -> None:
+    resources = coordinator(redis_connection, max_session_bytes=20)
+    redis_connection.hset(
+        "dt:resource:state",
+        f"session:{SESSION_A}:committed_bytes",
+        committed_bytes,
+    )
+    claim = resources.claim_session_cleanup(SESSION_A)
+    assert claim is not None
+    generation_id = "1" * 32
+
+    reconciled = resources.reconcile_legacy_session_usage(
+        SESSION_A,
+        claim,
+        generation_id,
+        current_committed_bytes=current_bytes,
+        legacy_physical_bytes=legacy_bytes,
+    )
+    repeated = resources.reconcile_legacy_session_usage(
+        SESSION_A,
+        claim,
+        generation_id,
+        current_committed_bytes=current_bytes,
+        legacy_physical_bytes=legacy_bytes,
+    )
+
+    assert reconciled == legacy_bytes
+    assert repeated == legacy_bytes
+    assert int(
+        redis_connection.hget(
+            "dt:resource:state",
+            f"session:{SESSION_A}:committed_bytes",
+        )
+        or 0
+    ) == current_bytes
+    tombstone_key = f"dt:resource:legacy-cleanup:{generation_id}"
+    assert redis_connection.hget(tombstone_key, "session_id") == SESSION_A.encode()
+    resources.finalize_legacy_session_usage(generation_id)
+    assert redis_connection.pttl(tombstone_key) > 0
+    resources.release_cleanup_claim(SESSION_A, claim)
+
+
+def test_legacy_session_usage_reconcile_rejects_unproven_counter_delta(
+    redis_connection: DeterministicRedis,
+) -> None:
+    resources = coordinator(redis_connection)
+    redis_connection.hset(
+        "dt:resource:state",
+        f"session:{SESSION_A}:committed_bytes",
+        9,
+    )
+    claim = resources.claim_session_cleanup(SESSION_A)
+    assert claim is not None
+
+    with pytest.raises(ResourceUnavailableError, match="cannot be reconciled"):
+        resources.reconcile_legacy_session_usage(
+            SESSION_A,
+            claim,
+            "1" * 32,
+            current_committed_bytes=3,
+            legacy_physical_bytes=4,
+        )
+
+    assert int(
+        redis_connection.hget(
+            "dt:resource:state",
+            f"session:{SESSION_A}:committed_bytes",
+        )
+    ) == 9
+    resources.release_cleanup_claim(SESSION_A, claim)
+
+
+def test_real_redis_reconciles_legacy_session_usage(
+    real_redis_connection: Redis,
+) -> None:
+    resources = coordinator(real_redis_connection, max_session_bytes=20)
+    real_redis_connection.hset(
+        "dt:resource:state",
+        f"session:{SESSION_A}:committed_bytes",
+        7,
+    )
+    claim = resources.claim_session_cleanup(SESSION_A)
+    assert claim is not None
+    generation_id = "1" * 32
+
+    assert resources.reconcile_legacy_session_usage(
+        SESSION_A,
+        claim,
+        generation_id,
+        current_committed_bytes=3,
+        legacy_physical_bytes=4,
+    ) == 4
+    assert int(
+        real_redis_connection.hget(
+            "dt:resource:state",
+            f"session:{SESSION_A}:committed_bytes",
+        )
+    ) == 3
+    resources.finalize_legacy_session_usage(generation_id)
+    assert real_redis_connection.pttl(
+        f"dt:resource:legacy-cleanup:{generation_id}"
+    ) > 0
     resources.release_cleanup_claim(SESSION_A, claim)
 
 

@@ -1069,7 +1069,7 @@ def test_hosted_task_holds_session_lease_through_queue_creation(
     assert coordinator.active_leases == 0
 
 
-def test_hosted_task_observes_session_heartbeat_failure_before_return(
+def test_hosted_task_returns_success_after_enqueue_when_late_heartbeat_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1088,11 +1088,20 @@ def test_hosted_task_observes_session_heartbeat_failure_before_return(
     )
     original_create = manager.create_video_frames_task
 
-    def slow_create(*args, **kwargs):
-        sleep(0.04)
-        return original_create(*args, **kwargs)
+    def create_then_fail_heartbeat(*args, **kwargs):
+        task = original_create(*args, **kwargs)
+        coordinator.fail_lease_refresh = True
+        deadline = monotonic() + 1
+        while coordinator.lease_refresh_calls < 2 and monotonic() < deadline:
+            sleep(0.001)
+        assert coordinator.lease_refresh_calls >= 2
+        return task
 
-    monkeypatch.setattr(manager, "create_video_frames_task", slow_create)
+    monkeypatch.setattr(
+        manager,
+        "create_video_frames_task",
+        create_then_fail_heartbeat,
+    )
     with _client(
         tmp_path,
         task_manager=manager,
@@ -1100,6 +1109,39 @@ def test_hosted_task_observes_session_heartbeat_failure_before_return(
     ) as client:
         reference = _upload(client, "clip.mp4", b"video").json()["reference"]
         coordinator.session_lease_heartbeat_interval = 0.01
+        coordinator.lease_refresh_calls = 0
+        response = client.post(
+            "/api/tasks/video-frames",
+            json={"input_path": reference, "image_format": "png"},
+        )
+
+    assert response.status_code == 200
+    assert manager.queue.count == 1
+    assert coordinator.active_leases == 0
+
+
+def test_hosted_task_heartbeat_failure_before_enqueue_returns_503_without_job(
+    tmp_path: Path,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = RedisTaskManager(
+        redis_connection=redis_connection,
+        queue=Queue("designtoolkit", connection=redis_connection),
+        data_dir=tmp_path,
+        max_queued_tasks=20,
+        retention_seconds=7200,
+    )
+    coordinator = StubCoordinator(
+        max_upload_concurrency=4,
+        max_session_bytes=1024,
+        min_free_bytes=0,
+    )
+    with _client(
+        tmp_path,
+        task_manager=manager,
+        resource_coordinator=coordinator,
+    ) as client:
+        reference = _upload(client, "clip.mp4", b"video").json()["reference"]
         coordinator.fail_lease_refresh = True
         response = client.post(
             "/api/tasks/video-frames",
@@ -1108,6 +1150,7 @@ def test_hosted_task_observes_session_heartbeat_failure_before_return(
 
     assert response.status_code == 503
     assert response.json()["error"]["code"] == "storage_unavailable"
+    assert manager.queue.count == 0
     assert coordinator.active_leases == 0
 
 
@@ -1131,11 +1174,15 @@ def test_hosted_task_logs_heartbeat_failure_when_endpoint_also_fails(
     )
 
     def fail_create(*_args, **_kwargs):
+        refresh_calls_before_failure = coordinator.lease_refresh_calls
         coordinator.fail_lease_refresh = True
         deadline = monotonic() + 1
-        while coordinator.lease_refresh_calls == 0 and monotonic() < deadline:
+        while (
+            coordinator.lease_refresh_calls == refresh_calls_before_failure
+            and monotonic() < deadline
+        ):
             sleep(0.001)
-        assert coordinator.lease_refresh_calls > 0
+        assert coordinator.lease_refresh_calls > refresh_calls_before_failure
         raise ValueError("endpoint rejected request")
 
     monkeypatch.setattr(manager, "create_video_frames_task", fail_create)

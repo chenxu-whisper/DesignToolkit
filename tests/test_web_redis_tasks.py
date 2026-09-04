@@ -11,6 +11,7 @@ from threading import Barrier
 import fakeredis
 import pytest
 from redis import Redis
+from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import RedisError
 from rq import Queue
 from rq.job import JobStatus
@@ -305,14 +306,14 @@ def test_run_task_reserves_refreshes_and_releases_worker_resources(
         ).model_dump(mode="json"),
     )
 
-    assert resources.events == [
+    assert resources.events[:3] == [
         f"acquire:{task.task_id}:{'a' * 32}",
-        f"reserve:{task.task_id}:{'a' * 32}:10:20:5",
-        "refresh:output",
         "refresh:lease",
-        "release:output",
-        "release:lease",
+        f"reserve:{task.task_id}:{'a' * 32}:10:20:5",
     ]
+    assert resources.events.count("refresh:output") >= 2
+    assert resources.events.count("refresh:lease") >= 3
+    assert resources.events[-2:] == ["release:output", "release:lease"]
     assert manager.get_task(task.task_id).status is TaskStatus.SUCCEEDED
 
 
@@ -370,6 +371,166 @@ def test_run_task_heartbeats_resources_during_slow_processing(
 
     assert resources.events.count("refresh:lease") >= 2
     assert resources.events.count("refresh:output") >= 2
+    assert resources.events[-2:] == ["release:output", "release:lease"]
+
+
+def test_run_task_heartbeats_lease_while_output_reservation_blocks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    settings = _hosted_settings(tmp_path)
+    manager = _manager(redis_connection, tmp_path)
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+        owner_id="a" * 32,
+    )
+
+    class ExpiringLease(TrackingHandle):
+        def __init__(self, events: list[str]) -> None:
+            super().__init__("lease", events)
+            self.expires_at = time.monotonic() + 0.03
+
+        def refresh(self) -> None:
+            if time.monotonic() >= self.expires_at:
+                raise RuntimeError("lease expired during reservation")
+            self.expires_at = time.monotonic() + 0.03
+            super().refresh()
+
+    class BlockingReservationResources(TrackingTaskResources):
+        def __init__(self) -> None:
+            super().__init__()
+            self.lease = ExpiringLease(self.events)
+            self.session_lease_heartbeat_interval = 0.005
+            self.reservation_heartbeat_interval = 0.005
+
+        def reserve_output(self, *args, **kwargs):
+            time.sleep(0.08)
+            if time.monotonic() >= self.lease.expires_at:
+                raise RuntimeError("lease expired during reservation")
+            return super().reserve_output(*args, **kwargs)
+
+    resources = BlockingReservationResources()
+    monkeypatch.setattr(worker_module.HostedSettings, "from_env", lambda: settings)
+    monkeypatch.setattr(
+        worker_module.Redis,
+        "from_url",
+        lambda _url: redis_connection,
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "_build_resource_coordinator",
+        lambda _settings, _connection: resources,
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "disk_usage",
+        lambda _path: type("Usage", (), {"free": 20})(),
+    )
+
+    def execute(executor, reserved_task, _request) -> None:
+        executor.mark_finished(
+            reserved_task.task_id,
+            status=TaskStatus.SUCCEEDED,
+        )
+
+    monkeypatch.setattr(
+        worker_module.RedisTaskExecutor,
+        "execute_reserved_task",
+        execute,
+    )
+
+    worker_module.run_task(
+        task.task_id,
+        "video_frames",
+        VideoFramesTaskRequest(
+            input_path=str(tmp_path / "clip.mp4")
+        ).model_dump(mode="json"),
+    )
+
+    completed = manager.get_task(task.task_id)
+    assert completed is not None
+    assert completed.status is TaskStatus.SUCCEEDED
+    assert resources.events.count("refresh:lease") >= 3
+    assert resources.events[-2:] == ["release:output", "release:lease"]
+
+
+def test_run_task_checks_heartbeat_failure_after_blocking_reservation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    settings = _hosted_settings(tmp_path)
+    manager = _manager(redis_connection, tmp_path)
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+        owner_id="a" * 32,
+    )
+
+    class FailingLease(TrackingHandle):
+        def __init__(self, events: list[str]) -> None:
+            super().__init__("lease", events)
+            self.refresh_count = 0
+
+        def refresh(self) -> None:
+            self.refresh_count += 1
+            if self.refresh_count >= 2:
+                raise RuntimeError("lease failed during reservation")
+            super().refresh()
+
+    class BlockingReservationResources(TrackingTaskResources):
+        def __init__(self) -> None:
+            super().__init__()
+            self.lease = FailingLease(self.events)
+            self.session_lease_heartbeat_interval = 0.005
+            self.reservation_heartbeat_interval = 0.005
+
+        def reserve_output(self, *args, **kwargs):
+            time.sleep(0.04)
+            return super().reserve_output(*args, **kwargs)
+
+    resources = BlockingReservationResources()
+    monkeypatch.setattr(worker_module.HostedSettings, "from_env", lambda: settings)
+    monkeypatch.setattr(
+        worker_module.Redis,
+        "from_url",
+        lambda _url: redis_connection,
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "_build_resource_coordinator",
+        lambda _settings, _connection: resources,
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "disk_usage",
+        lambda _path: type("Usage", (), {"free": 20})(),
+    )
+    executed = False
+
+    def unexpected_execute(*_args, **_kwargs) -> None:
+        nonlocal executed
+        executed = True
+
+    monkeypatch.setattr(
+        worker_module.RedisTaskExecutor,
+        "execute_reserved_task",
+        unexpected_execute,
+    )
+
+    worker_module.run_task(
+        task.task_id,
+        "video_frames",
+        VideoFramesTaskRequest(
+            input_path=str(tmp_path / "clip.mp4")
+        ).model_dump(mode="json"),
+    )
+
+    failed = manager.get_task(task.task_id)
+    assert failed is not None
+    assert failed.status is TaskStatus.FAILED
+    assert failed.error == "lease failed during reservation"
+    assert executed is False
     assert resources.events[-2:] == ["release:output", "release:lease"]
 
 
@@ -1532,6 +1693,115 @@ def test_worker_executor_runs_reserved_task_and_persists_success(
     assert completed.output_path == f"/api/tasks/{task.task_id}/download"
     assert completed.result_path is not None
     assert Path(completed.result_path).is_file()
+
+
+def test_worker_preserves_success_artifact_when_terminal_ack_is_lost(
+    tmp_path: Path,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    state = _manager(redis_connection, tmp_path)
+    task = state.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+        owner_id="a" * 32,
+    )
+    artifact = tmp_path / "result.png"
+    artifact.write_bytes(b"result")
+    original_transition = state._transition_finished
+    raised = False
+
+    def commit_then_raise(*args, **kwargs):
+        nonlocal raised
+        result = original_transition(*args, **kwargs)
+        if not raised:
+            raised = True
+            raise RedisConnectionError("terminal transition acknowledgement lost")
+        return result
+
+    state._transition_finished = commit_then_raise
+    executor = RedisTaskExecutor(state)
+
+    executor._mark_succeeded(task.task_id, str(artifact))
+
+    completed = state.get_task(task.task_id)
+    assert completed is not None
+    assert completed.status is TaskStatus.SUCCEEDED
+    assert completed.result_path == str(artifact)
+    assert artifact.read_bytes() == b"result"
+
+
+def test_run_task_releases_resources_after_success_ack_is_lost(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    settings = _hosted_settings(tmp_path)
+    manager = _manager(redis_connection, tmp_path)
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+        owner_id="a" * 32,
+    )
+    artifact = tmp_path / "result.png"
+    artifact.write_bytes(b"result")
+    resources = TrackingTaskResources()
+    original_transition = RedisTaskManager._transition_finished
+    acknowledgement_lost = False
+
+    def commit_then_raise(self, *args, **kwargs):
+        nonlocal acknowledgement_lost
+        result = original_transition(self, *args, **kwargs)
+        if (
+            kwargs["status"] is TaskStatus.SUCCEEDED
+            and not acknowledgement_lost
+        ):
+            acknowledgement_lost = True
+            raise RedisConnectionError("terminal transition acknowledgement lost")
+        return result
+
+    monkeypatch.setattr(worker_module.HostedSettings, "from_env", lambda: settings)
+    monkeypatch.setattr(
+        worker_module.Redis,
+        "from_url",
+        lambda _url: redis_connection,
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "_build_resource_coordinator",
+        lambda _settings, _connection: resources,
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "disk_usage",
+        lambda _path: type("Usage", (), {"free": 20})(),
+    )
+    monkeypatch.setattr(
+        RedisTaskManager,
+        "_transition_finished",
+        commit_then_raise,
+    )
+
+    def execute(executor, reserved_task, _request) -> None:
+        executor._mark_succeeded(reserved_task.task_id, str(artifact))
+
+    monkeypatch.setattr(
+        worker_module.RedisTaskExecutor,
+        "execute_reserved_task",
+        execute,
+    )
+
+    worker_module.run_task(
+        task.task_id,
+        "video_frames",
+        VideoFramesTaskRequest(
+            input_path=str(tmp_path / "clip.mp4")
+        ).model_dump(mode="json"),
+    )
+
+    completed = manager.get_task(task.task_id)
+    assert completed is not None
+    assert completed.status is TaskStatus.SUCCEEDED
+    assert completed.result_path == str(artifact)
+    assert artifact.read_bytes() == b"result"
+    assert resources.events[-2:] == ["release:output", "release:lease"]
 
 
 def test_worker_heartbeat_failure_after_packaging_blocks_session_touch_and_publish(

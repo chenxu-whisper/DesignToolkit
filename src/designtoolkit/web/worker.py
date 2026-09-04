@@ -193,13 +193,28 @@ class RedisTaskExecutor(TaskManager):
                 str(output_limit_error or exc),
             )
             return
-        completed, transition = self._state._transition_finished(
-            task_id,
-            status=TaskStatus.SUCCEEDED,
-            output_path=download_url,
-            result_path=str(artifact),
-            terminal_event=terminal_event,
-        )
+        try:
+            completed, transition = self._state._transition_finished(
+                task_id,
+                status=TaskStatus.SUCCEEDED,
+                output_path=download_url,
+                result_path=str(artifact),
+                terminal_event=terminal_event,
+            )
+        except Exception as exc:
+            authoritative = self._state.get_task(task_id)
+            if (
+                authoritative is not None
+                and authoritative.status is TaskStatus.SUCCEEDED
+            ):
+                if authoritative.result_path != str(artifact):
+                    artifact.unlink(missing_ok=True)
+                return
+            artifact.unlink(missing_ok=True)
+            archive_candidate.unlink(missing_ok=True)
+            self._discard_partial_output()
+            self._mark_failed(task_id, str(exc))
+            return
         if transition is not TerminalTransitionResult.APPLIED:
             if completed.result_path != str(artifact):
                 artifact.unlink(missing_ok=True)
@@ -306,13 +321,17 @@ class _PeriodicResourceHeartbeat:
         self._stopped = Event()
         self._failure: BaseException | None = None
         self._thread = Thread(target=self._run, daemon=True)
+        self._started = False
 
     def start(self) -> None:
+        self._heartbeat()
         self._thread.start()
+        self._started = True
 
     def stop(self) -> None:
         self._stopped.set()
-        self._thread.join()
+        if self._started:
+            self._thread.join()
 
     def raise_if_failed(self) -> None:
         if self._failure is not None:
@@ -423,13 +442,6 @@ def run_task(task_id: str, job_kind: str, payload: dict[str, object]) -> None:
     )
     try:
         lease = resources.acquire_session(task.owner_id, task_id=task_id)
-        output = resources.reserve_output(
-            task_id,
-            task.owner_id,
-            settings.max_output_bytes,
-            free_bytes=disk_usage(settings.data_dir).free,
-            min_free_bytes=settings.min_free_bytes,
-        )
         periodic_heartbeat = _PeriodicResourceHeartbeat(
             heartbeat,
             min(
@@ -442,12 +454,22 @@ def run_task(task_id: str, job_kind: str, payload: dict[str, object]) -> None:
             ),
         )
         periodic_heartbeat.start()
+        output = resources.reserve_output(
+            task_id,
+            task.owner_id,
+            settings.max_output_bytes,
+            free_bytes=disk_usage(settings.data_dir).free,
+            min_free_bytes=settings.min_free_bytes,
+        )
+        checked_heartbeat()
         request = _task_request(job_kind, payload)
         executor.execute_reserved_task(task, request)
         periodic_heartbeat.raise_if_failed()
     except Exception as exc:
-        executor._discard_partial_output()
-        state._finalize_external_failure(task_id, str(exc))
+        authoritative = state.get_task(task_id)
+        if authoritative is None or authoritative.status is not TaskStatus.SUCCEEDED:
+            executor._discard_partial_output()
+            state._finalize_external_failure(task_id, str(exc))
     finally:
         if periodic_heartbeat is not None and not heartbeat_stopped:
             periodic_heartbeat.stop()

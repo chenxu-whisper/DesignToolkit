@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
@@ -62,6 +63,7 @@ _QUARANTINE_PATTERN = re.compile(
 _ASSET_REFERENCE_PATTERN = re.compile(
     r"^asset:(?P<asset_id>[a-f0-9]{32})(?::[^:]*)?$"
 )
+_LOGGER = logging.getLogger(__name__)
 
 
 class UploadRejectedError(ValueError):
@@ -94,9 +96,30 @@ class _CleanupClaimHeartbeat:
         self._thread.start()
         return self
 
-    def __exit__(self, *_args: object) -> None:
+    def __exit__(
+        self,
+        _exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        _traceback: object,
+    ) -> None:
         self._stopped.set()
         self._thread.join()
+        try:
+            self.raise_if_failed()
+        except BaseException as heartbeat_error:
+            if exc_value is None:
+                raise
+            exc_value.add_note(
+                f"Cleanup claim heartbeat also failed: {heartbeat_error}"
+            )
+            _LOGGER.error(
+                "Cleanup claim heartbeat failed during cleanup error",
+                exc_info=(
+                    type(heartbeat_error),
+                    heartbeat_error,
+                    heartbeat_error.__traceback__,
+                ),
+            )
 
     def raise_if_failed(self) -> None:
         if self._failure is not None:
@@ -618,7 +641,28 @@ class HostedStorage:
                         quarantine,
                         expected_generation_id=generation_id,
                     )
-                    if generation is not None:
+                    if generation is None:
+                        current_bytes = _auditable_session_upload_bytes(
+                            self._session_dir(session_id)
+                        )
+                        legacy_physical_bytes = _auditable_session_upload_bytes(
+                            quarantine
+                        )
+                        if (
+                            current_bytes is None
+                            or legacy_physical_bytes is None
+                        ):
+                            raise ResourceUnavailableError(
+                                "Legacy session usage cannot be audited safely"
+                            )
+                        coordinator.reconcile_legacy_session_usage(
+                            session_id,
+                            claim_token,
+                            generation_id,
+                            current_committed_bytes=current_bytes,
+                            legacy_physical_bytes=legacy_physical_bytes,
+                        )
+                    else:
                         coordinator.clear_session_usage_generation(
                             session_id,
                             claim_token,
@@ -632,6 +676,8 @@ class HostedStorage:
                         coordinator.finalize_session_usage_generation(
                             generation.generation_id
                         )
+                    else:
+                        coordinator.finalize_legacy_session_usage(generation_id)
                     removed += 1
             finally:
                 coordinator.release_cleanup_claim(session_id, claim_token)
@@ -856,6 +902,35 @@ def _asset_payload_size(asset_dir: Path) -> int:
         if path.is_file()
         and not any(part.startswith(".") for part in path.relative_to(asset_dir).parts)
     )
+
+
+def _auditable_session_upload_bytes(session_dir: Path) -> int | None:
+    assets_dir = session_dir / "assets"
+    if not assets_dir.exists():
+        return 0
+    if not assets_dir.is_dir():
+        return None
+
+    total = 0
+    for asset_dir in assets_dir.iterdir():
+        if (
+            not asset_dir.is_dir()
+            or not _SESSION_PATTERN.fullmatch(asset_dir.name)
+        ):
+            return None
+        files = [path for path in asset_dir.rglob("*") if path.is_file()]
+        visible_files = [
+            path
+            for path in files
+            if not any(
+                part.startswith(".")
+                for part in path.relative_to(asset_dir).parts
+            )
+        ]
+        if len(files) != 1 or len(visible_files) != 1:
+            return None
+        total += visible_files[0].stat().st_size
+    return total
 
 
 def _write_asset_deletion(asset_dir: Path, deletion: AssetDeletion) -> None:

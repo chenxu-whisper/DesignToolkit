@@ -24,6 +24,7 @@ _RELEASED_ASSET_PREFIX = "dt:resource:asset-released:"
 _LEASE_PREFIX = "dt:resource:lease:"
 _CLEANUP_PREFIX = "dt:resource:cleanup:"
 _CLEANUP_GENERATION_PREFIX = "dt:resource:cleanup-generation:"
+_LEGACY_CLEANUP_PREFIX = "dt:resource:legacy-cleanup:"
 _TASK_RESOURCE_PREFIX = "dt:resource:task:"
 _SESSION_PATTERN = re.compile(r"^[a-f0-9]{32}$")
 _ASSET_PATTERN = re.compile(r"^[a-f0-9]{32}$")
@@ -562,6 +563,59 @@ return 1
 """
 )
 
+_RECONCILE_LEGACY_SESSION_USAGE_SCRIPT = """-- reconcile_legacy_session_usage
+local deleting = redis.call("HGET", KEYS[2], "deleting")
+if not deleting or deleting ~= ARGV[2] then
+    return {3}
+end
+if redis.call("EXISTS", KEYS[3]) == 0 then
+    return {3}
+end
+if redis.call("EXISTS", KEYS[4]) == 1 then
+    if redis.call("HGET", KEYS[4], "session_id") ~= ARGV[1] then
+        return {2}
+    end
+    return {
+        0,
+        tonumber(redis.call("HGET", KEYS[4], "legacy_bytes") or "0")
+    }
+end
+
+local committed_field = "session:" .. ARGV[1] .. ":committed_bytes"
+local committed = tonumber(redis.call("HGET", KEYS[1], committed_field) or "0")
+local current_bytes = tonumber(ARGV[3])
+local legacy_capacity = tonumber(ARGV[4])
+local legacy_bytes = committed - current_bytes
+if legacy_bytes < 0 or legacy_bytes > legacy_capacity then
+    return {2}
+end
+
+if current_bytes > 0 then
+    redis.call("HSET", KEYS[1], committed_field, current_bytes)
+else
+    redis.call("HDEL", KEYS[1], committed_field)
+end
+redis.call(
+    "HMSET",
+    KEYS[4],
+    "session_id",
+    ARGV[1],
+    "current_bytes",
+    current_bytes,
+    "legacy_bytes",
+    legacy_bytes
+)
+return {1, legacy_bytes}
+"""
+
+_FINALIZE_LEGACY_SESSION_USAGE_SCRIPT = """-- finalize_legacy_session_usage
+if redis.call("EXISTS", KEYS[1]) == 0 then
+    return 0
+end
+redis.call("PEXPIRE", KEYS[1], tonumber(ARGV[1]))
+return 1
+"""
+
 _RELEASE_COMMITTED_ASSET_SCRIPT = """-- release_committed_asset
 local session_id = ARGV[1]
 local asset_id = ARGV[2]
@@ -961,6 +1015,12 @@ class RedisResourceCoordinator:
         self._finalize_session_usage_generation_script = self._redis.register_script(
             _FINALIZE_SESSION_USAGE_GENERATION_SCRIPT
         )
+        self._reconcile_legacy_session_usage_script = self._redis.register_script(
+            _RECONCILE_LEGACY_SESSION_USAGE_SCRIPT
+        )
+        self._finalize_legacy_session_usage_script = self._redis.register_script(
+            _FINALIZE_LEGACY_SESSION_USAGE_SCRIPT
+        )
         self._release_committed_asset_script = self._redis.register_script(
             _RELEASE_COMMITTED_ASSET_SCRIPT
         )
@@ -1255,6 +1315,56 @@ class RedisResourceCoordinator:
             args=[self._release_marker_ttl_ms],
         )
 
+    def reconcile_legacy_session_usage(
+        self,
+        session_id: str,
+        claim_token: str,
+        generation_id: str,
+        *,
+        current_committed_bytes: int,
+        legacy_physical_bytes: int,
+    ) -> int:
+        _validate_session_id(session_id)
+        _validate_token(claim_token)
+        _validate_token(generation_id)
+        current_committed_bytes = _nonnegative_int(
+            current_committed_bytes,
+            "current committed bytes",
+        )
+        legacy_physical_bytes = _nonnegative_int(
+            legacy_physical_bytes,
+            "legacy physical bytes",
+        )
+        result = self._reconcile_legacy_session_usage_script(
+            keys=[
+                _STATE_KEY,
+                _session_state_key(session_id),
+                _cleanup_key(claim_token),
+                _legacy_cleanup_key(generation_id),
+            ],
+            args=[
+                session_id,
+                claim_token,
+                current_committed_bytes,
+                legacy_physical_bytes,
+            ],
+        )
+        code = int(result[0])
+        if code == 2:
+            raise ResourceUnavailableError(
+                "Legacy session usage cannot be reconciled safely"
+            )
+        if code == 3:
+            raise ResourceUnavailableError("Cleanup claim expired")
+        return int(result[1])
+
+    def finalize_legacy_session_usage(self, generation_id: str) -> None:
+        _validate_token(generation_id)
+        self._finalize_legacy_session_usage_script(
+            keys=[_legacy_cleanup_key(generation_id)],
+            args=[self._release_marker_ttl_ms],
+        )
+
     def release_committed_asset(
         self,
         session_id: str,
@@ -1516,6 +1626,10 @@ def _cleanup_key(token: str) -> str:
 
 def _cleanup_generation_key(token: str) -> str:
     return f"{_CLEANUP_GENERATION_PREFIX}{token}"
+
+
+def _legacy_cleanup_key(token: str) -> str:
+    return f"{_LEGACY_CLEANUP_PREFIX}{token}"
 
 
 def _task_resource_key(task_id: str) -> str:
