@@ -170,6 +170,12 @@ export type LocalPathPickResponse = {
   cancelled: boolean
 }
 
+export type UploadResponse = {
+  reference: string
+  filename: string
+  size: number
+}
+
 export type LocalFileKind = 'video' | 'media' | 'image' | 'any'
 type LocalSaveFileKind = 'media' | 'image' | 'any'
 
@@ -216,6 +222,54 @@ async function requestGet<T>(path: string): Promise<T> {
 
 export function createVideoFramesTask(payload: VideoFramesPayload): Promise<TaskCreateResponse> {
   return request<TaskCreateResponse>('/api/tasks/video-frames', payload)
+}
+
+export async function uploadFiles(
+  files: readonly File[],
+  onProgress: (percentage: number) => void,
+): Promise<readonly string[]> {
+  const references: string[] = []
+  for (let index = 0; index < files.length; index += 1) {
+    const file = files[index]
+    const response = await uploadFile(file, (fileProgress) => {
+      onProgress(Math.round(((index + fileProgress) / files.length) * 100))
+    })
+    references.push(response.reference)
+  }
+  return references
+}
+
+function uploadFile(
+  file: File,
+  onProgress: (fraction: number) => void,
+): Promise<UploadResponse> {
+  return new Promise((resolve, reject) => {
+    const request = new XMLHttpRequest()
+    request.open('POST', '/api/uploads')
+    request.responseType = 'json'
+    request.setRequestHeader('Content-Type', file.type || 'application/octet-stream')
+    request.setRequestHeader('X-Upload-Filename', encodeURIComponent(file.name))
+    request.upload.addEventListener('progress', (event) => {
+      if (event.lengthComputable && event.total > 0) {
+        onProgress(event.loaded / event.total)
+      }
+    })
+    request.addEventListener('load', () => {
+      const body = request.response as ApiErrorResponse | UploadResponse | null
+      if (request.status < 200 || request.status >= 300) {
+        const message =
+          body && typeof body === 'object' && 'error' in body
+            ? body.error?.message
+            : undefined
+        reject(new Error(message ?? `Request failed: ${request.status}`))
+        return
+      }
+      onProgress(1)
+      resolve(body as UploadResponse)
+    })
+    request.addEventListener('error', () => reject(new Error('文件上传失败')))
+    request.send(file)
+  })
 }
 
 export function createMediaResizeTask(payload: MediaResizePayload): Promise<TaskCreateResponse> {

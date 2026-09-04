@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from collections import OrderedDict
 from collections.abc import Callable, Hashable, Iterator
 from concurrent.futures import Future
@@ -12,12 +13,14 @@ from io import BytesIO
 from os import stat_result
 from pathlib import Path
 from queue import Empty
+from shutil import disk_usage
 from stat import S_ISREG
-from threading import Lock
+from threading import BoundedSemaphore, Lock
+from urllib.parse import unquote
 
 import numpy as np
-from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi import APIRouter, Depends, Request
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from PIL import Image
 
 from designtoolkit.chroma_keyer.core import key_rgb
@@ -42,13 +45,23 @@ from designtoolkit.chroma_keyer.video_models import (
 from designtoolkit.media_resize import MediaResizeError
 from designtoolkit.video_frames import VideoFrameError
 from designtoolkit.web.chroma_previews import ChromaPreviewEntry, ChromaPreviewStore
+from designtoolkit.web.hosted import (
+    HostedSettings,
+    HostedStorage,
+    UploadRejectedError,
+)
 from designtoolkit.web.local_paths import resolve_dropped_file_paths
 from designtoolkit.web.native_picker import (
     LocalPathPicker,
     LocalPathPickerError,
     TkinterLocalPathPicker,
 )
+from designtoolkit.web.resources import (
+    RedisResourceCoordinator,
+    ResourceUnavailableError,
+)
 from designtoolkit.web.schemas import (
+    AppConfigResponse,
     ChromaImageInspectRequest,
     ChromaImageInspectResponse,
     ChromaKeyerTaskRequest,
@@ -78,6 +91,7 @@ from designtoolkit.web.schemas import (
     MediaResizeTaskRequest,
     TaskCreateResponse,
     TaskResponse,
+    UploadResponse,
     VideoFramesTaskRequest,
 )
 from designtoolkit.web.tasks import TaskConflictError, TaskManager
@@ -605,11 +619,18 @@ def create_router(
     local_path_roots: list[Path] | None = None,
     local_path_picker: LocalPathPicker | None = None,
     video_decoder: VideoDecoder | None = None,
+    hosted_settings: HostedSettings | None = None,
+    hosted_storage: HostedStorage | None = None,
+    resource_coordinator: RedisResourceCoordinator | None = None,
 ) -> APIRouter:
     router = APIRouter(prefix="/api")
     picker = local_path_picker or TkinterLocalPathPicker()
     picker_accepts_allowed_suffixes = _picker_accepts_allowed_suffixes(picker)
     decoder = video_decoder if video_decoder is not None else ImageioVideoDecoder()
+    settings = hosted_settings or HostedSettings.from_env({})
+    storage = hosted_storage
+    resources = resource_coordinator
+    preview_semaphore = BoundedSemaphore(settings.max_preview_concurrency)
     read_video_frame = _select_video_frame_reader(
         decoder,
         "read_frame_with_metadata",
@@ -621,6 +642,8 @@ def create_router(
         decoder.read_preview_frame,
     )
     chroma_preview_store = ChromaPreviewStore()
+    chroma_preview_owners: OrderedDict[str, str] = OrderedDict()
+    chroma_preview_owners_lock = Lock()
     video_metadata_cache = _BoundedSingleFlightCache[
         tuple[
             Path,
@@ -650,9 +673,200 @@ def create_router(
             source_snapshot.version,
         )
 
+    def resolve_input_path(http_request: Request, reference: str) -> Path:
+        if storage is None:
+            return Path(reference)
+        try:
+            return storage.resolve(http_request.state.session_id, reference)
+        except UploadRejectedError as exc:
+            raise ApiError("asset_not_found", str(exc), 404) from exc
+
+    def owned_preview_url(http_request: Request, preview_id: str) -> str:
+        if storage is not None:
+            with chroma_preview_owners_lock:
+                chroma_preview_owners[preview_id] = http_request.state.session_id
+                chroma_preview_owners.move_to_end(preview_id)
+                if len(chroma_preview_owners) > 32:
+                    chroma_preview_owners.popitem(last=False)
+        return _chroma_preview_url(preview_id)
+
+    def preview_capacity() -> Iterator[bool]:
+        if storage is None:
+            yield True
+            return
+        if not preview_semaphore.acquire(blocking=False):
+            raise ApiError(
+                "preview_busy",
+                "Preview capacity is busy; retry shortly",
+                429,
+            )
+        try:
+            yield True
+        finally:
+            preview_semaphore.release()
+
+    def resolve_input_references(
+        http_request: Request,
+        references: list[str],
+    ) -> list[str]:
+        return [
+            str(resolve_input_path(http_request, reference))
+            for reference in references
+        ]
+
+    def hosted_video_frames_request(
+        http_request: Request,
+        payload: VideoFramesTaskRequest,
+    ) -> VideoFramesTaskRequest:
+        if storage is None:
+            return payload
+        references = (
+            [payload.input_path]
+            if payload.input_path is not None
+            else list(payload.input_paths or [])
+        )
+        paths = resolve_input_references(http_request, references)
+        output_dir = storage.create_task_dir(http_request.state.session_id) / "frames"
+        return payload.model_copy(
+            update={
+                "input_path": paths[0] if payload.input_path is not None else None,
+                "input_paths": paths if payload.input_paths is not None else None,
+                "output_dir": str(output_dir),
+                "overwrite": False,
+            }
+        )
+
+    def hosted_media_resize_request(
+        http_request: Request,
+        payload: MediaResizeTaskRequest,
+    ) -> MediaResizeTaskRequest:
+        if storage is None:
+            return payload
+        references = (
+            [payload.input_path]
+            if payload.input_path is not None
+            else list(payload.input_paths or [])
+        )
+        paths = resolve_input_references(http_request, references)
+        task_dir = storage.create_task_dir(http_request.state.session_id)
+        output_path = None
+        if payload.input_path is not None:
+            input_path = Path(paths[0])
+            output_path = str(
+                task_dir / f"{input_path.stem}_resized{input_path.suffix}"
+            )
+        return payload.model_copy(
+            update={
+                "input_path": paths[0] if payload.input_path is not None else None,
+                "input_paths": paths if payload.input_paths is not None else None,
+                "output_path": output_path,
+                "output_dir": str(task_dir)
+                if payload.input_paths is not None
+                else None,
+            }
+        )
+
+    def hosted_chroma_keyer_request(
+        http_request: Request,
+        payload: ChromaKeyerTaskRequest,
+    ) -> ChromaKeyerTaskRequest:
+        if storage is None:
+            return payload
+        input_path = resolve_input_path(http_request, payload.input_path)
+        task_dir = storage.create_task_dir(http_request.state.session_id)
+        return payload.model_copy(
+            update={
+                "input_path": str(input_path),
+                "output_path": str(task_dir / f"{input_path.stem}_keyed.png"),
+            }
+        )
+
+    def hosted_chroma_video_request(
+        http_request: Request,
+        payload: ChromaVideoKeyerTaskRequest,
+    ) -> ChromaVideoKeyerTaskRequest:
+        if storage is None:
+            return payload
+        input_path = resolve_input_path(http_request, payload.input_path)
+        task_dir = storage.create_task_dir(http_request.state.session_id)
+        return payload.model_copy(
+            update={
+                "input_path": str(input_path),
+                "output_root": str(task_dir),
+            }
+        )
+
     @router.get("/health")
     def health() -> dict[str, str]:
         return {"status": "ok"}
+
+    @router.get("/config", response_model=AppConfigResponse)
+    def app_config() -> AppConfigResponse:
+        return AppConfigResponse(
+            hosted=settings.enabled,
+            max_upload_bytes=settings.max_upload_bytes,
+        )
+
+    @router.post("/uploads", response_model=UploadResponse, status_code=201)
+    async def upload_asset(http_request: Request) -> UploadResponse:
+        if storage is None or resources is None:
+            raise ApiError("hosted_mode_disabled", "Uploads are unavailable", 404)
+        content_length = _upload_content_length(
+            http_request.headers.get("content-length")
+        )
+        encoded_filename = http_request.headers.get("x-upload-filename")
+        filename = _upload_filename(encoded_filename)
+        if content_length > settings.max_upload_bytes:
+            raise ApiError(
+                "upload_too_large",
+                "File exceeds the configured file limit",
+                413,
+            )
+
+        reservation = None
+        lease = None
+        try:
+            reservation = resources.reserve_upload(
+                http_request.state.session_id,
+                content_length,
+                free_bytes=disk_usage(settings.data_dir).free,
+            )
+            lease = resources.acquire_session(http_request.state.session_id)
+            asset = await storage.store_stream(
+                http_request.state.session_id,
+                filename=filename,
+                content_length=content_length,
+                chunks=http_request.stream(),
+                reservation=reservation,
+                lease=lease,
+            )
+        except UploadRejectedError as exc:
+            code = "upload_too_large" if "file limit" in str(exc) else "invalid_upload"
+            status_code = 413 if code == "upload_too_large" else 400
+            raise ApiError(code, str(exc), status_code) from exc
+        except ResourceUnavailableError as exc:
+            message = str(exc)
+            if "concurrency" in message:
+                raise ApiError("upload_concurrency", message, 429) from exc
+            if "session byte" in message:
+                raise ApiError("upload_too_large", message, 413) from exc
+            raise ApiError("storage_unavailable", message, 503) from exc
+        except OSError as exc:
+            raise ApiError(
+                "storage_unavailable",
+                "Server storage is temporarily unavailable",
+                503,
+            ) from exc
+        finally:
+            if lease is not None:
+                lease.release()
+            if reservation is not None:
+                reservation.release()
+        return UploadResponse(
+            reference=asset.reference,
+            filename=asset.filename,
+            size=asset.size,
+        )
 
     @router.post(
         "/local-paths/resolve-dropped-files",
@@ -661,6 +875,8 @@ def create_router(
     def resolve_dropped_files(
         request: DroppedFilePathResolveRequest,
     ) -> DroppedFilePathResolveResponse:
+        if settings.enabled:
+            raise ApiError("api_not_found", "API route not found", 404)
         paths, unresolved = resolve_dropped_file_paths(
             request.names,
             roots=local_path_roots,
@@ -672,6 +888,8 @@ def create_router(
 
     @router.post("/local-paths/pick-files", response_model=LocalPathPickResponse)
     def pick_local_files(request: LocalFilePickRequest) -> LocalPathPickResponse:
+        if settings.enabled:
+            raise ApiError("api_not_found", "API route not found", 404)
         try:
             if request.allowed_suffixes is None or not picker_accepts_allowed_suffixes:
                 paths = picker.pick_files(
@@ -703,6 +921,8 @@ def create_router(
     def pick_local_directory(
         request: LocalDirectoryPickRequest,
     ) -> LocalPathPickResponse:
+        if settings.enabled:
+            raise ApiError("api_not_found", "API route not found", 404)
         try:
             paths = picker.pick_directory(title=request.title)
         except LocalPathPickerError as exc:
@@ -716,6 +936,8 @@ def create_router(
     def pick_local_save_file(
         request: LocalSaveFilePickRequest,
     ) -> LocalPathPickResponse:
+        if settings.enabled:
+            raise ApiError("api_not_found", "API route not found", 404)
         try:
             paths = picker.pick_save_file(
                 title=request.title,
@@ -729,9 +951,15 @@ def create_router(
         )
 
     @router.post("/tasks/video-frames", response_model=TaskCreateResponse)
-    def create_video_frames(request: VideoFramesTaskRequest) -> TaskCreateResponse:
+    def create_video_frames(
+        payload: VideoFramesTaskRequest,
+        http_request: Request,
+    ) -> TaskCreateResponse:
         try:
-            task = task_manager.create_video_frames_task(request)
+            task = task_manager.create_video_frames_task(
+                hosted_video_frames_request(http_request, payload),
+                owner_id=getattr(http_request.state, "session_id", None),
+            )
         except TaskConflictError as exc:
             raise ApiError("task_conflict", str(exc), 409) from exc
         except _INVALID_REQUEST_ERRORS as exc:
@@ -739,9 +967,15 @@ def create_router(
         return TaskCreateResponse(task_id=task.task_id, status=task.status)
 
     @router.post("/tasks/media-resize", response_model=TaskCreateResponse)
-    def create_media_resize(request: MediaResizeTaskRequest) -> TaskCreateResponse:
+    def create_media_resize(
+        payload: MediaResizeTaskRequest,
+        http_request: Request,
+    ) -> TaskCreateResponse:
         try:
-            task = task_manager.create_media_resize_task(request)
+            task = task_manager.create_media_resize_task(
+                hosted_media_resize_request(http_request, payload),
+                owner_id=getattr(http_request.state, "session_id", None),
+            )
         except TaskConflictError as exc:
             raise ApiError("task_conflict", str(exc), 409) from exc
         except _INVALID_REQUEST_ERRORS as exc:
@@ -749,9 +983,15 @@ def create_router(
         return TaskCreateResponse(task_id=task.task_id, status=task.status)
 
     @router.post("/tasks/chroma-keyer", response_model=TaskCreateResponse)
-    def create_chroma_keyer(request: ChromaKeyerTaskRequest) -> TaskCreateResponse:
+    def create_chroma_keyer(
+        payload: ChromaKeyerTaskRequest,
+        http_request: Request,
+    ) -> TaskCreateResponse:
         try:
-            task = task_manager.create_chroma_keyer_task(request)
+            task = task_manager.create_chroma_keyer_task(
+                hosted_chroma_keyer_request(http_request, payload),
+                owner_id=getattr(http_request.state, "session_id", None),
+            )
         except TaskConflictError as exc:
             raise ApiError("task_conflict", str(exc), 409) from exc
         except KeyerError as exc:
@@ -760,10 +1000,14 @@ def create_router(
 
     @router.post("/tasks/chroma-keyer-video", response_model=TaskCreateResponse)
     def create_chroma_video_keyer(
-        request: ChromaVideoKeyerTaskRequest,
+        payload: ChromaVideoKeyerTaskRequest,
+        http_request: Request,
     ) -> TaskCreateResponse:
         try:
-            task = task_manager.create_chroma_video_keyer_task(request)
+            task = task_manager.create_chroma_video_keyer_task(
+                hosted_chroma_video_request(http_request, payload),
+                owner_id=getattr(http_request.state, "session_id", None),
+            )
         except TaskConflictError as exc:
             raise ApiError("task_conflict", str(exc), 409) from exc
         except KeyerError as exc:
@@ -773,12 +1017,14 @@ def create_router(
     @router.post(
         "/chroma-keyer/images/inspect",
         response_model=ChromaImageInspectResponse,
+        dependencies=[Depends(preview_capacity)],
     )
     def inspect_chroma_image(
-        request: ChromaImageInspectRequest,
+        payload: ChromaImageInspectRequest,
+        http_request: Request,
     ) -> ChromaImageInspectResponse:
         try:
-            input_path = Path(request.input_path)
+            input_path = resolve_input_path(http_request, payload.input_path)
             rgb, source_fingerprint = _read_rgb_snapshot(input_path)
             cache_key = _chroma_preview_cache_key(
                 "inspect",
@@ -795,23 +1041,25 @@ def create_router(
         with Image.open(BytesIO(preview_entry.png_bytes)) as preview_image:
             preview_width, preview_height = preview_image.size
         return ChromaImageInspectResponse(
-            input_path=request.input_path,
+            input_path=payload.input_path,
             width=int(width),
             height=int(height),
             preview_width=int(preview_width),
             preview_height=int(preview_height),
-            preview_url=_chroma_preview_url(preview_entry.preview_id),
+            preview_url=owned_preview_url(http_request, preview_entry.preview_id),
         )
 
     @router.post(
         "/chroma-keyer/videos/inspect",
         response_model=ChromaVideoInspectResponse,
+        dependencies=[Depends(preview_capacity)],
     )
     def inspect_chroma_video(
-        request: ChromaVideoInspectRequest,
+        payload: ChromaVideoInspectRequest,
+        http_request: Request,
     ) -> ChromaVideoInspectResponse:
         try:
-            input_path = Path(request.input_path)
+            input_path = resolve_input_path(http_request, payload.input_path)
             metadata, timestamp_seconds, preview_entry = (
                 _get_stable_video_preview_entry(
                     chroma_preview_store,
@@ -829,12 +1077,12 @@ def create_router(
         with Image.open(BytesIO(preview_entry.png_bytes)) as preview_image:
             preview_width, preview_height = preview_image.size
         return ChromaVideoInspectResponse(
-            input_path=request.input_path,
+            input_path=payload.input_path,
             width=metadata.width,
             height=metadata.height,
             preview_width=preview_width,
             preview_height=preview_height,
-            preview_url=_chroma_preview_url(preview_entry.preview_id),
+            preview_url=owned_preview_url(http_request, preview_entry.preview_id),
             duration_seconds=metadata.duration_seconds,
             fps=metadata.fps,
             estimated_frame_count=metadata.estimated_frame_count,
@@ -844,18 +1092,20 @@ def create_router(
     @router.post(
         "/chroma-keyer/videos/frame",
         response_model=ChromaVideoFrameResponse,
+        dependencies=[Depends(preview_capacity)],
     )
     def create_chroma_video_frame(
-        request: ChromaVideoFrameRequest,
+        payload: ChromaVideoFrameRequest,
+        http_request: Request,
     ) -> ChromaVideoFrameResponse:
         try:
-            input_path = Path(request.input_path)
+            input_path = resolve_input_path(http_request, payload.input_path)
             _metadata, timestamp_seconds, preview_entry = (
                 _get_stable_video_preview_entry(
                     chroma_preview_store,
                     input_path,
                     "video_frame",
-                    request.timestamp_seconds,
+                    payload.timestamp_seconds,
                     get_video_metadata,
                     read_video_preview_frame,
                     make_preview_png,
@@ -865,22 +1115,24 @@ def create_router(
             raise _chroma_video_error_response(exc) from exc
 
         return ChromaVideoFrameResponse(
-            preview_url=_chroma_preview_url(preview_entry.preview_id),
+            preview_url=owned_preview_url(http_request, preview_entry.preview_id),
             timestamp_seconds=timestamp_seconds,
         )
 
     @router.post(
         "/chroma-keyer/videos/sample",
         response_model=ChromaVideoSampleResponse,
+        dependencies=[Depends(preview_capacity)],
     )
     def sample_chroma_video(
-        request: ChromaVideoSampleRequest,
+        payload: ChromaVideoSampleRequest,
+        http_request: Request,
     ) -> ChromaVideoSampleResponse:
         try:
-            input_path = Path(request.input_path)
+            input_path = resolve_input_path(http_request, payload.input_path)
             metadata, timestamp_seconds, rgb = _read_stable_video_frame(
                 input_path,
-                request.timestamp_seconds,
+                payload.timestamp_seconds,
                 get_video_metadata,
                 read_video_frame,
             )
@@ -889,10 +1141,10 @@ def create_router(
 
         try:
             source_x, source_y = map_preview_point(
-                request.x,
-                request.y,
-                request.preview_width,
-                request.preview_height,
+                payload.x,
+                payload.y,
+                payload.preview_width,
+                payload.preview_height,
                 metadata.width,
                 metadata.height,
             )
@@ -918,19 +1170,21 @@ def create_router(
     @router.post(
         "/chroma-keyer/videos/preview",
         response_model=ChromaVideoPreviewResponse,
+        dependencies=[Depends(preview_capacity)],
     )
     def create_chroma_video_preview(
-        request: ChromaVideoPreviewRequest,
+        payload: ChromaVideoPreviewRequest,
+        http_request: Request,
     ) -> ChromaVideoPreviewResponse:
         try:
-            input_path = Path(request.input_path)
-            model = screen_model_from_samples(request.samples)
-            params_data = request.params.model_dump(mode="json")
+            input_path = resolve_input_path(http_request, payload.input_path)
+            model = screen_model_from_samples(payload.samples)
+            params_data = payload.params.model_dump(mode="json")
 
             def create_preview_png(rgb: np.ndarray) -> bytes:
                 params = KeyerParams(**params_data)
                 preview_rgb, alpha = key_rgb(rgb, model, params)
-                if request.view_mode is ChromaViewMode.FINAL:
+                if payload.view_mode is ChromaViewMode.FINAL:
                     return make_preview_png(preview_rgb, alpha=alpha)
                 alpha_rgb = np.repeat(alpha[..., np.newaxis], 3, axis=2)
                 return make_preview_png(alpha_rgb)
@@ -940,40 +1194,46 @@ def create_router(
                     chroma_preview_store,
                     input_path,
                     "video_generated",
-                    request.timestamp_seconds,
+                    payload.timestamp_seconds,
                     get_video_metadata,
                     read_video_preview_frame,
                     create_preview_png,
-                    samples=request.samples,
+                    samples=payload.samples,
                     params=params_data,
-                    view_mode=request.view_mode,
+                    view_mode=payload.view_mode,
                 )
             )
         except KeyerError as exc:
             raise _chroma_video_error_response(exc) from exc
 
         return ChromaVideoPreviewResponse(
-            preview_url=_chroma_preview_url(preview_entry.preview_id),
+            preview_url=owned_preview_url(http_request, preview_entry.preview_id),
             timestamp_seconds=timestamp_seconds,
         )
 
     @router.post(
         "/chroma-keyer/images/sample",
         response_model=ChromaSampleResponse,
+        dependencies=[Depends(preview_capacity)],
     )
-    def sample_chroma_image(request: ChromaSampleRequest) -> ChromaSampleResponse:
+    def sample_chroma_image(
+        payload: ChromaSampleRequest,
+        http_request: Request,
+    ) -> ChromaSampleResponse:
         try:
-            rgb = read_rgb_image(Path(request.input_path))
+            rgb = read_rgb_image(
+                resolve_input_path(http_request, payload.input_path)
+            )
         except KeyerError as exc:
             raise _chroma_keyer_error_response(exc) from exc
 
         try:
             height, width = rgb.shape[:2]
             source_x, source_y = map_preview_point(
-                request.x,
-                request.y,
-                request.preview_width,
-                request.preview_height,
+                payload.x,
+                payload.y,
+                payload.preview_width,
+                payload.preview_height,
                 width,
                 height,
             )
@@ -992,33 +1252,42 @@ def create_router(
             source_y=source_y,
         )
 
-    @router.post("/chroma-keyer/preview", response_model=ChromaPreviewResponse)
-    @router.post("/chroma-keyer/previews", response_model=ChromaPreviewResponse)
+    @router.post(
+        "/chroma-keyer/preview",
+        response_model=ChromaPreviewResponse,
+        dependencies=[Depends(preview_capacity)],
+    )
+    @router.post(
+        "/chroma-keyer/previews",
+        response_model=ChromaPreviewResponse,
+        dependencies=[Depends(preview_capacity)],
+    )
     def create_chroma_preview(
-        request: ChromaPreviewRequest,
+        payload: ChromaPreviewRequest,
+        http_request: Request,
     ) -> ChromaPreviewResponse:
         try:
-            model = screen_model_from_samples(request.samples)
+            model = screen_model_from_samples(payload.samples)
         except KeyerError as exc:
             raise _chroma_keyer_error_response(exc) from exc
 
         try:
-            input_path = Path(request.input_path)
+            input_path = resolve_input_path(http_request, payload.input_path)
             rgb, source_fingerprint = _read_rgb_snapshot(input_path)
-            params_data = request.params.model_dump(mode="json")
+            params_data = payload.params.model_dump(mode="json")
             cache_key = _chroma_preview_cache_key(
                 "generated",
                 source_fingerprint,
-                samples=request.samples,
+                samples=payload.samples,
                 params=params_data,
-                view_mode=request.view_mode,
+                view_mode=payload.view_mode,
             )
 
             def create_preview_png() -> bytes:
                 params = KeyerParams(**params_data)
                 preview_rgb = resize_preview_rgb(rgb)
                 preview_rgb, alpha = key_rgb(preview_rgb, model, params)
-                if request.view_mode is ChromaViewMode.FINAL:
+                if payload.view_mode is ChromaViewMode.FINAL:
                     return make_preview_png(preview_rgb, alpha=alpha)
                 else:
                     preview_rgb = np.repeat(alpha[..., np.newaxis], 3, axis=2)
@@ -1028,25 +1297,64 @@ def create_router(
         except KeyerError as exc:
             raise _chroma_keyer_error_response(exc) from exc
 
-        return ChromaPreviewResponse(preview_url=_chroma_preview_url(preview_id))
+        return ChromaPreviewResponse(
+            preview_url=owned_preview_url(http_request, preview_id)
+        )
 
     @router.get("/chroma-keyer/previews/{preview_id}")
-    def get_chroma_preview(preview_id: str) -> Response:
+    def get_chroma_preview(preview_id: str, http_request: Request) -> Response:
+        if storage is not None:
+            with chroma_preview_owners_lock:
+                owner_id = chroma_preview_owners.get(preview_id)
+            if owner_id != http_request.state.session_id:
+                raise ApiError("preview_not_found", "Preview not found", 404)
         preview_png = chroma_preview_store.get(preview_id)
         if preview_png is None:
             raise ApiError("preview_not_found", "Preview not found", 404)
         return Response(content=preview_png, media_type="image/png")
 
     @router.get("/tasks/{task_id}", response_model=TaskResponse)
-    def get_task(task_id: str) -> TaskResponse:
-        task = task_manager.get_task(task_id)
+    def get_task(task_id: str, http_request: Request) -> TaskResponse:
+        task = task_manager.get_task(
+            task_id,
+            owner_id=getattr(http_request.state, "session_id", None),
+        )
         if task is None:
             raise ApiError("task_not_found", f"Task not found: {task_id}", 404)
         return task.to_response()
 
+    @router.get("/tasks/{task_id}/download")
+    def download_task_result(
+        task_id: str,
+        http_request: Request,
+    ) -> FileResponse:
+        if storage is None:
+            raise ApiError("hosted_mode_disabled", "Downloads are unavailable", 404)
+        task = task_manager.get_task(
+            task_id,
+            owner_id=getattr(http_request.state, "session_id", None),
+        )
+        if task is None or task.status.value != "succeeded":
+            raise ApiError("task_not_found", f"Task not found: {task_id}", 404)
+        try:
+            result_path = storage.validated_result_path(task.result_path)
+        except UploadRejectedError as exc:
+            raise ApiError("result_not_found", str(exc), 404) from exc
+        return FileResponse(
+            result_path,
+            filename=result_path.name,
+            media_type="application/octet-stream",
+        )
+
     @router.get("/tasks/{task_id}/events")
-    def stream_task_events(task_id: str) -> StreamingResponse:
-        task = task_manager.get_task(task_id)
+    def stream_task_events(
+        task_id: str,
+        http_request: Request,
+    ) -> StreamingResponse:
+        task = task_manager.get_task(
+            task_id,
+            owner_id=getattr(http_request.state, "session_id", None),
+        )
         if task is None:
             raise ApiError("task_not_found", f"Task not found: {task_id}", 404)
 
@@ -1082,3 +1390,44 @@ def create_router(
         )
 
     return router
+
+
+def _upload_content_length(value: str | None) -> int:
+    try:
+        content_length = int(value) if value is not None else 0
+    except ValueError as exc:
+        raise ApiError(
+            "length_required",
+            "A positive Content-Length header is required",
+            411,
+        ) from exc
+    if content_length <= 0:
+        raise ApiError(
+            "length_required",
+            "A positive Content-Length header is required",
+            411,
+        )
+    return content_length
+
+
+def _upload_filename(value: str | None) -> str:
+    if value is None:
+        raise ApiError(
+            "invalid_upload",
+            "X-Upload-Filename header is required",
+            400,
+        )
+    try:
+        value.encode("ascii")
+        if re.search(r"%(?![0-9A-Fa-f]{2})", value):
+            raise ValueError
+        filename = unquote(value, encoding="utf-8", errors="strict")
+    except (UnicodeDecodeError, UnicodeEncodeError, ValueError) as exc:
+        raise ApiError(
+            "invalid_upload",
+            "X-Upload-Filename must contain URI-encoded UTF-8",
+            400,
+        ) from exc
+    if not filename:
+        raise ApiError("invalid_upload", "File name is invalid", 400)
+    return filename

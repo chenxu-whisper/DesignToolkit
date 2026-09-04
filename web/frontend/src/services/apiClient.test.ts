@@ -16,6 +16,7 @@ import {
   resolveDroppedFilePaths,
   sampleChromaImage,
   sampleChromaVideo,
+  uploadFiles,
   type ChromaKeyerPayload,
   type ChromaKeyerRgbSample,
   type ChromaPreviewPayload,
@@ -29,9 +30,98 @@ import {
 
 afterEach(() => {
   vi.restoreAllMocks()
+  vi.unstubAllGlobals()
 })
 
 describe('apiClient', () => {
+  it('uploads files sequentially as raw bodies with aggregate progress', async () => {
+    const requests: MockUploadRequest[] = []
+
+    class MockUploadRequest {
+      method = ''
+      url = ''
+      responseType = ''
+      status = 201
+      response: unknown = null
+      headers = new Map<string, string>()
+      sentBody: Document | XMLHttpRequestBodyInit | null = null
+      listeners = new Map<string, () => void>()
+      uploadListeners = new Map<string, (event: ProgressEvent) => void>()
+      upload = {
+        addEventListener: (
+          type: string,
+          listener: (event: ProgressEvent) => void,
+        ) => this.uploadListeners.set(type, listener),
+      }
+
+      constructor() {
+        requests.push(this)
+      }
+
+      open(method: string, url: string) {
+        this.method = method
+        this.url = url
+      }
+
+      setRequestHeader(name: string, value: string) {
+        this.headers.set(name, value)
+      }
+
+      addEventListener(type: string, listener: () => void) {
+        this.listeners.set(type, listener)
+      }
+
+      send(body: Document | XMLHttpRequestBodyInit | null) {
+        this.sentBody = body
+      }
+    }
+
+    vi.stubGlobal('XMLHttpRequest', MockUploadRequest)
+    const progress: number[] = []
+    const first = new File(['first'], 'first image.png', { type: 'image/png' })
+    const second = new File(['second'], '第二张.png')
+    const pending = uploadFiles([first, second], (value) => progress.push(value))
+
+    expect(requests).toHaveLength(1)
+    expect(requests[0].method).toBe('POST')
+    expect(requests[0].url).toBe('/api/uploads')
+    expect(requests[0].headers.get('Content-Type')).toBe('image/png')
+    expect(requests[0].headers.get('X-Upload-Filename')).toBe(
+      encodeURIComponent(first.name),
+    )
+    expect(requests[0].sentBody).toBe(first)
+
+    requests[0].uploadListeners.get('progress')?.(
+      new ProgressEvent('progress', { lengthComputable: true, loaded: 2, total: 5 }),
+    )
+    requests[0].response = {
+      filename: first.name,
+      reference: 'asset:first',
+      size: first.size,
+    }
+    requests[0].listeners.get('load')?.()
+    await Promise.resolve()
+
+    expect(requests).toHaveLength(2)
+    expect(requests[1].headers.get('Content-Type')).toBe(
+      'application/octet-stream',
+    )
+    expect(requests[1].headers.get('X-Upload-Filename')).toBe(
+      encodeURIComponent(second.name),
+    )
+    expect(requests[1].sentBody).toBe(second)
+
+    requests[1].response = {
+      filename: second.name,
+      reference: 'asset:second',
+      size: second.size,
+    }
+    requests[1].listeners.get('load')?.()
+
+    await expect(pending).resolves.toEqual(['asset:first', 'asset:second'])
+    expect(progress).toEqual([20, 50, 100])
+  })
+
   it('models chroma payloads with exactly one RGB sample', () => {
     expectTypeOf<ChromaKeyerPayload['samples']>().toEqualTypeOf<readonly [ChromaKeyerRgbSample]>()
     expectTypeOf<ChromaVideoKeyerPayload['samples']>().toEqualTypeOf<readonly [ChromaKeyerRgbSample]>()
