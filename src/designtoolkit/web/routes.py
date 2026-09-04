@@ -65,6 +65,7 @@ from designtoolkit.web.native_picker import (
     LocalPathPickerError,
     TkinterLocalPathPicker,
 )
+from designtoolkit.web.redis_tasks import RedisTaskManager
 from designtoolkit.web.resources import (
     AssetReleaseMismatchError,
     RedisResourceCoordinator,
@@ -105,7 +106,7 @@ from designtoolkit.web.schemas import (
     UploadResponse,
     VideoFramesTaskRequest,
 )
-from designtoolkit.web.tasks import TaskConflictError, TaskManager
+from designtoolkit.web.tasks import TaskConflictError, TaskManager, TaskRecord
 
 _INVALID_REQUEST_ERRORS = (ValueError, VideoFrameError, MediaResizeError)
 _TERMINAL_PHASES = (LogPhase.COMPLETED, LogPhase.FAILED)
@@ -129,6 +130,7 @@ class _SessionLeaseHeartbeat:
         self._interval = interval
         self._stopped = Event()
         self._failure: BaseException | None = None
+        self._lock = Lock()
         self._thread = Thread(target=self._run, daemon=True)
 
     def start(self) -> None:
@@ -139,16 +141,33 @@ class _SessionLeaseHeartbeat:
         self._thread.join()
 
     def raise_if_failed(self) -> None:
+        with self._lock:
+            self._raise_if_failed()
+
+    def barrier(self) -> None:
+        with self._lock:
+            self._raise_if_failed()
+            self._lease.refresh()
+            self._raise_if_failed()
+
+    def commit[T](self, action: Callable[[], T]) -> T:
+        self.barrier()
+        return action()
+
+    def _raise_if_failed(self) -> None:
         if self._failure is not None:
             raise self._failure
 
     def _run(self) -> None:
         while not self._stopped.wait(self._interval):
-            try:
-                self._lease.refresh()
-            except BaseException as exc:
-                self._failure = exc
-                return
+            with self._lock:
+                if self._stopped.is_set():
+                    return
+                try:
+                    self._lease.refresh()
+                except BaseException as exc:
+                    self._failure = exc
+                    return
 
 
 @dataclass
@@ -160,9 +179,15 @@ class _HostedSessionOperation:
     def barrier(self) -> None:
         if self.lease is None or self.heartbeat is None:
             return
-        self.heartbeat.raise_if_failed()
-        self.lease.refresh()
-        self.heartbeat.raise_if_failed()
+        self.heartbeat.barrier()
+
+    def commit[T](self, action: Callable[[], T]) -> T:
+        if self.heartbeat is None:
+            result = action()
+        else:
+            result = self.heartbeat.commit(action)
+        self.mark_committed()
+        return result
 
     def mark_committed(self) -> None:
         self.committed = True
@@ -885,6 +910,26 @@ def create_router(
                 "hosted session lease",
             )
 
+    def create_task_with_session_commit(
+        http_request: Request,
+        create_task: Callable[..., TaskRecord],
+        payload: object,
+    ) -> TaskRecord:
+        operation = http_request.state.hosted_session_operation
+        owner_id = getattr(http_request.state, "session_id", None)
+        if isinstance(task_manager, RedisTaskManager):
+            task = create_task(
+                payload,
+                owner_id=owner_id,
+                commit=operation.commit,
+            )
+            operation.mark_committed()
+            return task
+        operation.barrier()
+        task = create_task(payload, owner_id=owner_id)
+        operation.mark_committed()
+        return task
+
     def resolve_input_references(
         http_request: Request,
         references: list[str],
@@ -1076,35 +1121,46 @@ def create_router(
     def delete_upload(http_request: Request, asset_id: str) -> Response:
         if storage is None or resources is None:
             raise ApiError("hosted_mode_disabled", "Uploads are unavailable", 404)
+        operation = http_request.state.hosted_session_operation
+        session_id = http_request.state.session_id
         try:
             try:
-                deletion = storage.delete_asset(
-                    http_request.state.session_id,
-                    f"asset:{asset_id}",
+                deletion = operation.commit(
+                    lambda: storage.delete_asset(
+                        session_id,
+                        f"asset:{asset_id}",
+                    )
                 )
             except AssetDeletionStateError as exc:
                 if not resources.is_committed_asset_released(
-                    http_request.state.session_id,
+                    session_id,
                     exc.asset_id,
                 ):
                     raise
                 deletion = None
             if deletion is not None:
-                resources.release_committed_asset(
-                    http_request.state.session_id,
-                    deletion.asset_id,
-                    deletion.size,
+                operation.commit(
+                    lambda: resources.release_committed_asset(
+                        session_id,
+                        deletion.asset_id,
+                        deletion.size,
+                    )
                 )
             asset_was_absent = deletion is not None and deletion.size == 0
-            storage.finalize_asset_deletion(
-                http_request.state.session_id,
-                asset_id,
+            operation.commit(
+                lambda: storage.finalize_asset_deletion(
+                    session_id,
+                    asset_id,
+                )
             )
+            operation.barrier()
             if asset_was_absent:
                 try:
-                    resources.finalize_asset_release(
-                        http_request.state.session_id,
-                        asset_id,
+                    operation.commit(
+                        lambda: resources.finalize_asset_release(
+                            session_id,
+                            asset_id,
+                        )
                     )
                 except RedisError:
                     _LOGGER.warning(
@@ -1112,9 +1168,11 @@ def create_router(
                         exc_info=True,
                     )
             else:
-                resources.finalize_asset_release(
-                    http_request.state.session_id,
-                    asset_id,
+                operation.commit(
+                    lambda: resources.finalize_asset_release(
+                        session_id,
+                        asset_id,
+                    )
                 )
         except UploadRejectedError as exc:
             raise ApiError("asset_not_found", str(exc), 404) from exc
@@ -1226,14 +1284,12 @@ def create_router(
         http_request: Request,
     ) -> TaskCreateResponse:
         hosted_payload = hosted_video_frames_request(http_request, payload)
-        operation = http_request.state.hosted_session_operation
         try:
-            operation.barrier()
-            task = task_manager.create_video_frames_task(
+            task = create_task_with_session_commit(
+                http_request,
+                task_manager.create_video_frames_task,
                 hosted_payload,
-                owner_id=getattr(http_request.state, "session_id", None),
             )
-            operation.mark_committed()
         except Exception as exc:
             discard_failed_hosted_task_dir(http_request, hosted_payload)
             if isinstance(exc, TaskConflictError):
@@ -1255,14 +1311,12 @@ def create_router(
         http_request: Request,
     ) -> TaskCreateResponse:
         hosted_payload = hosted_media_resize_request(http_request, payload)
-        operation = http_request.state.hosted_session_operation
         try:
-            operation.barrier()
-            task = task_manager.create_media_resize_task(
+            task = create_task_with_session_commit(
+                http_request,
+                task_manager.create_media_resize_task,
                 hosted_payload,
-                owner_id=getattr(http_request.state, "session_id", None),
             )
-            operation.mark_committed()
         except Exception as exc:
             discard_failed_hosted_task_dir(http_request, hosted_payload)
             if isinstance(exc, TaskConflictError):
@@ -1284,14 +1338,12 @@ def create_router(
         http_request: Request,
     ) -> TaskCreateResponse:
         hosted_payload = hosted_chroma_keyer_request(http_request, payload)
-        operation = http_request.state.hosted_session_operation
         try:
-            operation.barrier()
-            task = task_manager.create_chroma_keyer_task(
+            task = create_task_with_session_commit(
+                http_request,
+                task_manager.create_chroma_keyer_task,
                 hosted_payload,
-                owner_id=getattr(http_request.state, "session_id", None),
             )
-            operation.mark_committed()
         except Exception as exc:
             discard_failed_hosted_task_dir(http_request, hosted_payload)
             if isinstance(exc, TaskConflictError):
@@ -1313,14 +1365,12 @@ def create_router(
         http_request: Request,
     ) -> TaskCreateResponse:
         hosted_payload = hosted_chroma_video_request(http_request, payload)
-        operation = http_request.state.hosted_session_operation
         try:
-            operation.barrier()
-            task = task_manager.create_chroma_video_keyer_task(
+            task = create_task_with_session_commit(
+                http_request,
+                task_manager.create_chroma_video_keyer_task,
                 hosted_payload,
-                owner_id=getattr(http_request.state, "session_id", None),
             )
-            operation.mark_committed()
         except Exception as exc:
             discard_failed_hosted_task_dir(http_request, hosted_payload)
             if isinstance(exc, TaskConflictError):

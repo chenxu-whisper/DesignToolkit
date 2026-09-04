@@ -532,6 +532,35 @@ def test_delete_upload_is_owner_scoped_idempotent_and_reclaims_quota(
     }
 
 
+def test_delete_upload_heartbeat_failure_before_start_preserves_asset_and_usage(
+    tmp_path: Path,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=5)
+    with _client(
+        tmp_path,
+        max_session_bytes=5,
+        hosted_storage=storage,
+    ) as owner:
+        uploaded = _upload(owner, "screen.png", b"image")
+        reference = uploaded.json()["reference"]
+        asset_id = reference.split(":", 2)[1]
+        session_id = owner.cookies["dt_session"]
+        asset_path = storage.resolve(session_id, reference)
+        tombstone = tmp_path / "sessions" / session_id / ".trash" / asset_id
+        coordinator = owner.app.state.resource_coordinator
+        coordinator.fail_lease_refresh = True
+
+        response = owner.delete(f"/api/uploads/{asset_id}")
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "storage_unavailable"
+    assert asset_path.read_bytes() == b"image"
+    assert coordinator.committed[session_id] == 5
+    assert coordinator.release_calls == 0
+    assert coordinator.released_assets == {}
+    assert not tombstone.exists()
+
+
 def test_delete_upload_surfaces_heartbeat_failure_during_slow_removal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -552,15 +581,25 @@ def test_delete_upload_surfaces_heartbeat_failure_during_slow_removal(
         coordinator.lease_acquisitions = 0
         coordinator.lease_refresh_calls = 0
         coordinator.lease_release_calls = 0
-        coordinator.fail_lease_refresh = True
+        failure_injected = False
 
         def slow_rmtree(
             path: Path,
             *args: object,
             **kwargs: object,
         ) -> None:
-            if Path(path) == tombstone:
-                sleep(0.04)
+            nonlocal failure_injected
+            if Path(path) == tombstone and not failure_injected:
+                failure_injected = True
+                refresh_calls = coordinator.lease_refresh_calls
+                coordinator.fail_lease_refresh = True
+                deadline = monotonic() + 1
+                while (
+                    coordinator.lease_refresh_calls == refresh_calls
+                    and monotonic() < deadline
+                ):
+                    sleep(0.001)
+                assert coordinator.lease_refresh_calls > refresh_calls
             original_rmtree(path, *args, **kwargs)
 
         monkeypatch.setattr(
@@ -569,14 +608,19 @@ def test_delete_upload_surfaces_heartbeat_failure_during_slow_removal(
         )
 
         response = owner.delete(f"/api/uploads/{asset_id}")
+        coordinator.fail_lease_refresh = False
+        retry = owner.delete(f"/api/uploads/{asset_id}")
 
     assert response.status_code == 503
     assert response.json()["error"]["code"] == "storage_unavailable"
-    assert coordinator.lease_acquisitions == 1
+    assert retry.status_code == 204
+    assert coordinator.lease_acquisitions == 2
     assert coordinator.lease_refresh_calls >= 1
-    assert coordinator.lease_release_calls == 1
+    assert coordinator.lease_release_calls == 2
     assert coordinator.active_leases == 0
     assert not tombstone.exists()
+    assert coordinator.committed.get(session_id, 0) == 0
+    assert coordinator.finalized_assets == {(session_id, asset_id)}
 
 
 def test_delete_absent_upload_best_effort_finalizes_known_release_marker(
@@ -1151,6 +1195,169 @@ def test_hosted_task_heartbeat_failure_before_enqueue_returns_503_without_job(
     assert response.status_code == 503
     assert response.json()["error"]["code"] == "storage_unavailable"
     assert manager.queue.count == 0
+    assert coordinator.active_leases == 0
+
+
+def test_hosted_task_heartbeat_failure_after_barrier_rolls_back_before_enqueue(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = RedisTaskManager(
+        redis_connection=redis_connection,
+        queue=Queue("designtoolkit", connection=redis_connection),
+        data_dir=tmp_path,
+        max_queued_tasks=20,
+        retention_seconds=7200,
+    )
+    coordinator = StubCoordinator(
+        max_upload_concurrency=4,
+        max_session_bytes=1024,
+        min_free_bytes=0,
+    )
+    original_save_work = manager._save_work
+
+    def save_work_then_fail_heartbeat(*args, **kwargs) -> None:
+        original_save_work(*args, **kwargs)
+        refresh_calls = coordinator.lease_refresh_calls
+        coordinator.fail_lease_refresh = True
+        deadline = monotonic() + 1
+        while (
+            coordinator.lease_refresh_calls == refresh_calls
+            and monotonic() < deadline
+        ):
+            sleep(0.001)
+        assert coordinator.lease_refresh_calls > refresh_calls
+
+    monkeypatch.setattr(manager, "_save_work", save_work_then_fail_heartbeat)
+    with _client(
+        tmp_path,
+        task_manager=manager,
+        resource_coordinator=coordinator,
+    ) as client:
+        reference = _upload(client, "clip.mp4", b"video").json()["reference"]
+        coordinator.session_lease_heartbeat_interval = 0.001
+        coordinator.lease_refresh_calls = 0
+        response = client.post(
+            "/api/tasks/video-frames",
+            json={"input_path": reference, "image_format": "png"},
+        )
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "storage_unavailable"
+    assert manager.queue.count == 0
+    assert redis_connection.llen("dt:queue:reservations") == 0
+    assert list(redis_connection.scan_iter(match="dt:task:*")) == []
+    assert list(redis_connection.scan_iter(match="dt:task-work:*")) == []
+    assert coordinator.active_leases == 0
+
+
+def test_hosted_task_recovers_enqueue_acknowledgement_loss_without_orphan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = RedisTaskManager(
+        redis_connection=redis_connection,
+        queue=Queue("designtoolkit", connection=redis_connection),
+        data_dir=tmp_path,
+        max_queued_tasks=20,
+        retention_seconds=7200,
+    )
+    coordinator = StubCoordinator(
+        max_upload_concurrency=4,
+        max_session_bytes=1024,
+        min_free_bytes=0,
+    )
+    original_enqueue = manager.queue.enqueue
+
+    def enqueue_then_lose_ack(*args, **kwargs):
+        original_enqueue(*args, **kwargs)
+        refresh_calls = coordinator.lease_refresh_calls
+        coordinator.fail_lease_refresh = True
+        deadline = monotonic() + 1
+        while (
+            coordinator.lease_refresh_calls == refresh_calls
+            and monotonic() < deadline
+        ):
+            sleep(0.001)
+        assert coordinator.lease_refresh_calls > refresh_calls
+        raise RedisConnectionError("enqueue acknowledgement lost")
+
+    monkeypatch.setattr(manager.queue, "enqueue", enqueue_then_lose_ack)
+    with _client(
+        tmp_path,
+        task_manager=manager,
+        resource_coordinator=coordinator,
+    ) as client:
+        reference = _upload(client, "clip.mp4", b"video").json()["reference"]
+        coordinator.session_lease_heartbeat_interval = 0.001
+        coordinator.lease_refresh_calls = 0
+        response = client.post(
+            "/api/tasks/video-frames",
+            json={"input_path": reference, "image_format": "png"},
+        )
+        task_id = response.json()["task_id"]
+        task_response = client.get(f"/api/tasks/{task_id}")
+
+    assert response.status_code == 200
+    assert task_response.status_code == 200
+    assert task_response.json()["status"] == TaskStatus.QUEUED
+    assert manager.queue.get_job_ids() == [task_id]
+    assert manager.queue.fetch_job(task_id) is not None
+    assert manager.task_work(task_id) is not None
+    assert redis_connection.lrange("dt:queue:reservations", 0, -1) == [
+        task_id.encode()
+    ]
+
+
+def test_hosted_task_heartbeats_session_during_slow_enqueue(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = RedisTaskManager(
+        redis_connection=redis_connection,
+        queue=Queue("designtoolkit", connection=redis_connection),
+        data_dir=tmp_path,
+        max_queued_tasks=20,
+        retention_seconds=7200,
+    )
+    coordinator = StubCoordinator(
+        max_upload_concurrency=4,
+        max_session_bytes=1024,
+        min_free_bytes=0,
+    )
+    original_enqueue = manager.queue.enqueue
+
+    def slow_enqueue(*args, **kwargs):
+        refresh_calls = coordinator.lease_refresh_calls
+        deadline = monotonic() + 1
+        while (
+            coordinator.lease_refresh_calls == refresh_calls
+            and monotonic() < deadline
+        ):
+            sleep(0.001)
+        assert coordinator.lease_refresh_calls > refresh_calls
+        return original_enqueue(*args, **kwargs)
+
+    monkeypatch.setattr(manager.queue, "enqueue", slow_enqueue)
+    with _client(
+        tmp_path,
+        task_manager=manager,
+        resource_coordinator=coordinator,
+    ) as client:
+        reference = _upload(client, "clip.mp4", b"video").json()["reference"]
+        coordinator.session_lease_heartbeat_interval = 0.001
+        coordinator.lease_refresh_calls = 0
+        response = client.post(
+            "/api/tasks/video-frames",
+            json={"input_path": reference, "image_format": "png"},
+        )
+
+    assert response.status_code == 200
+    assert manager.queue.count == 1
+    assert coordinator.lease_refresh_calls >= 2
     assert coordinator.active_leases == 0
 
 

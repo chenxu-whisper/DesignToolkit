@@ -14,7 +14,7 @@ from redis import Redis
 from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import RedisError
 from rq import Queue
-from rq.job import JobStatus
+from rq.job import Job, JobStatus
 from rq.registry import FailedJobRegistry, StartedJobRegistry
 
 from designtoolkit.chroma_keyer.models import KeyerError, KeyImageResult
@@ -221,6 +221,37 @@ def test_enqueue_registers_importable_rq_failure_and_stopped_callbacks(
     assert list(inspect.signature(handle_job_stopped).parameters) == [
         "job",
         "connection",
+    ]
+
+
+def test_enqueue_failure_preserves_records_when_rq_job_is_partially_written(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = _manager(redis_connection, tmp_path)
+
+    def save_job_hash_then_fail(*_args, **kwargs):
+        redis_connection.hset(
+            Job.key_for(kwargs["job_id"]),
+            mapping={"status": JobStatus.QUEUED.value},
+        )
+        raise RedisConnectionError("enqueue failed after job hash write")
+
+    monkeypatch.setattr(manager.queue, "enqueue", save_job_hash_then_fail)
+
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+        owner_id="a" * 32,
+    )
+
+    assert task.status is TaskStatus.QUEUED
+    assert manager.get_task(task.task_id) == task
+    assert manager.task_work(task.task_id) is not None
+    assert Job.exists(task.task_id, redis_connection)
+    assert manager.queue.count == 0
+    assert redis_connection.lrange("dt:queue:reservations", 0, -1) == [
+        task.task_id.encode()
     ]
 
 
@@ -1513,6 +1544,34 @@ def test_reconcile_fails_stale_running_task_with_terminal_or_missing_rq_job(
     assert manager.reconcile_tasks(grace_seconds=60) == 1
     assert manager.get_task(task.task_id).status is TaskStatus.FAILED
     assert resources.released == [task.task_id]
+
+
+def test_real_redis_recovers_committed_enqueue_after_acknowledgement_loss(
+    real_redis_connection: Redis,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(real_redis_connection, tmp_path)
+    original_enqueue = manager.queue.enqueue
+
+    def enqueue_then_lose_ack(*args, **kwargs):
+        original_enqueue(*args, **kwargs)
+        raise RedisConnectionError("enqueue acknowledgement lost")
+
+    monkeypatch.setattr(manager.queue, "enqueue", enqueue_then_lose_ack)
+
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+        owner_id="a" * 32,
+    )
+
+    assert manager.get_task(task.task_id) == task
+    assert manager.task_work(task.task_id) is not None
+    assert manager.queue.get_job_ids() == [task.task_id]
+    assert Job.exists(task.task_id, real_redis_connection)
+    assert real_redis_connection.lrange("dt:queue:reservations", 0, -1) == [
+        task.task_id.encode()
+    ]
 
 
 def test_real_redis_terminal_cas_and_reconciliation(

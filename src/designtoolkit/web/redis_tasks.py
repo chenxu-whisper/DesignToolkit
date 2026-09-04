@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
@@ -223,6 +224,7 @@ class RedisTaskManager:
         request: VideoFramesTaskRequest,
         *,
         owner_id: str | None = None,
+        commit: Callable[[Callable[[], Job]], Job] | None = None,
     ) -> TaskRecord:
         options = video_frame_options_list_from_request(request)
         return self._enqueue(
@@ -231,6 +233,7 @@ class RedisTaskManager:
             job_kind="video_frames",
             owner_id=owner_id,
             input_path=_joined_input_names(options),
+            commit=commit,
         )
 
     def create_media_resize_task(
@@ -238,6 +241,7 @@ class RedisTaskManager:
         request: MediaResizeTaskRequest,
         *,
         owner_id: str | None = None,
+        commit: Callable[[Callable[[], Job]], Job] | None = None,
     ) -> TaskRecord:
         options = media_resize_options_list_from_request(request)
         return self._enqueue(
@@ -246,6 +250,7 @@ class RedisTaskManager:
             job_kind="media_resize",
             owner_id=owner_id,
             input_path="\n".join(option.input_path.name for option in options),
+            commit=commit,
         )
 
     def create_chroma_keyer_task(
@@ -253,6 +258,7 @@ class RedisTaskManager:
         request: ChromaKeyerTaskRequest,
         *,
         owner_id: str | None = None,
+        commit: Callable[[Callable[[], Job]], Job] | None = None,
     ) -> TaskRecord:
         options, _model, _params = chroma_keyer_options_from_request(request)
         output_path = options.output_path or default_output_path(options.input_path)
@@ -263,6 +269,7 @@ class RedisTaskManager:
             job_kind="chroma_keyer",
             owner_id=owner_id,
             input_path=options.input_path.name,
+            commit=commit,
         )
 
     def create_chroma_video_keyer_task(
@@ -270,6 +277,7 @@ class RedisTaskManager:
         request: ChromaVideoKeyerTaskRequest,
         *,
         owner_id: str | None = None,
+        commit: Callable[[Callable[[], Job]], Job] | None = None,
     ) -> TaskRecord:
         options, _model, _params = chroma_video_keyer_options_from_request(request)
         output_root = options.output_root or options.input_path.parent
@@ -284,6 +292,7 @@ class RedisTaskManager:
             job_kind="chroma_video_keyer",
             owner_id=owner_id,
             input_path=options.input_path.name,
+            commit=commit,
         )
 
     def get_task(
@@ -493,6 +502,7 @@ class RedisTaskManager:
         job_kind: str,
         owner_id: str | None,
         input_path: str,
+        commit: Callable[[Callable[[], Job]], Job] | None,
     ) -> TaskRecord:
         task_id = str(uuid4())
         queued_count = self._redis.rpush(_queue_reservations_key(), task_id)
@@ -520,8 +530,8 @@ class RedisTaskManager:
             message=f"Created {kind.value} task",
             details={"input_path": input_path},
         )
-        try:
-            self.queue.enqueue(
+        def enqueue_job() -> Job:
+            return self.queue.enqueue(
                 "designtoolkit.web.worker.run_task",
                 task.task_id,
                 job_kind,
@@ -534,7 +544,24 @@ class RedisTaskManager:
                 on_failure=Callback(handle_job_failure),
                 on_stopped=Callback(handle_job_stopped),
             )
-        except Exception:
+
+        try:
+            if commit is None:
+                enqueue_job()
+            else:
+                commit(enqueue_job)
+        except Exception as enqueue_error:
+            try:
+                enqueue_committed = self._enqueue_has_authoritative_evidence(
+                    task.task_id
+                )
+            except Exception as recovery_error:
+                enqueue_error.add_note(
+                    "Enqueue recovery could not confirm whether the RQ job committed"
+                )
+                raise enqueue_error from recovery_error
+            if enqueue_committed:
+                return self.get_task(task.task_id) or task
             self._redis.delete(
                 _task_key(task.task_id),
                 _event_key(task.task_id),
@@ -543,6 +570,18 @@ class RedisTaskManager:
             self._release_queue_slot(task.task_id)
             raise
         return task
+
+    def _enqueue_has_authoritative_evidence(self, task_id: str) -> bool:
+        pipeline = self._redis.pipeline(transaction=False)
+        pipeline.exists(Job.key_for(task_id))
+        pipeline.lpos(self.queue.key, task_id)
+        pipeline.get(_task_key(task_id))
+        job_exists, queue_position, task_value = pipeline.execute()
+        if job_exists or queue_position is not None:
+            return True
+        if task_value is None:
+            return False
+        return _decode_task(task_value).status is not TaskStatus.QUEUED
 
     def _release_queue_slot(self, task_id: str) -> None:
         self._redis.lrem(_queue_reservations_key(), 0, task_id)
