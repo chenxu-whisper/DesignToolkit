@@ -104,6 +104,12 @@ def test_accepts_image_at_exact_pixel_limit(tmp_path: Path) -> None:
     assert validator.validate(image_path) is None
 
 
+def test_accepts_static_jpeg_without_frame_count(tmp_path: Path) -> None:
+    image_path = _write_image(tmp_path / "static.jpg", (2, 2))
+
+    assert HostedMediaValidator().validate(image_path) is None
+
+
 @pytest.mark.parametrize("suffix", [".gif", ".webp"])
 def test_accepts_static_multiframe_capable_image(
     tmp_path: Path,

@@ -169,7 +169,7 @@ class HostedMediaValidator:
                 warnings.simplefilter("ignore", Image.DecompressionBombWarning)
                 with Image.open(path) as image:
                     width, height = image.size
-                    frame_count = image.n_frames
+                    frame_count = getattr(image, "n_frames", 1)
         except Image.DecompressionBombError as exc:
             raise MediaLimitError(
                 "image_pixels_exceeded",
