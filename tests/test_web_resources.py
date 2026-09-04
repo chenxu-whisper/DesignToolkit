@@ -355,6 +355,8 @@ def coordinator(
     min_free_bytes: int = 5,
     reservation_ttl: float = 10,
     lease_ttl: float = 10,
+    reservation_heartbeat_interval: float = 5,
+    lease_heartbeat_interval: float = 5,
 ) -> RedisResourceCoordinator:
     return RedisResourceCoordinator(
         redis_connection=redis_connection,
@@ -363,6 +365,8 @@ def coordinator(
         min_free_bytes=min_free_bytes,
         reservation_ttl=reservation_ttl,
         lease_ttl=lease_ttl,
+        reservation_heartbeat_interval=reservation_heartbeat_interval,
+        lease_heartbeat_interval=lease_heartbeat_interval,
     )
 
 
@@ -582,6 +586,39 @@ def test_reservation_refresh_extends_token_ttl(
     assert redis_connection.pttl(token_key) > 1_000
 
 
+def test_ttls_are_clamped_to_twice_their_heartbeat_intervals(
+    redis_connection: DeterministicRedis,
+) -> None:
+    resources = coordinator(
+        redis_connection,
+        reservation_ttl=1,
+        lease_ttl=2,
+        reservation_heartbeat_interval=3,
+        lease_heartbeat_interval=4,
+    )
+
+    assert resources._reservation_ttl_ms == 6_000
+    assert resources._lease_ttl_ms == 8_000
+
+
+@pytest.mark.parametrize(
+    ("interval_name", "interval"),
+    [
+        ("reservation_heartbeat_interval", 0),
+        ("reservation_heartbeat_interval", -1),
+        ("lease_heartbeat_interval", 0),
+        ("lease_heartbeat_interval", -1),
+    ],
+)
+def test_heartbeat_intervals_must_be_positive(
+    redis_connection: DeterministicRedis,
+    interval_name: str,
+    interval: float,
+) -> None:
+    with pytest.raises(ValueError, match=interval_name):
+        coordinator(redis_connection, **{interval_name: interval})
+
+
 def test_reconcile_repairs_counters_after_reservation_expiry(
     redis_connection: DeterministicRedis,
 ) -> None:
@@ -668,6 +705,7 @@ def test_real_redis_ttl_expiry_is_reconciled(
         max_uploads=1,
         max_session_bytes=10,
         reservation_ttl=0.02,
+        reservation_heartbeat_interval=0.005,
     )
     expired = resources.reserve_upload(SESSION_A, 10, free_bytes=100)
     token_key = f"dt:resource:reservation:{expired.token}"

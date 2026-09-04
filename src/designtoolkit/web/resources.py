@@ -14,6 +14,7 @@ _RESERVATION_PREFIX = "dt:resource:reservation:"
 _LEASE_PREFIX = "dt:resource:lease:"
 _CLEANUP_PREFIX = "dt:resource:cleanup:"
 _SESSION_PATTERN = re.compile(r"^[a-f0-9]{32}$")
+_DEFAULT_HEARTBEAT_INTERVAL = 5.0
 
 _RESERVE_UPLOAD_SCRIPT = """-- reserve_upload
 local state_key = KEYS[1]
@@ -559,6 +560,8 @@ class RedisResourceCoordinator:
         min_free_bytes: int,
         reservation_ttl: float,
         lease_ttl: float,
+        reservation_heartbeat_interval: float = _DEFAULT_HEARTBEAT_INTERVAL,
+        lease_heartbeat_interval: float = _DEFAULT_HEARTBEAT_INTERVAL,
     ) -> None:
         self._redis = redis_connection
         self.max_upload_concurrency = _positive_int(
@@ -570,11 +573,24 @@ class RedisResourceCoordinator:
             "max_session_bytes",
         )
         self.min_free_bytes = _nonnegative_int(min_free_bytes, "min_free_bytes")
+        reservation_ttl = _positive_seconds(reservation_ttl, "reservation_ttl")
+        lease_ttl = _positive_seconds(lease_ttl, "lease_ttl")
+        reservation_heartbeat_interval = _positive_seconds(
+            reservation_heartbeat_interval,
+            "reservation_heartbeat_interval",
+        )
+        lease_heartbeat_interval = _positive_seconds(
+            lease_heartbeat_interval,
+            "lease_heartbeat_interval",
+        )
         self._reservation_ttl_ms = _ttl_milliseconds(
-            reservation_ttl,
+            max(reservation_ttl, 2 * reservation_heartbeat_interval),
             "reservation_ttl",
         )
-        self._lease_ttl_ms = _ttl_milliseconds(lease_ttl, "lease_ttl")
+        self._lease_ttl_ms = _ttl_milliseconds(
+            max(lease_ttl, 2 * lease_heartbeat_interval),
+            "lease_ttl",
+        )
         self._reserve_upload_script = self._redis.register_script(
             _RESERVE_UPLOAD_SCRIPT
         )
@@ -855,6 +871,11 @@ def _nonnegative_int(value: int, name: str) -> int:
 
 
 def _ttl_milliseconds(value: float, name: str) -> int:
+    value = _positive_seconds(value, name)
+    return max(1, math.ceil(value * 1000))
+
+
+def _positive_seconds(value: float, name: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
         raise ValueError(f"{name} must be positive")
-    return max(1, math.ceil(value * 1000))
+    return float(value)
