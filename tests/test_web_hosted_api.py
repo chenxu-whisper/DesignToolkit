@@ -4,7 +4,7 @@ import shutil
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from pathlib import Path
-from time import sleep
+from time import monotonic, sleep
 from unittest.mock import Mock
 from urllib.parse import quote
 
@@ -1057,6 +1057,55 @@ def test_hosted_task_observes_session_heartbeat_failure_before_return(
 
     assert response.status_code == 503
     assert response.json()["error"]["code"] == "storage_unavailable"
+    assert coordinator.active_leases == 0
+
+
+def test_hosted_task_logs_heartbeat_failure_when_endpoint_also_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = RedisTaskManager(
+        redis_connection=redis_connection,
+        queue=Queue("designtoolkit", connection=redis_connection),
+        data_dir=tmp_path,
+        max_queued_tasks=20,
+        retention_seconds=7200,
+    )
+    coordinator = StubCoordinator(
+        max_upload_concurrency=4,
+        max_session_bytes=1024,
+        min_free_bytes=0,
+    )
+
+    def fail_create(*_args, **_kwargs):
+        coordinator.fail_lease_refresh = True
+        deadline = monotonic() + 1
+        while coordinator.lease_refresh_calls == 0 and monotonic() < deadline:
+            sleep(0.001)
+        assert coordinator.lease_refresh_calls > 0
+        raise ValueError("endpoint rejected request")
+
+    monkeypatch.setattr(manager, "create_video_frames_task", fail_create)
+    caplog.set_level("ERROR", logger="designtoolkit.web.routes")
+    with _client(
+        tmp_path,
+        task_manager=manager,
+        resource_coordinator=coordinator,
+    ) as client:
+        reference = _upload(client, "clip.mp4", b"video").json()["reference"]
+        coordinator.session_lease_heartbeat_interval = 0.001
+        coordinator.lease_refresh_calls = 0
+        response = client.post(
+            "/api/tasks/video-frames",
+            json={"input_path": reference, "image_format": "png"},
+        )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_request"
+    assert "session lease heartbeat failed during endpoint error" in caplog.text
+    assert "Session lease heartbeat failed" in caplog.text
     assert coordinator.active_leases == 0
 
 

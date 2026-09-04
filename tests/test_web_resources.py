@@ -325,6 +325,83 @@ class DeterministicRedis(fakeredis.FakeRedis):
         )
         return 1
 
+    def _eval_capture_session_usage(self, keys, args):  # noqa: ANN001, ANN202
+        state_key, session_state_key, marker_index_key, cleanup_key = keys
+        session_id, claim_token = (str(value) for value in args)
+        deleting = self.hget(session_state_key, "deleting")
+        if (
+            deleting is None
+            or self._text(deleting) != claim_token
+            or not self.exists(cleanup_key)
+        ):
+            return [0]
+        marker_prefix = f"dt:resource:asset-released:{session_id}:"
+        marker_keys = sorted(
+            self._text(marker_key)
+            for marker_key in self.smembers(marker_index_key)
+            if self._text(marker_key).startswith(marker_prefix)
+        )
+        return [
+            1,
+            self._number(
+                state_key,
+                f"session:{session_id}:committed_bytes",
+            ),
+            *marker_keys,
+        ]
+
+    def _eval_clear_session_usage_generation(  # noqa: ANN001, ANN202
+        self,
+        keys,
+        args,
+    ):
+        (
+            state_key,
+            session_state_key,
+            cleanup_key,
+            marker_index_key,
+            generation_key,
+        ) = keys
+        (
+            session_id,
+            claim_token,
+            _generation_id,
+            committed_bytes,
+            marker_prefix,
+            *asset_ids,
+        ) = (str(value) for value in args)
+        deleting = self.hget(session_state_key, "deleting")
+        if (
+            deleting is None
+            or self._text(deleting) != claim_token
+            or not self.exists(cleanup_key)
+        ):
+            return 3
+        if self.exists(generation_key):
+            return 0
+        committed_bytes = int(committed_bytes)
+        field = f"session:{session_id}:committed_bytes"
+        current = self._number(state_key, field)
+        if committed_bytes > current:
+            return 2
+        self._decrement(state_key, field, committed_bytes)
+        for asset_id in asset_ids:
+            marker_key = f"{marker_prefix}{session_id}:{asset_id}"
+            self.delete(marker_key)
+            self.srem(marker_index_key, marker_key)
+        self.set(generation_key, "cleared")
+        return 1
+
+    def _eval_finalize_session_usage_generation(  # noqa: ANN001, ANN202
+        self,
+        keys,
+        args,
+    ):
+        if not self.exists(keys[0]):
+            return 0
+        self.pexpire(keys[0], int(args[0]))
+        return 1
+
     def _eval_release_committed_asset(self, keys, args):  # noqa: ANN001, ANN202
         state_key, marker_key, marker_index_key = keys
         session_id, asset_id, released_bytes = args
@@ -842,6 +919,46 @@ def test_clear_session_usage_removes_persistent_asset_release_markers(
 
     assert not redis_connection.exists(marker_key)
     assert not redis_connection.exists(marker_index_key)
+
+
+def test_generation_cleanup_is_idempotent_and_preserves_new_session_usage(
+    redis_connection: DeterministicRedis,
+) -> None:
+    resources = coordinator(redis_connection, max_session_bytes=10)
+    old_upload = resources.reserve_upload(SESSION_A, 4, free_bytes=100)
+    old_upload.commit()
+    old_asset_id = "1" * 32
+    resources.release_committed_asset(SESSION_A, old_asset_id, 1)
+    old_claim = resources.claim_session_cleanup(SESSION_A)
+    assert old_claim is not None
+    generation = resources.capture_session_usage(SESSION_A, old_claim)
+    resources.release_cleanup_claim(SESSION_A, old_claim)
+
+    new_upload = resources.reserve_upload(SESSION_A, 3, free_bytes=100)
+    new_upload.commit()
+    new_asset_id = "2" * 32
+    resources.release_committed_asset(SESSION_A, new_asset_id, 1)
+    recovery_claim = resources.claim_session_cleanup(SESSION_A)
+    assert recovery_claim is not None
+
+    resources.clear_session_usage_generation(
+        SESSION_A,
+        recovery_claim,
+        generation,
+    )
+    resources.clear_session_usage_generation(
+        SESSION_A,
+        recovery_claim,
+        generation,
+    )
+
+    assert resources.is_committed_asset_released(SESSION_A, old_asset_id) is False
+    assert resources.is_committed_asset_released(SESSION_A, new_asset_id) is True
+    resources.reserve_upload(SESSION_A, 8, free_bytes=100).release()
+    with pytest.raises(ResourceUnavailableError, match="session"):
+        resources.reserve_upload(SESSION_A, 9, free_bytes=100)
+    resources.finalize_session_usage_generation(generation.generation_id)
+    resources.release_cleanup_claim(SESSION_A, recovery_claim)
 
 
 @pytest.mark.parametrize(

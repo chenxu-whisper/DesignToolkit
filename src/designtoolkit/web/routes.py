@@ -826,22 +826,30 @@ def create_router(
             getattr(resources, "session_lease_heartbeat_interval", 5.0),
         )
         heartbeat.start()
-        operation_completed = False
         try:
             yield lease
-            operation_completed = True
-        finally:
+        except BaseException:
             heartbeat.stop()
             try:
-                if operation_completed:
-                    heartbeat.raise_if_failed()
+                heartbeat.raise_if_failed()
+            except BaseException:
+                _LOGGER.error(
+                    "storage_unavailable: hosted session lease heartbeat failed "
+                    "during endpoint error",
+                    exc_info=True,
+                )
+            raise
+        else:
+            heartbeat.stop()
+            try:
+                heartbeat.raise_if_failed()
             except (RedisError, ResourceUnavailableError) as exc:
                 raise ApiError("storage_unavailable", str(exc), 503) from exc
-            finally:
-                _release_redis_resource_best_effort(
-                    lease.release,
-                    "hosted session lease",
-                )
+        finally:
+            _release_redis_resource_best_effort(
+                lease.release,
+                "hosted session lease",
+            )
 
     def resolve_input_references(
         http_request: Request,

@@ -25,6 +25,7 @@ from designtoolkit.web.resources import (
     RedisSessionLease,
     ReservationState,
     ResourceUnavailableError,
+    SessionUsageGeneration,
 )
 
 _DEFAULT_MAX_UPLOAD_BYTES = 500 * 1024 * 1024
@@ -36,6 +37,7 @@ _DEFAULT_RETENTION_SECONDS = 2 * 60 * 60
 _UPLOAD_CHUNK_BYTES = 1024 * 1024
 _RESOURCE_RECOVERY_ATTEMPTS = 3
 _DELETION_METADATA_NAME = ".deletion.json"
+_CLEANUP_GENERATION_NAME = ".cleanup-generation.json"
 _DEFAULT_MEDIA_LIMITS = HostedMediaLimits()
 _ALLOWED_SUFFIXES = frozenset(
     {
@@ -563,14 +565,26 @@ class HostedStorage:
                     trash_dir = self.root / ".trash"
                     trash_dir.mkdir(parents=True, exist_ok=True)
                     quarantine = trash_dir / f"{session_id}-{token}"
+                    generation = coordinator.capture_session_usage(
+                        session_id,
+                        token,
+                    )
+                    _write_session_usage_generation(session_dir, generation)
                     heartbeat.raise_if_failed()
                     os.replace(session_dir, quarantine)
                     heartbeat.raise_if_failed()
-                    coordinator.clear_session_usage(session_id)
+                    coordinator.clear_session_usage_generation(
+                        session_id,
+                        token,
+                        generation,
+                    )
                     heartbeat.raise_if_failed()
                     quarantine_removed = self._delete_quarantine(quarantine)
                     heartbeat.raise_if_failed()
                 if quarantine_removed:
+                    coordinator.finalize_session_usage_generation(
+                        generation.generation_id
+                    )
                     removed += 1
             finally:
                 coordinator.release_cleanup_claim(session_id, token)
@@ -589,9 +603,42 @@ class HostedStorage:
             match = _QUARANTINE_PATTERN.fullmatch(quarantine.name)
             if not quarantine.is_dir() or match is None:
                 continue
-            coordinator.clear_session_usage(match.group("session_id"))
-            if self._delete_quarantine(quarantine):
-                removed += 1
+            session_id = match.group("session_id")
+            generation_id = match.group("token")
+            claim_token = coordinator.claim_session_cleanup(session_id)
+            if claim_token is None:
+                continue
+            try:
+                with _CleanupClaimHeartbeat(
+                    coordinator,
+                    session_id,
+                    claim_token,
+                ) as heartbeat:
+                    generation = _read_session_usage_generation(
+                        quarantine,
+                        expected_generation_id=generation_id,
+                    )
+                    if generation is None:
+                        if self._session_dir(session_id).is_dir():
+                            continue
+                        coordinator.clear_session_usage(session_id)
+                    else:
+                        coordinator.clear_session_usage_generation(
+                            session_id,
+                            claim_token,
+                            generation,
+                        )
+                    heartbeat.raise_if_failed()
+                    quarantine_removed = self._delete_quarantine(quarantine)
+                    heartbeat.raise_if_failed()
+                if quarantine_removed:
+                    if generation is not None:
+                        coordinator.finalize_session_usage_generation(
+                            generation.generation_id
+                        )
+                    removed += 1
+            finally:
+                coordinator.release_cleanup_claim(session_id, claim_token)
         self._remove_empty_trash()
         return removed
 
@@ -646,6 +693,56 @@ class HostedStorage:
             for candidate in sessions_dir.iterdir()
             if candidate.is_dir()
         )
+
+
+def _write_session_usage_generation(
+    session_dir: Path,
+    generation: SessionUsageGeneration,
+) -> None:
+    payload = {
+        "generation_id": generation.generation_id,
+        "committed_bytes": generation.committed_bytes,
+        "released_asset_ids": list(generation.released_asset_ids),
+    }
+    (session_dir / _CLEANUP_GENERATION_NAME).write_text(
+        json.dumps(payload, separators=(",", ":"), sort_keys=True),
+        encoding="utf-8",
+    )
+
+
+def _read_session_usage_generation(
+    quarantine: Path,
+    *,
+    expected_generation_id: str,
+) -> SessionUsageGeneration | None:
+    try:
+        payload = json.loads(
+            (quarantine / _CLEANUP_GENERATION_NAME).read_text(encoding="utf-8")
+        )
+        generation_id = payload["generation_id"]
+        committed_bytes = payload["committed_bytes"]
+        released_asset_ids = payload["released_asset_ids"]
+        if (
+            generation_id != expected_generation_id
+            or not _SESSION_PATTERN.fullmatch(generation_id)
+            or isinstance(committed_bytes, bool)
+            or not isinstance(committed_bytes, int)
+            or committed_bytes < 0
+            or not isinstance(released_asset_ids, list)
+            or any(
+                not isinstance(asset_id, str)
+                or not _SESSION_PATTERN.fullmatch(asset_id)
+                for asset_id in released_asset_ids
+            )
+        ):
+            return None
+    except (OSError, KeyError, TypeError, ValueError):
+        return None
+    return SessionUsageGeneration(
+        generation_id=generation_id,
+        committed_bytes=committed_bytes,
+        released_asset_ids=tuple(sorted(set(released_asset_ids))),
+    )
 
 
 def new_session_id() -> str:

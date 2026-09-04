@@ -442,6 +442,78 @@ def test_run_task_surfaces_background_heartbeat_failure_before_publish(
     assert resources.events[-2:] == ["release:output", "release:lease"]
 
 
+def test_run_task_observes_heartbeat_failure_recorded_during_stop_before_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    settings = _hosted_settings(tmp_path)
+    manager = _manager(redis_connection, tmp_path)
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+        owner_id="a" * 32,
+    )
+    resources = TrackingTaskResources()
+    artifact = tmp_path / "result.png"
+    artifact.write_bytes(b"result")
+    monkeypatch.setattr(worker_module.HostedSettings, "from_env", lambda: settings)
+    monkeypatch.setattr(
+        worker_module.Redis,
+        "from_url",
+        lambda _url: redis_connection,
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "_build_resource_coordinator",
+        lambda _settings, _connection: resources,
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "disk_usage",
+        lambda _path: type("Usage", (), {"free": 20})(),
+    )
+    original_stop = worker_module._PeriodicResourceHeartbeat.stop
+    stop_calls = 0
+
+    def stop_after_recording_failure(
+        heartbeat: worker_module._PeriodicResourceHeartbeat,
+    ) -> None:
+        nonlocal stop_calls
+        stop_calls += 1
+        heartbeat._failure = RuntimeError("lease heartbeat failed at stop")
+        original_stop(heartbeat)
+
+    monkeypatch.setattr(
+        worker_module._PeriodicResourceHeartbeat,
+        "stop",
+        stop_after_recording_failure,
+    )
+
+    def execute(executor, reserved_task, _request) -> None:
+        executor._mark_succeeded(reserved_task.task_id, str(artifact))
+
+    monkeypatch.setattr(
+        worker_module.RedisTaskExecutor,
+        "execute_reserved_task",
+        execute,
+    )
+
+    worker_module.run_task(
+        task.task_id,
+        "video_frames",
+        VideoFramesTaskRequest(
+            input_path=str(tmp_path / "clip.mp4")
+        ).model_dump(mode="json"),
+    )
+
+    failed = manager.get_task(task.task_id)
+    assert failed is not None
+    assert failed.status is TaskStatus.FAILED
+    assert failed.error == "lease heartbeat failed at stop"
+    assert stop_calls == 1
+    assert not artifact.exists()
+
+
 def test_run_task_stops_before_resource_mutation_when_start_is_rejected(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -23,9 +23,11 @@ _COMMITTED_PREFIX = "dt:resource:committed:"
 _RELEASED_ASSET_PREFIX = "dt:resource:asset-released:"
 _LEASE_PREFIX = "dt:resource:lease:"
 _CLEANUP_PREFIX = "dt:resource:cleanup:"
+_CLEANUP_GENERATION_PREFIX = "dt:resource:cleanup-generation:"
 _TASK_RESOURCE_PREFIX = "dt:resource:task:"
 _SESSION_PATTERN = re.compile(r"^[a-f0-9]{32}$")
 _ASSET_PATTERN = re.compile(r"^[a-f0-9]{32}$")
+_TOKEN_PATTERN = re.compile(r"^[a-f0-9]{32}$")
 _DEFAULT_HEARTBEAT_INTERVAL = 5.0
 
 _RESERVE_UPLOAD_SCRIPT = """-- reserve_upload
@@ -485,6 +487,81 @@ redis.call(
 return 1
 """
 
+_CAPTURE_SESSION_USAGE_SCRIPT = """-- capture_session_usage
+local deleting = redis.call("HGET", KEYS[2], "deleting")
+if not deleting or deleting ~= ARGV[2] then
+    return {0}
+end
+if redis.call("EXISTS", KEYS[4]) == 0 then
+    return {0}
+end
+
+local result = {
+    1,
+    tonumber(
+        redis.call(
+            "HGET",
+            KEYS[1],
+            "session:" .. ARGV[1] .. ":committed_bytes"
+        ) or "0"
+    )
+}
+local marker_keys = redis.call("SMEMBERS", KEYS[3])
+for _, marker_key in ipairs(marker_keys) do
+    table.insert(result, marker_key)
+end
+return result
+"""
+
+_CLEAR_SESSION_USAGE_GENERATION_SCRIPT = """-- clear_session_usage_generation
+local deleting = redis.call("HGET", KEYS[2], "deleting")
+if not deleting or deleting ~= ARGV[2] then
+    return 3
+end
+if redis.call("EXISTS", KEYS[3]) == 0 then
+    return 3
+end
+if redis.call("EXISTS", KEYS[5]) == 1 then
+    return 0
+end
+
+local committed_field = "session:" .. ARGV[1] .. ":committed_bytes"
+local current = tonumber(redis.call("HGET", KEYS[1], committed_field) or "0")
+local generation_bytes = tonumber(ARGV[4])
+if generation_bytes > current then
+    return 2
+end
+local remaining = current - generation_bytes
+if remaining > 0 then
+    redis.call("HSET", KEYS[1], committed_field, remaining)
+else
+    redis.call("HDEL", KEYS[1], committed_field)
+end
+
+for index = 6, #ARGV do
+    local asset_id = ARGV[index]
+    local marker_key = ARGV[5] .. ARGV[1] .. ":" .. asset_id
+    local marker_session = redis.call("HGET", marker_key, "session_id")
+    local marker_asset = redis.call("HGET", marker_key, "asset_id")
+    if marker_session == ARGV[1] and marker_asset == asset_id then
+        redis.call("DEL", marker_key)
+        redis.call("SREM", KEYS[4], marker_key)
+    end
+end
+redis.call("SET", KEYS[5], "cleared")
+return 1
+"""
+
+_FINALIZE_SESSION_USAGE_GENERATION_SCRIPT = (
+    """-- finalize_session_usage_generation
+if redis.call("EXISTS", KEYS[1]) == 0 then
+    return 0
+end
+redis.call("PEXPIRE", KEYS[1], tonumber(ARGV[1]))
+return 1
+"""
+)
+
 _RELEASE_COMMITTED_ASSET_SCRIPT = """-- release_committed_asset
 local session_id = ARGV[1]
 local asset_id = ARGV[2]
@@ -728,6 +805,13 @@ class ReservationState(StrEnum):
     FINALIZED_OR_ABSENT = "finalized_or_absent"
 
 
+@dataclass(frozen=True)
+class SessionUsageGeneration:
+    generation_id: str
+    committed_bytes: int
+    released_asset_ids: tuple[str, ...]
+
+
 @dataclass
 class RedisReservation:
     coordinator: RedisResourceCoordinator
@@ -867,6 +951,15 @@ class RedisResourceCoordinator:
         )
         self._clear_session_usage_script = self._redis.register_script(
             _CLEAR_SESSION_USAGE_SCRIPT
+        )
+        self._capture_session_usage_script = self._redis.register_script(
+            _CAPTURE_SESSION_USAGE_SCRIPT
+        )
+        self._clear_session_usage_generation_script = self._redis.register_script(
+            _CLEAR_SESSION_USAGE_GENERATION_SCRIPT
+        )
+        self._finalize_session_usage_generation_script = self._redis.register_script(
+            _FINALIZE_SESSION_USAGE_GENERATION_SCRIPT
         )
         self._release_committed_asset_script = self._redis.register_script(
             _RELEASE_COMMITTED_ASSET_SCRIPT
@@ -1071,6 +1164,95 @@ class RedisResourceCoordinator:
                 _session_released_assets_key(session_id),
             ],
             args=[session_id],
+        )
+
+    def capture_session_usage(
+        self,
+        session_id: str,
+        claim_token: str,
+    ) -> SessionUsageGeneration:
+        _validate_session_id(session_id)
+        _validate_token(claim_token)
+        result = self._capture_session_usage_script(
+            keys=[
+                _STATE_KEY,
+                _session_state_key(session_id),
+                _session_released_assets_key(session_id),
+                _cleanup_key(claim_token),
+            ],
+            args=[session_id, claim_token],
+        )
+        if int(result[0]) != 1:
+            raise ResourceUnavailableError("Cleanup claim expired")
+        marker_prefix = f"{_RELEASED_ASSET_PREFIX}{session_id}:"
+        released_asset_ids: list[str] = []
+        for raw_marker_key in result[2:]:
+            marker_key = (
+                raw_marker_key.decode()
+                if isinstance(raw_marker_key, bytes)
+                else raw_marker_key
+            )
+            if not marker_key.startswith(marker_prefix):
+                raise ResourceUnavailableError(
+                    "Session release marker state is invalid"
+                )
+            released_asset_ids.append(
+                _validate_asset_id(marker_key.removeprefix(marker_prefix))
+            )
+        return SessionUsageGeneration(
+            generation_id=claim_token,
+            committed_bytes=int(result[1]),
+            released_asset_ids=tuple(sorted(released_asset_ids)),
+        )
+
+    def clear_session_usage_generation(
+        self,
+        session_id: str,
+        claim_token: str,
+        generation: SessionUsageGeneration,
+    ) -> None:
+        _validate_session_id(session_id)
+        _validate_token(claim_token)
+        _validate_token(generation.generation_id)
+        committed_bytes = _nonnegative_int(
+            generation.committed_bytes,
+            "generation committed_bytes",
+        )
+        asset_ids = tuple(
+            _validate_asset_id(asset_id)
+            for asset_id in generation.released_asset_ids
+        )
+        result = int(
+            self._clear_session_usage_generation_script(
+                keys=[
+                    _STATE_KEY,
+                    _session_state_key(session_id),
+                    _cleanup_key(claim_token),
+                    _session_released_assets_key(session_id),
+                    _cleanup_generation_key(generation.generation_id),
+                ],
+                args=[
+                    session_id,
+                    claim_token,
+                    generation.generation_id,
+                    committed_bytes,
+                    _RELEASED_ASSET_PREFIX,
+                    *asset_ids,
+                ],
+            )
+        )
+        if result == 2:
+            raise ResourceUnavailableError(
+                "Session usage generation exceeds committed usage"
+            )
+        if result == 3:
+            raise ResourceUnavailableError("Cleanup claim expired")
+
+    def finalize_session_usage_generation(self, generation_id: str) -> None:
+        _validate_token(generation_id)
+        self._finalize_session_usage_generation_script(
+            keys=[_cleanup_generation_key(generation_id)],
+            args=[self._release_marker_ttl_ms],
         )
 
     def release_committed_asset(
@@ -1332,6 +1514,10 @@ def _cleanup_key(token: str) -> str:
     return f"{_CLEANUP_PREFIX}{token}"
 
 
+def _cleanup_generation_key(token: str) -> str:
+    return f"{_CLEANUP_GENERATION_PREFIX}{token}"
+
+
 def _task_resource_key(task_id: str) -> str:
     return f"{_TASK_RESOURCE_PREFIX}{task_id}"
 
@@ -1371,6 +1557,12 @@ def _validate_session_id(value: str) -> str:
 def _validate_asset_id(value: str) -> str:
     if not _ASSET_PATTERN.fullmatch(value):
         raise ValueError("Invalid hosted asset ID")
+    return value
+
+
+def _validate_token(value: str) -> str:
+    if not _TOKEN_PATTERN.fullmatch(value):
+        raise ValueError("Invalid resource token")
     return value
 
 

@@ -45,6 +45,7 @@ class RedisTaskExecutor(TaskManager):
         *,
         max_output_bytes: int = 5 * 1024 * 1024 * 1024,
         resource_heartbeat: Callable[[], None] | None = None,
+        before_success_publish: Callable[[], None] | None = None,
         task_already_running: bool = False,
     ) -> None:
         super().__init__(log_store=state.log_store, run_async=False)
@@ -54,6 +55,7 @@ class RedisTaskExecutor(TaskManager):
         self._output_root: Path | None = None
         self._input_paths: set[Path] = set()
         self._resource_heartbeat = resource_heartbeat
+        self._before_success_publish = before_success_publish
         self._task_already_running = task_already_running
         self._backend_factory = self._guarded_backend
 
@@ -157,6 +159,29 @@ class RedisTaskExecutor(TaskManager):
             )
             self._validate_artifact(artifact)
             self._heartbeat_resources()
+            download_url = f"/api/tasks/{task_id}/download"
+            task = self._state.get_task(task_id)
+            if task is not None and task.owner_id is not None:
+                HostedStorage(
+                    Path(self._state.data_dir),
+                    max_upload_bytes=1,
+                ).touch_session(task.owner_id)
+            self._heartbeat_resources()
+            details: dict[str, object] = {"output_path": download_url}
+            if elapsed_seconds is not None:
+                details["elapsed_seconds"] = elapsed_seconds
+            if frame_count is not None:
+                details["frame_count"] = frame_count
+            terminal_event = LogEventResponse(
+                task_id=task_id,
+                timestamp=datetime.now(UTC),
+                level=LogLevel.SUCCESS,
+                phase=LogPhase.COMPLETED,
+                message="Task completed",
+                details=details,
+            )
+            if self._before_success_publish is not None:
+                self._before_success_publish()
         except Exception as exc:
             if artifact is not None:
                 artifact.unlink(missing_ok=True)
@@ -168,27 +193,6 @@ class RedisTaskExecutor(TaskManager):
                 str(output_limit_error or exc),
             )
             return
-        download_url = f"/api/tasks/{task_id}/download"
-        task = self._state.get_task(task_id)
-        if task is not None and task.owner_id is not None:
-            HostedStorage(
-                Path(self._state.data_dir),
-                max_upload_bytes=1,
-            ).touch_session(task.owner_id)
-        self._heartbeat_resources()
-        details: dict[str, object] = {"output_path": download_url}
-        if elapsed_seconds is not None:
-            details["elapsed_seconds"] = elapsed_seconds
-        if frame_count is not None:
-            details["frame_count"] = frame_count
-        terminal_event = LogEventResponse(
-            task_id=task_id,
-            timestamp=datetime.now(UTC),
-            level=LogLevel.SUCCESS,
-            phase=LogPhase.COMPLETED,
-            message="Task completed",
-            details=details,
-        )
         completed, transition = self._state._transition_finished(
             task_id,
             status=TaskStatus.SUCCEEDED,
@@ -387,6 +391,7 @@ def run_task(task_id: str, job_kind: str, payload: dict[str, object]) -> None:
     lease: RedisSessionLease | None = None
     output: RedisReservation | None = None
     periodic_heartbeat: _PeriodicResourceHeartbeat | None = None
+    heartbeat_stopped = False
 
     def heartbeat() -> None:
         if output is not None:
@@ -400,10 +405,20 @@ def run_task(task_id: str, job_kind: str, payload: dict[str, object]) -> None:
             periodic_heartbeat.raise_if_failed()
         heartbeat()
 
+    def stop_heartbeat_before_success() -> None:
+        nonlocal heartbeat_stopped
+        if periodic_heartbeat is None:
+            return
+        if not heartbeat_stopped:
+            periodic_heartbeat.stop()
+            heartbeat_stopped = True
+        periodic_heartbeat.raise_if_failed()
+
     executor = RedisTaskExecutor(
         state,
         max_output_bytes=settings.max_output_bytes,
         resource_heartbeat=checked_heartbeat,
+        before_success_publish=stop_heartbeat_before_success,
         task_already_running=True,
     )
     try:
@@ -434,7 +449,7 @@ def run_task(task_id: str, job_kind: str, payload: dict[str, object]) -> None:
         executor._discard_partial_output()
         state._finalize_external_failure(task_id, str(exc))
     finally:
-        if periodic_heartbeat is not None:
+        if periodic_heartbeat is not None and not heartbeat_stopped:
             periodic_heartbeat.stop()
         if output is not None:
             output.release()

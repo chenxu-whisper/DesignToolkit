@@ -129,14 +129,21 @@ class RecordingLease:
 
 
 class RecordingCleanupCoordinator:
-    def __init__(self, *, active_sessions: set[str] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        active_sessions: set[str] | None = None,
+        committed_bytes: dict[str, int] | None = None,
+    ) -> None:
         self.cleanup_claim_heartbeat_interval = 0.01
         self.active_sessions = active_sessions or set()
+        self.committed_bytes = committed_bytes if committed_bytes is not None else {}
         self.claims: dict[str, str] = {}
         self.claim_calls: list[str] = []
         self.refresh_calls: list[tuple[str, str]] = []
         self.release_calls: list[tuple[str, str]] = []
         self.cleared_sessions: list[str] = []
+        self.cleared_generations: set[str] = set()
 
     def claim_session_cleanup(self, session_id: str) -> str | None:
         self.claim_calls.append(session_id)
@@ -157,6 +164,41 @@ class RecordingCleanupCoordinator:
 
     def clear_session_usage(self, session_id: str) -> None:
         self.cleared_sessions.append(session_id)
+        self.committed_bytes.pop(session_id, None)
+
+    def capture_session_usage(
+        self,
+        session_id: str,
+        claim_token: str,
+    ) -> SimpleNamespace:
+        assert self.claims.get(session_id) == claim_token
+        return SimpleNamespace(
+            generation_id=claim_token,
+            committed_bytes=self.committed_bytes.get(session_id, 0),
+            released_asset_ids=(),
+        )
+
+    def clear_session_usage_generation(
+        self,
+        session_id: str,
+        claim_token: str,
+        generation: SimpleNamespace,
+    ) -> None:
+        assert self.claims.get(session_id) == claim_token
+        if generation.generation_id in self.cleared_generations:
+            return
+        self.cleared_generations.add(generation.generation_id)
+        self.cleared_sessions.append(session_id)
+        remaining = (
+            self.committed_bytes.get(session_id, 0) - generation.committed_bytes
+        )
+        if remaining:
+            self.committed_bytes[session_id] = remaining
+        else:
+            self.committed_bytes.pop(session_id, None)
+
+    def finalize_session_usage_generation(self, generation_id: str) -> None:
+        assert generation_id in self.cleared_generations
 
 
 async def _chunks(*values: bytes) -> AsyncIterator[bytes]:
@@ -974,7 +1016,29 @@ def test_cleanup_retries_orphaned_quarantine_without_session_state(
 
     assert removed == 1
     assert not orphan.exists()
-    assert coordinator.claim_calls == []
+    assert coordinator.claim_calls == ["a" * 32]
+    assert coordinator.claims == {}
+
+
+def test_cleanup_preserves_orphaned_quarantine_while_new_lease_is_active(
+    tmp_path: Path,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    session_id = "a" * 32
+    orphan = tmp_path / ".trash" / f"{session_id}-{'1' * 32}"
+    orphan.mkdir(parents=True)
+    (orphan / "asset.bin").write_bytes(b"old")
+    coordinator = RecordingCleanupCoordinator(active_sessions={session_id})
+
+    removed = storage.cleanup_expired(
+        retention_seconds=2_000,
+        coordinator=coordinator,
+    )
+
+    assert removed == 0
+    assert orphan.is_dir()
+    assert coordinator.claim_calls == [session_id]
+    assert coordinator.cleared_sessions == []
 
 
 def test_cleanup_retries_quarantine_after_transient_delete_failure(
@@ -1056,16 +1120,47 @@ def test_cleanup_recovers_trash_after_crash_following_rename(
     session_dir.mkdir(parents=True)
 
     committed_bytes = {session_id: 4}
-    release_markers = {session_id: {"asset-marker"}}
+    old_marker = "1" * 32
+    new_marker = "2" * 32
+    release_markers = {session_id: {old_marker}}
 
     class StatefulCoordinator(RecordingCleanupCoordinator):
-        def clear_session_usage(self, session_id: str) -> None:
-            super().clear_session_usage(session_id)
-            committed_bytes.pop(session_id, None)
-            release_markers.pop(session_id, None)
+        def __init__(self) -> None:
+            super().__init__(committed_bytes=committed_bytes)
+
+        def capture_session_usage(
+            self,
+            session_id: str,
+            claim_token: str,
+        ) -> SimpleNamespace:
+            generation = super().capture_session_usage(session_id, claim_token)
+            generation.released_asset_ids = tuple(
+                sorted(release_markers.get(session_id, set()))
+            )
+            return generation
+
+        def clear_session_usage_generation(
+            self,
+            session_id: str,
+            claim_token: str,
+            generation: SimpleNamespace,
+        ) -> None:
+            super().clear_session_usage_generation(
+                session_id,
+                claim_token,
+                generation,
+            )
+            release_markers.setdefault(session_id, set()).difference_update(
+                generation.released_asset_ids
+            )
 
     class CrashingCoordinator(StatefulCoordinator):
-        def clear_session_usage(self, session_id: str) -> None:
+        def clear_session_usage_generation(
+            self,
+            session_id: str,
+            claim_token: str,
+            generation: SimpleNamespace,
+        ) -> None:
             raise RuntimeError("cleanup process crashed")
 
     coordinator = CrashingCoordinator()
@@ -1085,8 +1180,16 @@ def test_cleanup_recovers_trash_after_crash_following_rename(
     assert len(list((tmp_path / ".trash").iterdir())) == 1
     assert coordinator.claims == {}
     assert committed_bytes == {session_id: 4}
-    assert release_markers == {session_id: {"asset-marker"}}
+    assert release_markers == {session_id: {old_marker}}
 
+    session_dir.mkdir(parents=True)
+    (session_dir / "new.bin").write_bytes(b"new")
+    committed_bytes[session_id] += 3
+    release_markers[session_id].add(new_marker)
+    monkeypatch.setattr(
+        "designtoolkit.web.hosted._directory_modified_at",
+        lambda _path: 9_500.0,
+    )
     recovery = StatefulCoordinator()
     removed = storage.cleanup_expired(
         retention_seconds=2_000,
@@ -1095,8 +1198,10 @@ def test_cleanup_recovers_trash_after_crash_following_rename(
 
     assert removed == 1
     assert recovery.cleared_sessions == [session_id]
-    assert committed_bytes == {}
-    assert release_markers == {}
+    assert committed_bytes == {session_id: 3}
+    assert release_markers == {session_id: {new_marker}}
+    assert session_dir.is_dir()
+    assert (session_dir / "new.bin").read_bytes() == b"new"
     assert not (tmp_path / ".trash").exists()
 
     assert storage.cleanup_expired(
