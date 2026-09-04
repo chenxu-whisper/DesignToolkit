@@ -19,9 +19,11 @@ _STATE_KEY = "dt:resource:state"
 _RESERVATION_INDEX_KEY = "dt:resource:reservations"
 _RESERVATION_PREFIX = "dt:resource:reservation:"
 _COMMITTED_PREFIX = "dt:resource:committed:"
+_RELEASED_ASSETS_KEY = "dt:resource:released-assets"
 _LEASE_PREFIX = "dt:resource:lease:"
 _CLEANUP_PREFIX = "dt:resource:cleanup:"
 _SESSION_PATTERN = re.compile(r"^[a-f0-9]{32}$")
+_ASSET_PATTERN = re.compile(r"^[a-f0-9]{32}$")
 _DEFAULT_HEARTBEAT_INTERVAL = 5.0
 
 _RESERVE_UPLOAD_SCRIPT = """-- reserve_upload
@@ -444,6 +446,17 @@ return removed
 """
 
 _CLEAR_SESSION_USAGE_SCRIPT = """-- clear_session_usage
+local asset_ids = redis.call("SMEMBERS", KEYS[2])
+for _, asset_id in ipairs(asset_ids) do
+    local metadata = redis.call("HGET", KEYS[3], asset_id)
+    if metadata then
+        local marker_session = string.match(metadata, "^([^|]+)|")
+        if marker_session == ARGV[1] then
+            redis.call("HDEL", KEYS[3], asset_id)
+        end
+    end
+end
+redis.call("DEL", KEYS[2])
 redis.call(
     "HDEL",
     KEYS[1],
@@ -452,16 +465,47 @@ redis.call(
 return 1
 """
 
-_RELEASE_COMMITTED_USAGE_SCRIPT = """-- release_committed_usage
-local field = "session:" .. ARGV[1] .. ":committed_bytes"
+_RELEASE_COMMITTED_ASSET_SCRIPT = """-- release_committed_asset
+local session_id = ARGV[1]
+local asset_id = ARGV[2]
+local released_bytes = tonumber(ARGV[3])
+local existing = redis.call("HGET", KEYS[2], asset_id)
+if existing then
+    local marker_session, marker_bytes = string.match(
+        existing,
+        "^([^|]+)|(%d+)$"
+    )
+    if marker_session ~= session_id then
+        return 2
+    end
+    if released_bytes ~= 0 and tonumber(marker_bytes) ~= released_bytes then
+        return 3
+    end
+    return 0
+end
+
+local field = "session:" .. session_id .. ":committed_bytes"
 local current = tonumber(redis.call("HGET", KEYS[1], field) or "0")
-local remaining = math.max(0, current - tonumber(ARGV[2]))
+if released_bytes == 0 then
+    return 4
+end
+if released_bytes > current then
+    return 3
+end
+local remaining = current - released_bytes
 if remaining > 0 then
     redis.call("HSET", KEYS[1], field, remaining)
 else
     redis.call("HDEL", KEYS[1], field)
 end
-return remaining
+redis.call(
+    "HSET",
+    KEYS[2],
+    asset_id,
+    session_id .. "|" .. released_bytes
+)
+redis.call("SADD", KEYS[3], asset_id)
+return 1
 """
 
 _ACQUIRE_SESSION_SCRIPT = """-- acquire_session
@@ -600,6 +644,10 @@ class SessionDeletingError(ResourceUnavailableError):
     pass
 
 
+class AssetReleaseMismatchError(ResourceUnavailableError):
+    pass
+
+
 class ReservationState(StrEnum):
     RESERVED = "reserved"
     COMMITTED = "committed"
@@ -731,8 +779,8 @@ class RedisResourceCoordinator:
         self._clear_session_usage_script = self._redis.register_script(
             _CLEAR_SESSION_USAGE_SCRIPT
         )
-        self._release_committed_usage_script = self._redis.register_script(
-            _RELEASE_COMMITTED_USAGE_SCRIPT
+        self._release_committed_asset_script = self._redis.register_script(
+            _RELEASE_COMMITTED_ASSET_SCRIPT
         )
         self._acquire_session_script = self._redis.register_script(
             _ACQUIRE_SESSION_SCRIPT
@@ -908,17 +956,42 @@ class RedisResourceCoordinator:
     def clear_session_usage(self, session_id: str) -> None:
         _validate_session_id(session_id)
         self._clear_session_usage_script(
-            keys=[_STATE_KEY],
+            keys=[
+                _STATE_KEY,
+                _session_released_assets_key(session_id),
+                _RELEASED_ASSETS_KEY,
+            ],
             args=[session_id],
         )
 
-    def release_committed_usage(self, session_id: str, released_bytes: int) -> None:
+    def release_committed_asset(
+        self,
+        session_id: str,
+        asset_id: str,
+        released_bytes: int,
+    ) -> bool:
         _validate_session_id(session_id)
+        _validate_asset_id(asset_id)
         released_bytes = _nonnegative_int(released_bytes, "released_bytes")
-        self._release_committed_usage_script(
-            keys=[_STATE_KEY],
-            args=[session_id, released_bytes],
+        result = int(
+            self._release_committed_asset_script(
+                keys=[
+                    _STATE_KEY,
+                    _RELEASED_ASSETS_KEY,
+                    _session_released_assets_key(session_id),
+                ],
+                args=[session_id, asset_id, released_bytes],
+            )
         )
+        if result == 2:
+            raise AssetReleaseMismatchError(
+                "Asset release session does not match"
+            )
+        if result == 3:
+            raise ResourceUnavailableError(
+                "Asset release bytes do not match committed usage"
+            )
+        return result == 1
 
     def reconcile_reservations(self) -> int:
         return int(
@@ -1052,9 +1125,19 @@ def _session_leases_key(session_id: str) -> str:
     return f"dt:resource:session:{session_id}:leases"
 
 
+def _session_released_assets_key(session_id: str) -> str:
+    return f"dt:resource:session:{session_id}:released-assets"
+
+
 def _validate_session_id(value: str) -> str:
     if not _SESSION_PATTERN.fullmatch(value):
         raise ValueError("Invalid hosted session ID")
+    return value
+
+
+def _validate_asset_id(value: str) -> str:
+    if not _ASSET_PATTERN.fullmatch(value):
+        raise ValueError("Invalid hosted asset ID")
     return value
 
 

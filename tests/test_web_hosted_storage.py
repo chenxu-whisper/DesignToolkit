@@ -182,7 +182,9 @@ async def test_upload_is_streamed_to_an_opaque_session_asset(
 
 
 @pytest.mark.anyio
-async def test_delete_asset_is_owned_exact_and_idempotent(tmp_path: Path) -> None:
+async def test_delete_asset_preserves_retryable_state_until_finalized(
+    tmp_path: Path,
+) -> None:
     storage = HostedStorage(tmp_path, max_upload_bytes=16)
     owner = "a" * 32
     stranger = "b" * 32
@@ -197,11 +199,21 @@ async def test_delete_asset_is_owned_exact_and_idempotent(tmp_path: Path) -> Non
     with pytest.raises(UploadRejectedError, match="not available"):
         storage.delete_asset(stranger, asset.reference)
 
-    assert storage.delete_asset(owner, asset.reference) == 5
-    assert storage.delete_asset(owner, asset.reference) == 0
+    deletion = storage.delete_asset(owner, asset.reference)
+    retry = storage.delete_asset(owner, asset.reference)
+
+    assert deletion.asset_id == asset.reference.split(":", 2)[1]
+    assert deletion.size == 5
+    assert retry == deletion
     with pytest.raises(UploadRejectedError, match="not available"):
         storage.resolve(owner, asset.reference)
+    assert len(list(tmp_path.rglob("screen.png"))) == 1
+
+    storage.finalize_asset_deletion(owner, deletion.asset_id)
+    storage.finalize_asset_deletion(owner, deletion.asset_id)
+
     assert list(tmp_path.rglob("screen.png")) == []
+    assert storage.delete_asset(owner, asset.reference).size == 0
 
 
 @pytest.mark.parametrize(

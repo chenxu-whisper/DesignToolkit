@@ -59,6 +59,7 @@ from designtoolkit.web.native_picker import (
     TkinterLocalPathPicker,
 )
 from designtoolkit.web.resources import (
+    AssetReleaseMismatchError,
     RedisResourceCoordinator,
     ResourceUnavailableError,
 )
@@ -896,17 +897,27 @@ def create_router(
         lease = None
         try:
             lease = resources.acquire_session(http_request.state.session_id)
-            deleted_bytes = storage.delete_asset(
+            deletion = storage.delete_asset(
                 http_request.state.session_id,
                 f"asset:{asset_id}",
             )
-            if deleted_bytes:
-                resources.release_committed_usage(
-                    http_request.state.session_id,
-                    deleted_bytes,
-                )
+            resources.release_committed_asset(
+                http_request.state.session_id,
+                deletion.asset_id,
+                deletion.size,
+            )
+            storage.finalize_asset_deletion(
+                http_request.state.session_id,
+                deletion.asset_id,
+            )
         except UploadRejectedError as exc:
             raise ApiError("asset_not_found", str(exc), 404) from exc
+        except AssetReleaseMismatchError as exc:
+            raise ApiError(
+                "asset_not_found",
+                "Uploaded asset is not available",
+                404,
+            ) from exc
         except (RedisError, ResourceUnavailableError) as exc:
             raise ApiError("storage_unavailable", str(exc), 503) from exc
         except OSError as exc:

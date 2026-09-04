@@ -285,23 +285,49 @@ class DeterministicRedis(fakeredis.FakeRedis):
         return removed
 
     def _eval_clear_session_usage(self, keys, args):  # noqa: ANN001, ANN202
+        state_key, session_released_key, released_key = keys
+        session_id = str(args[0])
+        for raw_asset_id in self.smembers(session_released_key):
+            asset_id = self._text(raw_asset_id)
+            metadata = self.hget(released_key, asset_id)
+            if (
+                metadata is not None
+                and self._text(metadata).split("|", 1)[0] == session_id
+            ):
+                self.hdel(released_key, asset_id)
+        self.delete(session_released_key)
         self.hdel(
-            keys[0],
-            f"session:{args[0]}:committed_bytes",
+            state_key,
+            f"session:{session_id}:committed_bytes",
         )
         return 1
 
-    def _eval_release_committed_usage(self, keys, args):  # noqa: ANN001, ANN202
-        state_key = keys[0]
-        field = f"session:{args[0]}:committed_bytes"
-        released_bytes = int(args[1])
+    def _eval_release_committed_asset(self, keys, args):  # noqa: ANN001, ANN202
+        state_key, released_key, session_released_key = keys
+        session_id, asset_id, released_bytes = args
+        released_bytes = int(released_bytes)
+        existing = self.hget(released_key, asset_id)
+        if existing is not None:
+            existing_session, existing_bytes = self._text(existing).split("|")
+            if existing_session != session_id:
+                return 2
+            if released_bytes != 0 and int(existing_bytes) != released_bytes:
+                return 3
+            return 0
+        field = f"session:{session_id}:committed_bytes"
         current = self._number(state_key, field)
-        remaining = max(0, current - released_bytes)
+        if released_bytes == 0:
+            return 4
+        if released_bytes > current:
+            return 3
+        remaining = current - released_bytes
         if remaining:
             self.hset(state_key, field, remaining)
         else:
             self.hdel(state_key, field)
-        return remaining
+        self.hset(released_key, asset_id, f"{session_id}|{released_bytes}")
+        self.sadd(session_released_key, asset_id)
+        return 1
 
     def _eval_acquire_session(self, keys, args):  # noqa: ANN001, ANN202
         state_key, leases_key, lease_key = keys
@@ -541,7 +567,7 @@ def test_committed_uploads_retain_session_usage_until_cleanup(
     replacement.release()
 
 
-def test_release_committed_usage_is_session_scoped_and_clamped_at_zero(
+def test_release_committed_asset_is_idempotent_and_session_scoped(
     redis_connection: DeterministicRedis,
 ) -> None:
     resources = coordinator(redis_connection, max_session_bytes=10)
@@ -549,16 +575,105 @@ def test_release_committed_usage_is_session_scoped_and_clamped_at_zero(
     second = resources.reserve_upload(SESSION_B, 6, free_bytes=100)
     first.commit()
     second.commit()
+    asset_id = "1" * 32
 
-    resources.release_committed_usage(SESSION_A, 4)
+    resources.release_committed_asset(SESSION_A, asset_id, 4)
+    resources.release_committed_asset(SESSION_A, asset_id, 4)
     with pytest.raises(ResourceUnavailableError, match="session"):
         resources.reserve_upload(SESSION_A, 8, free_bytes=100)
     resources.reserve_upload(SESSION_A, 7, free_bytes=100).release()
 
-    resources.release_committed_usage(SESSION_A, 99)
-    resources.reserve_upload(SESSION_A, 10, free_bytes=100).release()
+    with pytest.raises(ResourceUnavailableError, match="session"):
+        resources.release_committed_asset(SESSION_B, asset_id, 4)
+    with pytest.raises(ResourceUnavailableError, match="bytes"):
+        resources.release_committed_asset(SESSION_A, asset_id, 3)
     with pytest.raises(ResourceUnavailableError, match="session"):
         resources.reserve_upload(SESSION_B, 5, free_bytes=100)
+
+
+def test_concurrent_asset_release_decrements_committed_usage_once(
+    redis_connection: DeterministicRedis,
+) -> None:
+    resources = coordinator(redis_connection, max_session_bytes=10)
+    first = resources.reserve_upload(SESSION_A, 5, free_bytes=100)
+    second = resources.reserve_upload(SESSION_A, 3, free_bytes=100)
+    first.commit()
+    second.commit()
+    start = Barrier(8)
+
+    def release() -> None:
+        start.wait()
+        resources.release_committed_asset(SESSION_A, "1" * 32, 5)
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [executor.submit(release) for _ in range(8)]
+        for future in futures:
+            future.result()
+
+    resources.reserve_upload(SESSION_A, 7, free_bytes=100).release()
+    with pytest.raises(ResourceUnavailableError, match="session"):
+        resources.reserve_upload(SESSION_A, 8, free_bytes=100)
+
+
+def test_asset_release_acknowledgement_loss_can_be_retried_without_double_release(
+) -> None:
+    redis_connection = ExecuteThenRaiseRedis("release_committed_asset")
+    resources = coordinator(redis_connection, max_session_bytes=10)
+    first = resources.reserve_upload(SESSION_A, 5, free_bytes=100)
+    second = resources.reserve_upload(SESSION_A, 3, free_bytes=100)
+    first.commit()
+    second.commit()
+
+    with pytest.raises(RedisConnectionError, match="acknowledgement lost"):
+        resources.release_committed_asset(SESSION_A, "1" * 32, 5)
+    resources.release_committed_asset(SESSION_A, "1" * 32, 5)
+
+    resources.reserve_upload(SESSION_A, 7, free_bytes=100).release()
+    with pytest.raises(ResourceUnavailableError, match="session"):
+        resources.reserve_upload(SESSION_A, 8, free_bytes=100)
+
+
+def test_clear_session_usage_removes_bounded_asset_release_markers(
+    redis_connection: DeterministicRedis,
+) -> None:
+    resources = coordinator(redis_connection, max_session_bytes=10)
+    reservation = resources.reserve_upload(SESSION_A, 4, free_bytes=100)
+    reservation.commit()
+    asset_id = "1" * 32
+    resources.release_committed_asset(SESSION_A, asset_id, 4)
+
+    assert redis_connection.hget(
+        "dt:resource:released-assets",
+        asset_id,
+    ) == f"{SESSION_A}|4".encode()
+    assert redis_connection.smembers(
+        f"dt:resource:session:{SESSION_A}:released-assets"
+    ) == {asset_id.encode()}
+
+    resources.clear_session_usage(SESSION_A)
+
+    assert not redis_connection.hexists("dt:resource:released-assets", asset_id)
+    assert not redis_connection.exists(
+        f"dt:resource:session:{SESSION_A}:released-assets"
+    )
+
+
+@pytest.mark.parametrize(
+    ("asset_id", "released_bytes"),
+    [
+        ("not-an-asset", 1),
+        ("1" * 32, -1),
+    ],
+)
+def test_release_committed_asset_rejects_malformed_input(
+    redis_connection: DeterministicRedis,
+    asset_id: str,
+    released_bytes: int,
+) -> None:
+    resources = coordinator(redis_connection)
+
+    with pytest.raises(ValueError):
+        resources.release_committed_asset(SESSION_A, asset_id, released_bytes)
 
 
 def test_upload_commit_creates_bounded_marker_with_accounting_metadata(
@@ -987,6 +1102,11 @@ def test_real_redis_executes_reservation_scripts(
     finalized.finalize()
     with pytest.raises(ResourceUnavailableError, match="session"):
         resources.reserve_upload(SESSION_A, 1, free_bytes=100)
+
+    resources.release_committed_asset(SESSION_A, "1" * 32, 10)
+    resources.release_committed_asset(SESSION_A, "1" * 32, 0)
+    replacement = resources.reserve_upload(SESSION_A, 10, free_bytes=100)
+    replacement.release()
 
     resources.clear_session_usage(SESSION_A)
     released = resources.reserve_upload(SESSION_A, 10, free_bytes=100)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -29,6 +30,7 @@ _DEFAULT_MAX_QUEUED_TASKS = 20
 _DEFAULT_RETENTION_SECONDS = 2 * 60 * 60
 _UPLOAD_CHUNK_BYTES = 1024 * 1024
 _RESOURCE_RECOVERY_ATTEMPTS = 3
+_DELETION_METADATA_NAME = ".deletion.json"
 _ALLOWED_SUFFIXES = frozenset(
     {
         ".avi",
@@ -168,6 +170,13 @@ class UploadedAsset:
     size: int
 
 
+@dataclass(frozen=True)
+class AssetDeletion:
+    asset_id: str
+    reference: str
+    size: int
+
+
 class HostedStorage:
     def __init__(
         self,
@@ -289,35 +298,50 @@ class HostedStorage:
         os.utime(self._session_dir(session_id), None)
         return matches[0]
 
-    def delete_asset(self, session_id: str, reference: str) -> int:
+    def delete_asset(self, session_id: str, reference: str) -> AssetDeletion:
         session_id = _validate_session_id(session_id)
         asset_id = _asset_id(reference)
-        assets_dir = self._session_dir(session_id) / "assets"
+        session_dir = self._session_dir(session_id)
+        assets_dir = session_dir / "assets"
         asset_dir = assets_dir / asset_id
-        tombstone = assets_dir / ".deleted" / asset_id
+        tombstone = session_dir / ".trash" / asset_id
         if tombstone.is_dir():
-            return 0
+            return _read_asset_deletion(tombstone, asset_id)
         if not asset_dir.is_dir():
             if self._asset_belongs_to_other_session(session_id, asset_id):
                 raise UploadRejectedError("Uploaded asset is not available")
-            return 0
+            return AssetDeletion(
+                asset_id=asset_id,
+                reference=f"asset:{asset_id}",
+                size=0,
+            )
 
         tombstone.parent.mkdir(parents=True, exist_ok=True)
+        deletion = AssetDeletion(
+            asset_id=asset_id,
+            reference=f"asset:{asset_id}",
+            size=_asset_payload_size(asset_dir),
+        )
         try:
+            _write_asset_deletion(asset_dir, deletion)
             asset_dir.replace(tombstone)
-        except FileNotFoundError:
+        except OSError:
             if tombstone.is_dir():
-                return 0
-            raise UploadRejectedError("Uploaded asset is not available") from None
+                return _read_asset_deletion(tombstone, asset_id)
+            raise
 
-        deleted_bytes = _directory_size(tombstone)
-        for child in tombstone.iterdir():
-            if child.is_dir():
-                shutil.rmtree(child)
-            else:
-                child.unlink()
-        os.utime(self._session_dir(session_id), None)
-        return deleted_bytes
+        os.utime(session_dir, None)
+        return deletion
+
+    def finalize_asset_deletion(self, session_id: str, asset_id: str) -> None:
+        session_id = _validate_session_id(session_id)
+        asset_id = _asset_id(f"asset:{asset_id}")
+        tombstone = self._session_dir(session_id) / ".trash" / asset_id
+        try:
+            shutil.rmtree(tombstone)
+        except FileNotFoundError:
+            return
+        self._remove_empty_session(session_id)
 
     def create_task_dir(self, session_id: str) -> Path:
         session_id = _validate_session_id(session_id)
@@ -396,6 +420,9 @@ class HostedStorage:
         assets_dir = session_dir / "assets"
         if assets_dir.is_dir() and not any(assets_dir.iterdir()):
             assets_dir.rmdir()
+        trash_dir = session_dir / ".trash"
+        if trash_dir.is_dir() and not any(trash_dir.iterdir()):
+            trash_dir.rmdir()
         if session_dir.is_dir() and not any(session_dir.iterdir()):
             session_dir.rmdir()
         sessions_dir = self.root / "sessions"
@@ -418,7 +445,7 @@ class HostedStorage:
             candidate.name != session_id
             and (
                 (candidate / "assets" / asset_id).is_dir()
-                or (candidate / "assets" / ".deleted" / asset_id).is_dir()
+                or (candidate / ".trash" / asset_id).is_dir()
             )
             for candidate in sessions_dir.iterdir()
             if candidate.is_dir()
@@ -492,6 +519,53 @@ def _asset_id(reference: str) -> str:
     if parsed.hex != value:
         raise UploadRejectedError("Uploaded asset is not available")
     return value
+
+
+def _asset_payload_size(asset_dir: Path) -> int:
+    return sum(
+        path.stat().st_size
+        for path in asset_dir.rglob("*")
+        if path.is_file()
+        and not any(part.startswith(".") for part in path.relative_to(asset_dir).parts)
+    )
+
+
+def _write_asset_deletion(asset_dir: Path, deletion: AssetDeletion) -> None:
+    metadata_path = asset_dir / _DELETION_METADATA_NAME
+    temporary_path = asset_dir / f"{_DELETION_METADATA_NAME}.{uuid4().hex}.tmp"
+    payload = {
+        "asset_id": deletion.asset_id,
+        "reference": deletion.reference,
+        "bytes": deletion.size,
+    }
+    try:
+        with temporary_path.open("x", encoding="utf-8") as metadata:
+            json.dump(payload, metadata, separators=(",", ":"), sort_keys=True)
+            metadata.flush()
+            os.fsync(metadata.fileno())
+        temporary_path.replace(metadata_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def _read_asset_deletion(tombstone: Path, asset_id: str) -> AssetDeletion:
+    try:
+        payload = json.loads(
+            (tombstone / _DELETION_METADATA_NAME).read_text(encoding="utf-8")
+        )
+        reference = payload["reference"]
+        size = payload["bytes"]
+        if (
+            payload["asset_id"] != asset_id
+            or reference != f"asset:{asset_id}"
+            or isinstance(size, bool)
+            or not isinstance(size, int)
+            or size <= 0
+        ):
+            raise ValueError
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise OSError("Asset deletion state is invalid") from exc
+    return AssetDeletion(asset_id=asset_id, reference=reference, size=size)
 
 
 def _safe_filename(value: str | None) -> str:

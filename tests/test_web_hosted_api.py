@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 from io import BytesIO
 from pathlib import Path
 from urllib.parse import quote
@@ -14,7 +15,10 @@ from rq import Queue
 from designtoolkit.web.app import create_app
 from designtoolkit.web.hosted import HostedSettings, HostedStorage
 from designtoolkit.web.redis_tasks import RedisTaskManager
-from designtoolkit.web.resources import ResourceUnavailableError
+from designtoolkit.web.resources import (
+    AssetReleaseMismatchError,
+    ResourceUnavailableError,
+)
 from designtoolkit.web.schemas import TaskStatus
 from designtoolkit.web.tasks import TaskManager
 
@@ -90,6 +94,7 @@ class StubCoordinator:
         self.min_free_bytes = min_free_bytes
         self.active_uploads = 0
         self.committed: dict[str, int] = {}
+        self.released_assets: dict[str, tuple[str, int]] = {}
 
     def reserve_upload(
         self,
@@ -113,16 +118,30 @@ class StubCoordinator:
     def acquire_session(self, _session_id: str) -> StubLease:
         return StubLease()
 
-    def release_committed_usage(
+    def release_committed_asset(
         self,
         session_id: str,
+        asset_id: str,
         released_bytes: int,
     ) -> None:
-        remaining = max(0, self.committed.get(session_id, 0) - released_bytes)
+        released = self.released_assets.get(asset_id)
+        if released is not None:
+            if released[0] != session_id:
+                raise AssetReleaseMismatchError("Uploaded asset is not available")
+            if released_bytes != 0 and released[1] != released_bytes:
+                raise ResourceUnavailableError("Asset release metadata mismatch")
+            return
+        if released_bytes == 0:
+            return
+        current = self.committed.get(session_id, 0)
+        if released_bytes > current:
+            raise ResourceUnavailableError("Asset release bytes mismatch")
+        remaining = current - released_bytes
         if remaining:
             self.committed[session_id] = remaining
         else:
             self.committed.pop(session_id, None)
+        self.released_assets[asset_id] = (session_id, released_bytes)
 
 
 def _png_bytes() -> bytes:
@@ -140,6 +159,7 @@ def _client(
     min_free_bytes: int = 0,
     task_manager: TaskManager | RedisTaskManager | None = None,
     upload_requests_per_hour: int = 30,
+    resource_coordinator: StubCoordinator | None = None,
 ) -> TestClient:
     if task_manager is None:
         redis_connection = fakeredis.FakeRedis(decode_responses=False)
@@ -161,7 +181,7 @@ def _client(
         secure_cookies=False,
         upload_requests_per_hour=upload_requests_per_hour,
     )
-    coordinator = StubCoordinator(
+    coordinator = resource_coordinator or StubCoordinator(
         max_upload_concurrency=max_upload_concurrency,
         max_session_bytes=max_session_bytes,
         min_free_bytes=min_free_bytes,
@@ -365,6 +385,89 @@ def test_delete_upload_is_owner_scoped_idempotent_and_reclaims_quota(
     assert replacement.status_code == 201
 
 
+def test_delete_upload_retries_quota_release_from_durable_tombstone(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _client(tmp_path, max_session_bytes=5) as owner:
+        uploaded = _upload(owner, "screen.png", b"image")
+        asset_id = uploaded.json()["reference"].split(":", 2)[1]
+        session_id = owner.cookies["dt_session"]
+        coordinator = owner.app.state.resource_coordinator
+        original_release = coordinator.release_committed_asset
+        attempts = 0
+
+        def fail_once(
+            release_session_id: str,
+            release_asset_id: str,
+            released_bytes: int,
+        ) -> None:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RedisConnectionError("release unavailable")
+            original_release(
+                release_session_id,
+                release_asset_id,
+                released_bytes,
+            )
+
+        monkeypatch.setattr(coordinator, "release_committed_asset", fail_once)
+
+        first_delete = owner.delete(f"/api/uploads/{asset_id}")
+        tombstone = tmp_path / "sessions" / session_id / ".trash" / asset_id
+        assert first_delete.status_code == 503
+        assert tombstone.is_dir()
+        blocked_replacement = _upload(owner, "blocked.png", b"12345")
+        retry = owner.delete(f"/api/uploads/{asset_id}")
+        replacement = _upload(owner, "replacement.png", b"12345")
+
+    assert blocked_replacement.status_code == 413
+    assert retry.status_code == 204
+    assert replacement.status_code == 201
+    assert attempts == 2
+    assert not tombstone.exists()
+
+
+def test_delete_upload_retries_tombstone_removal_without_double_release(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    removal_attempts = 0
+    with _client(tmp_path, max_session_bytes=5) as owner:
+        uploaded = _upload(owner, "screen.png", b"image")
+        asset_id = uploaded.json()["reference"].split(":", 2)[1]
+        session_id = owner.cookies["dt_session"]
+        tombstone = tmp_path / "sessions" / session_id / ".trash" / asset_id
+        original_rmtree = shutil.rmtree
+
+        def fail_removal_once(path: Path, *args: object, **kwargs: object) -> None:
+            nonlocal removal_attempts
+            if Path(path) == tombstone:
+                removal_attempts += 1
+                if removal_attempts == 1:
+                    raise OSError("removal unavailable")
+            original_rmtree(path, *args, **kwargs)
+
+        monkeypatch.setattr(
+            "designtoolkit.web.hosted.shutil.rmtree",
+            fail_removal_once,
+        )
+
+        first_delete = owner.delete(f"/api/uploads/{asset_id}")
+        assert first_delete.status_code == 503
+        assert tombstone.is_dir()
+        replacement = _upload(owner, "replacement.png", b"12345")
+        retry = owner.delete(f"/api/uploads/{asset_id}")
+        overflow = _upload(owner, "overflow.png", b"x")
+
+    assert replacement.status_code == 201
+    assert retry.status_code == 204
+    assert overflow.status_code == 413
+    assert removal_attempts == 2
+    assert not tombstone.exists()
+
+
 def test_delete_upload_cannot_remove_another_sessions_asset(tmp_path: Path) -> None:
     with _client(tmp_path) as owner:
         uploaded = _upload(owner, "screen.png", _png_bytes())
@@ -381,6 +484,26 @@ def test_delete_upload_cannot_remove_another_sessions_asset(tmp_path: Path) -> N
 
     assert rejected.status_code == 404
     assert inspection.status_code == 200
+
+
+def test_deleted_asset_token_remains_isolated_from_other_sessions(
+    tmp_path: Path,
+) -> None:
+    coordinator = StubCoordinator(
+        max_upload_concurrency=4,
+        max_session_bytes=2 * 1024 * 1024 * 1024,
+        min_free_bytes=0,
+    )
+    with _client(tmp_path, resource_coordinator=coordinator) as owner:
+        uploaded = _upload(owner, "screen.png", b"image")
+        asset_id = uploaded.json()["reference"].split(":", 2)[1]
+        deleted = owner.delete(f"/api/uploads/{asset_id}")
+
+        with _client(tmp_path, resource_coordinator=coordinator) as stranger:
+            rejected = stranger.delete(f"/api/uploads/{asset_id}")
+
+    assert deleted.status_code == 204
+    assert rejected.status_code == 404
 
 
 def test_hosted_upload_reference_can_drive_image_inspection(tmp_path: Path) -> None:
