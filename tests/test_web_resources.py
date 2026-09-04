@@ -285,8 +285,12 @@ class DeterministicRedis(fakeredis.FakeRedis):
         return removed
 
     def _eval_clear_session_usage(self, keys, args):  # noqa: ANN001, ANN202
-        state_key = keys[0]
+        state_key, marker_index_key = keys
         session_id = str(args[0])
+        marker_keys = self.smembers(marker_index_key)
+        if marker_keys:
+            self.delete(*marker_keys)
+        self.delete(marker_index_key)
         self.hdel(
             state_key,
             f"session:{session_id}:committed_bytes",
@@ -294,8 +298,8 @@ class DeterministicRedis(fakeredis.FakeRedis):
         return 1
 
     def _eval_release_committed_asset(self, keys, args):  # noqa: ANN001, ANN202
-        state_key, marker_key = keys
-        session_id, asset_id, released_bytes, marker_ttl_ms = args
+        state_key, marker_key, marker_index_key = keys
+        session_id, asset_id, released_bytes = args
         released_bytes = int(released_bytes)
         if self.exists(marker_key):
             existing_session = self._text(self.hget(marker_key, "session_id"))
@@ -307,6 +311,8 @@ class DeterministicRedis(fakeredis.FakeRedis):
                 return 2
             if released_bytes != 0 and int(existing_bytes) != released_bytes:
                 return 3
+            if self.hget(marker_key, "finalized") != b"1":
+                self.sadd(marker_index_key, marker_key)
             return 0
         field = f"session:{session_id}:committed_bytes"
         current = self._number(state_key, field)
@@ -327,7 +333,7 @@ class DeterministicRedis(fakeredis.FakeRedis):
                 "bytes": released_bytes,
             },
         )
-        self.pexpire(marker_key, int(marker_ttl_ms))
+        self.sadd(marker_index_key, marker_key)
         return 1
 
     def _eval_is_committed_asset_released(  # noqa: ANN001, ANN202
@@ -341,6 +347,22 @@ class DeterministicRedis(fakeredis.FakeRedis):
         existing_session = self._text(self.hget(marker_key, "session_id"))
         existing_asset = self._text(self.hget(marker_key, "asset_id"))
         return int(existing_session == args[0] and existing_asset == args[1])
+
+    def _eval_finalize_asset_release(self, keys, args):  # noqa: ANN001, ANN202
+        marker_key, marker_index_key = keys
+        session_id, asset_id, marker_ttl_ms = args
+        if not self.exists(marker_key):
+            return 0
+        existing_session = self._text(self.hget(marker_key, "session_id"))
+        existing_asset = self._text(self.hget(marker_key, "asset_id"))
+        if existing_session != session_id or existing_asset != asset_id:
+            return 2
+        self.srem(marker_index_key, marker_key)
+        if self.hget(marker_key, "finalized") == b"1":
+            return 0
+        self.hset(marker_key, "finalized", 1)
+        self.pexpire(marker_key, int(marker_ttl_ms))
+        return 1
 
     def _eval_acquire_session(self, keys, args):  # noqa: ANN001, ANN202
         state_key, leases_key, lease_key = keys
@@ -612,7 +634,7 @@ def test_release_committed_asset_is_idempotent_and_session_scoped(
         resources.reserve_upload(SESSION_B, 5, free_bytes=100)
 
 
-def test_asset_release_marker_outlives_retention_recovery_boundary(
+def test_asset_release_marker_remains_persistent_until_finalized(
     redis_connection: DeterministicRedis,
 ) -> None:
     resources = coordinator(
@@ -628,15 +650,16 @@ def test_asset_release_marker_outlives_retention_recovery_boundary(
 
     resources.release_committed_asset(SESSION_A, "1" * 32, 4)
 
-    released_ttl = redis_connection.pttl(
-        f"dt:resource:asset-released:{SESSION_A}:{'1' * 32}"
-    )
-    assert 19_000 <= released_ttl <= 20_000
-    assert released_ttl > resources._reservation_ttl_ms
-    assert released_ttl > resources._lease_ttl_ms
+    marker_key = f"dt:resource:asset-released:{SESSION_A}:{'1' * 32}"
+    assert redis_connection.pttl(marker_key) == -1
+
+    resources.is_committed_asset_released(SESSION_A, "1" * 32)
+    resources.release_committed_asset(SESSION_A, "1" * 32, 4)
+
+    assert redis_connection.pttl(marker_key) == -1
 
 
-def test_asset_release_markers_expire_independently_without_ttl_refresh(
+def test_finalized_asset_release_marker_expires_without_ttl_refresh(
     redis_connection: DeterministicRedis,
 ) -> None:
     resources = coordinator(
@@ -648,32 +671,27 @@ def test_asset_release_markers_expire_independently_without_ttl_refresh(
         lease_heartbeat_interval=0.005,
         release_marker_ttl=0.15,
     )
-    first = resources.reserve_upload(SESSION_A, 4, free_bytes=100)
-    second = resources.reserve_upload(SESSION_A, 3, free_bytes=100)
-    first.commit()
-    second.commit()
-    first_asset = "1" * 32
-    second_asset = "2" * 32
-    first_key = f"dt:resource:asset-released:{SESSION_A}:{first_asset}"
-    second_key = f"dt:resource:asset-released:{SESSION_A}:{second_asset}"
+    reservation = resources.reserve_upload(SESSION_A, 4, free_bytes=100)
+    reservation.commit()
+    asset_id = "1" * 32
+    marker_key = f"dt:resource:asset-released:{SESSION_A}:{asset_id}"
+    marker_index_key = f"dt:resource:session:{SESSION_A}:released-assets"
 
-    resources.release_committed_asset(SESSION_A, first_asset, 4)
+    resources.release_committed_asset(SESSION_A, asset_id, 4)
+    resources.finalize_asset_release(SESSION_A, asset_id)
+    initial_ttl = redis_connection.pttl(marker_key)
+    assert not redis_connection.exists(marker_index_key)
     sleep(0.06)
-    resources.release_committed_asset(SESSION_A, second_asset, 3)
-    first_ttl_before_retry = redis_connection.pttl(first_key)
-    second_ttl = redis_connection.pttl(second_key)
+    ttl_before_retry = redis_connection.pttl(marker_key)
+    resources.finalize_asset_release(SESSION_A, asset_id)
 
-    assert 0 < first_ttl_before_retry < second_ttl
-    assert resources.is_committed_asset_released(SESSION_A, first_asset) is True
-    resources.release_committed_asset(SESSION_A, first_asset, 4)
-    assert 0 < redis_connection.pttl(first_key) <= first_ttl_before_retry
-
+    assert 0 < ttl_before_retry < initial_ttl <= 150
+    assert 0 < redis_connection.pttl(marker_key) <= ttl_before_retry
     deadline = monotonic() + 0.2
-    while redis_connection.exists(first_key) and monotonic() < deadline:
+    while redis_connection.exists(marker_key) and monotonic() < deadline:
         sleep(0.005)
 
-    assert not redis_connection.exists(first_key)
-    assert redis_connection.exists(second_key)
+    assert not redis_connection.exists(marker_key)
 
 
 def test_concurrent_asset_release_decrements_committed_usage_once(
@@ -718,7 +736,34 @@ def test_asset_release_acknowledgement_loss_can_be_retried_without_double_releas
         resources.reserve_upload(SESSION_A, 8, free_bytes=100)
 
 
-def test_clear_session_usage_leaves_only_independently_expiring_release_markers(
+def test_asset_release_finalization_acknowledgement_loss_does_not_refresh_ttl(
+) -> None:
+    redis_connection = ExecuteThenRaiseRedis("finalize_asset_release")
+    resources = coordinator(
+        redis_connection,
+        max_session_bytes=10,
+        reservation_ttl=0.02,
+        lease_ttl=0.02,
+        reservation_heartbeat_interval=0.005,
+        lease_heartbeat_interval=0.005,
+        release_marker_ttl=0.15,
+    )
+    reservation = resources.reserve_upload(SESSION_A, 5, free_bytes=100)
+    reservation.commit()
+    asset_id = "1" * 32
+    marker_key = f"dt:resource:asset-released:{SESSION_A}:{asset_id}"
+    resources.release_committed_asset(SESSION_A, asset_id, 5)
+
+    with pytest.raises(RedisConnectionError, match="acknowledgement lost"):
+        resources.finalize_asset_release(SESSION_A, asset_id)
+    sleep(0.06)
+    ttl_before_retry = redis_connection.pttl(marker_key)
+    resources.finalize_asset_release(SESSION_A, asset_id)
+
+    assert 0 < redis_connection.pttl(marker_key) <= ttl_before_retry
+
+
+def test_clear_session_usage_removes_persistent_asset_release_markers(
     redis_connection: DeterministicRedis,
 ) -> None:
     resources = coordinator(
@@ -731,21 +776,20 @@ def test_clear_session_usage_leaves_only_independently_expiring_release_markers(
     asset_id = "1" * 32
     resources.release_committed_asset(SESSION_A, asset_id, 4)
     marker_key = f"dt:resource:asset-released:{SESSION_A}:{asset_id}"
+    marker_index_key = f"dt:resource:session:{SESSION_A}:released-assets"
 
     assert redis_connection.hgetall(marker_key) == {
         b"session_id": SESSION_A.encode(),
         b"asset_id": asset_id.encode(),
         b"bytes": b"4",
     }
+    assert redis_connection.pttl(marker_key) == -1
+    assert redis_connection.smembers(marker_index_key) == {marker_key.encode()}
 
     resources.clear_session_usage(SESSION_A)
 
-    assert 0 < redis_connection.pttl(marker_key) <= 20_000
-    assert list(
-        redis_connection.scan_iter(
-            match=f"dt:resource:session:{SESSION_A}:released-assets"
-        )
-    ) == []
+    assert not redis_connection.exists(marker_key)
+    assert not redis_connection.exists(marker_index_key)
 
 
 @pytest.mark.parametrize(

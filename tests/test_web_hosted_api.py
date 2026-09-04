@@ -98,6 +98,8 @@ class StubCoordinator:
         self.released_assets: dict[str, tuple[str, int]] = {}
         self.release_calls = 0
         self.release_query_calls = 0
+        self.finalize_release_calls = 0
+        self.finalized_assets: set[tuple[str, str]] = set()
         self.reserve_calls = 0
 
     def reserve_upload(
@@ -153,6 +155,12 @@ class StubCoordinator:
         self.release_query_calls += 1
         released = self.released_assets.get(asset_id)
         return released is not None and released[0] == session_id
+
+    def finalize_asset_release(self, session_id: str, asset_id: str) -> None:
+        self.finalize_release_calls += 1
+        released = self.released_assets.get(asset_id)
+        if released is not None and released[0] == session_id:
+            self.finalized_assets.add((session_id, asset_id))
 
 
 def _png_bytes() -> bytes:
@@ -405,6 +413,7 @@ def test_delete_upload_is_owner_scoped_idempotent_and_reclaims_quota(
     tmp_path: Path,
 ) -> None:
     with _client(tmp_path, max_session_bytes=5) as owner:
+        coordinator = owner.app.state.resource_coordinator
         uploaded = _upload(owner, "screen.png", b"image")
         reference = uploaded.json()["reference"]
         asset_id = reference.split(":", 2)[1]
@@ -415,6 +424,51 @@ def test_delete_upload_is_owner_scoped_idempotent_and_reclaims_quota(
     assert first_delete.status_code == 204
     assert second_delete.status_code == 204
     assert replacement.status_code == 201
+    assert coordinator.finalize_release_calls == 2
+    assert coordinator.finalized_assets == {
+        (owner.cookies["dt_session"], asset_id)
+    }
+
+
+def test_delete_absent_upload_best_effort_finalizes_known_release_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=5)
+    with _client(
+        tmp_path,
+        max_session_bytes=5,
+        hosted_storage=storage,
+    ) as owner:
+        uploaded = _upload(owner, "screen.png", b"image")
+        asset_id = uploaded.json()["reference"].split(":", 2)[1]
+        session_id = owner.cookies["dt_session"]
+        coordinator = owner.app.state.resource_coordinator
+        deletion = storage.delete_asset(session_id, f"asset:{asset_id}")
+        coordinator.release_committed_asset(
+            session_id,
+            deletion.asset_id,
+            deletion.size,
+        )
+        storage.finalize_asset_deletion(session_id, asset_id)
+        finalize_attempts = 0
+
+        def fail_finalize(_session_id: str, _asset_id: str) -> None:
+            nonlocal finalize_attempts
+            finalize_attempts += 1
+            raise RedisConnectionError("finalize unavailable")
+
+        monkeypatch.setattr(
+            coordinator,
+            "finalize_asset_release",
+            fail_finalize,
+        )
+
+        response = owner.delete(f"/api/uploads/{asset_id}")
+
+    assert response.status_code == 204
+    assert finalize_attempts == 1
+    assert asset_id in coordinator.released_assets
 
 
 def test_delete_upload_retries_quota_release_from_durable_tombstone(
@@ -471,6 +525,7 @@ def test_delete_upload_retries_tombstone_removal_without_double_release(
         asset_id = uploaded.json()["reference"].split(":", 2)[1]
         session_id = owner.cookies["dt_session"]
         tombstone = tmp_path / "sessions" / session_id / ".trash" / asset_id
+        coordinator = owner.app.state.resource_coordinator
         original_rmtree = shutil.rmtree
 
         def fail_removal_once(path: Path, *args: object, **kwargs: object) -> None:
@@ -489,6 +544,8 @@ def test_delete_upload_retries_tombstone_removal_without_double_release(
         first_delete = owner.delete(f"/api/uploads/{asset_id}")
         assert first_delete.status_code == 503
         assert tombstone.is_dir()
+        assert coordinator.finalize_release_calls == 0
+        assert asset_id in coordinator.released_assets
         replacement = _upload(owner, "replacement.png", b"12345")
         retry = owner.delete(f"/api/uploads/{asset_id}")
         overflow = _upload(owner, "overflow.png", b"x")
@@ -498,6 +555,8 @@ def test_delete_upload_retries_tombstone_removal_without_double_release(
     assert overflow.status_code == 413
     assert removal_attempts == 2
     assert not tombstone.exists()
+    assert coordinator.finalize_release_calls == 1
+    assert (session_id, asset_id) in coordinator.finalized_assets
 
 
 def test_delete_upload_recovers_when_rmtree_removed_metadata_before_failure(

@@ -446,6 +446,11 @@ return removed
 """
 
 _CLEAR_SESSION_USAGE_SCRIPT = """-- clear_session_usage
+local marker_keys = redis.call("SMEMBERS", KEYS[2])
+for _, marker_key in ipairs(marker_keys) do
+    redis.call("DEL", marker_key)
+end
+redis.call("DEL", KEYS[2])
 redis.call(
     "HDEL",
     KEYS[1],
@@ -458,7 +463,6 @@ _RELEASE_COMMITTED_ASSET_SCRIPT = """-- release_committed_asset
 local session_id = ARGV[1]
 local asset_id = ARGV[2]
 local released_bytes = tonumber(ARGV[3])
-local marker_ttl_ms = tonumber(ARGV[4])
 if redis.call("EXISTS", KEYS[2]) == 1 then
     local marker_session = redis.call("HGET", KEYS[2], "session_id")
     local marker_asset = redis.call("HGET", KEYS[2], "asset_id")
@@ -468,6 +472,9 @@ if redis.call("EXISTS", KEYS[2]) == 1 then
     end
     if released_bytes ~= 0 and marker_bytes ~= released_bytes then
         return 3
+    end
+    if redis.call("HGET", KEYS[2], "finalized") ~= "1" then
+        redis.call("SADD", KEYS[3], KEYS[2])
     end
     return 0
 end
@@ -496,7 +503,7 @@ redis.call(
     "bytes",
     released_bytes
 )
-redis.call("PEXPIRE", KEYS[2], marker_ttl_ms)
+redis.call("SADD", KEYS[3], KEYS[2])
 return 1
 """
 
@@ -509,6 +516,24 @@ local marker_asset = redis.call("HGET", KEYS[1], "asset_id")
 if marker_session ~= ARGV[1] or marker_asset ~= ARGV[2] then
     return 0
 end
+return 1
+"""
+
+_FINALIZE_ASSET_RELEASE_SCRIPT = """-- finalize_asset_release
+if redis.call("EXISTS", KEYS[1]) == 0 then
+    return 0
+end
+local marker_session = redis.call("HGET", KEYS[1], "session_id")
+local marker_asset = redis.call("HGET", KEYS[1], "asset_id")
+if marker_session ~= ARGV[1] or marker_asset ~= ARGV[2] then
+    return 2
+end
+redis.call("SREM", KEYS[2], KEYS[1])
+if redis.call("HGET", KEYS[1], "finalized") == "1" then
+    return 0
+end
+redis.call("HSET", KEYS[1], "finalized", "1")
+redis.call("PEXPIRE", KEYS[1], tonumber(ARGV[3]))
 return 1
 """
 
@@ -800,6 +825,9 @@ class RedisResourceCoordinator:
         self._is_committed_asset_released_script = self._redis.register_script(
             _IS_COMMITTED_ASSET_RELEASED_SCRIPT
         )
+        self._finalize_asset_release_script = self._redis.register_script(
+            _FINALIZE_ASSET_RELEASE_SCRIPT
+        )
         self._acquire_session_script = self._redis.register_script(
             _ACQUIRE_SESSION_SCRIPT
         )
@@ -974,7 +1002,10 @@ class RedisResourceCoordinator:
     def clear_session_usage(self, session_id: str) -> None:
         _validate_session_id(session_id)
         self._clear_session_usage_script(
-            keys=[_STATE_KEY],
+            keys=[
+                _STATE_KEY,
+                _session_released_assets_key(session_id),
+            ],
             args=[session_id],
         )
 
@@ -992,12 +1023,12 @@ class RedisResourceCoordinator:
                 keys=[
                     _STATE_KEY,
                     _released_asset_key(session_id, asset_id),
+                    _session_released_assets_key(session_id),
                 ],
                 args=[
                     session_id,
                     asset_id,
                     released_bytes,
-                    self._release_marker_ttl_ms,
                 ],
             )
         )
@@ -1027,6 +1058,28 @@ class RedisResourceCoordinator:
                 ],
             )
         )
+
+    def finalize_asset_release(self, session_id: str, asset_id: str) -> bool:
+        _validate_session_id(session_id)
+        _validate_asset_id(asset_id)
+        result = int(
+            self._finalize_asset_release_script(
+                keys=[
+                    _released_asset_key(session_id, asset_id),
+                    _session_released_assets_key(session_id),
+                ],
+                args=[
+                    session_id,
+                    asset_id,
+                    self._release_marker_ttl_ms,
+                ],
+            )
+        )
+        if result == 2:
+            raise AssetReleaseMismatchError(
+                "Asset release session does not match"
+            )
+        return result == 1
 
     def reconcile_reservations(self) -> int:
         return int(
@@ -1158,6 +1211,10 @@ def _session_state_key(session_id: str) -> str:
 
 def _session_leases_key(session_id: str) -> str:
     return f"dt:resource:session:{session_id}:leases"
+
+
+def _session_released_assets_key(session_id: str) -> str:
+    return f"dt:resource:session:{session_id}:released-assets"
 
 
 def _released_asset_key(session_id: str, asset_id: str) -> str:

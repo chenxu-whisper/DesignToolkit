@@ -917,10 +917,27 @@ def create_router(
                     deletion.asset_id,
                     deletion.size,
                 )
+            asset_was_absent = deletion is not None and deletion.size == 0
             storage.finalize_asset_deletion(
                 http_request.state.session_id,
                 asset_id,
             )
+            if asset_was_absent:
+                try:
+                    resources.finalize_asset_release(
+                        http_request.state.session_id,
+                        asset_id,
+                    )
+                except RedisError:
+                    _LOGGER.warning(
+                        "Failed to finalize release marker for absent asset",
+                        exc_info=True,
+                    )
+            else:
+                resources.finalize_asset_release(
+                    http_request.state.session_id,
+                    asset_id,
+                )
         except UploadRejectedError as exc:
             raise ApiError("asset_not_found", str(exc), 404) from exc
         except AssetReleaseMismatchError as exc:
