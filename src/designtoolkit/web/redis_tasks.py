@@ -147,11 +147,49 @@ local owner_token = ARGV[1]
 if redis.call("HGET", KEYS[1], "owner_token") ~= owner_token then
     return 0
 end
+local state = redis.call("HGET", KEYS[1], "state")
+if state ~= "creating" and state ~= "uncertain" then
+    return 0
+end
 if redis.call("GET", KEYS[2]) ~= owner_token then
     return 0
 end
 redis.call("PEXPIRE", KEYS[2], ARGV[2])
 return 1
+"""
+_CLAIM_EXPIRED_ENQUEUE_INTENT_SCRIPT = """-- claim_expired_enqueue_intent
+local task_id = ARGV[1]
+local reconciler_token = ARGV[2]
+local ttl_seconds = tonumber(ARGV[3])
+local owner_ttl_ms = tonumber(ARGV[4])
+local stored_task_id = redis.call("HGET", KEYS[1], "task_id")
+local job_id = redis.call("HGET", KEYS[1], "job_id")
+local state = redis.call("HGET", KEYS[1], "state")
+local owner_token = redis.call("HGET", KEYS[1], "owner_token")
+
+if stored_task_id ~= task_id or job_id ~= task_id then
+    return 0
+end
+if state ~= "creating"
+    and state ~= "uncertain"
+    and state ~= "reconciling" then
+    return 0
+end
+if owner_token and redis.call("GET", KEYS[2]) == owner_token then
+    return 1
+end
+
+redis.call(
+    "HSET",
+    KEYS[1],
+    "state",
+    "reconciling",
+    "owner_token",
+    reconciler_token
+)
+redis.call("EXPIRE", KEYS[1], ttl_seconds)
+redis.call("SET", KEYS[2], reconciler_token, "PX", owner_ttl_ms)
+return 2
 """
 _MARK_RUNNING_SCRIPT = """-- mark_task_running
 local value = redis.call("GET", KEYS[1])
@@ -383,6 +421,11 @@ class RedisTaskManager:
         self._refresh_enqueue_owner_script = self._redis.register_script(
             _REFRESH_ENQUEUE_OWNER_SCRIPT
         )
+        self._claim_expired_enqueue_intent_script = (
+            self._redis.register_script(
+                _CLAIM_EXPIRED_ENQUEUE_INTENT_SCRIPT
+            )
+        )
         self._mark_running_script = self._redis.register_script(
             _MARK_RUNNING_SCRIPT
         )
@@ -579,11 +622,13 @@ class RedisTaskManager:
             if self._reconcile_enqueue_intent(task_id):
                 reconciled += 1
         for task in self._active_tasks():
-            job = self.queue.fetch_job(task.task_id)
-            status = job.get_status(refresh=True) if job is not None else None
             if task.status is TaskStatus.QUEUED:
-                if self._enqueue_intent_is_active(task.task_id):
+                if self._enqueue_intent_exists(task.task_id):
                     continue
+                job = self.queue.fetch_job(task.task_id)
+                status = (
+                    job.get_status(refresh=True) if job is not None else None
+                )
                 stale = (now - task.created_at).total_seconds() > grace_seconds
                 abandoned = job is None or status in {
                     JobStatus.FAILED,
@@ -599,6 +644,10 @@ class RedisTaskManager:
                     else "Queued task was abandoned before execution"
                 )
             else:
+                job = self.queue.fetch_job(task.task_id)
+                status = (
+                    job.get_status(refresh=True) if job is not None else None
+                )
                 if status is JobStatus.STARTED or task.task_id in started_ids:
                     continue
                 if not self._heartbeat_is_stale(task, now, grace_seconds):
@@ -647,9 +696,9 @@ class RedisTaskManager:
         for value in self._redis.lrange(_queue_reservations_key(), 0, -1):
             task_id = value.decode() if isinstance(value, bytes) else value
             task = self.get_task(task_id)
-            intent_active = self._enqueue_intent_is_active(task_id)
+            intent_exists = self._enqueue_intent_exists(task_id)
             if task is None:
-                if intent_active:
+                if intent_exists:
                     continue
                 self._release_queue_slot(task_id)
                 continue
@@ -657,7 +706,7 @@ class RedisTaskManager:
                 task.status is TaskStatus.QUEUED
                 and (datetime.now(UTC) - task.created_at).total_seconds() > 60
                 and self.queue.fetch_job(task_id) is None
-                and not intent_active
+                and not intent_exists
             )
             if task.status is not TaskStatus.QUEUED or stale_missing_job:
                 self._release_queue_slot(task_id)
@@ -1058,9 +1107,15 @@ class RedisTaskManager:
                         _enqueue_intent_key(task_id),
                         "owner_token",
                     )
+                    intent_state = pipeline.hget(
+                        _enqueue_intent_key(task_id),
+                        "state",
+                    )
                     lease_token = pipeline.get(_enqueue_owner_key(task_id))
                     if (
                         _redis_text(intent_token) != owner_token
+                        or _redis_text(intent_state)
+                        not in {"creating", "uncertain"}
                         or _redis_text(lease_token) != owner_token
                     ):
                         pipeline.unwatch()
@@ -1089,9 +1144,12 @@ class RedisTaskManager:
                 try:
                     pipeline.watch(intent_key, owner_key)
                     intent_token = pipeline.hget(intent_key, "owner_token")
+                    intent_state = pipeline.hget(intent_key, "state")
                     lease_token = pipeline.get(owner_key)
                     if (
                         _redis_text(intent_token) != owner_token
+                        or _redis_text(intent_state)
+                        not in {"creating", "uncertain"}
                         or _redis_text(lease_token) != owner_token
                     ):
                         pipeline.unwatch()
@@ -1151,29 +1209,106 @@ class RedisTaskManager:
             stored_task_id = metadata.get(b"task_id", metadata.get("task_id"))
             job_id = metadata.get(b"job_id", metadata.get("job_id"))
             if (
-                _redis_text(state) in {"creating", "uncertain"}
+                _redis_text(state)
+                in {"creating", "uncertain", "reconciling"}
                 and _redis_text(stored_task_id) == task_id
                 and _redis_text(job_id) == task_id
             ):
                 task_ids.append(task_id)
         return task_ids
 
-    def _enqueue_intent_is_active(self, task_id: str) -> bool:
-        pipeline = self._redis.pipeline(transaction=False)
-        pipeline.hgetall(_enqueue_intent_key(task_id))
-        pipeline.get(_enqueue_owner_key(task_id))
-        metadata, lease_token = pipeline.execute()
-        owner_token = metadata.get(b"owner_token", metadata.get("owner_token"))
+    def _enqueue_intent_exists(self, task_id: str) -> bool:
+        metadata = self._redis.hgetall(_enqueue_intent_key(task_id))
         return (
             _redis_text(metadata.get(b"task_id", metadata.get("task_id")))
             == task_id
             and _redis_text(metadata.get(b"job_id", metadata.get("job_id")))
             == task_id
             and _redis_text(metadata.get(b"state", metadata.get("state")))
-            in {"creating", "uncertain"}
-            and _redis_text(owner_token) is not None
-            and _redis_text(owner_token) == _redis_text(lease_token)
+            in {"creating", "uncertain", "reconciling"}
+            and _redis_text(
+                metadata.get(b"owner_token", metadata.get("owner_token"))
+            )
+            is not None
         )
+
+    def _claim_expired_enqueue_intent(
+        self,
+        task_id: str,
+        reconciler_token: str,
+    ) -> int:
+        intent_key = _enqueue_intent_key(task_id)
+        owner_key = _enqueue_owner_key(task_id)
+        try:
+            return int(
+                self._claim_expired_enqueue_intent_script(
+                    keys=[intent_key, owner_key],
+                    args=[
+                        task_id,
+                        reconciler_token,
+                        self.live_task_ttl,
+                        self._enqueue_intent_ttl_ms,
+                    ],
+                )
+            )
+        except ResponseError as error_response:
+            if "unknown command" not in str(error_response).lower():
+                raise
+        while True:
+            with self._redis.pipeline() as pipeline:
+                try:
+                    pipeline.watch(intent_key, owner_key)
+                    metadata = pipeline.hgetall(intent_key)
+                    state = _redis_text(
+                        metadata.get(b"state", metadata.get("state"))
+                    )
+                    owner_token = _redis_text(
+                        metadata.get(
+                            b"owner_token",
+                            metadata.get("owner_token"),
+                        )
+                    )
+                    if (
+                        _redis_text(
+                            metadata.get(
+                                b"task_id",
+                                metadata.get("task_id"),
+                            )
+                        )
+                        != task_id
+                        or _redis_text(
+                            metadata.get(b"job_id", metadata.get("job_id"))
+                        )
+                        != task_id
+                        or state
+                        not in {"creating", "uncertain", "reconciling"}
+                    ):
+                        pipeline.unwatch()
+                        return 0
+                    if (
+                        owner_token is not None
+                        and _redis_text(pipeline.get(owner_key)) == owner_token
+                    ):
+                        pipeline.unwatch()
+                        return 1
+                    pipeline.multi()
+                    pipeline.hset(
+                        intent_key,
+                        mapping={
+                            "state": "reconciling",
+                            "owner_token": reconciler_token,
+                        },
+                    )
+                    pipeline.expire(intent_key, self.live_task_ttl)
+                    pipeline.psetex(
+                        owner_key,
+                        self._enqueue_intent_ttl_ms,
+                        reconciler_token,
+                    )
+                    pipeline.execute()
+                    return 2
+                except WatchError:
+                    continue
 
     def _reconcile_enqueue_intent(
         self,
@@ -1191,6 +1326,15 @@ class RedisTaskManager:
             message=_UNCERTAIN_ENQUEUE_ERROR,
             details={},
         )
+        reconciler_token = uuid4().hex
+        if (
+            self._claim_expired_enqueue_intent(
+                task_id,
+                reconciler_token,
+            )
+            != 2
+        ):
+            return False
         transitioned = False
         while True:
             with self._redis.pipeline() as pipeline:
@@ -1200,6 +1344,9 @@ class RedisTaskManager:
                     if not metadata:
                         pipeline.unwatch()
                         return False
+                    state = _redis_text(
+                        metadata.get(b"state", metadata.get("state"))
+                    )
                     owner_id = _redis_text(
                         metadata.get(b"owner_id", metadata.get("owner_id"))
                     )
@@ -1209,16 +1356,16 @@ class RedisTaskManager:
                             metadata.get("owner_token"),
                         )
                     )
+                    if (
+                        state != "reconciling"
+                        or owner_token != reconciler_token
+                    ):
+                        pipeline.unwatch()
+                        return False
                     if pipeline.exists(job_key):
                         pipeline.multi()
                         pipeline.delete(intent_key, owner_key)
                         pipeline.execute()
-                        return False
-                    if (
-                        owner_token is not None
-                        and _redis_text(pipeline.get(owner_key)) == owner_token
-                    ):
-                        pipeline.unwatch()
                         return False
                     if owner_id:
                         pipeline.watch(
@@ -1243,6 +1390,16 @@ class RedisTaskManager:
                         pipeline.multi()
                         pipeline.lrem(_queue_reservations_key(), 0, task_id)
                         pipeline.delete(intent_key, owner_key)
+                        if (
+                            owner_id
+                            and task.status
+                            in {TaskStatus.SUCCEEDED, TaskStatus.FAILED}
+                        ):
+                            pipeline.delete(_task_pin_key(task_id))
+                            pipeline.srem(
+                                _session_task_pins_key(owner_id),
+                                task_id,
+                            )
                         pipeline.execute()
                         if (
                             task.status is TaskStatus.FAILED
@@ -1292,6 +1449,8 @@ class RedisTaskManager:
         for key in self._redis.scan_iter(match="dt:resource:task-pin:*"):
             key_text = key.decode() if isinstance(key, bytes) else key
             task_id = key_text.removeprefix("dt:resource:task-pin:")
+            if self._enqueue_intent_exists(task_id):
+                continue
             task = self.get_task(task_id)
             if task is not None and task.status in {
                 TaskStatus.QUEUED,

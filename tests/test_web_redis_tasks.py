@@ -515,6 +515,205 @@ def test_real_redis_expired_enqueue_owner_is_fenced_after_reconcile(
     assert set(slot_ids) == set(job_ids)
 
 
+def test_real_redis_reconcile_claims_expired_intent_before_job_absence(
+    real_redis_connection: Redis,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = "a" * 32
+    resources = _resources(real_redis_connection)
+    manager = _manager(
+        real_redis_connection,
+        tmp_path,
+        max_queued_tasks=20,
+        resource_coordinator=resources,
+    )
+    request = VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4"))
+    original_commit = manager._commit_enqueue_job
+    original_confirmation = manager._enqueue_has_authoritative_evidence
+    staged_job: Job | None = None
+    confirmation_calls = 0
+
+    def disconnect_before_commit(job: Job, **_kwargs) -> Job:
+        nonlocal staged_job
+        staged_job = job
+        raise RedisConnectionError("enqueue disconnected before commit")
+
+    def confirmation_disconnect_once(task_id: str) -> bool:
+        nonlocal confirmation_calls
+        confirmation_calls += 1
+        if confirmation_calls == 1:
+            raise RedisConnectionError("enqueue confirmation unavailable")
+        return original_confirmation(task_id)
+
+    monkeypatch.setattr(manager, "_commit_enqueue_job", disconnect_before_commit)
+    monkeypatch.setattr(
+        manager,
+        "_enqueue_has_authoritative_evidence",
+        confirmation_disconnect_once,
+    )
+    task = manager.create_video_frames_task(request, owner_id=session_id)
+    assert staged_job is not None
+    intent_key = f"dt:enqueue-intent:{task.task_id}"
+    original_token = real_redis_connection.hget(intent_key, "owner_token")
+    assert original_token
+
+    pipeline_type = type(real_redis_connection.pipeline())
+    original_exists = pipeline_type.exists
+    job_absent = Event()
+    continue_reconcile = Event()
+
+    def pause_after_job_absence(pipeline, *names):
+        result = original_exists(pipeline, *names)
+        if (
+            names == (Job.key_for(task.task_id),)
+            and not result
+            and not job_absent.is_set()
+        ):
+            job_absent.set()
+            assert continue_reconcile.wait(timeout=5)
+        return result
+
+    monkeypatch.setattr(pipeline_type, "exists", pause_after_job_absence)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        pending_reconcile = executor.submit(
+            manager.reconcile_tasks,
+            grace_seconds=0,
+        )
+        try:
+            assert job_absent.wait(timeout=5)
+            claimed = real_redis_connection.hgetall(intent_key)
+            assert claimed[b"state"] == b"reconciling"
+            assert claimed[b"owner_token"] != original_token
+            assert (
+                manager._claim_expired_enqueue_intent(
+                    task.task_id,
+                    "competing-reconciler",
+                )
+                == 1
+            )
+            assert (
+                real_redis_connection.hget(intent_key, "owner_token")
+                == claimed[b"owner_token"]
+            )
+            with pytest.raises(TaskConflictError, match="reservation expired"):
+                original_commit(
+                    staged_job,
+                    task_id=task.task_id,
+                    owner_token=original_token.decode(),
+                )
+        finally:
+            continue_reconcile.set()
+        assert pending_reconcile.result(timeout=5) == 1
+
+    monkeypatch.setattr(manager, "_commit_enqueue_job", original_commit)
+
+    def submit(_index: int) -> bool:
+        try:
+            manager.create_video_frames_task(request, owner_id=session_id)
+        except TaskConflictError:
+            return False
+        return True
+
+    with ThreadPoolExecutor(max_workers=20) as executor:
+        accepted = list(executor.map(submit, range(20)))
+
+    job_ids = manager.queue.get_job_ids()
+    slot_ids = real_redis_connection.lrange(
+        "dt:queue:reservations",
+        0,
+        -1,
+    )
+    assert sum(accepted) == len(job_ids) == len(slot_ids) == 20
+    assert set(slot_ids) == {job_id.encode() for job_id in job_ids}
+    assert manager.get_task(task.task_id).status is TaskStatus.FAILED
+
+
+def test_real_redis_enqueue_commit_before_reconcile_preserves_queued_task(
+    real_redis_connection: Redis,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(
+        real_redis_connection,
+        tmp_path,
+        max_queued_tasks=20,
+    )
+    request = VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4"))
+    commit_entered = Event()
+    continue_commit = Event()
+    claim_entered = Event()
+    continue_claim = Event()
+    original_claim = manager._claim_expired_enqueue_intent
+
+    def block_before_commit(action):
+        commit_entered.set()
+        assert continue_commit.wait(timeout=5)
+        return action()
+
+    def block_before_claim(task_id: str, reconciler_token: str) -> int:
+        claim_entered.set()
+        assert continue_claim.wait(timeout=5)
+        return original_claim(task_id, reconciler_token)
+
+    monkeypatch.setattr(
+        manager,
+        "_claim_expired_enqueue_intent",
+        block_before_claim,
+    )
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        pending_enqueue = executor.submit(
+            manager.create_video_frames_task,
+            request,
+            owner_id="a" * 32,
+            commit=block_before_commit,
+        )
+        assert commit_entered.wait(timeout=5)
+        pending_reconcile = executor.submit(
+            manager.reconcile_tasks,
+            grace_seconds=0,
+        )
+        try:
+            assert claim_entered.wait(timeout=5)
+            continue_commit.set()
+            task = pending_enqueue.result(timeout=5)
+        finally:
+            continue_commit.set()
+            continue_claim.set()
+        assert pending_reconcile.result(timeout=5) == 0
+
+    assert manager.get_task(task.task_id).status is TaskStatus.QUEUED
+    monkeypatch.setattr(
+        manager,
+        "_claim_expired_enqueue_intent",
+        original_claim,
+    )
+
+    def submit(_index: int) -> bool:
+        try:
+            manager.create_video_frames_task(
+                request,
+                owner_id="a" * 32,
+            )
+        except TaskConflictError:
+            return False
+        return True
+
+    with ThreadPoolExecutor(max_workers=20) as executor:
+        accepted = list(executor.map(submit, range(20)))
+
+    job_ids = manager.queue.get_job_ids()
+    slot_ids = real_redis_connection.lrange(
+        "dt:queue:reservations",
+        0,
+        -1,
+    )
+    assert sum(accepted) == 19
+    assert len(job_ids) == len(slot_ids) == 20
+    assert set(slot_ids) == {job_id.encode() for job_id in job_ids}
+    assert task.task_id in job_ids
+
+
 def test_expired_queued_session_is_pinned_until_terminal_cleanup(
     real_redis_connection: Redis,
     tmp_path: Path,
@@ -577,6 +776,60 @@ def test_cleanup_claim_blocks_atomic_task_pin_and_enqueue(
     resources.release_cleanup_claim(session_id, claim)
 
 
+def test_reconcile_preserves_active_enqueue_pin_while_task_save_is_blocked(
+    real_redis_connection: Redis,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = "a" * 32
+    resources = _resources(real_redis_connection)
+    manager = _manager(
+        real_redis_connection,
+        tmp_path,
+        resource_coordinator=resources,
+        enqueue_intent_ttl=0.5,
+        enqueue_intent_heartbeat_interval=0.05,
+    )
+    save_entered = Event()
+    continue_save = Event()
+    original_save = manager._save_task
+
+    def block_task_save(task: TaskRecord) -> None:
+        save_entered.set()
+        assert continue_save.wait(timeout=5)
+        original_save(task)
+
+    monkeypatch.setattr(manager, "_save_task", block_task_save)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        pending = executor.submit(
+            manager.create_video_frames_task,
+            VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+            owner_id=session_id,
+        )
+        try:
+            assert save_entered.wait(timeout=5)
+            time.sleep(0.8)
+            intent_keys = list(
+                real_redis_connection.scan_iter(match="dt:enqueue-intent:*")
+            )
+            assert len(intent_keys) == 1
+            task_id = intent_keys[0].decode().rsplit(":", 1)[-1]
+            assert manager.reconcile_tasks(grace_seconds=0) == 0
+            assert real_redis_connection.exists(
+                f"dt:resource:task-pin:{task_id}"
+            )
+            assert resources.claim_session_cleanup(session_id) is None
+        finally:
+            continue_save.set()
+        task = pending.result(timeout=5)
+
+    assert manager.get_task(task.task_id).status is TaskStatus.QUEUED
+    assert real_redis_connection.exists(
+        f"dt:resource:task-pin:{task.task_id}"
+    )
+    assert resources.claim_session_cleanup(session_id) is None
+
+
 def test_reconcile_releases_task_pin_after_crash_during_enqueue(
     real_redis_connection: Redis,
     tmp_path: Path,
@@ -588,6 +841,8 @@ def test_reconcile_releases_task_pin_after_crash_during_enqueue(
         real_redis_connection,
         tmp_path,
         resource_coordinator=resources,
+        enqueue_intent_ttl=0.2,
+        enqueue_intent_heartbeat_interval=0.05,
     )
 
     class SimulatedProcessCrash(BaseException):
@@ -609,7 +864,11 @@ def test_reconcile_releases_task_pin_after_crash_during_enqueue(
     )
     assert len(intent_keys) == 1
     task_id = intent_keys[0].decode().rsplit(":", 1)[-1]
-    real_redis_connection.delete(f"dt:enqueue-owner:{task_id}")
+    owner_key = f"dt:enqueue-owner:{task_id}"
+    deadline = time.monotonic() + 2
+    while real_redis_connection.exists(owner_key) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert not real_redis_connection.exists(owner_key)
     assert manager.reconcile_tasks(grace_seconds=0) == 1
     claim = resources.claim_session_cleanup(session_id)
     assert claim is not None
