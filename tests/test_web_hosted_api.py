@@ -1390,22 +1390,13 @@ def test_hosted_task_recovers_enqueue_acknowledgement_loss_without_orphan(
         max_session_bytes=1024,
         min_free_bytes=0,
     )
-    original_enqueue = manager.queue.enqueue
+    original_enqueue = manager._commit_enqueue_job
 
     def enqueue_then_lose_ack(*args, **kwargs):
         original_enqueue(*args, **kwargs)
-        refresh_calls = coordinator.lease_refresh_calls
-        coordinator.fail_lease_refresh = True
-        deadline = monotonic() + 1
-        while (
-            coordinator.lease_refresh_calls == refresh_calls
-            and monotonic() < deadline
-        ):
-            sleep(0.001)
-        assert coordinator.lease_refresh_calls > refresh_calls
         raise RedisConnectionError("enqueue acknowledgement lost")
 
-    monkeypatch.setattr(manager.queue, "enqueue", enqueue_then_lose_ack)
+    monkeypatch.setattr(manager, "_commit_enqueue_job", enqueue_then_lose_ack)
     with _client(
         tmp_path,
         task_manager=manager,
@@ -1444,7 +1435,7 @@ def test_hosted_task_returns_handle_when_enqueue_and_confirmation_disconnect(
         max_queued_tasks=20,
         retention_seconds=7200,
     )
-    original_enqueue = manager.queue.enqueue
+    original_enqueue = manager._commit_enqueue_job
 
     def enqueue_then_lose_ack(*args, **kwargs):
         original_enqueue(*args, **kwargs)
@@ -1453,7 +1444,7 @@ def test_hosted_task_returns_handle_when_enqueue_and_confirmation_disconnect(
     def confirmation_disconnect(_task_id: str) -> bool:
         raise RedisConnectionError("enqueue confirmation unavailable")
 
-    monkeypatch.setattr(manager.queue, "enqueue", enqueue_then_lose_ack)
+    monkeypatch.setattr(manager, "_commit_enqueue_job", enqueue_then_lose_ack)
     monkeypatch.setattr(
         manager,
         "_enqueue_has_authoritative_evidence",
@@ -1494,7 +1485,7 @@ def test_hosted_task_refreshes_once_before_slow_enqueue(
         max_session_bytes=1024,
         min_free_bytes=0,
     )
-    original_enqueue = manager.queue.enqueue
+    original_enqueue = manager.queue.enqueue_job
     refreshes_during_enqueue: list[tuple[int, int]] = []
 
     def slow_enqueue(*args, **kwargs):
@@ -1506,7 +1497,7 @@ def test_hosted_task_refreshes_once_before_slow_enqueue(
         )
         return original_enqueue(*args, **kwargs)
 
-    monkeypatch.setattr(manager.queue, "enqueue", slow_enqueue)
+    monkeypatch.setattr(manager.queue, "enqueue_job", slow_enqueue)
     with _client(
         tmp_path,
         task_manager=manager,

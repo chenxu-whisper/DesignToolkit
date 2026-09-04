@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from queue import Empty
+from threading import Event, Thread
 from time import monotonic, sleep, time
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
@@ -54,18 +55,23 @@ if TYPE_CHECKING:
 _QUEUE_NAME = "designtoolkit"
 _TERMINAL_TTL_SECONDS = 2 * 60 * 60
 _UNCERTAIN_ENQUEUE_ERROR = "Task enqueue could not be confirmed"
+_ENQUEUE_INTENT_TTL_SECONDS = 60.0
+_ENQUEUE_INTENT_HEARTBEAT_SECONDS = 10.0
 _RESERVE_ENQUEUE_SCRIPT = """-- reserve_enqueue_intent
 local queue_key = KEYS[1]
 local intent_key = KEYS[2]
-local session_state_key = KEYS[3]
-local session_task_pins_key = KEYS[4]
-local task_pin_key = KEYS[5]
+local owner_key = KEYS[3]
+local session_state_key = KEYS[4]
+local session_task_pins_key = KEYS[5]
+local task_pin_key = KEYS[6]
 local task_id = ARGV[1]
 local max_queued_tasks = tonumber(ARGV[2])
 local ttl_seconds = tonumber(ARGV[3])
 local owner_id = ARGV[4]
 local created_at = ARGV[5]
 local cleanup_prefix = ARGV[6]
+local owner_token = ARGV[7]
+local owner_ttl_ms = tonumber(ARGV[8])
 
 if owner_id ~= "" then
     local deleting = redis.call("HGET", session_state_key, "deleting")
@@ -95,9 +101,12 @@ redis.call(
     "owner_id",
     owner_id,
     "created_at",
-    created_at
+    created_at,
+    "owner_token",
+    owner_token
 )
 redis.call("EXPIRE", intent_key, ttl_seconds)
+redis.call("SET", owner_key, owner_token, "PX", owner_ttl_ms)
 if owner_id ~= "" then
     redis.call(
         "HMSET",
@@ -114,8 +123,12 @@ return 0
 _ROLLBACK_ENQUEUE_SCRIPT = """-- rollback_enqueue_intent
 local task_id = ARGV[1]
 local owner_id = ARGV[2]
+local owner_token = ARGV[3]
+if redis.call("HGET", KEYS[5], "owner_token") ~= owner_token then
+    return 0
+end
 redis.call("LREM", KEYS[1], 0, task_id)
-redis.call("DEL", KEYS[2], KEYS[3], KEYS[4], KEYS[5])
+redis.call("DEL", KEYS[2], KEYS[3], KEYS[4], KEYS[5], KEYS[8])
 if owner_id ~= "" then
     local pin_session = redis.call("HGET", KEYS[6], "session_id")
     local pin_task = redis.call("HGET", KEYS[6], "task_id")
@@ -127,6 +140,17 @@ if owner_id ~= "" then
         end
     end
 end
+return 1
+"""
+_REFRESH_ENQUEUE_OWNER_SCRIPT = """-- refresh_enqueue_owner
+local owner_token = ARGV[1]
+if redis.call("HGET", KEYS[1], "owner_token") ~= owner_token then
+    return 0
+end
+if redis.call("GET", KEYS[2]) ~= owner_token then
+    return 0
+end
+redis.call("PEXPIRE", KEYS[2], ARGV[2])
 return 1
 """
 _MARK_RUNNING_SCRIPT = """-- mark_task_running
@@ -195,6 +219,42 @@ class RunningTransitionResult(StrEnum):
 class TerminalTransitionResult(StrEnum):
     APPLIED = "applied"
     ALREADY_TERMINAL = "already_terminal"
+
+
+class _EnqueueIntentHeartbeat:
+    def __init__(
+        self,
+        refresh: Callable[[], bool],
+        interval: float,
+    ) -> None:
+        self._refresh = refresh
+        self._interval = interval
+        self._stopped = Event()
+        self._failure: BaseException | None = None
+        self._thread = Thread(target=self._run, daemon=True)
+        self._started = False
+
+    def start(self) -> None:
+        self._thread.start()
+        self._started = True
+
+    def stop(self) -> None:
+        self._stopped.set()
+        if self._started:
+            self._thread.join()
+
+    def raise_if_failed(self) -> None:
+        if self._failure is not None:
+            raise self._failure
+
+    def _run(self) -> None:
+        while not self._stopped.wait(self._interval):
+            try:
+                if not self._refresh():
+                    raise TaskConflictError("Task enqueue reservation expired")
+            except BaseException as exc:
+                self._failure = exc
+                return
 
 
 class RedisEventSubscriber:
@@ -283,7 +343,17 @@ class RedisTaskManager:
         max_queued_tasks: int,
         retention_seconds: int,
         resource_coordinator: RedisResourceCoordinator | None = None,
+        enqueue_intent_ttl: float = _ENQUEUE_INTENT_TTL_SECONDS,
+        enqueue_intent_heartbeat_interval: float = (
+            _ENQUEUE_INTENT_HEARTBEAT_SECONDS
+        ),
     ) -> None:
+        if enqueue_intent_ttl <= 0:
+            raise ValueError("enqueue_intent_ttl must be positive")
+        if enqueue_intent_heartbeat_interval <= 0:
+            raise ValueError(
+                "enqueue_intent_heartbeat_interval must be positive"
+            )
         self._redis = redis_connection
         self.queue = queue or Queue(_QUEUE_NAME, connection=redis_connection)
         self.data_dir = data_dir
@@ -291,11 +361,27 @@ class RedisTaskManager:
         self.retention_seconds = retention_seconds
         self.resource_coordinator = resource_coordinator
         self.live_task_ttl = max(retention_seconds * 2, 24 * 60 * 60)
+        self.enqueue_intent_heartbeat_interval = (
+            enqueue_intent_heartbeat_interval
+        )
+        self._enqueue_intent_ttl_ms = max(
+            1,
+            round(
+                max(
+                    enqueue_intent_ttl,
+                    enqueue_intent_heartbeat_interval * 2,
+                )
+                * 1000
+            ),
+        )
         self._reserve_enqueue_script = self._redis.register_script(
             _RESERVE_ENQUEUE_SCRIPT
         )
         self._rollback_enqueue_script = self._redis.register_script(
             _ROLLBACK_ENQUEUE_SCRIPT
+        )
+        self._refresh_enqueue_owner_script = self._redis.register_script(
+            _REFRESH_ENQUEUE_OWNER_SCRIPT
         )
         self._mark_running_script = self._redis.register_script(
             _MARK_RUNNING_SCRIPT
@@ -490,16 +576,14 @@ class RedisTaskManager:
             if self._finalize_external_failure(task.task_id, message):
                 reconciled += 1
         for task_id in self._enqueue_intent_task_ids():
-            if self._reconcile_enqueue_intent(
-                task_id,
-                now=now,
-                grace_seconds=grace_seconds,
-            ):
+            if self._reconcile_enqueue_intent(task_id):
                 reconciled += 1
         for task in self._active_tasks():
             job = self.queue.fetch_job(task.task_id)
             status = job.get_status(refresh=True) if job is not None else None
             if task.status is TaskStatus.QUEUED:
+                if self._enqueue_intent_is_active(task.task_id):
+                    continue
                 stale = (now - task.created_at).total_seconds() > grace_seconds
                 abandoned = job is None or status in {
                     JobStatus.FAILED,
@@ -616,7 +700,13 @@ class RedisTaskManager:
             error=None,
             owner_id=owner_id,
         )
-        self._reserve_enqueue_intent(task)
+        owner_token = uuid4().hex
+        self._reserve_enqueue_intent(task, owner_token)
+        heartbeat = _EnqueueIntentHeartbeat(
+            lambda: self._refresh_enqueue_intent(task.task_id, owner_token),
+            self.enqueue_intent_heartbeat_interval,
+        )
+        heartbeat.start()
         try:
             self._save_task(task)
             self._save_work(
@@ -631,26 +721,42 @@ class RedisTaskManager:
                 message=f"Created {kind.value} task",
                 details={"input_path": input_path},
             )
-        except Exception:
-            self._rollback_enqueue(task.task_id, owner_id=owner_id)
-            raise
-        if not self._enqueue_intent_is_active(task.task_id):
-            self._rollback_enqueue(task.task_id, owner_id=owner_id)
-            raise TaskConflictError("Task enqueue reservation expired")
-
-        def enqueue_job() -> Job:
-            return self.queue.enqueue(
+            job = self.queue.create_job(
                 "designtoolkit.web.worker.run_task",
-                task.task_id,
-                job_kind,
-                request.model_dump(mode="json"),
+                args=(
+                    task.task_id,
+                    job_kind,
+                    request.model_dump(mode="json"),
+                ),
                 job_id=task.task_id,
-                job_timeout=self.retention_seconds,
+                timeout=self.retention_seconds,
                 result_ttl=self.retention_seconds,
                 failure_ttl=self.retention_seconds,
                 meta={"owner_id": owner_id},
                 on_failure=Callback(handle_job_failure),
                 on_stopped=Callback(handle_job_stopped),
+            )
+        except Exception:
+            heartbeat.stop()
+            self._rollback_enqueue(
+                task.task_id,
+                owner_id=owner_id,
+                owner_token=owner_token,
+            )
+            raise
+        except BaseException:
+            heartbeat.stop()
+            raise
+
+        def enqueue_job() -> Job:
+            heartbeat.stop()
+            heartbeat.raise_if_failed()
+            if not self._refresh_enqueue_intent(task.task_id, owner_token):
+                raise TaskConflictError("Task enqueue reservation expired")
+            return self._commit_enqueue_job(
+                job,
+                task_id=task.task_id,
+                owner_token=owner_token,
             )
 
         try:
@@ -658,7 +764,16 @@ class RedisTaskManager:
                 enqueue_job()
             else:
                 commit(enqueue_job)
+        except TaskConflictError:
+            heartbeat.stop()
+            self._rollback_enqueue(
+                task.task_id,
+                owner_id=owner_id,
+                owner_token=owner_token,
+            )
+            raise
         except Exception as enqueue_error:
+            heartbeat.stop()
             try:
                 enqueue_committed = self._enqueue_has_authoritative_evidence(
                     task.task_id
@@ -671,7 +786,7 @@ class RedisTaskManager:
                     f"Enqueue recovery failed with: {recovery_error}"
                 )
                 try:
-                    self._mark_enqueue_uncertain(task.task_id)
+                    self._mark_enqueue_uncertain(task.task_id, owner_token)
                 except Exception as intent_error:
                     enqueue_error.add_note(
                         f"Enqueue intent could not be persisted: {intent_error}"
@@ -679,14 +794,26 @@ class RedisTaskManager:
                     raise enqueue_error from intent_error
                 return task
             if enqueue_committed:
-                self._clear_enqueue_intent(task.task_id)
+                self._clear_enqueue_intent(task.task_id, owner_token)
                 return task
-            self._rollback_enqueue(task.task_id, owner_id=owner_id)
+            self._rollback_enqueue(
+                task.task_id,
+                owner_id=owner_id,
+                owner_token=owner_token,
+            )
             raise
-        self._clear_enqueue_intent(task.task_id)
+        except BaseException:
+            heartbeat.stop()
+            raise
+        heartbeat.stop()
+        heartbeat.raise_if_failed()
         return task
 
-    def _reserve_enqueue_intent(self, task: TaskRecord) -> None:
+    def _reserve_enqueue_intent(
+        self,
+        task: TaskRecord,
+        owner_token: str,
+    ) -> None:
         owner_id = task.owner_id or ""
         session_state_key = (
             _session_state_key(owner_id)
@@ -704,6 +831,7 @@ class RedisTaskManager:
                     keys=[
                         _queue_reservations_key(),
                         _enqueue_intent_key(task.task_id),
+                        _enqueue_owner_key(task.task_id),
                         session_state_key,
                         session_task_pins_key,
                         _task_pin_key(task.task_id),
@@ -715,19 +843,28 @@ class RedisTaskManager:
                         owner_id,
                         task.created_at.timestamp(),
                         _CLEANUP_PREFIX,
+                        owner_token,
+                        self._enqueue_intent_ttl_ms,
                     ],
                 )
             )
         except ResponseError as error_response:
             if "unknown command" not in str(error_response).lower():
                 raise
-            result = self._reserve_enqueue_intent_without_lua(task)
+            result = self._reserve_enqueue_intent_without_lua(
+                task,
+                owner_token,
+            )
         if result == 1:
             raise TaskConflictError("The task queue is full")
         if result == 2:
             raise SessionDeletingError("Session is being deleted")
 
-    def _reserve_enqueue_intent_without_lua(self, task: TaskRecord) -> int:
+    def _reserve_enqueue_intent_without_lua(
+        self,
+        task: TaskRecord,
+        owner_token: str,
+    ) -> int:
         owner_id = task.owner_id or ""
         state_key = (
             _session_state_key(owner_id)
@@ -756,11 +893,19 @@ class RedisTaskManager:
                     pipeline.rpush(_queue_reservations_key(), task.task_id)
                     pipeline.hset(
                         _enqueue_intent_key(task.task_id),
-                        mapping=self._enqueue_intent_mapping(task),
+                        mapping=self._enqueue_intent_mapping(
+                            task,
+                            owner_token,
+                        ),
                     )
                     pipeline.expire(
                         _enqueue_intent_key(task.task_id),
                         self.live_task_ttl,
+                    )
+                    pipeline.psetex(
+                        _enqueue_owner_key(task.task_id),
+                        self._enqueue_intent_ttl_ms,
+                        owner_token,
                     )
                     if owner_id:
                         pipeline.hset(
@@ -780,7 +925,10 @@ class RedisTaskManager:
                     continue
 
     @staticmethod
-    def _enqueue_intent_mapping(task: TaskRecord) -> dict[str, str]:
+    def _enqueue_intent_mapping(
+        task: TaskRecord,
+        owner_token: str,
+    ) -> dict[str, str]:
         return {
             "task_id": task.task_id,
             "job_id": task.task_id,
@@ -788,6 +936,7 @@ class RedisTaskManager:
             "state": "creating",
             "owner_id": task.owner_id or "",
             "created_at": str(task.created_at.timestamp()),
+            "owner_token": owner_token,
         }
 
     def _rollback_enqueue(
@@ -795,7 +944,8 @@ class RedisTaskManager:
         task_id: str,
         *,
         owner_id: str | None,
-    ) -> None:
+        owner_token: str,
+    ) -> bool:
         owner = owner_id or ""
         session_task_pins_key = (
             _session_task_pins_key(owner)
@@ -803,40 +953,158 @@ class RedisTaskManager:
             else _enqueue_intent_key(task_id)
         )
         try:
-            self._rollback_enqueue_script(
-                keys=[
-                    _queue_reservations_key(),
-                    _task_key(task_id),
-                    _event_key(task_id),
-                    _task_work_key(task_id),
-                    _enqueue_intent_key(task_id),
-                    _task_pin_key(task_id),
-                    session_task_pins_key,
-                ],
-                args=[task_id, owner],
+            return bool(
+                self._rollback_enqueue_script(
+                    keys=[
+                        _queue_reservations_key(),
+                        _task_key(task_id),
+                        _event_key(task_id),
+                        _task_work_key(task_id),
+                        _enqueue_intent_key(task_id),
+                        _task_pin_key(task_id),
+                        session_task_pins_key,
+                        _enqueue_owner_key(task_id),
+                    ],
+                    args=[task_id, owner, owner_token],
+                )
             )
         except ResponseError as error_response:
             if "unknown command" not in str(error_response).lower():
                 raise
-            pipeline = self._redis.pipeline()
-            pipeline.lrem(_queue_reservations_key(), 0, task_id)
-            pipeline.delete(
-                _task_key(task_id),
-                _event_key(task_id),
-                _task_work_key(task_id),
-                _enqueue_intent_key(task_id),
-            )
-            if owner:
-                pipeline.delete(_task_pin_key(task_id))
-                pipeline.srem(_session_task_pins_key(owner), task_id)
-            pipeline.execute()
+        while True:
+            with self._redis.pipeline() as pipeline:
+                try:
+                    pipeline.watch(_enqueue_intent_key(task_id))
+                    token = pipeline.hget(
+                        _enqueue_intent_key(task_id),
+                        "owner_token",
+                    )
+                    if _redis_text(token) != owner_token:
+                        pipeline.unwatch()
+                        return False
+                    pipeline.multi()
+                    pipeline.lrem(_queue_reservations_key(), 0, task_id)
+                    pipeline.delete(
+                        _task_key(task_id),
+                        _event_key(task_id),
+                        _task_work_key(task_id),
+                        _enqueue_intent_key(task_id),
+                        _enqueue_owner_key(task_id),
+                    )
+                    if owner:
+                        pipeline.delete(_task_pin_key(task_id))
+                        pipeline.srem(_session_task_pins_key(owner), task_id)
+                    pipeline.execute()
+                    return True
+                except WatchError:
+                    continue
 
-    def _clear_enqueue_intent(self, task_id: str) -> None:
+    def _clear_enqueue_intent(
+        self,
+        task_id: str,
+        owner_token: str,
+    ) -> None:
         try:
-            self._redis.delete(_enqueue_intent_key(task_id))
+            while True:
+                with self._redis.pipeline() as pipeline:
+                    try:
+                        pipeline.watch(_enqueue_intent_key(task_id))
+                        token = pipeline.hget(
+                            _enqueue_intent_key(task_id),
+                            "owner_token",
+                        )
+                        if _redis_text(token) != owner_token:
+                            pipeline.unwatch()
+                            return
+                        pipeline.multi()
+                        pipeline.delete(
+                            _enqueue_intent_key(task_id),
+                            _enqueue_owner_key(task_id),
+                        )
+                        pipeline.execute()
+                        return
+                    except WatchError:
+                        continue
         except Exception:
             # The durable intent remains safe for reconciliation after ack loss.
             pass
+
+    def _refresh_enqueue_intent(
+        self,
+        task_id: str,
+        owner_token: str,
+    ) -> bool:
+        try:
+            return bool(
+                self._refresh_enqueue_owner_script(
+                    keys=[
+                        _enqueue_intent_key(task_id),
+                        _enqueue_owner_key(task_id),
+                    ],
+                    args=[owner_token, self._enqueue_intent_ttl_ms],
+                )
+            )
+        except ResponseError as error_response:
+            if "unknown command" not in str(error_response).lower():
+                raise
+        while True:
+            with self._redis.pipeline() as pipeline:
+                try:
+                    pipeline.watch(
+                        _enqueue_intent_key(task_id),
+                        _enqueue_owner_key(task_id),
+                    )
+                    intent_token = pipeline.hget(
+                        _enqueue_intent_key(task_id),
+                        "owner_token",
+                    )
+                    lease_token = pipeline.get(_enqueue_owner_key(task_id))
+                    if (
+                        _redis_text(intent_token) != owner_token
+                        or _redis_text(lease_token) != owner_token
+                    ):
+                        pipeline.unwatch()
+                        return False
+                    pipeline.multi()
+                    pipeline.pexpire(
+                        _enqueue_owner_key(task_id),
+                        self._enqueue_intent_ttl_ms,
+                    )
+                    pipeline.execute()
+                    return True
+                except WatchError:
+                    continue
+
+    def _commit_enqueue_job(
+        self,
+        job: Job,
+        *,
+        task_id: str,
+        owner_token: str,
+    ) -> Job:
+        intent_key = _enqueue_intent_key(task_id)
+        owner_key = _enqueue_owner_key(task_id)
+        while True:
+            with self._redis.pipeline() as pipeline:
+                try:
+                    pipeline.watch(intent_key, owner_key)
+                    intent_token = pipeline.hget(intent_key, "owner_token")
+                    lease_token = pipeline.get(owner_key)
+                    if (
+                        _redis_text(intent_token) != owner_token
+                        or _redis_text(lease_token) != owner_token
+                    ):
+                        pipeline.unwatch()
+                        raise TaskConflictError(
+                            "Task enqueue reservation expired"
+                        )
+                    pipeline.multi()
+                    self.queue.enqueue_job(job, pipeline=pipeline)
+                    pipeline.delete(intent_key, owner_key)
+                    pipeline.execute()
+                    return job
+                except WatchError:
+                    continue
 
     def _enqueue_has_authoritative_evidence(self, task_id: str) -> bool:
         pipeline = self._redis.pipeline(transaction=False)
@@ -849,19 +1117,29 @@ class RedisTaskManager:
             return False
         return _decode_task(task_value).status is not TaskStatus.QUEUED
 
-    def _mark_enqueue_uncertain(self, task_id: str) -> None:
-        pipeline = self._redis.pipeline()
-        pipeline.hset(
-            _enqueue_intent_key(task_id),
-            mapping={
-                "task_id": task_id,
-                "job_id": task_id,
-                "slot_reserved": "1",
-                "state": "uncertain",
-            },
-        )
-        pipeline.expire(_enqueue_intent_key(task_id), self.live_task_ttl)
-        pipeline.execute()
+    def _mark_enqueue_uncertain(
+        self,
+        task_id: str,
+        owner_token: str,
+    ) -> None:
+        intent_key = _enqueue_intent_key(task_id)
+        owner_key = _enqueue_owner_key(task_id)
+        while True:
+            with self._redis.pipeline() as pipeline:
+                try:
+                    pipeline.watch(intent_key, owner_key)
+                    token = pipeline.hget(intent_key, "owner_token")
+                    if _redis_text(token) != owner_token:
+                        pipeline.unwatch()
+                        return
+                    pipeline.multi()
+                    pipeline.hset(intent_key, "state", "uncertain")
+                    pipeline.expire(intent_key, self.live_task_ttl)
+                    pipeline.delete(owner_key)
+                    pipeline.execute()
+                    return
+                except WatchError:
+                    continue
 
     def _enqueue_intent_task_ids(self) -> list[str]:
         task_ids: list[str] = []
@@ -881,7 +1159,11 @@ class RedisTaskManager:
         return task_ids
 
     def _enqueue_intent_is_active(self, task_id: str) -> bool:
-        metadata = self._redis.hgetall(_enqueue_intent_key(task_id))
+        pipeline = self._redis.pipeline(transaction=False)
+        pipeline.hgetall(_enqueue_intent_key(task_id))
+        pipeline.get(_enqueue_owner_key(task_id))
+        metadata, lease_token = pipeline.execute()
+        owner_token = metadata.get(b"owner_token", metadata.get("owner_token"))
         return (
             _redis_text(metadata.get(b"task_id", metadata.get("task_id")))
             == task_id
@@ -889,17 +1171,17 @@ class RedisTaskManager:
             == task_id
             and _redis_text(metadata.get(b"state", metadata.get("state")))
             in {"creating", "uncertain"}
+            and _redis_text(owner_token) is not None
+            and _redis_text(owner_token) == _redis_text(lease_token)
         )
 
     def _reconcile_enqueue_intent(
         self,
         task_id: str,
-        *,
-        now: datetime,
-        grace_seconds: float,
     ) -> bool:
         task_key = _task_key(task_id)
         intent_key = _enqueue_intent_key(task_id)
+        owner_key = _enqueue_owner_key(task_id)
         job_key = Job.key_for(task_id)
         event = LogEventResponse(
             task_id=task_id,
@@ -913,46 +1195,41 @@ class RedisTaskManager:
         while True:
             with self._redis.pipeline() as pipeline:
                 try:
-                    pipeline.watch(task_key, intent_key, job_key)
+                    pipeline.watch(task_key, intent_key, owner_key, job_key)
                     metadata = pipeline.hgetall(intent_key)
                     if not metadata:
                         pipeline.unwatch()
                         return False
-                    state = _redis_text(
-                        metadata.get(b"state", metadata.get("state"))
-                    )
                     owner_id = _redis_text(
                         metadata.get(b"owner_id", metadata.get("owner_id"))
                     )
-                    if state == "creating":
-                        created_at = float(
-                            _redis_text(
-                                metadata.get(
-                                    b"created_at",
-                                    metadata.get("created_at"),
-                                )
-                            )
-                            or "0"
+                    owner_token = _redis_text(
+                        metadata.get(
+                            b"owner_token",
+                            metadata.get("owner_token"),
                         )
-                        age = now.timestamp() - created_at
-                        if age <= grace_seconds:
-                            pipeline.unwatch()
-                            return False
+                    )
+                    if pipeline.exists(job_key):
+                        pipeline.multi()
+                        pipeline.delete(intent_key, owner_key)
+                        pipeline.execute()
+                        return False
+                    if (
+                        owner_token is not None
+                        and _redis_text(pipeline.get(owner_key)) == owner_token
+                    ):
+                        pipeline.unwatch()
+                        return False
                     if owner_id:
                         pipeline.watch(
                             _task_pin_key(task_id),
                             _session_task_pins_key(owner_id),
                         )
-                    if pipeline.exists(job_key):
-                        pipeline.multi()
-                        pipeline.delete(intent_key)
-                        pipeline.execute()
-                        return False
                     value = pipeline.get(task_key)
                     if value is None:
                         pipeline.multi()
                         pipeline.lrem(_queue_reservations_key(), 0, task_id)
-                        pipeline.delete(intent_key)
+                        pipeline.delete(intent_key, owner_key)
                         if owner_id:
                             pipeline.delete(_task_pin_key(task_id))
                             pipeline.srem(
@@ -965,7 +1242,7 @@ class RedisTaskManager:
                     if task.status is not TaskStatus.QUEUED:
                         pipeline.multi()
                         pipeline.lrem(_queue_reservations_key(), 0, task_id)
-                        pipeline.delete(intent_key)
+                        pipeline.delete(intent_key, owner_key)
                         pipeline.execute()
                         if (
                             task.status is TaskStatus.FAILED
@@ -992,7 +1269,13 @@ class RedisTaskManager:
                         _TERMINAL_TTL_SECONDS,
                     )
                     pipeline.lrem(_queue_reservations_key(), 0, task_id)
-                    pipeline.delete(intent_key)
+                    pipeline.delete(intent_key, owner_key)
+                    if owner_id:
+                        pipeline.delete(_task_pin_key(task_id))
+                        pipeline.srem(
+                            _session_task_pins_key(owner_id),
+                            task_id,
+                        )
                     pipeline.execute()
                     transitioned = True
                     break
@@ -1317,6 +1600,10 @@ def _queue_reservations_key() -> str:
 
 def _enqueue_intent_key(task_id: str) -> str:
     return f"dt:enqueue-intent:{task_id}"
+
+
+def _enqueue_owner_key(task_id: str) -> str:
+    return f"dt:enqueue-owner:{task_id}"
 
 
 def _task_resources_key(task_id: str) -> str:

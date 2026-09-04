@@ -114,6 +114,8 @@ def _manager(
     *,
     max_queued_tasks: int = 20,
     resource_coordinator=None,
+    enqueue_intent_ttl: float = 60,
+    enqueue_intent_heartbeat_interval: float = 10,
 ) -> RedisTaskManager:
     return RedisTaskManager(
         redis_connection=redis_connection,
@@ -122,6 +124,8 @@ def _manager(
         max_queued_tasks=max_queued_tasks,
         retention_seconds=7200,
         resource_coordinator=resource_coordinator,
+        enqueue_intent_ttl=enqueue_intent_ttl,
+        enqueue_intent_heartbeat_interval=enqueue_intent_heartbeat_interval,
     )
 
 
@@ -243,35 +247,33 @@ def test_enqueue_registers_importable_rq_failure_and_stopped_callbacks(
     ]
 
 
-def test_enqueue_failure_preserves_records_when_rq_job_is_partially_written(
+def test_enqueue_failure_discards_staged_rq_transaction(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     redis_connection = fakeredis.FakeRedis(decode_responses=False)
     manager = _manager(redis_connection, tmp_path)
+    original_enqueue_job = manager.queue.enqueue_job
 
-    def save_job_hash_then_fail(*_args, **kwargs):
-        redis_connection.hset(
-            Job.key_for(kwargs["job_id"]),
-            mapping={"status": JobStatus.QUEUED.value},
+    def stage_job_then_fail(*args, **kwargs):
+        original_enqueue_job(*args, **kwargs)
+        raise RedisConnectionError("enqueue failed before transaction commit")
+
+    monkeypatch.setattr(manager.queue, "enqueue_job", stage_job_then_fail)
+
+    with pytest.raises(RedisConnectionError, match="before transaction commit"):
+        manager.create_video_frames_task(
+            VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+            owner_id="a" * 32,
         )
-        raise RedisConnectionError("enqueue failed after job hash write")
 
-    monkeypatch.setattr(manager.queue, "enqueue", save_job_hash_then_fail)
-
-    task = manager.create_video_frames_task(
-        VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
-        owner_id="a" * 32,
-    )
-
-    assert task.status is TaskStatus.QUEUED
-    assert manager.get_task(task.task_id) == task
-    assert manager.task_work(task.task_id) is not None
-    assert Job.exists(task.task_id, redis_connection)
     assert manager.queue.count == 0
-    assert redis_connection.lrange("dt:queue:reservations", 0, -1) == [
-        task.task_id.encode()
-    ]
+    assert redis_connection.llen("dt:queue:reservations") == 0
+    assert list(redis_connection.scan_iter(match="rq:job:*")) == []
+    assert list(redis_connection.scan_iter(match="dt:task:*")) == []
+    assert list(redis_connection.scan_iter(match="dt:task-work:*")) == []
+    assert list(redis_connection.scan_iter(match="dt:enqueue-intent:*")) == []
+    assert list(redis_connection.scan_iter(match="dt:enqueue-owner:*")) == []
 
 
 def test_redis_manager_rejects_when_waiting_queue_is_full(tmp_path: Path) -> None:
@@ -366,6 +368,153 @@ def test_real_redis_queue_reconcile_cannot_release_inflight_enqueue_slot(
     assert set(slot_ids) == set(job_ids)
 
 
+def test_real_redis_reconcile_preserves_heartbeat_active_enqueue_past_grace(
+    real_redis_connection: Redis,
+    tmp_path: Path,
+) -> None:
+    session_id = "a" * 32
+    resources = _resources(real_redis_connection)
+    manager = _manager(
+        real_redis_connection,
+        tmp_path,
+        resource_coordinator=resources,
+        enqueue_intent_ttl=0.5,
+        enqueue_intent_heartbeat_interval=0.05,
+    )
+    request = VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4"))
+    commit_entered = Event()
+    continue_commit = Event()
+
+    def block_before_commit(action):
+        commit_entered.set()
+        assert continue_commit.wait(timeout=5)
+        return action()
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        pending = executor.submit(
+            manager.create_video_frames_task,
+            request,
+            owner_id=session_id,
+            commit=block_before_commit,
+        )
+        try:
+            assert commit_entered.wait(timeout=5)
+            time.sleep(0.8)
+            assert manager.reconcile_tasks(grace_seconds=0.02) == 0
+            intent_keys = list(
+                real_redis_connection.scan_iter(match="dt:enqueue-intent:*")
+            )
+            assert len(intent_keys) == 1
+            task_id = intent_keys[0].decode().rsplit(":", 1)[-1]
+            assert real_redis_connection.pttl(
+                f"dt:enqueue-owner:{task_id}"
+            ) > 0
+            assert manager.get_task(task_id).status is TaskStatus.QUEUED
+            assert real_redis_connection.exists(
+                f"dt:resource:task-pin:{task_id}"
+            )
+        finally:
+            continue_commit.set()
+        task = pending.result(timeout=5)
+
+    assert manager.queue.get_job_ids() == [task.task_id]
+    assert real_redis_connection.llen("dt:queue:reservations") == 1
+    assert not real_redis_connection.exists(
+        f"dt:enqueue-intent:{task.task_id}"
+    )
+    assert not real_redis_connection.exists(
+        f"dt:enqueue-owner:{task.task_id}"
+    )
+
+
+def test_real_redis_expired_enqueue_owner_is_fenced_after_reconcile(
+    real_redis_connection: Redis,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = "a" * 32
+    resources = _resources(real_redis_connection)
+    manager = _manager(
+        real_redis_connection,
+        tmp_path,
+        max_queued_tasks=20,
+        resource_coordinator=resources,
+        enqueue_intent_ttl=0.5,
+        enqueue_intent_heartbeat_interval=0.05,
+    )
+    request = VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4"))
+    commit_entered = Event()
+    continue_commit = Event()
+    original_commit = manager._commit_enqueue_job
+
+    def block_before_commit(*args, **kwargs):
+        commit_entered.set()
+        assert continue_commit.wait(timeout=10)
+        return original_commit(*args, **kwargs)
+
+    monkeypatch.setattr(manager, "_commit_enqueue_job", block_before_commit)
+
+    with ThreadPoolExecutor(max_workers=21) as executor:
+        stale_owner = executor.submit(
+            manager.create_video_frames_task,
+            request,
+            owner_id=session_id,
+        )
+        assert commit_entered.wait(timeout=5)
+        monkeypatch.setattr(manager, "_commit_enqueue_job", original_commit)
+        intent_keys = list(
+            real_redis_connection.scan_iter(match="dt:enqueue-intent:*")
+        )
+        assert len(intent_keys) == 1
+        stale_task_id = intent_keys[0].decode().rsplit(":", 1)[-1]
+
+        owner_key = f"dt:enqueue-owner:{stale_task_id}"
+        assert real_redis_connection.pttl(owner_key) > 0
+        deadline = time.monotonic() + 2
+        while (
+            real_redis_connection.exists(owner_key)
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        assert not real_redis_connection.exists(owner_key)
+        assert manager.reconcile_tasks(grace_seconds=0) == 1
+
+        replacements = [
+            executor.submit(
+                manager.create_video_frames_task,
+                request,
+                owner_id=session_id,
+            )
+            for _index in range(20)
+        ]
+        replacement_tasks = [
+            future.result(timeout=10) for future in replacements
+        ]
+        continue_commit.set()
+        with pytest.raises(TaskConflictError, match="reservation expired"):
+            stale_owner.result(timeout=5)
+
+    job_ids = manager.queue.get_job_ids()
+    slot_ids = [
+        value.decode()
+        for value in real_redis_connection.lrange(
+            "dt:queue:reservations",
+            0,
+            -1,
+        )
+    ]
+    stale_task = manager.get_task(stale_task_id)
+    assert stale_task is not None
+    assert stale_task.status is TaskStatus.FAILED
+    assert stale_task.error == "Task enqueue could not be confirmed"
+    assert stale_task_id not in job_ids
+    assert not real_redis_connection.exists(
+        f"dt:resource:task-pin:{stale_task_id}"
+    )
+    assert len(replacement_tasks) == len(job_ids) == len(slot_ids) == 20
+    assert set(slot_ids) == set(job_ids)
+
+
 def test_expired_queued_session_is_pinned_until_terminal_cleanup(
     real_redis_connection: Redis,
     tmp_path: Path,
@@ -455,6 +604,12 @@ def test_reconcile_releases_task_pin_after_crash_during_enqueue(
         )
 
     assert resources.claim_session_cleanup(session_id) is None
+    intent_keys = list(
+        real_redis_connection.scan_iter(match="dt:enqueue-intent:*")
+    )
+    assert len(intent_keys) == 1
+    task_id = intent_keys[0].decode().rsplit(":", 1)[-1]
+    real_redis_connection.delete(f"dt:enqueue-owner:{task_id}")
     assert manager.reconcile_tasks(grace_seconds=0) == 1
     claim = resources.claim_session_cleanup(session_id)
     assert claim is not None
@@ -1735,12 +1890,12 @@ def test_real_redis_recovers_committed_enqueue_after_acknowledgement_loss(
         tmp_path,
         resource_coordinator=resources,
     )
-    original_enqueue = manager.queue.enqueue
+    original_commit = manager._commit_enqueue_job
     original_confirmation = manager._enqueue_has_authoritative_evidence
     confirmation_calls = 0
 
     def enqueue_then_lose_ack(*args, **kwargs):
-        original_enqueue(*args, **kwargs)
+        original_commit(*args, **kwargs)
         raise RedisConnectionError("enqueue acknowledgement lost")
 
     def confirmation_disconnect_once(task_id: str) -> bool:
@@ -1750,7 +1905,7 @@ def test_real_redis_recovers_committed_enqueue_after_acknowledgement_loss(
             raise RedisConnectionError("enqueue confirmation unavailable")
         return original_confirmation(task_id)
 
-    monkeypatch.setattr(manager.queue, "enqueue", enqueue_then_lose_ack)
+    monkeypatch.setattr(manager, "_commit_enqueue_job", enqueue_then_lose_ack)
     monkeypatch.setattr(
         manager,
         "_enqueue_has_authoritative_evidence",
@@ -1762,18 +1917,12 @@ def test_real_redis_recovers_committed_enqueue_after_acknowledgement_loss(
         owner_id="a" * 32,
     )
 
-    intent = real_redis_connection.hgetall(
+    assert not real_redis_connection.exists(
         f"dt:enqueue-intent:{task.task_id}"
     )
-    assert intent == {
-        b"task_id": task.task_id.encode(),
-        b"job_id": task.task_id.encode(),
-        b"slot_reserved": b"1",
-        b"state": b"uncertain",
-        b"owner_id": b"a" * 32,
-        b"created_at": intent[b"created_at"],
-    }
-    assert float(intent[b"created_at"]) > 0
+    assert not real_redis_connection.exists(
+        f"dt:enqueue-owner:{task.task_id}"
+    )
     assert manager.reconcile_tasks(grace_seconds=60) == 0
     assert manager.get_task(task.task_id) == task
     assert manager.task_work(task.task_id) is not None
@@ -1812,7 +1961,7 @@ def test_real_redis_reconcile_fails_uncommitted_ambiguous_enqueue(
             raise RedisConnectionError("enqueue confirmation unavailable")
         return original_confirmation(task_id)
 
-    monkeypatch.setattr(manager.queue, "enqueue", enqueue_without_commit)
+    monkeypatch.setattr(manager, "_commit_enqueue_job", enqueue_without_commit)
     monkeypatch.setattr(
         manager,
         "_enqueue_has_authoritative_evidence",
@@ -1835,8 +1984,13 @@ def test_real_redis_reconcile_fails_uncommitted_ambiguous_enqueue(
         b"state": b"uncertain",
         b"owner_id": b"a" * 32,
         b"created_at": intent[b"created_at"],
+        b"owner_token": intent[b"owner_token"],
     }
     assert float(intent[b"created_at"]) > 0
+    assert intent[b"owner_token"]
+    assert not real_redis_connection.exists(
+        f"dt:enqueue-owner:{task.task_id}"
+    )
     assert manager.reconcile_tasks(grace_seconds=60) == 1
     failed = manager.get_task(task.task_id)
     assert failed is not None
