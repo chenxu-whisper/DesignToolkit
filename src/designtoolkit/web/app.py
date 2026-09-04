@@ -16,6 +16,7 @@ from designtoolkit.web.hosted import (
     HostedStorage,
     is_valid_session_id,
     new_session_id,
+    redis_connection_options,
 )
 from designtoolkit.web.logs import LogStore
 from designtoolkit.web.native_picker import LocalPathPicker
@@ -54,20 +55,27 @@ def create_app(
         if isinstance(manager, RedisTaskManager):
             redis_connection = manager.queue.connection
     elif settings.enabled:
-        redis_connection = Redis.from_url(settings.redis_url)
+        redis_connection = Redis.from_url(
+            settings.redis_url,
+            **redis_connection_options(settings),
+        )
         manager = RedisTaskManager(
             redis_connection=redis_connection,
             queue=Queue("designtoolkit", connection=redis_connection),
             data_dir=settings.data_dir,
             max_queued_tasks=settings.max_queued_tasks,
             retention_seconds=settings.retention_seconds,
+            heartbeat_stop_timeout_seconds=settings.heartbeat_stop_timeout_seconds,
         )
     else:
         manager = TaskManager(log_store=LogStore())
     if settings.enabled and resource_coordinator is None:
         settings.data_dir.mkdir(parents=True, exist_ok=True)
         if redis_connection is None:
-            redis_connection = Redis.from_url(settings.redis_url)
+            redis_connection = Redis.from_url(
+                settings.redis_url,
+                **redis_connection_options(settings),
+            )
         resource_coordinator = RedisResourceCoordinator(
             redis_connection=redis_connection,
             max_upload_concurrency=settings.max_upload_concurrency,
@@ -77,6 +85,7 @@ def create_app(
             lease_ttl=settings.lease_ttl_seconds,
             reservation_heartbeat_interval=settings.reservation_heartbeat_seconds,
             lease_heartbeat_interval=settings.lease_heartbeat_seconds,
+            heartbeat_stop_timeout_seconds=settings.heartbeat_stop_timeout_seconds,
             release_marker_ttl=max(
                 settings.retention_seconds * 2,
                 settings.reservation_ttl_seconds,

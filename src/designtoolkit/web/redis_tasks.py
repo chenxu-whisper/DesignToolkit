@@ -29,6 +29,11 @@ from designtoolkit.web.adapters import (
     media_resize_options_list_from_request,
     video_frame_options_list_from_request,
 )
+from designtoolkit.web.heartbeat import (
+    DEFAULT_HEARTBEAT_STOP_TIMEOUT_SECONDS,
+    HeartbeatStopTimeoutError,
+    stop_heartbeat_thread,
+)
 from designtoolkit.web.resources import (
     _CLEANUP_PREFIX,
     SessionDeletingError,
@@ -264,9 +269,11 @@ class _EnqueueIntentHeartbeat:
         self,
         refresh: Callable[[], bool],
         interval: float,
+        stop_timeout: float = DEFAULT_HEARTBEAT_STOP_TIMEOUT_SECONDS,
     ) -> None:
         self._refresh = refresh
         self._interval = interval
+        self._stop_timeout = stop_timeout
         self._stopped = Event()
         self._failure: BaseException | None = None
         self._thread = Thread(target=self._run, daemon=True)
@@ -277,9 +284,19 @@ class _EnqueueIntentHeartbeat:
         self._started = True
 
     def stop(self) -> None:
-        self._stopped.set()
         if self._started:
-            self._thread.join()
+            try:
+                stop_heartbeat_thread(
+                    self._stopped,
+                    self._thread,
+                    timeout=self._stop_timeout,
+                    heartbeat_name="Enqueue intent heartbeat",
+                )
+            except HeartbeatStopTimeoutError as exc:
+                self._failure = exc
+                raise
+        else:
+            self._stopped.set()
 
     def raise_if_failed(self) -> None:
         if self._failure is not None:
@@ -385,6 +402,9 @@ class RedisTaskManager:
         enqueue_intent_heartbeat_interval: float = (
             _ENQUEUE_INTENT_HEARTBEAT_SECONDS
         ),
+        heartbeat_stop_timeout_seconds: float = (
+            DEFAULT_HEARTBEAT_STOP_TIMEOUT_SECONDS
+        ),
     ) -> None:
         if enqueue_intent_ttl <= 0:
             raise ValueError("enqueue_intent_ttl must be positive")
@@ -392,6 +412,8 @@ class RedisTaskManager:
             raise ValueError(
                 "enqueue_intent_heartbeat_interval must be positive"
             )
+        if heartbeat_stop_timeout_seconds <= 0:
+            raise ValueError("heartbeat_stop_timeout_seconds must be positive")
         self._redis = redis_connection
         self.queue = queue or Queue(_QUEUE_NAME, connection=redis_connection)
         self.data_dir = data_dir
@@ -402,6 +424,7 @@ class RedisTaskManager:
         self.enqueue_intent_heartbeat_interval = (
             enqueue_intent_heartbeat_interval
         )
+        self.heartbeat_stop_timeout_seconds = heartbeat_stop_timeout_seconds
         self._enqueue_intent_ttl_ms = max(
             1,
             round(
@@ -754,6 +777,7 @@ class RedisTaskManager:
         heartbeat = _EnqueueIntentHeartbeat(
             lambda: self._refresh_enqueue_intent(task.task_id, owner_token),
             self.enqueue_intent_heartbeat_interval,
+            self.heartbeat_stop_timeout_seconds,
         )
         heartbeat.start()
         try:
@@ -1821,7 +1845,12 @@ def _callback_manager(connection: Redis) -> RedisTaskManager:
         lease_ttl=settings.lease_ttl_seconds,
         reservation_heartbeat_interval=settings.reservation_heartbeat_seconds,
         lease_heartbeat_interval=settings.lease_heartbeat_seconds,
-        release_marker_ttl=_TERMINAL_TTL_SECONDS,
+        heartbeat_stop_timeout_seconds=settings.heartbeat_stop_timeout_seconds,
+        release_marker_ttl=max(
+            settings.retention_seconds * 2,
+            settings.reservation_ttl_seconds,
+            settings.lease_ttl_seconds,
+        ),
     )
     return RedisTaskManager(
         redis_connection=connection,
@@ -1830,6 +1859,7 @@ def _callback_manager(connection: Redis) -> RedisTaskManager:
         max_queued_tasks=settings.max_queued_tasks,
         retention_seconds=_TERMINAL_TTL_SECONDS,
         resource_coordinator=resources,
+        heartbeat_stop_timeout_seconds=settings.heartbeat_stop_timeout_seconds,
     )
 
 

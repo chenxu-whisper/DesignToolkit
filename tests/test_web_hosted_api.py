@@ -1186,6 +1186,43 @@ def test_session_commit_waits_for_in_flight_refresh_failure_and_blocks_action() 
         executor.shutdown(wait=True)
 
 
+def test_session_heartbeat_stop_timeout_is_bounded_and_observable() -> None:
+    entered_refresh = Event()
+    allow_refresh = Event()
+
+    class BlockingLease:
+        coordinator = type(
+            "Coordinator",
+            (),
+            {"heartbeat_stop_timeout_seconds": 0.02},
+        )()
+
+        def refresh(self) -> None:
+            entered_refresh.set()
+            assert allow_refresh.wait(timeout=1)
+
+    heartbeat = routes_module._SessionLeaseHeartbeat(BlockingLease(), 0.001)
+    executor = ThreadPoolExecutor(max_workers=1)
+    heartbeat.start()
+    try:
+        assert entered_refresh.wait(timeout=1)
+        stop = executor.submit(heartbeat.stop)
+        with pytest.raises(
+            ResourceUnavailableError,
+            match="Session lease heartbeat did not stop",
+        ):
+            stop.result(timeout=0.2)
+        with pytest.raises(
+            ResourceUnavailableError,
+            match="Session lease heartbeat did not stop",
+        ):
+            heartbeat.raise_if_failed()
+    finally:
+        allow_refresh.set()
+        heartbeat._thread.join(timeout=1)
+        executor.shutdown(wait=True)
+
+
 def test_hosted_task_returns_success_after_enqueue_when_late_heartbeat_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

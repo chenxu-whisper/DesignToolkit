@@ -892,7 +892,7 @@ def test_run_task_reserves_refreshes_and_releases_worker_resources(
     monkeypatch.setattr(
         worker_module.Redis,
         "from_url",
-        lambda _url: redis_connection,
+        lambda _url, **_kwargs: redis_connection,
     )
     monkeypatch.setattr(
         worker_module,
@@ -958,7 +958,7 @@ def test_run_task_heartbeats_resources_during_slow_processing(
     monkeypatch.setattr(
         worker_module.Redis,
         "from_url",
-        lambda _url: redis_connection,
+        lambda _url, **_kwargs: redis_connection,
     )
     monkeypatch.setattr(
         worker_module,
@@ -1008,29 +1008,25 @@ def test_run_task_heartbeats_lease_while_output_reservation_blocks(
         VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
         owner_id="a" * 32,
     )
+    reservation_entered = Event()
+    heartbeat_during_reservation = Event()
 
-    class ExpiringLease(TrackingHandle):
-        def __init__(self, events: list[str]) -> None:
-            super().__init__("lease", events)
-            self.expires_at = time.monotonic() + 0.03
-
+    class InterleavedLease(TrackingHandle):
         def refresh(self) -> None:
-            if time.monotonic() >= self.expires_at:
-                raise RuntimeError("lease expired during reservation")
-            self.expires_at = time.monotonic() + 0.03
             super().refresh()
+            if reservation_entered.is_set():
+                heartbeat_during_reservation.set()
 
     class BlockingReservationResources(TrackingTaskResources):
         def __init__(self) -> None:
             super().__init__()
-            self.lease = ExpiringLease(self.events)
+            self.lease = InterleavedLease("lease", self.events)
             self.session_lease_heartbeat_interval = 0.005
             self.reservation_heartbeat_interval = 0.005
 
         def reserve_output(self, *args, **kwargs):
-            time.sleep(0.08)
-            if time.monotonic() >= self.lease.expires_at:
-                raise RuntimeError("lease expired during reservation")
+            reservation_entered.set()
+            assert heartbeat_during_reservation.wait(timeout=1)
             return super().reserve_output(*args, **kwargs)
 
     resources = BlockingReservationResources()
@@ -1038,7 +1034,7 @@ def test_run_task_heartbeats_lease_while_output_reservation_blocks(
     monkeypatch.setattr(
         worker_module.Redis,
         "from_url",
-        lambda _url: redis_connection,
+        lambda _url, **_kwargs: redis_connection,
     )
     monkeypatch.setattr(
         worker_module,
@@ -1074,7 +1070,7 @@ def test_run_task_heartbeats_lease_while_output_reservation_blocks(
     completed = manager.get_task(task.task_id)
     assert completed is not None
     assert completed.status is TaskStatus.SUCCEEDED
-    assert resources.events.count("refresh:lease") >= 3
+    assert heartbeat_during_reservation.is_set()
     assert resources.events[-2:] == ["release:output", "release:lease"]
 
 
@@ -1117,7 +1113,7 @@ def test_run_task_checks_heartbeat_failure_after_blocking_reservation(
     monkeypatch.setattr(
         worker_module.Redis,
         "from_url",
-        lambda _url: redis_connection,
+        lambda _url, **_kwargs: redis_connection,
     )
     monkeypatch.setattr(
         worker_module,
@@ -1184,7 +1180,7 @@ def test_run_task_surfaces_background_heartbeat_failure_before_publish(
     monkeypatch.setattr(
         worker_module.Redis,
         "from_url",
-        lambda _url: redis_connection,
+        lambda _url, **_kwargs: redis_connection,
     )
     monkeypatch.setattr(
         worker_module,
@@ -1244,7 +1240,7 @@ def test_run_task_observes_heartbeat_failure_recorded_during_stop_before_success
     monkeypatch.setattr(
         worker_module.Redis,
         "from_url",
-        lambda _url: redis_connection,
+        lambda _url, **_kwargs: redis_connection,
     )
     monkeypatch.setattr(
         worker_module,
@@ -1319,7 +1315,7 @@ def test_run_task_stops_before_resource_mutation_when_start_is_rejected(
     monkeypatch.setattr(
         worker_module.Redis,
         "from_url",
-        lambda _url: redis_connection,
+        lambda _url, **_kwargs: redis_connection,
     )
     monkeypatch.setattr(
         worker_module,
@@ -1369,7 +1365,7 @@ def test_run_task_failure_cleans_output_terminalizes_and_releases_resources(
     monkeypatch.setattr(
         worker_module.Redis,
         "from_url",
-        lambda _url: redis_connection,
+        lambda _url, **_kwargs: redis_connection,
     )
     monkeypatch.setattr(
         worker_module,
@@ -2534,7 +2530,7 @@ def test_run_task_releases_resources_after_success_ack_is_lost(
     monkeypatch.setattr(
         worker_module.Redis,
         "from_url",
-        lambda _url: redis_connection,
+        lambda _url, **_kwargs: redis_connection,
     )
     monkeypatch.setattr(
         worker_module,

@@ -9,12 +9,14 @@ def test_cleanup_reconciles_stale_tasks_and_reservations_before_storage(
     monkeypatch,
 ) -> None:
     events: list[str] = []
+    redis_options: dict[str, object] = {}
     redis_connection = object()
     coordinator = object()
 
     class FakeRedis:
         @staticmethod
-        def from_url(_url: str) -> object:
+        def from_url(_url: str, **kwargs: object) -> object:
+            redis_options.update(kwargs)
             return redis_connection
 
     class FakeQueue:
@@ -84,3 +86,7 @@ def test_cleanup_reconciles_stale_tasks_and_reservations_before_storage(
 
     assert result == 2
     assert events == ["tasks", "queue-slots", "reservations", "cleanup"]
+    assert redis_options == {
+        "socket_connect_timeout": 5.0,
+        "socket_timeout": 5.0,
+    }

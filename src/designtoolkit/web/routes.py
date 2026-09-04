@@ -47,6 +47,11 @@ from designtoolkit.chroma_keyer.video_models import (
 from designtoolkit.media_resize import MediaResizeError
 from designtoolkit.video_frames import VideoFrameError
 from designtoolkit.web.chroma_previews import ChromaPreviewEntry, ChromaPreviewStore
+from designtoolkit.web.heartbeat import (
+    DEFAULT_HEARTBEAT_STOP_TIMEOUT_SECONDS,
+    HeartbeatStopTimeoutError,
+    stop_heartbeat_thread,
+)
 from designtoolkit.web.hosted import (
     AssetDeletionStateError,
     HostedSettings,
@@ -128,6 +133,11 @@ class _SessionLeaseHeartbeat:
     def __init__(self, lease: RedisSessionLease, interval: float) -> None:
         self._lease = lease
         self._interval = interval
+        self._stop_timeout = getattr(
+            getattr(lease, "coordinator", None),
+            "heartbeat_stop_timeout_seconds",
+            DEFAULT_HEARTBEAT_STOP_TIMEOUT_SECONDS,
+        )
         self._stopped = Event()
         self._failure: BaseException | None = None
         self._thread = Thread(target=self._run, daemon=True)
@@ -136,12 +146,24 @@ class _SessionLeaseHeartbeat:
         self._thread.start()
 
     def stop(self) -> None:
-        self._stopped.set()
-        self._thread.join()
+        try:
+            stop_heartbeat_thread(
+                self._stopped,
+                self._thread,
+                timeout=self._stop_timeout,
+                heartbeat_name="Session lease heartbeat",
+            )
+        except HeartbeatStopTimeoutError as exc:
+            self._failure = exc
+            raise
 
     def raise_if_failed(self) -> None:
         if self._failure is not None:
             raise self._failure
+
+    @property
+    def quiesced(self) -> bool:
+        return not self._thread.is_alive()
 
     def commit[T](self, action: Callable[[], T]) -> T:
         # Quiescing removes all in-flight refreshes from the irreversible
@@ -213,10 +235,11 @@ class _LeaseProtectedFileResponse(FileResponse):
         else:
             _stop_session_lease_heartbeat(self._heartbeat)
         finally:
-            _release_redis_resource_best_effort(
-                self._lease.release,
-                "download session lease",
-            )
+            if self._heartbeat.quiesced:
+                _release_redis_resource_best_effort(
+                    self._lease.release,
+                    "download session lease",
+                )
 
 
 class _BoundedSingleFlightCache[CacheKey: Hashable, CacheValue]:
@@ -894,10 +917,11 @@ def create_router(
                 except (RedisError, ResourceUnavailableError) as exc:
                     raise ApiError("storage_unavailable", str(exc), 503) from exc
         finally:
-            _release_redis_resource_best_effort(
-                lease.release,
-                "hosted session lease",
-            )
+            if heartbeat.quiesced:
+                _release_redis_resource_best_effort(
+                    lease.release,
+                    "hosted session lease",
+                )
 
     def create_task_with_session_commit(
         http_request: Request,
@@ -1052,6 +1076,7 @@ def create_router(
 
         reservation = None
         lease = None
+        release_resources = True
         try:
             reservation = resources.reserve_upload(
                 http_request.state.session_id,
@@ -1071,6 +1096,9 @@ def create_router(
             code = "upload_too_large" if "file limit" in str(exc) else "invalid_upload"
             status_code = 413 if code == "upload_too_large" else 400
             raise ApiError(code, str(exc), status_code) from exc
+        except HeartbeatStopTimeoutError as exc:
+            release_resources = False
+            raise ApiError("storage_unavailable", str(exc), 503) from exc
         except ResourceUnavailableError as exc:
             message = str(exc)
             if "concurrency" in message:
@@ -1085,12 +1113,12 @@ def create_router(
                 503,
             ) from exc
         finally:
-            if lease is not None:
+            if release_resources and lease is not None:
                 _release_redis_resource_best_effort(
                     lease.release,
                     "upload session lease",
                 )
-            if reservation is not None:
+            if release_resources and reservation is not None:
                 _release_redis_resource_best_effort(
                     reservation.release,
                     "upload reservation",
@@ -1738,10 +1766,11 @@ def create_router(
                     "validation error"
                 ),
             )
-            _release_redis_resource_best_effort(
-                lease.release,
-                "download session lease",
-            )
+            if heartbeat.quiesced:
+                _release_redis_resource_best_effort(
+                    lease.release,
+                    "download session lease",
+                )
             raise ApiError("result_not_found", str(exc), 404) from exc
         except BaseException:
             _stop_session_lease_heartbeat(
@@ -1751,10 +1780,11 @@ def create_router(
                     "validation error"
                 ),
             )
-            _release_redis_resource_best_effort(
-                lease.release,
-                "download session lease",
-            )
+            if heartbeat.quiesced:
+                _release_redis_resource_best_effort(
+                    lease.release,
+                    "download session lease",
+                )
             raise
         return _LeaseProtectedFileResponse(
             result_path,

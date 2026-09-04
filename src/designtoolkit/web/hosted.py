@@ -19,6 +19,11 @@ from zipfile import ZIP_DEFLATED, ZipFile
 
 from redis.exceptions import RedisError
 
+from designtoolkit.web.heartbeat import (
+    DEFAULT_HEARTBEAT_STOP_TIMEOUT_SECONDS,
+    HeartbeatStopTimeoutError,
+    stop_heartbeat_thread,
+)
 from designtoolkit.web.media_limits import HostedMediaLimits
 from designtoolkit.web.resources import (
     RedisReservation,
@@ -87,6 +92,11 @@ class _CleanupClaimHeartbeat:
         self._session_id = session_id
         self._token = token
         self._interval = coordinator.cleanup_claim_heartbeat_interval
+        self._stop_timeout = getattr(
+            coordinator,
+            "heartbeat_stop_timeout_seconds",
+            DEFAULT_HEARTBEAT_STOP_TIMEOUT_SECONDS,
+        )
         self._stopped = Event()
         self._failure: BaseException | None = None
         self._committed = False
@@ -103,9 +113,8 @@ class _CleanupClaimHeartbeat:
         exc_value: BaseException | None,
         _traceback: object,
     ) -> None:
-        self._stopped.set()
-        self._thread.join()
         try:
+            self.stop()
             self.raise_if_failed()
         except BaseException as heartbeat_error:
             if exc_value is None and self._committed:
@@ -136,11 +145,26 @@ class _CleanupClaimHeartbeat:
         if self._failure is not None:
             raise self._failure
 
+    @property
+    def quiesced(self) -> bool:
+        return not self._thread.is_alive()
+
+    def stop(self) -> None:
+        try:
+            stop_heartbeat_thread(
+                self._stopped,
+                self._thread,
+                timeout=self._stop_timeout,
+                heartbeat_name="Cleanup claim heartbeat",
+            )
+        except HeartbeatStopTimeoutError as exc:
+            self._failure = exc
+            raise
+
     def commit[T](self, action: Callable[[], T]) -> T:
         # Rename starts only after every periodic refresh has completed. The
         # synchronous refresh gives the short rename boundary a full claim TTL.
-        self._stopped.set()
-        self._thread.join()
+        self.stop()
         self.raise_if_failed()
         self._coordinator.refresh_cleanup_claim(
             self._session_id,
@@ -190,6 +214,22 @@ class _UploadResourceHeartbeat:
                     5.0,
                 )
             )
+        coordinators = [
+            getattr(reservation, "coordinator", None),
+            getattr(lease, "coordinator", None),
+        ]
+        self._stop_timeout = max(
+            (
+                getattr(
+                    coordinator,
+                    "heartbeat_stop_timeout_seconds",
+                    DEFAULT_HEARTBEAT_STOP_TIMEOUT_SECONDS,
+                )
+                for coordinator in coordinators
+                if coordinator is not None
+            ),
+            default=DEFAULT_HEARTBEAT_STOP_TIMEOUT_SECONDS,
+        )
         self._interval = min(intervals)
         self._stopped = Event()
         self._failure: BaseException | None = None
@@ -208,8 +248,16 @@ class _UploadResourceHeartbeat:
         self.seal()
 
     def seal(self) -> None:
-        self._stopped.set()
-        self._thread.join()
+        try:
+            stop_heartbeat_thread(
+                self._stopped,
+                self._thread,
+                timeout=self._stop_timeout,
+                heartbeat_name="Upload resource heartbeat",
+            )
+        except HeartbeatStopTimeoutError as exc:
+            self._failure = exc
+            raise
         self.raise_if_failed()
 
     def raise_if_failed(self) -> None:
@@ -235,6 +283,8 @@ class HostedSettings:
     enabled: bool
     data_dir: Path
     redis_url: str
+    redis_socket_connect_timeout_seconds: float = 5.0
+    redis_socket_timeout_seconds: float = 5.0
     max_upload_bytes: int = _DEFAULT_MAX_UPLOAD_BYTES
     max_session_bytes: int = _DEFAULT_MAX_SESSION_BYTES
     max_output_bytes: int = _DEFAULT_MAX_OUTPUT_BYTES
@@ -264,6 +314,16 @@ class HostedSettings:
             enabled=_read_bool(values, "DESIGNTOOLKIT_HOSTED", False),
             data_dir=Path(values.get("DESIGNTOOLKIT_DATA_DIR", "/data")),
             redis_url=values.get("REDIS_URL", "redis://redis:6379/0"),
+            redis_socket_connect_timeout_seconds=_read_positive_float(
+                values,
+                "DESIGNTOOLKIT_REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS",
+                5.0,
+            ),
+            redis_socket_timeout_seconds=_read_positive_float(
+                values,
+                "DESIGNTOOLKIT_REDIS_SOCKET_TIMEOUT_SECONDS",
+                5.0,
+            ),
             max_upload_bytes=_read_positive_int(
                 values,
                 "DESIGNTOOLKIT_MAX_UPLOAD_BYTES",
@@ -360,6 +420,21 @@ class HostedSettings:
                 True,
             ),
         )
+
+    @property
+    def heartbeat_stop_timeout_seconds(self) -> float:
+        return (
+            self.redis_socket_connect_timeout_seconds
+            + self.redis_socket_timeout_seconds
+            + 1.0
+        )
+
+
+def redis_connection_options(settings: HostedSettings) -> dict[str, float]:
+    return {
+        "socket_connect_timeout": settings.redis_socket_connect_timeout_seconds,
+        "socket_timeout": settings.redis_socket_timeout_seconds,
+    }
 
 
 @dataclass(frozen=True)
@@ -461,6 +536,9 @@ class HostedStorage:
                 _commit_with_recovery(reservation)
                 committed = True
                 temporary_path.replace(final_path)
+        except HeartbeatStopTimeoutError:
+            self._discard_asset(session_id, asset_dir)
+            raise
         except _AmbiguousCommitError:
             raise
         except Exception:
@@ -606,12 +684,13 @@ class HostedStorage:
             token = coordinator.claim_session_cleanup(session_id)
             if token is None:
                 continue
+            heartbeat = _CleanupClaimHeartbeat(
+                coordinator,
+                session_id,
+                token,
+            )
             try:
-                with _CleanupClaimHeartbeat(
-                    coordinator,
-                    session_id,
-                    token,
-                ) as heartbeat:
+                with heartbeat:
                     if _directory_modified_at(session_dir) >= cutoff:
                         continue
                     heartbeat.raise_if_failed()
@@ -644,7 +723,8 @@ class HostedStorage:
                     )
                     removed += 1
             finally:
-                coordinator.release_cleanup_claim(session_id, token)
+                if heartbeat.quiesced:
+                    coordinator.release_cleanup_claim(session_id, token)
         self._remove_empty_trash()
         return removed
 
@@ -665,56 +745,69 @@ class HostedStorage:
             claim_token = coordinator.claim_session_cleanup(session_id)
             if claim_token is None:
                 continue
+            heartbeat = _CleanupClaimHeartbeat(
+                coordinator,
+                session_id,
+                claim_token,
+            )
             try:
-                with _CleanupClaimHeartbeat(
-                    coordinator,
-                    session_id,
-                    claim_token,
-                ) as heartbeat:
-                    generation = _read_session_usage_generation(
-                        quarantine,
-                        expected_generation_id=generation_id,
-                    )
-                    if generation is None:
-                        current_bytes = _auditable_session_upload_bytes(
-                            self._session_dir(session_id)
+                try:
+                    with heartbeat:
+                        generation = _read_session_usage_generation(
+                            quarantine,
+                            expected_generation_id=generation_id,
                         )
-                        legacy_physical_bytes = _auditable_session_upload_bytes(
-                            quarantine
-                        )
-                        if (
-                            current_bytes is None
-                            or legacy_physical_bytes is None
-                        ):
-                            raise ResourceUnavailableError(
-                                "Legacy session usage cannot be audited safely"
+                        if generation is None:
+                            current_bytes = _auditable_session_upload_bytes(
+                                self._session_dir(session_id)
                             )
-                        coordinator.reconcile_legacy_session_usage(
-                            session_id,
-                            claim_token,
-                            generation_id,
-                            current_committed_bytes=current_bytes,
-                            legacy_physical_bytes=legacy_physical_bytes,
-                        )
-                    else:
-                        coordinator.clear_session_usage_generation(
-                            session_id,
-                            claim_token,
-                            generation,
-                        )
-                    heartbeat.raise_if_failed()
-                    quarantine_removed = self._delete_quarantine(quarantine)
-                    heartbeat.raise_if_failed()
-                if quarantine_removed:
-                    if generation is not None:
-                        coordinator.finalize_session_usage_generation(
-                            generation.generation_id
-                        )
-                    else:
-                        coordinator.finalize_legacy_session_usage(generation_id)
-                    removed += 1
-            finally:
-                coordinator.release_cleanup_claim(session_id, claim_token)
+                            legacy_physical_bytes = _auditable_session_upload_bytes(
+                                quarantine
+                            )
+                            if (
+                                current_bytes is None
+                                or legacy_physical_bytes is None
+                            ):
+                                raise ResourceUnavailableError(
+                                    "Legacy session usage cannot be audited safely"
+                                )
+                            coordinator.reconcile_legacy_session_usage(
+                                session_id,
+                                claim_token,
+                                generation_id,
+                                current_committed_bytes=current_bytes,
+                                legacy_physical_bytes=legacy_physical_bytes,
+                            )
+                        else:
+                            coordinator.clear_session_usage_generation(
+                                session_id,
+                                claim_token,
+                                generation,
+                            )
+                        heartbeat.raise_if_failed()
+                        quarantine_removed = self._delete_quarantine(quarantine)
+                        heartbeat.raise_if_failed()
+                    if quarantine_removed:
+                        if generation is not None:
+                            coordinator.finalize_session_usage_generation(
+                                generation.generation_id
+                            )
+                        else:
+                            coordinator.finalize_legacy_session_usage(generation_id)
+                        removed += 1
+                finally:
+                    if heartbeat.quiesced:
+                        coordinator.release_cleanup_claim(session_id, claim_token)
+            except Exception:
+                _LOGGER.warning(
+                    "Failed to recover quarantined session",
+                    extra={
+                        "generation_id": generation_id,
+                        "quarantine": str(quarantine),
+                        "session_id": session_id,
+                    },
+                    exc_info=True,
+                )
         self._remove_empty_trash()
         return removed
 

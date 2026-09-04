@@ -6,13 +6,20 @@ from time import sleep
 from redis import Redis
 from rq import Queue
 
-from designtoolkit.web.hosted import HostedSettings, HostedStorage
+from designtoolkit.web.hosted import (
+    HostedSettings,
+    HostedStorage,
+    redis_connection_options,
+)
 from designtoolkit.web.redis_tasks import RedisTaskManager
 from designtoolkit.web.resources import RedisResourceCoordinator
 
 
 def cleanup_once(settings: HostedSettings) -> int:
-    redis_connection = Redis.from_url(settings.redis_url)
+    redis_connection = Redis.from_url(
+        settings.redis_url,
+        **redis_connection_options(settings),
+    )
     coordinator = RedisResourceCoordinator(
         redis_connection=redis_connection,
         max_upload_concurrency=settings.max_upload_concurrency,
@@ -22,8 +29,9 @@ def cleanup_once(settings: HostedSettings) -> int:
         lease_ttl=settings.lease_ttl_seconds,
         reservation_heartbeat_interval=settings.reservation_heartbeat_seconds,
         lease_heartbeat_interval=settings.lease_heartbeat_seconds,
+        heartbeat_stop_timeout_seconds=settings.heartbeat_stop_timeout_seconds,
         release_marker_ttl=max(
-            settings.retention_seconds,
+            settings.retention_seconds * 2,
             settings.reservation_ttl_seconds,
             settings.lease_ttl_seconds,
         ),
@@ -35,6 +43,7 @@ def cleanup_once(settings: HostedSettings) -> int:
         max_queued_tasks=settings.max_queued_tasks,
         retention_seconds=settings.retention_seconds,
         resource_coordinator=coordinator,
+        heartbeat_stop_timeout_seconds=settings.heartbeat_stop_timeout_seconds,
     )
     storage = HostedStorage(
         settings.data_dir,

@@ -9,10 +9,16 @@ from threading import Event, Thread
 from redis import Redis
 from rq import Queue
 
+from designtoolkit.web.heartbeat import (
+    DEFAULT_HEARTBEAT_STOP_TIMEOUT_SECONDS,
+    HeartbeatStopTimeoutError,
+    stop_heartbeat_thread,
+)
 from designtoolkit.web.hosted import (
     HostedSettings,
     HostedStorage,
     prepare_download_artifact,
+    redis_connection_options,
 )
 from designtoolkit.web.output_limits import OutputBudgetGuard, OutputLimitExceeded
 from designtoolkit.web.redis_tasks import (
@@ -315,9 +321,15 @@ class _HeartbeatOutputBudgetGuard(OutputBudgetGuard):
 
 
 class _PeriodicResourceHeartbeat:
-    def __init__(self, heartbeat: Callable[[], None], interval: float) -> None:
+    def __init__(
+        self,
+        heartbeat: Callable[[], None],
+        interval: float,
+        stop_timeout: float = DEFAULT_HEARTBEAT_STOP_TIMEOUT_SECONDS,
+    ) -> None:
         self._heartbeat = heartbeat
         self._interval = interval
+        self._stop_timeout = stop_timeout
         self._stopped = Event()
         self._failure: BaseException | None = None
         self._thread = Thread(target=self._run, daemon=True)
@@ -329,9 +341,19 @@ class _PeriodicResourceHeartbeat:
         self._started = True
 
     def stop(self) -> None:
-        self._stopped.set()
         if self._started:
-            self._thread.join()
+            try:
+                stop_heartbeat_thread(
+                    self._stopped,
+                    self._thread,
+                    timeout=self._stop_timeout,
+                    heartbeat_name="Worker resource heartbeat",
+                )
+            except HeartbeatStopTimeoutError as exc:
+                self._failure = exc
+                raise
+        else:
+            self._stopped.set()
 
     def raise_if_failed(self) -> None:
         if self._failure is not None:
@@ -359,8 +381,9 @@ def _build_resource_coordinator(
         lease_ttl=settings.lease_ttl_seconds,
         reservation_heartbeat_interval=settings.reservation_heartbeat_seconds,
         lease_heartbeat_interval=settings.lease_heartbeat_seconds,
+        heartbeat_stop_timeout_seconds=settings.heartbeat_stop_timeout_seconds,
         release_marker_ttl=max(
-            settings.retention_seconds,
+            settings.retention_seconds * 2,
             settings.reservation_ttl_seconds,
             settings.lease_ttl_seconds,
         ),
@@ -388,7 +411,10 @@ def discard_failed_task_output(
 
 def run_task(task_id: str, job_kind: str, payload: dict[str, object]) -> None:
     settings = HostedSettings.from_env()
-    redis_connection = Redis.from_url(settings.redis_url)
+    redis_connection = Redis.from_url(
+        settings.redis_url,
+        **redis_connection_options(settings),
+    )
     resources = _build_resource_coordinator(settings, redis_connection)
     state = RedisTaskManager(
         redis_connection=redis_connection,
@@ -397,6 +423,7 @@ def run_task(task_id: str, job_kind: str, payload: dict[str, object]) -> None:
         max_queued_tasks=settings.max_queued_tasks,
         retention_seconds=settings.retention_seconds,
         resource_coordinator=resources,
+        heartbeat_stop_timeout_seconds=settings.heartbeat_stop_timeout_seconds,
     )
     task = state.get_task(task_id)
     if task is None:
@@ -451,6 +478,11 @@ def run_task(task_id: str, job_kind: str, payload: dict[str, object]) -> None:
                     "reservation_heartbeat_interval",
                     resources.session_lease_heartbeat_interval,
                 ),
+            ),
+            getattr(
+                resources,
+                "heartbeat_stop_timeout_seconds",
+                DEFAULT_HEARTBEAT_STOP_TIMEOUT_SECONDS,
             ),
         )
         periodic_heartbeat.start()

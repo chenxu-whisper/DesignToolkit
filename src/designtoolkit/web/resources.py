@@ -540,7 +540,7 @@ else
     redis.call("HDEL", KEYS[1], committed_field)
 end
 
-for index = 6, #ARGV do
+for index = 7, #ARGV do
     local asset_id = ARGV[index]
     local marker_key = ARGV[5] .. ARGV[1] .. ":" .. asset_id
     local marker_session = redis.call("HGET", marker_key, "session_id")
@@ -550,7 +550,7 @@ for index = 6, #ARGV do
         redis.call("SREM", KEYS[4], marker_key)
     end
 end
-redis.call("SET", KEYS[5], "cleared")
+redis.call("SET", KEYS[5], "cleared", "PX", ARGV[6])
 return 1
 """
 
@@ -606,6 +606,7 @@ redis.call(
     "legacy_bytes",
     legacy_bytes
 )
+redis.call("PEXPIRE", KEYS[4], tonumber(ARGV[5]))
 return {1, legacy_bytes}
 """
 
@@ -970,6 +971,7 @@ class RedisResourceCoordinator:
         lease_ttl: float,
         reservation_heartbeat_interval: float = _DEFAULT_HEARTBEAT_INTERVAL,
         lease_heartbeat_interval: float = _DEFAULT_HEARTBEAT_INTERVAL,
+        heartbeat_stop_timeout_seconds: float = 11.0,
         release_marker_ttl: float | None = None,
     ) -> None:
         self._redis = redis_connection
@@ -991,6 +993,10 @@ class RedisResourceCoordinator:
         lease_heartbeat_interval = _positive_seconds(
             lease_heartbeat_interval,
             "lease_heartbeat_interval",
+        )
+        self.heartbeat_stop_timeout_seconds = _positive_seconds(
+            heartbeat_stop_timeout_seconds,
+            "heartbeat_stop_timeout_seconds",
         )
         self._reservation_ttl_ms = _ttl_milliseconds(
             max(reservation_ttl, 2 * reservation_heartbeat_interval),
@@ -1338,6 +1344,7 @@ class RedisResourceCoordinator:
                     generation.generation_id,
                     committed_bytes,
                     _RELEASED_ASSET_PREFIX,
+                    self._release_marker_ttl_ms,
                     *asset_ids,
                 ],
             )
@@ -1388,6 +1395,7 @@ class RedisResourceCoordinator:
                 claim_token,
                 current_committed_bytes,
                 legacy_physical_bytes,
+                self._release_marker_ttl_ms,
             ],
         )
         code = int(result[0])

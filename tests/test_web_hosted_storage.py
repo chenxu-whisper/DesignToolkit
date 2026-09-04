@@ -274,6 +274,21 @@ def test_hosted_settings_use_public_deployment_defaults(tmp_path: Path) -> None:
     assert settings.lease_ttl_seconds >= 2 * settings.lease_heartbeat_seconds
     assert settings.max_queued_tasks == 20
     assert settings.retention_seconds == 2 * 60 * 60
+    assert settings.redis_socket_connect_timeout_seconds == 5.0
+    assert settings.redis_socket_timeout_seconds == 5.0
+
+
+def test_hosted_settings_read_redis_socket_timeouts(tmp_path: Path) -> None:
+    settings = HostedSettings.from_env(
+        {
+            "DESIGNTOOLKIT_DATA_DIR": str(tmp_path),
+            "DESIGNTOOLKIT_REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS": "1.5",
+            "DESIGNTOOLKIT_REDIS_SOCKET_TIMEOUT_SECONDS": "2.5",
+        }
+    )
+
+    assert settings.redis_socket_connect_timeout_seconds == 1.5
+    assert settings.redis_socket_timeout_seconds == 2.5
 
 
 @pytest.mark.anyio
@@ -1314,6 +1329,50 @@ def test_cleanup_retries_orphaned_quarantine_without_session_state(
     assert removed == 1
     assert not orphan.exists()
     assert coordinator.claim_calls == ["a" * 32]
+    assert coordinator.claims == {}
+
+
+def test_cleanup_preserves_unauditable_quarantine_and_continues(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    quarantined_session_id = "a" * 32
+    generation_id = "1" * 32
+    quarantine = (
+        tmp_path / ".trash" / f"{quarantined_session_id}-{generation_id}"
+    )
+    invalid_asset = quarantine / "assets" / "not-an-asset-id"
+    invalid_asset.mkdir(parents=True)
+    (invalid_asset / "old.bin").write_bytes(b"old")
+    expired_session_id = "b" * 32
+    expired_session = tmp_path / "sessions" / expired_session_id
+    expired_session.mkdir(parents=True)
+    coordinator = RecordingCleanupCoordinator()
+    monkeypatch.setattr("designtoolkit.web.hosted.time", lambda: 10_000.0)
+    monkeypatch.setattr(
+        "designtoolkit.web.hosted._directory_modified_at",
+        lambda _path: 1_000.0,
+    )
+    caplog.set_level("WARNING", logger="designtoolkit.web.hosted")
+
+    removed = storage.cleanup_expired(
+        retention_seconds=2_000,
+        coordinator=coordinator,
+    )
+
+    assert removed == 1
+    assert quarantine.is_dir()
+    assert not expired_session.exists()
+    failure = next(
+        record
+        for record in caplog.records
+        if record.message == "Failed to recover quarantined session"
+    )
+    assert failure.session_id == quarantined_session_id
+    assert failure.generation_id == generation_id
+    assert failure.quarantine == str(quarantine)
     assert coordinator.claims == {}
 
 
