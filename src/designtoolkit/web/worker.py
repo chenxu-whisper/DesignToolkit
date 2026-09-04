@@ -14,7 +14,10 @@ from designtoolkit.web.hosted import (
     prepare_download_artifact,
 )
 from designtoolkit.web.output_limits import OutputBudgetGuard, OutputLimitExceeded
-from designtoolkit.web.redis_tasks import RedisTaskManager
+from designtoolkit.web.redis_tasks import (
+    RedisTaskManager,
+    TerminalTransitionResult,
+)
 from designtoolkit.web.resources import (
     RedisReservation,
     RedisResourceCoordinator,
@@ -176,14 +179,14 @@ class RedisTaskExecutor(TaskManager):
             message="Task completed",
             details=details,
         )
-        completed, transitioned = self._state._transition_finished(
+        completed, transition = self._state._transition_finished(
             task_id,
             status=TaskStatus.SUCCEEDED,
             output_path=download_url,
             result_path=str(artifact),
             terminal_event=terminal_event,
         )
-        if not transitioned:
+        if transition is not TerminalTransitionResult.APPLIED:
             if completed.result_path != str(artifact):
                 artifact.unlink(missing_ok=True)
             return

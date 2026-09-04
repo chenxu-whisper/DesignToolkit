@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 from queue import Empty
 from time import monotonic, sleep, time
@@ -9,7 +10,7 @@ from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from redis import Redis
-from redis.exceptions import WatchError
+from redis.exceptions import ResponseError, WatchError
 from rq import Queue
 from rq.job import Callback, Job, JobStatus
 from rq.registry import FailedJobRegistry, StartedJobRegistry
@@ -44,6 +45,47 @@ if TYPE_CHECKING:
 
 _QUEUE_NAME = "designtoolkit"
 _TERMINAL_TTL_SECONDS = 2 * 60 * 60
+_TERMINAL_TRANSITION_SCRIPT = """-- transition_task_terminal
+local value = redis.call("GET", KEYS[1])
+if not value then
+    return {0, ""}
+end
+
+local task = cjson.decode(value)
+if task.status == "succeeded" or task.status == "failed" then
+    return {2, value}
+end
+
+task.status = ARGV[1]
+if ARGV[2] == "1" then
+    task.output_path = ARGV[3]
+end
+if ARGV[4] == "1" then
+    task.error = ARGV[5]
+else
+    task.error = cjson.null
+end
+if ARGV[6] == "1" then
+    task.result_path = ARGV[7]
+end
+task.finished_at = ARGV[8]
+
+local encoded = cjson.encode(task)
+redis.call("SET", KEYS[1], encoded, "EX", ARGV[9])
+if redis.call("EXISTS", KEYS[2]) == 1 then
+    redis.call("EXPIRE", KEYS[2], ARGV[9])
+end
+if ARGV[10] == "1" then
+    redis.call("RPUSH", KEYS[3], ARGV[11])
+    redis.call("EXPIRE", KEYS[3], ARGV[9])
+end
+return {1, encoded}
+"""
+
+
+class TerminalTransitionResult(StrEnum):
+    APPLIED = "applied"
+    ALREADY_TERMINAL = "already_terminal"
 
 
 class RedisEventSubscriber:
@@ -140,6 +182,9 @@ class RedisTaskManager:
         self.retention_seconds = retention_seconds
         self.resource_coordinator = resource_coordinator
         self.live_task_ttl = max(retention_seconds * 2, 24 * 60 * 60)
+        self._terminal_transition_script = self._redis.register_script(
+            _TERMINAL_TRANSITION_SCRIPT
+        )
         self.log_store = RedisLogStore(
             redis_connection,
             retention_seconds=retention_seconds,
@@ -294,10 +339,15 @@ class RedisTaskManager:
                     JobStatus.FAILED,
                     JobStatus.STOPPED,
                     JobStatus.CANCELED,
+                    JobStatus.FINISHED,
                 }
                 if not stale or not abandoned:
                     continue
-                message = "Queued task was abandoned before execution"
+                message = (
+                    "Task finished without publishing a terminal result"
+                    if status is JobStatus.FINISHED
+                    else "Queued task was abandoned before execution"
+                )
             else:
                 if status is JobStatus.STARTED or task.task_id in started_ids:
                     continue
@@ -311,11 +361,16 @@ class RedisTaskManager:
                         JobStatus.FAILED,
                         JobStatus.STOPPED,
                         JobStatus.CANCELED,
+                        JobStatus.FINISHED,
                     }
                 )
                 if not terminal_evidence:
                     continue
-                message = "Running task was abandoned by its worker"
+                message = (
+                    "Task finished without publishing a terminal result"
+                    if status is JobStatus.FINISHED
+                    else "Running task was abandoned by its worker"
+                )
             if self._finalize_external_failure(task.task_id, message):
                 reconciled += 1
         return reconciled
@@ -446,7 +501,66 @@ class RedisTaskManager:
         error: str | None = None,
         result_path: str | None = None,
         terminal_event: LogEventResponse | None = None,
-    ) -> tuple[TaskRecord, bool]:
+    ) -> tuple[TaskRecord, TerminalTransitionResult]:
+        finished_at = datetime.now(UTC)
+        event_json = (
+            terminal_event.model_dump_json() if terminal_event is not None else ""
+        )
+        try:
+            result = self._terminal_transition_script(
+                keys=[
+                    _task_key(task_id),
+                    _task_work_key(task_id),
+                    _event_key(task_id),
+                ],
+                args=[
+                    status.value,
+                    "1" if output_path is not None else "0",
+                    output_path or "",
+                    "1" if error is not None else "0",
+                    error or "",
+                    "1" if result_path is not None else "0",
+                    result_path or "",
+                    finished_at.isoformat(),
+                    _TERMINAL_TTL_SECONDS,
+                    "1" if terminal_event is not None else "0",
+                    event_json,
+                ],
+            )
+        except ResponseError as error_response:
+            if "unknown command" not in str(error_response).lower():
+                raise
+            return self._transition_finished_without_lua(
+                task_id,
+                status=status,
+                output_path=output_path,
+                error=error,
+                result_path=result_path,
+                terminal_event=terminal_event,
+                finished_at=finished_at,
+            )
+        code = int(result[0])
+        if code == 0:
+            raise KeyError(task_id)
+        task = _decode_task(result[1])
+        transition = (
+            TerminalTransitionResult.APPLIED
+            if code == 1
+            else TerminalTransitionResult.ALREADY_TERMINAL
+        )
+        return task, transition
+
+    def _transition_finished_without_lua(
+        self,
+        task_id: str,
+        *,
+        status: TaskStatus,
+        output_path: str | None,
+        error: str | None,
+        result_path: str | None,
+        terminal_event: LogEventResponse | None,
+        finished_at: datetime,
+    ) -> tuple[TaskRecord, TerminalTransitionResult]:
         key = _task_key(task_id)
         while True:
             with self._redis.pipeline() as pipeline:
@@ -458,14 +572,14 @@ class RedisTaskManager:
                     task = _decode_task(value)
                     if task.status in {TaskStatus.SUCCEEDED, TaskStatus.FAILED}:
                         pipeline.unwatch()
-                        return task, False
+                        return task, TerminalTransitionResult.ALREADY_TERMINAL
                     task.status = status
                     if output_path is not None:
                         task.output_path = output_path
                     task.error = error
                     if result_path is not None:
                         task.result_path = result_path
-                    task.finished_at = datetime.now(UTC)
+                    task.finished_at = finished_at
                     pipeline.multi()
                     pipeline.set(
                         key,
@@ -486,7 +600,7 @@ class RedisTaskManager:
                             _TERMINAL_TTL_SECONDS,
                         )
                     pipeline.execute()
-                    return task, True
+                    return task, TerminalTransitionResult.APPLIED
                 except WatchError:
                     continue
 
@@ -500,14 +614,16 @@ class RedisTaskManager:
             details={},
         )
         try:
-            _task, transitioned = self._transition_finished(
+            _task, transition = self._transition_finished(
                 task_id,
                 status=TaskStatus.FAILED,
                 error=message,
                 terminal_event=terminal_event,
             )
         except KeyError:
-            transitioned = False
+            return False
+        if transition is not TerminalTransitionResult.APPLIED:
+            return False
         self._release_queue_slot(task_id)
         from designtoolkit.web.worker import discard_failed_task_output
 
@@ -516,7 +632,7 @@ class RedisTaskManager:
                 self.resource_coordinator.release_task_resources(task_id)
         finally:
             discard_failed_task_output(task_id, self)
-        return transitioned
+        return True
 
     def _active_tasks(self) -> list[TaskRecord]:
         tasks: list[TaskRecord] = []
