@@ -8,10 +8,12 @@ from time import monotonic, sleep
 import fakeredis
 import pytest
 from redis import Redis
+from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import RedisError
 
 from designtoolkit.web.resources import (
     RedisResourceCoordinator,
+    ReservationState,
     ResourceUnavailableError,
     SessionDeletingError,
 )
@@ -192,6 +194,8 @@ class DeterministicRedis(fakeredis.FakeRedis):
 
     def _eval_commit_reservation(self, keys, args):  # noqa: ANN001, ANN202
         state_key, index_key, token_key, committed_key = keys
+        if self.hget(committed_key, "state") == b"committed":
+            return 2
         if not self.exists(token_key):
             return 0
         kind = self._text(self.hget(token_key, "kind"))
@@ -212,33 +216,48 @@ class DeterministicRedis(fakeredis.FakeRedis):
                 f"session:{session_id}:committed_bytes",
                 reserved_bytes,
             )
-            self.hset(
-                committed_key,
-                mapping={
-                    "session_id": session_id,
-                    "bytes": reserved_bytes,
-                },
-            )
-            self.pexpire(committed_key, int(args[1]))
+        self.hset(
+            committed_key,
+            mapping={
+                "state": "committed",
+                "kind": kind,
+                "session_id": session_id,
+                "bytes": reserved_bytes,
+            },
+        )
+        self.pexpire(committed_key, int(args[1]))
         self._recompute_capacity(state_key, index_key)
         return 1
 
-    def _eval_rollback_commit(self, keys, _args):  # noqa: ANN001, ANN202
+    def _eval_rollback_commit(self, keys, args):  # noqa: ANN001, ANN202
         state_key, committed_key = keys
         if not self.exists(committed_key):
             return 0
+        if self.hget(committed_key, "state") == b"rolled_back":
+            return 2
+        kind = self._text(self.hget(committed_key, "kind"))
         session_id = self._text(self.hget(committed_key, "session_id"))
         committed_bytes = int(self.hget(committed_key, "bytes"))
-        self.delete(committed_key)
-        self._decrement(
-            state_key,
-            f"session:{session_id}:committed_bytes",
-            committed_bytes,
-        )
+        if kind == "upload":
+            self._decrement(
+                state_key,
+                f"session:{session_id}:committed_bytes",
+                committed_bytes,
+            )
+        self.hset(committed_key, "state", "rolled_back")
+        self.pexpire(committed_key, int(args[0]))
         return 1
 
     def _eval_finalize_commit(self, keys, _args):  # noqa: ANN001, ANN202
         return self.delete(keys[0])
+
+    def _eval_reservation_state(self, keys, _args):  # noqa: ANN001, ANN202
+        token_key, committed_key = keys
+        if self.exists(token_key):
+            return 1
+        if self.hget(committed_key, "state") == b"committed":
+            return 2
+        return 0
 
     def _eval_reconcile_reservations(self, keys, args):  # noqa: ANN001, ANN202
         state_key, index_key = keys
@@ -381,6 +400,21 @@ class DeterministicRedis(fakeredis.FakeRedis):
         return value.decode() if isinstance(value, bytes) else value
 
 
+class ExecuteThenRaiseRedis(DeterministicRedis):
+    def __init__(self, operation: str) -> None:
+        super().__init__()
+        self.operation = operation
+        self.raised = False
+
+    def eval(self, script, numkeys, *keys_and_args):  # noqa: ANN001, ANN201
+        result = super().eval(script, numkeys, *keys_and_args)
+        operation = script.splitlines()[0].removeprefix("-- ")
+        if operation == self.operation and not self.raised:
+            self.raised = True
+            raise RedisConnectionError(f"{operation} acknowledgement lost")
+        return result
+
+
 @pytest.fixture
 def redis_connection() -> DeterministicRedis:
     return DeterministicRedis()
@@ -509,6 +543,8 @@ def test_upload_commit_creates_bounded_marker_with_accounting_metadata(
 
     marker_key = f"dt:resource:committed:{reservation.token}"
     assert redis_connection.hgetall(marker_key) == {
+        b"state": b"committed",
+        b"kind": b"upload",
         b"session_id": SESSION_A.encode(),
         b"bytes": b"4",
     }
@@ -582,7 +618,7 @@ def test_expired_committed_marker_preserves_usage(
         resources.reserve_upload(SESSION_A, 1, free_bytes=100)
 
 
-def test_output_commit_does_not_create_rollback_marker(
+def test_output_commit_uses_idempotent_marker_without_session_charging(
     redis_connection: DeterministicRedis,
 ) -> None:
     resources = coordinator(redis_connection)
@@ -594,7 +630,10 @@ def test_output_commit_does_not_create_rollback_marker(
     )
 
     reservation.commit()
+    reservation.commit()
+    assert reservation.state() is ReservationState.COMMITTED
     reservation.rollback()
+    assert reservation.rollback() is True
     reservation.finalize()
 
     assert not redis_connection.exists(
@@ -743,16 +782,73 @@ def test_expired_reservation_commit_fails_explicitly(
         reservation.commit()
 
 
-def test_reservation_commit_is_one_shot(
+def test_upload_commit_is_idempotent_after_reservation_conversion(
+    redis_connection: DeterministicRedis,
+) -> None:
+    resources = coordinator(redis_connection, max_session_bytes=2)
+    reservation = resources.reserve_upload(SESSION_A, 2, free_bytes=100)
+
+    reservation.commit()
+    reservation.commit()
+
+    assert reservation.state() is ReservationState.COMMITTED
+    with pytest.raises(ResourceUnavailableError, match="session"):
+        resources.reserve_upload(SESSION_A, 1, free_bytes=100)
+
+
+def test_missing_reservation_without_commit_marker_still_fails(
     redis_connection: DeterministicRedis,
 ) -> None:
     resources = coordinator(redis_connection)
     reservation = resources.reserve_upload(SESSION_A, 1, free_bytes=100)
+    redis_connection.delete(f"dt:resource:reservation:{reservation.token}")
 
-    reservation.commit()
-
+    assert reservation.state() is ReservationState.FINALIZED_OR_ABSENT
     with pytest.raises(ResourceUnavailableError, match="expired"):
         reservation.commit()
+
+
+def test_commit_execute_then_raise_can_be_retried_without_double_charging() -> None:
+    redis_connection = ExecuteThenRaiseRedis("commit_reservation")
+    resources = coordinator(redis_connection, max_session_bytes=4)
+    reservation = resources.reserve_upload(SESSION_A, 4, free_bytes=100)
+
+    with pytest.raises(RedisConnectionError, match="acknowledgement lost"):
+        reservation.commit()
+    reservation.commit()
+
+    assert reservation.state() is ReservationState.COMMITTED
+    with pytest.raises(ResourceUnavailableError, match="session"):
+        resources.reserve_upload(SESSION_A, 1, free_bytes=100)
+
+
+def test_rollback_execute_then_raise_is_idempotently_resolved() -> None:
+    redis_connection = ExecuteThenRaiseRedis("rollback_commit")
+    resources = coordinator(redis_connection, max_session_bytes=4)
+    reservation = resources.reserve_upload(SESSION_A, 4, free_bytes=100)
+    reservation.commit()
+
+    with pytest.raises(RedisConnectionError, match="acknowledgement lost"):
+        reservation.rollback()
+    assert reservation.rollback() is True
+
+    replacement = resources.reserve_upload(SESSION_A, 4, free_bytes=100)
+    replacement.release()
+
+
+def test_finalize_execute_then_raise_never_changes_committed_usage() -> None:
+    redis_connection = ExecuteThenRaiseRedis("finalize_commit")
+    resources = coordinator(redis_connection, max_session_bytes=4)
+    reservation = resources.reserve_upload(SESSION_A, 4, free_bytes=100)
+    reservation.commit()
+
+    with pytest.raises(RedisConnectionError, match="acknowledgement lost"):
+        reservation.finalize()
+    reservation.finalize()
+
+    assert reservation.state() is ReservationState.FINALIZED_OR_ABSENT
+    with pytest.raises(ResourceUnavailableError, match="session"):
+        resources.reserve_upload(SESSION_A, 1, free_bytes=100)
 
 
 def test_commit_release_race_has_single_accounting_winner(

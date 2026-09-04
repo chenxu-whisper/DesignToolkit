@@ -11,7 +11,14 @@ from urllib.parse import quote
 from uuid import UUID, uuid4
 from zipfile import ZIP_DEFLATED, ZipFile
 
-from designtoolkit.web.resources import RedisReservation, RedisSessionLease
+from redis.exceptions import RedisError
+
+from designtoolkit.web.resources import (
+    RedisReservation,
+    RedisSessionLease,
+    ReservationState,
+    ResourceUnavailableError,
+)
 
 _DEFAULT_MAX_UPLOAD_BYTES = 500 * 1024 * 1024
 _DEFAULT_MAX_SESSION_BYTES = 2 * 1024 * 1024 * 1024
@@ -20,6 +27,7 @@ _DEFAULT_MIN_FREE_BYTES = 5 * 1024 * 1024 * 1024
 _DEFAULT_MAX_QUEUED_TASKS = 20
 _DEFAULT_RETENTION_SECONDS = 2 * 60 * 60
 _UPLOAD_CHUNK_BYTES = 1024 * 1024
+_RESOURCE_RECOVERY_ATTEMPTS = 3
 _ALLOWED_SUFFIXES = frozenset(
     {
         ".avi",
@@ -180,6 +188,13 @@ class HostedStorage:
         reservation: RedisReservation,
         lease: RedisSessionLease | None = None,
     ) -> UploadedAsset:
+        """Store an upload with conservative Redis/filesystem recovery.
+
+        Redis and the filesystem cannot be committed atomically. Unpublished
+        data is therefore kept hidden whenever Redis state remains ambiguous,
+        and published data is never removed because marker cleanup failed.
+        Session expiry eventually removes quarantined hidden data.
+        """
         try:
             session_id = _validate_session_id(session_id)
             filename = _safe_filename(filename)
@@ -204,7 +219,6 @@ class HostedStorage:
         temporary_path = asset_dir / ".uploading"
         final_path = asset_dir / filename
         size = 0
-        committed = False
         try:
             asset_dir.mkdir(parents=True, exist_ok=False)
             with temporary_path.open("xb") as destination:
@@ -229,21 +243,28 @@ class HostedStorage:
                     "Upload size does not match declared Content-Length"
                 )
             os.utime(self._session_dir(session_id), None)
-            reservation.commit()
-            committed = True
-            temporary_path.replace(final_path)
-            reservation.finalize()
         except Exception:
-            try:
-                if committed:
-                    reservation.rollback()
-                else:
-                    reservation.release()
-            finally:
-                shutil.rmtree(asset_dir, ignore_errors=True)
-                self._remove_empty_session(session_id)
+            _release_best_effort(reservation)
+            self._discard_asset(session_id, asset_dir)
             raise
 
+        try:
+            _commit_with_recovery(reservation)
+        except _AmbiguousCommitError:
+            raise
+        except Exception:
+            _release_best_effort(reservation)
+            self._discard_asset(session_id, asset_dir)
+            raise
+
+        try:
+            temporary_path.replace(final_path)
+        except Exception:
+            if _rollback_with_recovery(reservation):
+                self._discard_asset(session_id, asset_dir)
+            raise
+
+        _finalize_best_effort(reservation)
         return UploadedAsset(
             reference=f"asset:{asset_id}:{quote(filename, safe='')}",
             filename=filename,
@@ -320,6 +341,10 @@ class HostedStorage:
         sessions_dir = self.root / "sessions"
         if sessions_dir.is_dir() and not any(sessions_dir.iterdir()):
             sessions_dir.rmdir()
+
+    def _discard_asset(self, session_id: str, asset_dir: Path) -> None:
+        shutil.rmtree(asset_dir, ignore_errors=True)
+        self._remove_empty_session(session_id)
 
 
 def new_session_id() -> str:
@@ -466,6 +491,68 @@ def _directory_size(path: Path) -> int:
         for entry in path.rglob("*")
         if entry.is_file()
     )
+
+
+class _AmbiguousCommitError(ResourceUnavailableError):
+    pass
+
+
+def _commit_with_recovery(reservation: RedisReservation) -> None:
+    last_error: RedisError | None = None
+    for _attempt in range(_RESOURCE_RECOVERY_ATTEMPTS):
+        try:
+            reservation.commit()
+        except RedisError as exc:
+            last_error = exc
+            continue
+        except ResourceUnavailableError:
+            if last_error is None:
+                raise
+            break
+        return
+
+    for _attempt in range(_RESOURCE_RECOVERY_ATTEMPTS):
+        try:
+            state = reservation.state()
+        except RedisError as exc:
+            last_error = exc
+            continue
+        if state is ReservationState.COMMITTED:
+            return
+        if state is ReservationState.RESERVED:
+            raise ResourceUnavailableError(
+                "Upload reservation was not committed"
+            ) from last_error
+        break
+
+    raise _AmbiguousCommitError(
+        "Upload commit state could not be confirmed; hidden data was quarantined"
+    ) from last_error
+
+
+def _rollback_with_recovery(reservation: RedisReservation) -> bool:
+    for _attempt in range(_RESOURCE_RECOVERY_ATTEMPTS):
+        try:
+            return reservation.rollback()
+        except RedisError:
+            continue
+    return False
+
+
+def _finalize_best_effort(reservation: RedisReservation) -> None:
+    for _attempt in range(_RESOURCE_RECOVERY_ATTEMPTS):
+        try:
+            reservation.finalize()
+        except RedisError:
+            continue
+        return
+
+
+def _release_best_effort(reservation: RedisReservation) -> None:
+    try:
+        reservation.release()
+    except RedisError:
+        pass
 
 
 def _ensure_free_space(root: Path, minimum_free_bytes: int) -> None:

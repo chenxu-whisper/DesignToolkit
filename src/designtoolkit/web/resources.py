@@ -9,6 +9,7 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Literal
 from uuid import uuid4
 
@@ -239,6 +240,9 @@ local state_key = KEYS[1]
 local index_key = KEYS[2]
 local token_key = KEYS[3]
 local committed_key = KEYS[4]
+if redis.call("HGET", committed_key, "state") == "committed" then
+    return 2
+end
 if redis.call("EXISTS", token_key) == 0 then
     return 0
 end
@@ -305,16 +309,20 @@ if kind == "upload" then
         "session:" .. session_id .. ":committed_bytes",
         reserved_bytes
     )
-    redis.call(
-        "HMSET",
-        committed_key,
-        "session_id",
-        session_id,
-        "bytes",
-        reserved_bytes
-    )
-    redis.call("PEXPIRE", committed_key, tonumber(ARGV[2]))
 end
+redis.call(
+    "HMSET",
+    committed_key,
+    "state",
+    "committed",
+    "kind",
+    kind,
+    "session_id",
+    session_id,
+    "bytes",
+    reserved_bytes
+)
+redis.call("PEXPIRE", committed_key, tonumber(ARGV[2]))
 recompute_capacity()
 return 1
 """
@@ -325,24 +333,40 @@ local committed_key = KEYS[2]
 if redis.call("EXISTS", committed_key) == 0 then
     return 0
 end
+if redis.call("HGET", committed_key, "state") == "rolled_back" then
+    return 2
+end
 
+local kind = redis.call("HGET", committed_key, "kind")
 local session_id = redis.call("HGET", committed_key, "session_id")
 local committed_bytes = tonumber(redis.call("HGET", committed_key, "bytes") or "0")
-local committed_field = "session:" .. session_id .. ":committed_bytes"
-local current = tonumber(redis.call("HGET", state_key, committed_field) or "0")
-local remaining = current - committed_bytes
-
-redis.call("DEL", committed_key)
-if remaining > 0 then
-    redis.call("HSET", state_key, committed_field, remaining)
-else
-    redis.call("HDEL", state_key, committed_field)
+if kind == "upload" then
+    local committed_field = "session:" .. session_id .. ":committed_bytes"
+    local current = tonumber(redis.call("HGET", state_key, committed_field) or "0")
+    local remaining = current - committed_bytes
+    if remaining > 0 then
+        redis.call("HSET", state_key, committed_field, remaining)
+    else
+        redis.call("HDEL", state_key, committed_field)
+    end
 end
+redis.call("HSET", committed_key, "state", "rolled_back")
+redis.call("PEXPIRE", committed_key, tonumber(ARGV[1]))
 return 1
 """
 
 _FINALIZE_COMMIT_SCRIPT = """-- finalize_commit
 return redis.call("DEL", KEYS[1])
+"""
+
+_RESERVATION_STATE_SCRIPT = """-- reservation_state
+if redis.call("EXISTS", KEYS[1]) == 1 then
+    return 1
+end
+if redis.call("HGET", KEYS[2], "state") == "committed" then
+    return 2
+end
+return 0
 """
 
 _RECONCILE_RESERVATIONS_SCRIPT = """-- reconcile_reservations
@@ -564,6 +588,12 @@ class SessionDeletingError(ResourceUnavailableError):
     pass
 
 
+class ReservationState(StrEnum):
+    RESERVED = "reserved"
+    COMMITTED = "committed"
+    FINALIZED_OR_ABSENT = "finalized_or_absent"
+
+
 @dataclass
 class RedisReservation:
     coordinator: RedisResourceCoordinator
@@ -576,16 +606,20 @@ class RedisReservation:
         self.coordinator._refresh_reservation(self)
 
     def commit(self) -> None:
-        """Consume this reservation once; repeated or expired commits fail."""
+        """Commit once; retries succeed while this token's marker exists."""
         self.coordinator._commit_reservation(self)
 
-    def rollback(self) -> None:
-        """Roll back this upload commit while its marker still exists."""
-        self.coordinator._rollback_commit(self)
+    def rollback(self) -> bool:
+        """Roll back this token, returning whether rollback is confirmed."""
+        return self.coordinator._rollback_commit(self)
 
     def finalize(self) -> None:
         """Make this upload commit ineligible for rollback."""
         self.coordinator._finalize_commit(self)
+
+    def state(self) -> ReservationState:
+        """Resolve token state; finalized, rolled-back, and unknown are absent."""
+        return self.coordinator._reservation_state(self)
 
     def release(self) -> None:
         self.coordinator._release_reservation(self)
@@ -675,6 +709,9 @@ class RedisResourceCoordinator:
         )
         self._finalize_commit_script = self._redis.register_script(
             _FINALIZE_COMMIT_SCRIPT
+        )
+        self._reservation_state_script = self._redis.register_script(
+            _RESERVATION_STATE_SCRIPT
         )
         self._reconcile_reservations_script = self._redis.register_script(
             _RECONCILE_RESERVATIONS_SCRIPT
@@ -913,13 +950,15 @@ class RedisResourceCoordinator:
                 f"{reservation.kind.capitalize()} reservation expired"
             )
 
-    def _rollback_commit(self, reservation: RedisReservation) -> None:
-        self._rollback_commit_script(
-            keys=[
-                _STATE_KEY,
-                _committed_key(reservation.token),
-            ],
-            args=[],
+    def _rollback_commit(self, reservation: RedisReservation) -> bool:
+        return bool(
+            self._rollback_commit_script(
+                keys=[
+                    _STATE_KEY,
+                    _committed_key(reservation.token),
+                ],
+                args=[self._reservation_ttl_ms],
+            )
         )
 
     def _finalize_commit(self, reservation: RedisReservation) -> None:
@@ -927,6 +966,25 @@ class RedisResourceCoordinator:
             keys=[_committed_key(reservation.token)],
             args=[],
         )
+
+    def _reservation_state(
+        self,
+        reservation: RedisReservation,
+    ) -> ReservationState:
+        state = int(
+            self._reservation_state_script(
+                keys=[
+                    _reservation_key(reservation.token),
+                    _committed_key(reservation.token),
+                ],
+                args=[],
+            )
+        )
+        if state == 1:
+            return ReservationState.RESERVED
+        if state == 2:
+            return ReservationState.COMMITTED
+        return ReservationState.FINALIZED_OR_ABSENT
 
     def _refresh_session(self, lease: RedisSessionLease) -> None:
         refreshed = self._refresh_token_script(

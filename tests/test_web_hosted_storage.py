@@ -4,6 +4,7 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 
 import pytest
+from redis.exceptions import ConnectionError as RedisConnectionError
 
 from designtoolkit.web.hosted import (
     HostedSettings,
@@ -11,7 +12,7 @@ from designtoolkit.web.hosted import (
     UploadRejectedError,
     prepare_download_artifact,
 )
-from designtoolkit.web.resources import ResourceUnavailableError
+from designtoolkit.web.resources import ReservationState, ResourceUnavailableError
 
 
 @pytest.fixture
@@ -25,6 +26,11 @@ class RecordingReservation:
         *,
         root: Path | None = None,
         fail_commit: bool = False,
+        commit_transport_errors: int = 0,
+        rollback_transport_errors: int = 0,
+        finalize_transport_errors: int = 0,
+        state_transport_errors: int = 0,
+        resolved_state: ReservationState | None = None,
     ) -> None:
         self.root = root
         self.committed = False
@@ -33,6 +39,12 @@ class RecordingReservation:
         self.released = False
         self.refresh_count = 0
         self.fail_commit = fail_commit
+        self.commit_transport_errors = commit_transport_errors
+        self.rollback_transport_errors = rollback_transport_errors
+        self.finalize_transport_errors = finalize_transport_errors
+        self.state_transport_errors = state_transport_errors
+        self.resolved_state = resolved_state
+        self.charge_count = 0
         self.operations: list[str] = []
         self.hidden_at_commit: list[Path] = []
         self.visible_at_commit: list[Path] = []
@@ -51,16 +63,42 @@ class RecordingReservation:
             ]
         if self.fail_commit:
             raise ResourceUnavailableError("Upload reservation expired")
-        self.committed = True
+        if not self.committed:
+            self.committed = True
+            self.charge_count += 1
+        if self.commit_transport_errors:
+            self.commit_transport_errors -= 1
+            raise RedisConnectionError("commit acknowledgement lost")
 
-    def rollback(self) -> None:
+    def rollback(self) -> bool:
         self.operations.append("rollback")
-        self.rolled_back = True
-        self.committed = False
+        if not self.rolled_back:
+            self.rolled_back = True
+            self.committed = False
+        if self.rollback_transport_errors:
+            self.rollback_transport_errors -= 1
+            raise RedisConnectionError("rollback acknowledgement lost")
+        return True
 
     def finalize(self) -> None:
         self.operations.append("finalize")
         self.finalized = True
+        if self.finalize_transport_errors:
+            self.finalize_transport_errors -= 1
+            raise RedisConnectionError("finalize acknowledgement lost")
+
+    def state(self) -> ReservationState:
+        self.operations.append("state")
+        if self.state_transport_errors:
+            self.state_transport_errors -= 1
+            raise RedisConnectionError("state unavailable")
+        if self.resolved_state is not None:
+            return self.resolved_state
+        if self.committed:
+            return ReservationState.COMMITTED
+        if self.released:
+            return ReservationState.FINALIZED_OR_ABSENT
+        return ReservationState.RESERVED
 
     def release(self) -> None:
         self.operations.append("release")
@@ -234,6 +272,119 @@ async def test_upload_removes_unpublished_asset_when_commit_fails(
 
 
 @pytest.mark.anyio
+async def test_upload_retries_commit_after_acknowledgement_loss_without_double_charge(
+    tmp_path: Path,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    reservation = RecordingReservation(
+        root=tmp_path,
+        commit_transport_errors=1,
+    )
+
+    asset = await storage.store_stream(
+        "a" * 32,
+        filename="screen.png",
+        content_length=4,
+        chunks=_chunks(b"1234"),
+        reservation=reservation,
+    )
+
+    assert storage.resolve("a" * 32, asset.reference).read_bytes() == b"1234"
+    assert reservation.charge_count == 1
+    assert reservation.operations == ["commit", "commit", "finalize"]
+
+
+@pytest.mark.anyio
+async def test_upload_resolves_committed_state_after_retry_acknowledgements_are_lost(
+    tmp_path: Path,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    reservation = RecordingReservation(
+        root=tmp_path,
+        commit_transport_errors=3,
+        resolved_state=ReservationState.COMMITTED,
+    )
+
+    asset = await storage.store_stream(
+        "a" * 32,
+        filename="screen.png",
+        content_length=4,
+        chunks=_chunks(b"1234"),
+        reservation=reservation,
+    )
+
+    assert storage.resolve("a" * 32, asset.reference).read_bytes() == b"1234"
+    assert reservation.charge_count == 1
+    assert reservation.operations == [
+        "commit",
+        "commit",
+        "commit",
+        "state",
+        "finalize",
+    ]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("state_transport_errors", "resolved_state"),
+    [
+        (3, None),
+        (0, ReservationState.FINALIZED_OR_ABSENT),
+    ],
+)
+async def test_upload_preserves_hidden_data_when_commit_state_stays_ambiguous(
+    tmp_path: Path,
+    state_transport_errors: int,
+    resolved_state: ReservationState | None,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    reservation = RecordingReservation(
+        root=tmp_path,
+        commit_transport_errors=3,
+        state_transport_errors=state_transport_errors,
+        resolved_state=resolved_state,
+    )
+
+    with pytest.raises(ResourceUnavailableError, match="could not be confirmed"):
+        await storage.store_stream(
+            "a" * 32,
+            filename="screen.png",
+            content_length=4,
+            chunks=_chunks(b"1234"),
+            reservation=reservation,
+        )
+
+    assert len(list(tmp_path.rglob(".uploading"))) == 1
+    assert not list(tmp_path.rglob("screen.png"))
+    assert reservation.released is False
+    assert reservation.rolled_back is False
+
+
+@pytest.mark.anyio
+async def test_upload_cleans_hidden_data_when_failed_commit_is_still_reserved(
+    tmp_path: Path,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    reservation = RecordingReservation(
+        root=tmp_path,
+        commit_transport_errors=3,
+        resolved_state=ReservationState.RESERVED,
+    )
+
+    with pytest.raises(ResourceUnavailableError, match="was not committed"):
+        await storage.store_stream(
+            "a" * 32,
+            filename="screen.png",
+            content_length=4,
+            chunks=_chunks(b"1234"),
+            reservation=reservation,
+        )
+
+    assert reservation.released is True
+    assert list(tmp_path.rglob("*")) == []
+
+
+@pytest.mark.anyio
 async def test_upload_rolls_back_commit_when_publication_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -265,6 +416,92 @@ async def test_upload_rolls_back_commit_when_publication_fails(
     assert reservation.finalized is False
     assert reservation.released is False
     assert list(tmp_path.rglob("*")) == []
+
+
+@pytest.mark.anyio
+async def test_upload_resolves_rollback_acknowledgement_loss_before_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    reservation = RecordingReservation(
+        root=tmp_path,
+        rollback_transport_errors=1,
+    )
+
+    def fail_publication(_source: Path, _target: Path) -> Path:
+        raise OSError("publication failed")
+
+    monkeypatch.setattr(Path, "replace", fail_publication)
+
+    with pytest.raises(OSError, match="publication failed"):
+        await storage.store_stream(
+            "a" * 32,
+            filename="screen.png",
+            content_length=4,
+            chunks=_chunks(b"1234"),
+            reservation=reservation,
+        )
+
+    assert reservation.operations == ["commit", "rollback", "rollback"]
+    assert reservation.charge_count == 1
+    assert reservation.rolled_back is True
+    assert list(tmp_path.rglob("*")) == []
+
+
+@pytest.mark.anyio
+async def test_upload_preserves_hidden_data_when_rollback_stays_ambiguous(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    reservation = RecordingReservation(
+        root=tmp_path,
+        rollback_transport_errors=3,
+    )
+
+    def fail_publication(_source: Path, _target: Path) -> Path:
+        raise OSError("publication failed")
+
+    monkeypatch.setattr(Path, "replace", fail_publication)
+
+    with pytest.raises(OSError, match="publication failed"):
+        await storage.store_stream(
+            "a" * 32,
+            filename="screen.png",
+            content_length=4,
+            chunks=_chunks(b"1234"),
+            reservation=reservation,
+        )
+
+    assert len(list(tmp_path.rglob(".uploading"))) == 1
+    assert not list(tmp_path.rglob("screen.png"))
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("finalize_transport_errors", [1, 3])
+async def test_finalize_acknowledgement_loss_never_deletes_published_asset(
+    tmp_path: Path,
+    finalize_transport_errors: int,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    reservation = RecordingReservation(
+        root=tmp_path,
+        finalize_transport_errors=finalize_transport_errors,
+    )
+
+    asset = await storage.store_stream(
+        "a" * 32,
+        filename="screen.png",
+        content_length=4,
+        chunks=_chunks(b"1234"),
+        reservation=reservation,
+    )
+
+    assert storage.resolve("a" * 32, asset.reference).read_bytes() == b"1234"
+    finalize_attempts = min(finalize_transport_errors + 1, 3)
+    assert reservation.operations == ["commit"] + ["finalize"] * finalize_attempts
+    assert reservation.rolled_back is False
 
 
 @pytest.mark.anyio
