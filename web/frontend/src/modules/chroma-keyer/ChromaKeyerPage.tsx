@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { Eraser, Pipette, Trash2 } from 'lucide-react'
+import { hostedMode } from '../../app/runtimeConfig'
+import { TaskResult } from '../../components/TaskResult'
 import {
   createChromaKeyerTask,
   createChromaPreview,
@@ -865,7 +867,9 @@ export function ChromaKeyerPage() {
           <Pipette aria-hidden="true" size={22} />
           色键抠图
         </h1>
-        {showOutcome && status === 'succeeded' && resultPath ? <p className="task-result">输出：{resultPath}</p> : null}
+        {showOutcome && status === 'succeeded' && resultPath ? (
+          <TaskResult hosted={hostedMode} value={resultPath} />
+        ) : null}
         {showOutcome && status === 'failed' && taskError ? (
           <p className="task-error" role="alert">
             失败：{taskError}

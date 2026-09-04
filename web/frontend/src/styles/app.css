@@ -152,6 +152,13 @@ button {
   color: #166534;
 }
 
+.task-result a {
+  align-items: center;
+  color: inherit;
+  display: inline-flex;
+  gap: 6px;
+}
+
 .task-error {
   background: #fef2f2;
   color: #b91c1c;
@@ -211,6 +218,13 @@ button {
   display: grid;
   gap: 8px;
   grid-template-columns: minmax(0, 1fr) 40px;
+}
+
+.upload-progress {
+  display: block;
+  height: 4px;
+  margin-top: 6px;
+  width: 100%;
 }
 
 .path-textarea {

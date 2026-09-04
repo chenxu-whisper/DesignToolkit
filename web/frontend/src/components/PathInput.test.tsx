@@ -72,6 +72,27 @@ function ControlledBatchPathInputWithPicker({
   )
 }
 
+function ControlledUploadPathInput({
+  uploadFiles,
+}: {
+  uploadFiles: (
+    files: readonly File[],
+    onProgress: (percentage: number) => void,
+  ) => Promise<readonly string[]>
+}) {
+  const [value, setValue] = useState('')
+
+  return (
+    <PathInput
+      label="输入媒体路径"
+      multiline
+      onChange={setValue}
+      uploadFiles={uploadFiles}
+      value={value}
+    />
+  )
+}
+
 function ControlledCommittedPathInput({
   disabled = false,
   initialValue = '',
@@ -932,5 +953,33 @@ describe('PathInput', () => {
 
     await waitFor(() => expect(screen.getByLabelText('本地路径')).toHaveFocus())
     expect(screen.getByText('无法打开系统选择器，请手动输入本地路径')).toBeInTheDocument()
+  })
+
+  it('uploads browser files and displays their original names', async () => {
+    const user = userEvent.setup()
+    const uploadFiles = vi.fn(async (_files, onProgress) => {
+      onProgress(50)
+      onProgress(100)
+      return ['asset:11111111111111111111111111111111:screen.png']
+    })
+    const { container } = render(
+      <ControlledUploadPathInput uploadFiles={uploadFiles} />,
+    )
+    const fileInput = container.querySelector<HTMLInputElement>(
+      'input[type="file"]',
+    )
+    if (!fileInput) {
+      throw new Error('upload input missing')
+    }
+
+    await user.upload(
+      fileInput,
+      new File(['image'], 'screen.png', { type: 'image/png' }),
+    )
+
+    await waitFor(() =>
+      expect(screen.getByLabelText('输入媒体路径')).toHaveValue('screen.png'),
+    )
+    expect(uploadFiles).toHaveBeenCalledOnce()
   })
 })

@@ -1,0 +1,16 @@
+{$DOMAIN} {
+	encode zstd gzip
+
+	request_body {
+		max_size 525MB
+	}
+
+	header {
+		Referrer-Policy "strict-origin-when-cross-origin"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		-Server
+	}
+
+	reverse_proxy app:8765
+}

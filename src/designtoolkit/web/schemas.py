@@ -284,6 +284,7 @@ class MediaResizeTaskRequest(BaseModel):
     input_path: str | None = Field(default=None, min_length=1)
     input_paths: list[str] | None = None
     output_path: str | None = None
+    output_dir: str | None = None
     size: str = Field(min_length=1)
 
     @field_validator("input_paths")
@@ -306,6 +307,8 @@ class MediaResizeTaskRequest(BaseModel):
             raise ValueError("Specify either input_path or input_paths")
         if has_input_paths and self.output_path:
             raise ValueError("output_path cannot be used with input_paths")
+        if self.output_path and self.output_dir:
+            raise ValueError("output_path cannot be used with output_dir")
         return self
 
 
@@ -387,6 +390,17 @@ class LocalSaveFilePickRequest(BaseModel):
 class LocalPathPickResponse(BaseModel):
     paths: list[str]
     cancelled: bool
+
+
+class AppConfigResponse(BaseModel):
+    hosted: bool
+    max_upload_bytes: PositiveInt
+
+
+class UploadResponse(BaseModel):
+    reference: str
+    filename: str
+    size: Annotated[int, Field(strict=True, ge=0)]
 
 
 class TaskCreateResponse(BaseModel):

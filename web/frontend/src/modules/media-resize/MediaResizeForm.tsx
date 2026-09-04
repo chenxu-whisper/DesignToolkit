@@ -1,9 +1,15 @@
 import { useEffect, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
+import { hostedMode } from '../../app/runtimeConfig'
 import { PathInput } from '../../components/PathInput'
 import { SizeInput } from '../../components/SizeInput'
 import { SubmitButton } from '../../components/SubmitButton'
-import { pickLocalFiles, pickLocalSaveFile, resolveDroppedFilePaths } from '../../services/apiClient'
+import {
+  pickLocalFiles,
+  pickLocalSaveFile,
+  resolveDroppedFilePaths,
+  uploadFiles,
+} from '../../services/apiClient'
 import { createMediaResizeDefaultValues } from './mediaResizeDefaults'
 import {
   normalizeMediaResizeInputPaths,
@@ -79,7 +85,7 @@ export function MediaResizeForm({ disabled, onSubmit }: MediaResizeFormProps) {
         disabled={formDisabled}
         error={errors.inputPath}
         id="media-resize-input-path"
-        label="输入媒体路径"
+        label={hostedMode ? '输入媒体' : '输入媒体路径'}
         multiline
         onChange={updateInputPath}
         pickPaths={async () => {
@@ -97,24 +103,28 @@ export function MediaResizeForm({ disabled, onSubmit }: MediaResizeFormProps) {
           return response.paths
         }}
         rows={4}
+        uploadAccept="image/*,video/*,.mkv,.m4v"
+        uploadFiles={hostedMode ? uploadFiles : undefined}
         value={values.inputPath}
       />
-      <PathInput
-        disabled={formDisabled || isBatchInput}
-        error={errors.outputPath}
-        id="media-resize-output-path"
-        label="输出路径"
-        onChange={(value) => updateValue('outputPath', value)}
-        pickPaths={async () => {
-          const response = await pickLocalSaveFile({
-            fileKind: 'media',
-            title: '选择输出路径',
-          })
-          return response.paths
-        }}
-        placeholder={isBatchInput ? '批量输入时自动生成 _resized 输出路径' : undefined}
-        value={values.outputPath}
-      />
+      {!hostedMode ? (
+        <PathInput
+          disabled={formDisabled || isBatchInput}
+          error={errors.outputPath}
+          id="media-resize-output-path"
+          label="输出路径"
+          onChange={(value) => updateValue('outputPath', value)}
+          pickPaths={async () => {
+            const response = await pickLocalSaveFile({
+              fileKind: 'media',
+              title: '选择输出路径',
+            })
+            return response.paths
+          }}
+          placeholder={isBatchInput ? '批量输入时自动生成 _resized 输出路径' : undefined}
+          value={values.outputPath}
+        />
+      ) : null}
       <SizeInput
         disabled={formDisabled}
         error={errors.size}

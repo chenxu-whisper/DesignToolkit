@@ -1,4 +1,4 @@
-import { FolderOpen } from 'lucide-react'
+import { FolderOpen, Upload } from 'lucide-react'
 import { type DragEvent, useEffect, useId, useRef, useState } from 'react'
 import { FieldError } from './FieldError'
 
@@ -18,6 +18,11 @@ type PathInputProps = {
   required?: boolean
   resolveDroppedFilePaths?: (names: readonly string[]) => Promise<readonly string[]>
   rows?: number
+  uploadAccept?: string
+  uploadFiles?: (
+    files: readonly File[],
+    onProgress: (percentage: number) => void,
+  ) => Promise<readonly string[]>
   value: string
 }
 
@@ -34,6 +39,8 @@ export function PathInput({
   required = false,
   resolveDroppedFilePaths,
   rows = 4,
+  uploadAccept,
+  uploadFiles,
   value,
 }: PathInputProps) {
   const generatedId = useId()
@@ -48,11 +55,13 @@ export function PathInput({
   const [draftPath, setDraftPath] = useState(value)
   const [dropError, setDropError] = useState<string | null>(null)
   const [pickerError, setPickerError] = useState<string | null>(null)
+  const [uploadProgress, setUploadProgress] = useState<number | null>(null)
   const currentValueRef = useRef(value)
   const latestIntentRef = useRef(0)
   const pickerPointerSequenceRef = useRef(0)
   const suppressPickerBlurRef = useRef(false)
   const skipNextBlurRef = useRef(false)
+  const uploadInputRef = useRef<HTMLInputElement>(null)
   currentValueRef.current = value
 
   useEffect(() => {
@@ -127,6 +136,10 @@ export function PathInput({
     if (disabled || isPicking) {
       return
     }
+    if (uploadFiles) {
+      uploadInputRef.current?.click()
+      return
+    }
     const intent = beginIntent()
     if (!pickPaths) {
       openEditor()
@@ -155,6 +168,39 @@ export function PathInput({
     }
   }
 
+  const handleUploads = async (files: readonly File[]) => {
+    if (disabled || isPicking || !uploadFiles || files.length === 0) {
+      return
+    }
+    const intent = beginIntent()
+    setPickerError(null)
+    setDropError(null)
+    setIsPicking(true)
+    setUploadProgress(0)
+    try {
+      const references = await uploadFiles(files, setUploadProgress)
+      if (isLatestIntent(intent) && references.length > 0) {
+        commitValue(
+          valueWithDroppedPaths(currentValueRef.current, references, multiline),
+        )
+      }
+    } catch (error) {
+      if (isLatestIntent(intent)) {
+        setPickerError(
+          error instanceof Error && error.message
+            ? error.message
+            : '文件上传失败',
+        )
+      }
+    } finally {
+      setIsPicking(false)
+      setUploadProgress(null)
+      if (uploadInputRef.current) {
+        uploadInputRef.current.value = ''
+      }
+    }
+  }
+
   const handleDragOver = (event: DragEvent<HTMLInputElement | HTMLTextAreaElement>) => {
     if (disabled) {
       return
@@ -171,6 +217,10 @@ export function PathInput({
     event.preventDefault()
     const intent = beginIntent()
     setIsDragActive(false)
+    if (uploadFiles && event.dataTransfer.files.length > 0) {
+      await handleUploads(Array.from(event.dataTransfer.files))
+      return
+    }
     const fileNames = droppedFileNames(event.dataTransfer.files)
     const paths = droppedPathsFromDataTransfer(event.dataTransfer)
     if (paths.length === 0) {
@@ -203,6 +253,7 @@ export function PathInput({
     .join(' ')
   const ariaDescribedBy = describedBy || undefined
   const isPickerDisabled = disabled || isPicking
+  const visibleValue = uploadFiles ? uploadedFileNames(value) : value
 
   return (
     <div className="field">
@@ -234,7 +285,8 @@ export function PathInput({
             placeholder={placeholder}
             required={required}
             rows={rows}
-            value={value}
+            readOnly={Boolean(uploadFiles)}
+            value={visibleValue}
           />
         ) : (
           <input
@@ -270,15 +322,29 @@ export function PathInput({
             }}
             placeholder={placeholder}
             required={required}
+            readOnly={Boolean(uploadFiles)}
             type="text"
-            value={value}
+            value={visibleValue}
           />
         )}
+        {uploadFiles ? (
+          <input
+            accept={uploadAccept}
+            disabled={disabled}
+            hidden
+            multiple={multiline}
+            onChange={(event) => {
+              void handleUploads(Array.from(event.currentTarget.files ?? []))
+            }}
+            ref={uploadInputRef}
+            type="file"
+          />
+        ) : null}
         <button
           aria-controls={isEditorOpen ? editorId : undefined}
           aria-disabled={isPickerDisabled}
           aria-expanded={isEditorOpen}
-          aria-label={`指定${label}`}
+          aria-label={`${uploadFiles ? '上传' : '指定'}${label}`}
           className={`icon-button path-picker-button${isEditorOpen || isPicking ? ' path-picker-button-active' : ''}`}
           onClick={() => {
             clearPickerPointerBlur()
@@ -289,12 +355,24 @@ export function PathInput({
               armPickerPointerBlur()
             }
           }}
-          title={`指定${label}`}
+          title={`${uploadFiles ? '上传' : '指定'}${label}`}
           type="button"
         >
-          <FolderOpen aria-hidden="true" size={18} strokeWidth={2} />
+          {uploadFiles ? (
+            <Upload aria-hidden="true" size={18} strokeWidth={2} />
+          ) : (
+            <FolderOpen aria-hidden="true" size={18} strokeWidth={2} />
+          )}
         </button>
       </div>
+      {uploadProgress !== null ? (
+        <progress
+          aria-label="上传进度"
+          className="upload-progress"
+          max={100}
+          value={uploadProgress}
+        />
+      ) : null}
       {isEditorOpen ? (
         <div aria-label={`指定${label}`} className="path-editor" role="dialog">
           <label className="field-label" htmlFor={editorId}>
@@ -409,4 +487,20 @@ function pathLines(value: string): string[] {
 
 function uniquePaths(paths: string[]): string[] {
   return Array.from(new Set(paths))
+}
+
+function uploadedFileNames(value: string): string {
+  return pathLines(value)
+    .map((reference) => {
+      const parts = reference.split(':', 3)
+      if (parts[0] !== 'asset' || !parts[2]) {
+        return reference
+      }
+      try {
+        return decodeURIComponent(parts[2])
+      } catch {
+        return parts[2]
+      }
+    })
+    .join('\n')
 }

@@ -1,4 +1,6 @@
 import { useEffect, useRef } from 'react'
+import { hostedMode } from '../../app/runtimeConfig'
+import { TaskResult } from '../../components/TaskResult'
 import { createMediaResizeTask, type MediaResizePayload } from '../../services/apiClient'
 import { createClientTaskEvent } from '../../services/taskEventHelpers'
 import { useLogStore } from '../../state/useLogStore'
@@ -93,7 +95,9 @@ export function MediaResizePage() {
     <section className="module-surface" aria-labelledby="media-resize-title">
       <div className="module-header">
         <h1 id="media-resize-title">媒体尺寸修改</h1>
-        {showOutcome && status === 'succeeded' && resultPath ? <p className="task-result">输出：{resultPath}</p> : null}
+        {showOutcome && status === 'succeeded' && resultPath ? (
+          <TaskResult hosted={hostedMode} value={resultPath} />
+        ) : null}
         {showOutcome && status === 'failed' && error ? (
           <p className="task-error" role="alert">
             失败：{error}

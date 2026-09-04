@@ -4,7 +4,13 @@ import { FieldError } from '../../components/FieldError'
 import { PathInput } from '../../components/PathInput'
 import { SizeInput } from '../../components/SizeInput'
 import { SubmitButton } from '../../components/SubmitButton'
-import { pickLocalDirectory, pickLocalFiles, resolveDroppedFilePaths } from '../../services/apiClient'
+import { hostedMode } from '../../app/runtimeConfig'
+import {
+  pickLocalDirectory,
+  pickLocalFiles,
+  resolveDroppedFilePaths,
+  uploadFiles,
+} from '../../services/apiClient'
 import { createVideoFramesDefaultValues } from './videoFramesDefaults'
 import {
   validateVideoFramesValues,
@@ -68,7 +74,7 @@ export function VideoFramesForm({ disabled, onSubmit }: VideoFramesFormProps) {
         disabled={formDisabled}
         error={errors.inputPath}
         id="video-frames-input-path"
-        label="输入视频路径"
+        label={hostedMode ? '输入视频' : '输入视频路径'}
         multiline
         onChange={(value) => updateValue('inputPath', value)}
         pickPaths={async () => {
@@ -86,20 +92,24 @@ export function VideoFramesForm({ disabled, onSubmit }: VideoFramesFormProps) {
           return response.paths
         }}
         rows={4}
+        uploadAccept="video/*,.mkv,.m4v"
+        uploadFiles={hostedMode ? uploadFiles : undefined}
         value={values.inputPath}
       />
-      <PathInput
-        disabled={formDisabled}
-        error={errors.outputDir}
-        id="video-frames-output-dir"
-        label="输出目录"
-        onChange={(value) => updateValue('outputDir', value)}
-        pickPaths={async () => {
-          const response = await pickLocalDirectory({ title: '选择输出目录' })
-          return response.paths
-        }}
-        value={values.outputDir}
-      />
+      {!hostedMode ? (
+        <PathInput
+          disabled={formDisabled}
+          error={errors.outputDir}
+          id="video-frames-output-dir"
+          label="输出目录"
+          onChange={(value) => updateValue('outputDir', value)}
+          pickPaths={async () => {
+            const response = await pickLocalDirectory({ title: '选择输出目录' })
+            return response.paths
+          }}
+          value={values.outputDir}
+        />
+      ) : null}
 
       <div className="form-row">
         <div className="field">

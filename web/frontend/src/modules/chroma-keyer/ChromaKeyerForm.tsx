@@ -1,5 +1,6 @@
 import type { FormEvent } from 'react'
 import { ImageUp, SlidersHorizontal } from 'lucide-react'
+import { hostedMode } from '../../app/runtimeConfig'
 import { FieldError } from '../../components/FieldError'
 import { PathInput } from '../../components/PathInput'
 import {
@@ -7,6 +8,7 @@ import {
   pickLocalFiles,
   pickLocalSaveFile,
   resolveDroppedFilePaths,
+  uploadFiles,
 } from '../../services/apiClient'
 import type { ChromaKeyerErrors, ChromaKeyerValues } from './chromaKeyerValidation'
 
@@ -73,7 +75,7 @@ export function ChromaKeyerForm({
           disabled={disabled}
           error={errors.inputPath}
           id="chroma-keyer-input-path"
-          label="输入图片或视频路径"
+          label={hostedMode ? '输入图片或视频' : '输入图片或视频路径'}
           onChange={(value) => updateValue('inputPath', value)}
           onCommit={onInputPathCommit}
           pickPaths={async () => {
@@ -91,6 +93,8 @@ export function ChromaKeyerForm({
             const response = await resolveDroppedFilePaths(names)
             return response.paths
           }}
+          uploadAccept={chromaInputAllowedSuffixes.join(',')}
+          uploadFiles={hostedMode ? uploadFiles : undefined}
           value={values.inputPath}
         />
       </div>
@@ -175,7 +179,7 @@ export function ChromaKeyerForm({
         </fieldset>
       </div>
 
-      {values.mediaKind === 'video' ? (
+      {hostedMode ? null : values.mediaKind === 'video' ? (
         <PathInput
           disabled={disabled}
           error={errors.outputRoot}

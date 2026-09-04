@@ -1,0 +1,112 @@
+name: designtoolkit
+
+x-app-environment: &app-environment
+  DESIGNTOOLKIT_DATA_DIR: /data
+  DESIGNTOOLKIT_HOSTED: "1"
+  DESIGNTOOLKIT_MAX_QUEUED_TASKS: "20"
+  DESIGNTOOLKIT_MAX_PREVIEW_CONCURRENCY: "2"
+  DESIGNTOOLKIT_MAX_OUTPUT_BYTES: "5368709120"
+  DESIGNTOOLKIT_MAX_SESSION_BYTES: "2147483648"
+  DESIGNTOOLKIT_MAX_UPLOAD_BYTES: "524288000"
+  DESIGNTOOLKIT_MIN_FREE_BYTES: "5368709120"
+  DESIGNTOOLKIT_API_REQUESTS_PER_MINUTE: "120"
+  DESIGNTOOLKIT_RETENTION_SECONDS: "7200"
+  DESIGNTOOLKIT_SECURE_COOKIES: "1"
+  DESIGNTOOLKIT_UPLOAD_REQUESTS_PER_HOUR: "30"
+  REDIS_URL: redis://redis:6379/0
+
+x-worker: &worker
+  image: designtoolkit:latest
+  pull_policy: never
+  init: true
+  restart: unless-stopped
+  depends_on:
+    redis:
+      condition: service_healthy
+  environment: *app-environment
+  volumes:
+    - app_data:/data
+  security_opt:
+    - no-new-privileges:true
+
+services:
+  redis:
+    image: redis:8.2-alpine
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - redis_data:/data
+    security_opt:
+      - no-new-privileges:true
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        VITE_HOSTED_MODE: "true"
+    image: designtoolkit:latest
+    init: true
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment: *app-environment
+    expose:
+      - "8765"
+    volumes:
+      - app_data:/data
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen("http://127.0.0.1:8765/", timeout=5)
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    security_opt:
+      - no-new-privileges:true
+
+  worker-1:
+    <<: *worker
+    command: rq worker designtoolkit --url redis://redis:6379/0
+
+  worker-2:
+    <<: *worker
+    command: rq worker designtoolkit --url redis://redis:6379/0
+
+  cleanup:
+    <<: *worker
+    command: python -m designtoolkit.web.cleanup --interval 60
+
+  caddy:
+    image: caddy:2.10-alpine
+    restart: unless-stopped
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      DOMAIN: ${DOMAIN:?Set DOMAIN in .env}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  app_data:
+  caddy_data:
+  caddy_config:
+  redis_data:

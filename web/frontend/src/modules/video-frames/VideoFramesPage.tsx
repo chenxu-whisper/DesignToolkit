@@ -1,4 +1,6 @@
 import { useEffect, useRef } from 'react'
+import { hostedMode } from '../../app/runtimeConfig'
+import { TaskResult } from '../../components/TaskResult'
 import { createVideoFramesTask, type VideoFramesPayload } from '../../services/apiClient'
 import { createClientTaskEvent } from '../../services/taskEventHelpers'
 import { useLogStore } from '../../state/useLogStore'
@@ -100,7 +102,9 @@ export function VideoFramesPage() {
     <section className="module-surface" aria-labelledby="video-frames-title">
       <div className="module-header">
         <h1 id="video-frames-title">视频转序列</h1>
-        {showOutcome && status === 'succeeded' && resultPath ? <p className="task-result">输出：{resultPath}</p> : null}
+        {showOutcome && status === 'succeeded' && resultPath ? (
+          <TaskResult hosted={hostedMode} value={resultPath} />
+        ) : null}
         {showOutcome && status === 'failed' && error ? (
           <p className="task-error" role="alert">
             失败：{error}

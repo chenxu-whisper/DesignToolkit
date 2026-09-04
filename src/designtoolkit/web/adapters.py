@@ -9,7 +9,12 @@ from designtoolkit.chroma_keyer.models import (
 )
 from designtoolkit.chroma_keyer.sampling import screen_model_from_samples
 from designtoolkit.chroma_keyer.video_models import VideoKeyOptions
-from designtoolkit.media_resize import MediaResizeOptions
+from designtoolkit.media_resize import (
+    MediaResizeOptions,
+)
+from designtoolkit.media_resize import (
+    default_output_path as default_resize_output_path,
+)
 from designtoolkit.video_frames import (
     VideoFrameError,
     VideoFrameOptions,
@@ -137,11 +142,19 @@ def media_resize_options_list_from_request(
     if any(input_path == "" for input_path in input_paths):
         raise ValueError("Specify either input_path or input_paths")
     size = _parse_request_size(request.size)
-    return [
-        MediaResizeOptions(
-            input_path=Path(input_path),
-            size=size,
-            output_path=Path(request.output_path) if request.output_path else None,
+    output_root = Path(request.output_dir) if request.output_dir else None
+    options: list[MediaResizeOptions] = []
+    for index, input_path in enumerate(input_paths, start=1):
+        input_path_object = Path(input_path)
+        output_path = Path(request.output_path) if request.output_path else None
+        if output_root is not None:
+            default_name = default_resize_output_path(input_path_object).name
+            output_path = output_root / f"{index:03d}_{default_name}"
+        options.append(
+            MediaResizeOptions(
+                input_path=input_path_object,
+                size=size,
+                output_path=output_path,
+            )
         )
-        for input_path in input_paths
-    ]
+    return options
