@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import os
 from concurrent.futures import ThreadPoolExecutor
 from threading import RLock
-from time import sleep
+from time import monotonic, sleep
 
 import fakeredis
 import pytest
+from redis import Redis
+from redis.exceptions import RedisError
 
 from designtoolkit.web.resources import (
     RedisResourceCoordinator,
@@ -17,8 +20,8 @@ SESSION_A = "a" * 32
 SESSION_B = "b" * 32
 
 
-class LuaRedis(fakeredis.FakeRedis):
-    """Execute the coordinator's Lua contracts without fakeredis[lua]."""
+class DeterministicRedis(fakeredis.FakeRedis):
+    """Deterministically model coordinator behavior without executing Lua."""
 
     def __init__(self) -> None:
         super().__init__(decode_responses=False)
@@ -31,6 +34,12 @@ class LuaRedis(fakeredis.FakeRedis):
         handler = getattr(self, f"_eval_{operation}")
         with self._script_lock:
             return handler(keys, args)
+
+    def register_script(self, script):  # noqa: ANN001, ANN201
+        def execute(*, keys, args):
+            return self.eval(script, len(keys), *keys, *args)
+
+        return execute
 
     def _eval_reserve_upload(self, keys, args):  # noqa: ANN001, ANN202
         state_key, index_key, token_key = keys
@@ -45,18 +54,33 @@ class LuaRedis(fakeredis.FakeRedis):
             ttl_ms,
         ) = args
         requested = int(requested)
+        free_bytes = int(free_bytes)
+        min_free_bytes = int(min_free_bytes)
         if self._number(state_key, "upload_count") >= int(max_uploads):
             return 1
-        if (
-            self._number(state_key, f"session:{session_id}:bytes") + requested
-            > int(max_session_bytes)
-        ):
+        if self._number(
+            state_key,
+            f"session:{session_id}:reserved_bytes",
+        ) + self._number(
+            state_key,
+            f"session:{session_id}:committed_bytes",
+        ) + requested > int(max_session_bytes):
             return 2
+        observed_free = self._optional_number(
+            state_key,
+            "observed_free_bytes",
+            free_bytes,
+        )
+        active_min_free = self._optional_number(
+            state_key,
+            "min_free_bytes",
+            min_free_bytes,
+        )
+        effective_free = min(observed_free, free_bytes)
+        effective_min_free = max(active_min_free, min_free_bytes)
         if (
-            int(free_bytes)
-            - self._number(state_key, "reserved_bytes")
-            - requested
-            < int(min_free_bytes)
+            effective_free - self._number(state_key, "reserved_bytes") - requested
+            < effective_min_free
         ):
             return 3
         self.hset(
@@ -66,13 +90,25 @@ class LuaRedis(fakeredis.FakeRedis):
                 "owner_id": session_id,
                 "session_id": session_id,
                 "bytes": requested,
+                "free_bytes": free_bytes,
+                "min_free_bytes": min_free_bytes,
             },
         )
         self.pexpire(token_key, int(ttl_ms))
-        self.hset(index_key, token, f"upload|{session_id}|{requested}")
+        self.hset(
+            index_key,
+            token,
+            f"upload|{session_id}|{requested}|{free_bytes}|{min_free_bytes}",
+        )
         self.hincrby(state_key, "reserved_bytes", requested)
         self.hincrby(state_key, "upload_count", 1)
-        self.hincrby(state_key, f"session:{session_id}:bytes", requested)
+        self.hincrby(
+            state_key,
+            f"session:{session_id}:reserved_bytes",
+            requested,
+        )
+        self.hset(state_key, "observed_free_bytes", effective_free)
+        self.hset(state_key, "min_free_bytes", effective_min_free)
         return 0
 
     def _eval_reserve_output(self, keys, args):  # noqa: ANN001, ANN202
@@ -87,11 +123,23 @@ class LuaRedis(fakeredis.FakeRedis):
             ttl_ms,
         ) = args
         requested = int(requested)
+        free_bytes = int(free_bytes)
+        min_free_bytes = int(min_free_bytes)
+        observed_free = self._optional_number(
+            state_key,
+            "observed_free_bytes",
+            free_bytes,
+        )
+        active_min_free = self._optional_number(
+            state_key,
+            "min_free_bytes",
+            min_free_bytes,
+        )
+        effective_free = min(observed_free, free_bytes)
+        effective_min_free = max(active_min_free, min_free_bytes)
         if (
-            int(free_bytes)
-            - self._number(state_key, "reserved_bytes")
-            - requested
-            < int(min_free_bytes)
+            effective_free - self._number(state_key, "reserved_bytes") - requested
+            < effective_min_free
         ):
             return 1
         self.hset(
@@ -101,11 +149,19 @@ class LuaRedis(fakeredis.FakeRedis):
                 "owner_id": task_id,
                 "session_id": session_id,
                 "bytes": requested,
+                "free_bytes": free_bytes,
+                "min_free_bytes": min_free_bytes,
             },
         )
         self.pexpire(token_key, int(ttl_ms))
-        self.hset(index_key, token, f"output|{session_id}|{requested}")
+        self.hset(
+            index_key,
+            token,
+            f"output|{session_id}|{requested}|{free_bytes}|{min_free_bytes}",
+        )
         self.hincrby(state_key, "reserved_bytes", requested)
+        self.hset(state_key, "observed_free_bytes", effective_free)
+        self.hset(state_key, "min_free_bytes", effective_min_free)
         return 0
 
     def _eval_refresh_token(self, keys, args):  # noqa: ANN001, ANN202
@@ -128,9 +184,35 @@ class LuaRedis(fakeredis.FakeRedis):
             self._decrement(state_key, "upload_count", 1)
             self._decrement(
                 state_key,
-                f"session:{session_id}:bytes",
+                f"session:{session_id}:reserved_bytes",
                 reserved_bytes,
             )
+        self._recompute_capacity(state_key, index_key)
+        return 1
+
+    def _eval_commit_reservation(self, keys, _args):  # noqa: ANN001, ANN202
+        state_key, index_key, token_key = keys
+        if not self.exists(token_key):
+            return 0
+        kind = self._text(self.hget(token_key, "kind"))
+        session_id = self._text(self.hget(token_key, "session_id"))
+        reserved_bytes = int(self.hget(token_key, "bytes"))
+        self.delete(token_key)
+        self.hdel(index_key, token_key.rsplit(":", 1)[-1])
+        self._decrement(state_key, "reserved_bytes", reserved_bytes)
+        if kind == "upload":
+            self._decrement(state_key, "upload_count", 1)
+            self._decrement(
+                state_key,
+                f"session:{session_id}:reserved_bytes",
+                reserved_bytes,
+            )
+            self.hincrby(
+                state_key,
+                f"session:{session_id}:committed_bytes",
+                reserved_bytes,
+            )
+        self._recompute_capacity(state_key, index_key)
         return 1
 
     def _eval_reconcile_reservations(self, keys, args):  # noqa: ANN001, ANN202
@@ -141,7 +223,9 @@ class LuaRedis(fakeredis.FakeRedis):
             token = self._text(raw_token)
             if self.exists(f"{token_prefix}{token}"):
                 continue
-            kind, session_id, byte_count = self._text(raw_metadata).split("|")
+            kind, session_id, byte_count, *_capacity = self._text(raw_metadata).split(
+                "|"
+            )
             reserved_bytes = int(byte_count)
             self.hdel(index_key, token)
             self._decrement(state_key, "reserved_bytes", reserved_bytes)
@@ -149,11 +233,19 @@ class LuaRedis(fakeredis.FakeRedis):
                 self._decrement(state_key, "upload_count", 1)
                 self._decrement(
                     state_key,
-                    f"session:{session_id}:bytes",
+                    f"session:{session_id}:reserved_bytes",
                     reserved_bytes,
                 )
             removed += 1
+        self._recompute_capacity(state_key, index_key)
         return removed
+
+    def _eval_clear_session_usage(self, keys, args):  # noqa: ANN001, ANN202
+        self.hdel(
+            keys[0],
+            f"session:{args[0]}:committed_bytes",
+        )
+        return 1
 
     def _eval_acquire_session(self, keys, args):  # noqa: ANN001, ANN202
         state_key, leases_key, lease_key = keys
@@ -223,6 +315,24 @@ class LuaRedis(fakeredis.FakeRedis):
         value = self.hget(key, field)
         return int(value) if value is not None else 0
 
+    def _optional_number(self, key: str, field: str, default: int) -> int:
+        value = self.hget(key, field)
+        return int(value) if value is not None else default
+
+    def _recompute_capacity(self, state_key: str, index_key: str) -> None:
+        observations: list[int] = []
+        floors: list[int] = []
+        for raw_metadata in self.hvals(index_key):
+            parts = self._text(raw_metadata).split("|")
+            if len(parts) == 5:
+                observations.append(int(parts[3]))
+                floors.append(int(parts[4]))
+        if observations:
+            self.hset(state_key, "observed_free_bytes", min(observations))
+            self.hset(state_key, "min_free_bytes", max(floors))
+        else:
+            self.hdel(state_key, "observed_free_bytes", "min_free_bytes")
+
     def _decrement(self, key: str, field: str, amount: int) -> None:
         current = self._number(key, field)
         self.hset(key, field, max(0, current - amount))
@@ -233,12 +343,12 @@ class LuaRedis(fakeredis.FakeRedis):
 
 
 @pytest.fixture
-def redis_connection() -> LuaRedis:
-    return LuaRedis()
+def redis_connection() -> DeterministicRedis:
+    return DeterministicRedis()
 
 
 def coordinator(
-    redis_connection: LuaRedis,
+    redis_connection: Redis,
     *,
     max_uploads: int = 2,
     max_session_bytes: int = 10,
@@ -256,8 +366,38 @@ def coordinator(
     )
 
 
+def _clear_resource_keys(redis_connection: Redis) -> None:
+    keys = list(redis_connection.scan_iter(match="dt:resource:*"))
+    if keys:
+        redis_connection.delete(*keys)
+
+
+@pytest.fixture
+def real_redis_connection() -> Redis:
+    url = os.environ.get(
+        "DESIGNTOOLKIT_TEST_REDIS_URL",
+        "redis://localhost:6379/15",
+    )
+    connection = Redis.from_url(
+        url,
+        decode_responses=False,
+        socket_connect_timeout=0.2,
+        socket_timeout=0.2,
+    )
+    try:
+        connection.ping()
+    except RedisError as error:
+        pytest.skip(f"real Redis unavailable at {url}: {error}")
+    _clear_resource_keys(connection)
+    try:
+        yield connection
+    finally:
+        _clear_resource_keys(connection)
+        connection.close()
+
+
 def test_upload_reservations_enforce_global_concurrency_atomically(
-    redis_connection: LuaRedis,
+    redis_connection: DeterministicRedis,
 ) -> None:
     resources = coordinator(redis_connection, max_uploads=2, max_session_bytes=100)
 
@@ -281,7 +421,7 @@ def test_upload_reservations_enforce_global_concurrency_atomically(
 
 
 def test_upload_reservations_enforce_per_session_bytes(
-    redis_connection: LuaRedis,
+    redis_connection: DeterministicRedis,
 ) -> None:
     resources = coordinator(redis_connection, max_session_bytes=10)
     first = resources.reserve_upload(SESSION_A, 6, free_bytes=100)
@@ -294,8 +434,42 @@ def test_upload_reservations_enforce_per_session_bytes(
     second.release()
 
 
+def test_committed_uploads_retain_session_usage_until_cleanup(
+    redis_connection: DeterministicRedis,
+) -> None:
+    resources = coordinator(redis_connection, max_session_bytes=10)
+    first = resources.reserve_upload(SESSION_A, 4, free_bytes=100)
+    second = resources.reserve_upload(SESSION_A, 4, free_bytes=100)
+
+    first.commit()
+    second.commit()
+
+    with pytest.raises(ResourceUnavailableError, match="session"):
+        resources.reserve_upload(SESSION_A, 3, free_bytes=100)
+
+    resources.clear_session_usage(SESSION_A)
+    replacement = resources.reserve_upload(SESSION_A, 10, free_bytes=100)
+    replacement.release()
+
+
+def test_failed_upload_release_frees_reserved_session_capacity(
+    redis_connection: DeterministicRedis,
+) -> None:
+    resources = coordinator(redis_connection, max_session_bytes=10)
+    committed = resources.reserve_upload(SESSION_A, 4, free_bytes=100)
+    committed.commit()
+    failed = resources.reserve_upload(SESSION_A, 5, free_bytes=100)
+
+    failed.release()
+
+    replacement = resources.reserve_upload(SESSION_A, 6, free_bytes=100)
+    replacement.release()
+    with pytest.raises(ResourceUnavailableError, match="session"):
+        resources.reserve_upload(SESSION_A, 7, free_bytes=100)
+
+
 def test_upload_capacity_includes_all_active_reservations(
-    redis_connection: LuaRedis,
+    redis_connection: DeterministicRedis,
 ) -> None:
     resources = coordinator(
         redis_connection,
@@ -316,7 +490,7 @@ def test_upload_capacity_includes_all_active_reservations(
 
 
 def test_output_reservations_preserve_effective_minimum_free_bytes(
-    redis_connection: LuaRedis,
+    redis_connection: DeterministicRedis,
 ) -> None:
     resources = coordinator(redis_connection, min_free_bytes=3)
     first = resources.reserve_output(
@@ -339,8 +513,47 @@ def test_output_reservations_preserve_effective_minimum_free_bytes(
     first.release()
 
 
+def test_mixed_reservations_preserve_strictest_capacity_observation(
+    redis_connection: DeterministicRedis,
+) -> None:
+    resources = coordinator(
+        redis_connection,
+        max_uploads=3,
+        max_session_bytes=100,
+        min_free_bytes=5,
+    )
+    output = resources.reserve_output(
+        "task-1",
+        SESSION_A,
+        10,
+        free_bytes=100,
+        min_free_bytes=30,
+    )
+    upload = resources.reserve_upload(SESSION_B, 10, free_bytes=200)
+
+    with pytest.raises(ResourceUnavailableError, match="disk"):
+        resources.reserve_output(
+            "task-2",
+            SESSION_A,
+            55,
+            free_bytes=200,
+            min_free_bytes=5,
+        )
+
+    output.release()
+    relaxed = resources.reserve_output(
+        "task-3",
+        SESSION_A,
+        170,
+        free_bytes=200,
+        min_free_bytes=5,
+    )
+    relaxed.release()
+    upload.release()
+
+
 def test_reservation_release_is_idempotent_and_token_scoped(
-    redis_connection: LuaRedis,
+    redis_connection: DeterministicRedis,
 ) -> None:
     resources = coordinator(redis_connection, max_uploads=2, max_session_bytes=100)
     first = resources.reserve_upload(SESSION_A, 3, free_bytes=100)
@@ -357,7 +570,7 @@ def test_reservation_release_is_idempotent_and_token_scoped(
 
 
 def test_reservation_refresh_extends_token_ttl(
-    redis_connection: LuaRedis,
+    redis_connection: DeterministicRedis,
 ) -> None:
     resources = coordinator(redis_connection, reservation_ttl=2)
     reservation = resources.reserve_upload(SESSION_A, 1, free_bytes=100)
@@ -370,7 +583,7 @@ def test_reservation_refresh_extends_token_ttl(
 
 
 def test_reconcile_repairs_counters_after_reservation_expiry(
-    redis_connection: LuaRedis,
+    redis_connection: DeterministicRedis,
 ) -> None:
     resources = coordinator(redis_connection, max_uploads=1)
     expired = resources.reserve_upload(SESSION_A, 10, free_bytes=100)
@@ -382,8 +595,95 @@ def test_reconcile_repairs_counters_after_reservation_expiry(
     replacement.release()
 
 
+def test_real_redis_executes_reservation_scripts(
+    real_redis_connection: Redis,
+) -> None:
+    resources = coordinator(
+        real_redis_connection,
+        max_uploads=3,
+        max_session_bytes=10,
+        min_free_bytes=5,
+    )
+    upload = resources.reserve_upload(SESSION_A, 6, free_bytes=100)
+    upload.commit()
+
+    with pytest.raises(ResourceUnavailableError, match="session"):
+        resources.reserve_upload(SESSION_A, 5, free_bytes=100)
+
+    resources.clear_session_usage(SESSION_A)
+    released = resources.reserve_upload(SESSION_A, 10, free_bytes=100)
+    released.refresh()
+    released.release()
+
+    capacity_resources = coordinator(
+        real_redis_connection,
+        max_uploads=3,
+        max_session_bytes=100,
+        min_free_bytes=5,
+    )
+    output = capacity_resources.reserve_output(
+        "task-1",
+        SESSION_A,
+        10,
+        free_bytes=100,
+        min_free_bytes=30,
+    )
+    active_upload = capacity_resources.reserve_upload(
+        SESSION_B,
+        10,
+        free_bytes=200,
+    )
+    with pytest.raises(ResourceUnavailableError, match="disk"):
+        capacity_resources.reserve_output(
+            "task-2",
+            SESSION_A,
+            55,
+            free_bytes=200,
+            min_free_bytes=5,
+        )
+    output.release()
+    relaxed = capacity_resources.reserve_output(
+        "task-3",
+        SESSION_A,
+        170,
+        free_bytes=200,
+        min_free_bytes=5,
+    )
+    relaxed.release()
+    active_upload.release()
+
+    lease = resources.acquire_session(SESSION_A)
+    lease.refresh()
+    lease.release()
+    claim = resources.claim_session_cleanup(SESSION_A)
+    assert claim is not None
+    resources.release_cleanup_claim(SESSION_A, claim)
+
+
+def test_real_redis_ttl_expiry_is_reconciled(
+    real_redis_connection: Redis,
+) -> None:
+    resources = coordinator(
+        real_redis_connection,
+        max_uploads=1,
+        max_session_bytes=10,
+        reservation_ttl=0.02,
+    )
+    expired = resources.reserve_upload(SESSION_A, 10, free_bytes=100)
+    token_key = f"dt:resource:reservation:{expired.token}"
+
+    deadline = monotonic() + 1
+    while real_redis_connection.exists(token_key) and monotonic() < deadline:
+        sleep(0.005)
+
+    assert not real_redis_connection.exists(token_key)
+    assert resources.reconcile_reservations() == 1
+    replacement = resources.reserve_upload(SESSION_A, 10, free_bytes=100)
+    replacement.release()
+
+
 def test_context_managers_release_reservation_and_session_lease(
-    redis_connection: LuaRedis,
+    redis_connection: DeterministicRedis,
 ) -> None:
     resources = coordinator(redis_connection, max_uploads=1)
 
@@ -400,7 +700,7 @@ def test_context_managers_release_reservation_and_session_lease(
 
 
 def test_cleanup_claim_cannot_overlap_active_session_lease(
-    redis_connection: LuaRedis,
+    redis_connection: DeterministicRedis,
 ) -> None:
     resources = coordinator(redis_connection)
     lease = resources.acquire_session(SESSION_A)
@@ -413,7 +713,7 @@ def test_cleanup_claim_cannot_overlap_active_session_lease(
 
 
 def test_cleanup_claim_blocks_new_leases_until_matching_release(
-    redis_connection: LuaRedis,
+    redis_connection: DeterministicRedis,
 ) -> None:
     resources = coordinator(redis_connection)
     claim = resources.claim_session_cleanup(SESSION_A)
@@ -430,7 +730,7 @@ def test_cleanup_claim_blocks_new_leases_until_matching_release(
 
 
 def test_cleanup_claim_remains_until_released(
-    redis_connection: LuaRedis,
+    redis_connection: DeterministicRedis,
 ) -> None:
     resources = coordinator(redis_connection, lease_ttl=0.01)
     claim = resources.claim_session_cleanup(SESSION_A)
@@ -444,7 +744,7 @@ def test_cleanup_claim_remains_until_released(
 
 
 def test_session_lease_release_is_idempotent_and_token_scoped(
-    redis_connection: LuaRedis,
+    redis_connection: DeterministicRedis,
 ) -> None:
     resources = coordinator(redis_connection)
     first = resources.acquire_session(SESSION_A)
@@ -461,7 +761,7 @@ def test_session_lease_release_is_idempotent_and_token_scoped(
 
 
 def test_expired_session_lease_is_reconciled_before_cleanup_claim(
-    redis_connection: LuaRedis,
+    redis_connection: DeterministicRedis,
 ) -> None:
     resources = coordinator(redis_connection)
     lease = resources.acquire_session(SESSION_A)
@@ -475,7 +775,7 @@ def test_expired_session_lease_is_reconciled_before_cleanup_claim(
 
 @pytest.mark.parametrize("requested_bytes", [0, -1])
 def test_reservations_require_positive_sizes(
-    redis_connection: LuaRedis,
+    redis_connection: DeterministicRedis,
     requested_bytes: int,
 ) -> None:
     resources = coordinator(redis_connection)
@@ -493,7 +793,7 @@ def test_reservations_require_positive_sizes(
 
 @pytest.mark.parametrize("session_id", ["A" * 32, "a" * 31, "../session"])
 def test_public_operations_require_lowercase_32_hex_session_ids(
-    redis_connection: LuaRedis,
+    redis_connection: DeterministicRedis,
     session_id: str,
 ) -> None:
     resources = coordinator(redis_connection)
@@ -506,3 +806,5 @@ def test_public_operations_require_lowercase_32_hex_session_ids(
         resources.acquire_session(session_id)
     with pytest.raises(ValueError, match="session"):
         resources.claim_session_cleanup(session_id)
+    with pytest.raises(ValueError, match="session"):
+        resources.clear_session_usage(session_id)

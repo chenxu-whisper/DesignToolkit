@@ -33,16 +33,30 @@ if upload_count >= max_uploads then
     return 1
 end
 
-local session_field = "session:" .. session_id .. ":bytes"
-local session_bytes = tonumber(redis.call("HGET", state_key, session_field) or "0")
-if session_bytes + requested > max_session_bytes then
+local session_reserved_field = "session:" .. session_id .. ":reserved_bytes"
+local session_committed_field = "session:" .. session_id .. ":committed_bytes"
+local session_reserved = tonumber(
+    redis.call("HGET", state_key, session_reserved_field) or "0"
+)
+local session_committed = tonumber(
+    redis.call("HGET", state_key, session_committed_field) or "0"
+)
+if session_reserved + session_committed + requested > max_session_bytes then
     return 2
 end
 
 local reserved_bytes = tonumber(
     redis.call("HGET", state_key, "reserved_bytes") or "0"
 )
-if free_bytes - reserved_bytes - requested < min_free_bytes then
+local observed_free = tonumber(
+    redis.call("HGET", state_key, "observed_free_bytes") or free_bytes
+)
+local active_min_free = tonumber(
+    redis.call("HGET", state_key, "min_free_bytes") or min_free_bytes
+)
+local effective_free = math.min(observed_free, free_bytes)
+local effective_min_free = math.max(active_min_free, min_free_bytes)
+if effective_free - reserved_bytes - requested < effective_min_free then
     return 3
 end
 
@@ -56,18 +70,25 @@ redis.call(
     "session_id",
     session_id,
     "bytes",
-    requested
+    requested,
+    "free_bytes",
+    free_bytes,
+    "min_free_bytes",
+    min_free_bytes
 )
 redis.call("PEXPIRE", token_key, ttl_ms)
 redis.call(
     "HSET",
     index_key,
     token,
-    "upload|" .. session_id .. "|" .. requested
+    "upload|" .. session_id .. "|" .. requested ..
+        "|" .. free_bytes .. "|" .. min_free_bytes
 )
 redis.call("HINCRBY", state_key, "reserved_bytes", requested)
 redis.call("HINCRBY", state_key, "upload_count", 1)
-redis.call("HINCRBY", state_key, session_field, requested)
+redis.call("HINCRBY", state_key, session_reserved_field, requested)
+redis.call("HSET", state_key, "observed_free_bytes", effective_free)
+redis.call("HSET", state_key, "min_free_bytes", effective_min_free)
 return 0
 """
 
@@ -86,7 +107,15 @@ local ttl_ms = tonumber(ARGV[7])
 local reserved_bytes = tonumber(
     redis.call("HGET", state_key, "reserved_bytes") or "0"
 )
-if free_bytes - reserved_bytes - requested < min_free_bytes then
+local observed_free = tonumber(
+    redis.call("HGET", state_key, "observed_free_bytes") or free_bytes
+)
+local active_min_free = tonumber(
+    redis.call("HGET", state_key, "min_free_bytes") or min_free_bytes
+)
+local effective_free = math.min(observed_free, free_bytes)
+local effective_min_free = math.max(active_min_free, min_free_bytes)
+if effective_free - reserved_bytes - requested < effective_min_free then
     return 1
 end
 
@@ -100,16 +129,23 @@ redis.call(
     "session_id",
     session_id,
     "bytes",
-    requested
+    requested,
+    "free_bytes",
+    free_bytes,
+    "min_free_bytes",
+    min_free_bytes
 )
 redis.call("PEXPIRE", token_key, ttl_ms)
 redis.call(
     "HSET",
     index_key,
     token,
-    "output|" .. session_id .. "|" .. requested
+    "output|" .. session_id .. "|" .. requested ..
+        "|" .. free_bytes .. "|" .. min_free_bytes
 )
 redis.call("HINCRBY", state_key, "reserved_bytes", requested)
+redis.call("HSET", state_key, "observed_free_bytes", effective_free)
+redis.call("HSET", state_key, "min_free_bytes", effective_min_free)
 return 0
 """
 
@@ -143,13 +179,125 @@ local function decrement(field, amount)
     end
 end
 
+local function recompute_capacity()
+    local metadata_entries = redis.call("HVALS", index_key)
+    local observed_free = nil
+    local min_free_bytes = nil
+    for _, metadata in ipairs(metadata_entries) do
+        local _, _, _, free_text, min_free_text = string.match(
+            metadata,
+            "^([^|]+)|([^|]+)|(%d+)|(%d+)|(%d+)$"
+        )
+        if free_text then
+            local entry_free = tonumber(free_text)
+            local entry_min_free = tonumber(min_free_text)
+            if not observed_free or entry_free < observed_free then
+                observed_free = entry_free
+            end
+            if not min_free_bytes or entry_min_free > min_free_bytes then
+                min_free_bytes = entry_min_free
+            end
+        end
+    end
+    if observed_free then
+        redis.call("HSET", state_key, "observed_free_bytes", observed_free)
+        redis.call("HSET", state_key, "min_free_bytes", min_free_bytes)
+    else
+        redis.call(
+            "HDEL",
+            state_key,
+            "observed_free_bytes",
+            "min_free_bytes"
+        )
+    end
+end
+
 redis.call("DEL", token_key)
 redis.call("HDEL", index_key, ARGV[1])
 decrement("reserved_bytes", reserved_bytes)
 if kind == "upload" then
     decrement("upload_count", 1)
-    decrement("session:" .. session_id .. ":bytes", reserved_bytes)
+    decrement(
+        "session:" .. session_id .. ":reserved_bytes",
+        reserved_bytes
+    )
 end
+recompute_capacity()
+return 1
+"""
+
+_COMMIT_RESERVATION_SCRIPT = """-- commit_reservation
+local state_key = KEYS[1]
+local index_key = KEYS[2]
+local token_key = KEYS[3]
+if redis.call("EXISTS", token_key) == 0 then
+    return 0
+end
+
+local kind = redis.call("HGET", token_key, "kind")
+local session_id = redis.call("HGET", token_key, "session_id")
+local reserved_bytes = tonumber(redis.call("HGET", token_key, "bytes") or "0")
+
+local function decrement(field, amount)
+    local current = tonumber(redis.call("HGET", state_key, field) or "0")
+    local remaining = current - amount
+    if remaining > 0 then
+        redis.call("HSET", state_key, field, remaining)
+    else
+        redis.call("HDEL", state_key, field)
+    end
+end
+
+local function recompute_capacity()
+    local metadata_entries = redis.call("HVALS", index_key)
+    local observed_free = nil
+    local min_free_bytes = nil
+    for _, metadata in ipairs(metadata_entries) do
+        local _, _, _, free_text, min_free_text = string.match(
+            metadata,
+            "^([^|]+)|([^|]+)|(%d+)|(%d+)|(%d+)$"
+        )
+        if free_text then
+            local entry_free = tonumber(free_text)
+            local entry_min_free = tonumber(min_free_text)
+            if not observed_free or entry_free < observed_free then
+                observed_free = entry_free
+            end
+            if not min_free_bytes or entry_min_free > min_free_bytes then
+                min_free_bytes = entry_min_free
+            end
+        end
+    end
+    if observed_free then
+        redis.call("HSET", state_key, "observed_free_bytes", observed_free)
+        redis.call("HSET", state_key, "min_free_bytes", min_free_bytes)
+    else
+        redis.call(
+            "HDEL",
+            state_key,
+            "observed_free_bytes",
+            "min_free_bytes"
+        )
+    end
+end
+
+redis.call("DEL", token_key)
+redis.call("HDEL", index_key, ARGV[1])
+decrement("reserved_bytes", reserved_bytes)
+if kind == "upload" then
+    decrement("upload_count", 1)
+    decrement(
+        "session:" .. session_id .. ":reserved_bytes",
+        reserved_bytes
+    )
+    redis.call(
+        "HINCRBY",
+        state_key,
+        "session:" .. session_id .. ":committed_bytes",
+        reserved_bytes
+    )
+end
+recompute_capacity()
 return 1
 """
 
@@ -176,7 +324,7 @@ for index = 1, #entries, 2 do
     if redis.call("EXISTS", token_prefix .. token) == 0 then
         local kind, session_id, byte_text = string.match(
             metadata,
-            "^([^|]+)|([^|]+)|(%d+)$"
+            "^([^|]+)|([^|]+)|(%d+)"
         )
         if kind then
             local reserved_bytes = tonumber(byte_text)
@@ -184,7 +332,7 @@ for index = 1, #entries, 2 do
             if kind == "upload" then
                 decrement("upload_count", 1)
                 decrement(
-                    "session:" .. session_id .. ":bytes",
+                    "session:" .. session_id .. ":reserved_bytes",
                     reserved_bytes
                 )
             end
@@ -193,7 +341,47 @@ for index = 1, #entries, 2 do
         removed = removed + 1
     end
 end
+
+local metadata_entries = redis.call("HVALS", index_key)
+local observed_free = nil
+local min_free_bytes = nil
+for _, metadata in ipairs(metadata_entries) do
+    local _, _, _, free_text, min_free_text = string.match(
+        metadata,
+        "^([^|]+)|([^|]+)|(%d+)|(%d+)|(%d+)$"
+    )
+    if free_text then
+        local entry_free = tonumber(free_text)
+        local entry_min_free = tonumber(min_free_text)
+        if not observed_free or entry_free < observed_free then
+            observed_free = entry_free
+        end
+        if not min_free_bytes or entry_min_free > min_free_bytes then
+            min_free_bytes = entry_min_free
+        end
+    end
+end
+if observed_free then
+    redis.call("HSET", state_key, "observed_free_bytes", observed_free)
+    redis.call("HSET", state_key, "min_free_bytes", min_free_bytes)
+else
+    redis.call(
+        "HDEL",
+        state_key,
+        "observed_free_bytes",
+        "min_free_bytes"
+    )
+end
 return removed
+"""
+
+_CLEAR_SESSION_USAGE_SCRIPT = """-- clear_session_usage
+redis.call(
+    "HDEL",
+    KEYS[1],
+    "session:" .. ARGV[1] .. ":committed_bytes"
+)
+return 1
 """
 
 _ACQUIRE_SESSION_SCRIPT = """-- acquire_session
@@ -329,6 +517,9 @@ class RedisReservation:
     def refresh(self) -> None:
         self.coordinator._refresh_reservation(self)
 
+    def commit(self) -> None:
+        self.coordinator._commit_reservation(self)
+
     def release(self) -> None:
         self.coordinator._release_reservation(self)
 
@@ -384,6 +575,35 @@ class RedisResourceCoordinator:
             "reservation_ttl",
         )
         self._lease_ttl_ms = _ttl_milliseconds(lease_ttl, "lease_ttl")
+        self._reserve_upload_script = self._redis.register_script(
+            _RESERVE_UPLOAD_SCRIPT
+        )
+        self._reserve_output_script = self._redis.register_script(
+            _RESERVE_OUTPUT_SCRIPT
+        )
+        self._refresh_token_script = self._redis.register_script(_REFRESH_TOKEN_SCRIPT)
+        self._release_reservation_script = self._redis.register_script(
+            _RELEASE_RESERVATION_SCRIPT
+        )
+        self._commit_reservation_script = self._redis.register_script(
+            _COMMIT_RESERVATION_SCRIPT
+        )
+        self._reconcile_reservations_script = self._redis.register_script(
+            _RECONCILE_RESERVATIONS_SCRIPT
+        )
+        self._clear_session_usage_script = self._redis.register_script(
+            _CLEAR_SESSION_USAGE_SCRIPT
+        )
+        self._acquire_session_script = self._redis.register_script(
+            _ACQUIRE_SESSION_SCRIPT
+        )
+        self._release_session_script = self._redis.register_script(
+            _RELEASE_SESSION_SCRIPT
+        )
+        self._claim_cleanup_script = self._redis.register_script(_CLAIM_CLEANUP_SCRIPT)
+        self._release_cleanup_script = self._redis.register_script(
+            _RELEASE_CLEANUP_SCRIPT
+        )
 
     def reserve_upload(
         self,
@@ -397,20 +617,22 @@ class RedisResourceCoordinator:
         free_bytes = _nonnegative_int(free_bytes, "free_bytes")
         token = uuid4().hex
         result = int(
-            self._redis.eval(
-                _RESERVE_UPLOAD_SCRIPT,
-                3,
-                _STATE_KEY,
-                _RESERVATION_INDEX_KEY,
-                _reservation_key(token),
-                token,
-                session_id,
-                requested_bytes,
-                free_bytes,
-                self.max_upload_concurrency,
-                self.max_session_bytes,
-                self.min_free_bytes,
-                self._reservation_ttl_ms,
+            self._reserve_upload_script(
+                keys=[
+                    _STATE_KEY,
+                    _RESERVATION_INDEX_KEY,
+                    _reservation_key(token),
+                ],
+                args=[
+                    token,
+                    session_id,
+                    requested_bytes,
+                    free_bytes,
+                    self.max_upload_concurrency,
+                    self.max_session_bytes,
+                    self.min_free_bytes,
+                    self._reservation_ttl_ms,
+                ],
             )
         )
         if result == 1:
@@ -445,19 +667,21 @@ class RedisResourceCoordinator:
         )
         token = uuid4().hex
         result = int(
-            self._redis.eval(
-                _RESERVE_OUTPUT_SCRIPT,
-                3,
-                _STATE_KEY,
-                _RESERVATION_INDEX_KEY,
-                _reservation_key(token),
-                token,
-                task_id,
-                session_id,
-                requested_bytes,
-                free_bytes,
-                min_free_bytes,
-                self._reservation_ttl_ms,
+            self._reserve_output_script(
+                keys=[
+                    _STATE_KEY,
+                    _RESERVATION_INDEX_KEY,
+                    _reservation_key(token),
+                ],
+                args=[
+                    token,
+                    task_id,
+                    session_id,
+                    requested_bytes,
+                    free_bytes,
+                    min_free_bytes,
+                    self._reservation_ttl_ms,
+                ],
             )
         )
         if result != 0:
@@ -474,17 +698,19 @@ class RedisResourceCoordinator:
         _validate_session_id(session_id)
         token = uuid4().hex
         result = int(
-            self._redis.eval(
-                _ACQUIRE_SESSION_SCRIPT,
-                3,
-                _session_state_key(session_id),
-                _session_leases_key(session_id),
-                _lease_key(token),
-                token,
-                session_id,
-                self._lease_ttl_ms,
-                _LEASE_PREFIX,
-                _CLEANUP_PREFIX,
+            self._acquire_session_script(
+                keys=[
+                    _session_state_key(session_id),
+                    _session_leases_key(session_id),
+                    _lease_key(token),
+                ],
+                args=[
+                    token,
+                    session_id,
+                    self._lease_ttl_ms,
+                    _LEASE_PREFIX,
+                    _CLEANUP_PREFIX,
+                ],
             )
         )
         if result != 0:
@@ -495,47 +721,56 @@ class RedisResourceCoordinator:
         _validate_session_id(session_id)
         token = uuid4().hex
         result = int(
-            self._redis.eval(
-                _CLAIM_CLEANUP_SCRIPT,
-                3,
-                _session_state_key(session_id),
-                _session_leases_key(session_id),
-                _cleanup_key(token),
-                token,
-                self._lease_ttl_ms,
-                _LEASE_PREFIX,
-                _CLEANUP_PREFIX,
+            self._claim_cleanup_script(
+                keys=[
+                    _session_state_key(session_id),
+                    _session_leases_key(session_id),
+                    _cleanup_key(token),
+                ],
+                args=[
+                    token,
+                    self._lease_ttl_ms,
+                    _LEASE_PREFIX,
+                    _CLEANUP_PREFIX,
+                ],
             )
         )
         return token if result == 0 else None
 
     def release_cleanup_claim(self, session_id: str, token: str) -> None:
         _validate_session_id(session_id)
-        self._redis.eval(
-            _RELEASE_CLEANUP_SCRIPT,
-            2,
-            _session_state_key(session_id),
-            _cleanup_key(token),
-            token,
+        self._release_cleanup_script(
+            keys=[
+                _session_state_key(session_id),
+                _cleanup_key(token),
+            ],
+            args=[token],
+        )
+
+    def clear_session_usage(self, session_id: str) -> None:
+        _validate_session_id(session_id)
+        self._clear_session_usage_script(
+            keys=[_STATE_KEY],
+            args=[session_id],
         )
 
     def reconcile_reservations(self) -> int:
         return int(
-            self._redis.eval(
-                _RECONCILE_RESERVATIONS_SCRIPT,
-                2,
-                _STATE_KEY,
-                _RESERVATION_INDEX_KEY,
-                _RESERVATION_PREFIX,
+            self._reconcile_reservations_script(
+                keys=[
+                    _STATE_KEY,
+                    _RESERVATION_INDEX_KEY,
+                ],
+                args=[
+                    _RESERVATION_PREFIX,
+                ],
             )
         )
 
     def _refresh_reservation(self, reservation: RedisReservation) -> None:
-        refreshed = self._redis.eval(
-            _REFRESH_TOKEN_SCRIPT,
-            1,
-            _reservation_key(reservation.token),
-            self._reservation_ttl_ms,
+        refreshed = self._refresh_token_script(
+            keys=[_reservation_key(reservation.token)],
+            args=[self._reservation_ttl_ms],
         )
         if not refreshed:
             raise ResourceUnavailableError(
@@ -543,33 +778,41 @@ class RedisResourceCoordinator:
             )
 
     def _release_reservation(self, reservation: RedisReservation) -> None:
-        self._redis.eval(
-            _RELEASE_RESERVATION_SCRIPT,
-            3,
-            _STATE_KEY,
-            _RESERVATION_INDEX_KEY,
-            _reservation_key(reservation.token),
-            reservation.token,
+        self._release_reservation_script(
+            keys=[
+                _STATE_KEY,
+                _RESERVATION_INDEX_KEY,
+                _reservation_key(reservation.token),
+            ],
+            args=[reservation.token],
+        )
+
+    def _commit_reservation(self, reservation: RedisReservation) -> None:
+        self._commit_reservation_script(
+            keys=[
+                _STATE_KEY,
+                _RESERVATION_INDEX_KEY,
+                _reservation_key(reservation.token),
+            ],
+            args=[reservation.token],
         )
 
     def _refresh_session(self, lease: RedisSessionLease) -> None:
-        refreshed = self._redis.eval(
-            _REFRESH_TOKEN_SCRIPT,
-            1,
-            _lease_key(lease.token),
-            self._lease_ttl_ms,
+        refreshed = self._refresh_token_script(
+            keys=[_lease_key(lease.token)],
+            args=[self._lease_ttl_ms],
         )
         if not refreshed:
             raise ResourceUnavailableError("Session lease expired")
 
     def _release_session(self, lease: RedisSessionLease) -> None:
-        self._redis.eval(
-            _RELEASE_SESSION_SCRIPT,
-            3,
-            _session_state_key(lease.session_id),
-            _session_leases_key(lease.session_id),
-            _lease_key(lease.token),
-            lease.token,
+        self._release_session_script(
+            keys=[
+                _session_state_key(lease.session_id),
+                _session_leases_key(lease.session_id),
+                _lease_key(lease.token),
+            ],
+            args=[lease.token],
         )
 
 
