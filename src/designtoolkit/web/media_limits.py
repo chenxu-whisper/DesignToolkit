@@ -3,9 +3,11 @@ from __future__ import annotations
 import warnings
 from collections import OrderedDict
 from collections.abc import Callable, Iterable
+from concurrent.futures import Future
 from dataclasses import dataclass
 from math import isfinite
 from numbers import Integral, Real
+from os import stat_result
 from pathlib import Path
 from threading import Lock
 
@@ -46,6 +48,11 @@ class _ValidatedMedia:
     video_metadata: VideoMetadata | None = None
 
 
+_StatIdentity = tuple[int | None, int | None, int, int | None, int | None]
+_CacheKey = tuple[Path, _StatIdentity]
+_CacheEntry = _ValidatedMedia | MediaLimitError
+
+
 class HostedMediaValidator:
     def __init__(
         self,
@@ -59,10 +66,8 @@ class HostedMediaValidator:
         self.limits = limits or HostedMediaLimits()
         self._video_probe = video_probe or ImageioVideoDecoder().probe
         self._cache_size = cache_size
-        self._cache: OrderedDict[
-            tuple[Path, int, int],
-            _ValidatedMedia,
-        ] = OrderedDict()
+        self._cache: OrderedDict[_CacheKey, _CacheEntry] = OrderedDict()
+        self._inflight: dict[_CacheKey, Future[_ValidatedMedia]] = {}
         self._cache_lock = Lock()
 
     def validate(self, path: Path) -> VideoMetadata | None:
@@ -75,20 +80,57 @@ class HostedMediaValidator:
             stat = resolved_path.stat()
         except OSError as exc:
             raise MediaLimitError("invalid_media", "Media could not be read") from exc
-        cache_key = (resolved_path, stat.st_size, stat.st_mtime_ns)
+        cache_key = (resolved_path, _stat_identity(stat))
 
         with self._cache_lock:
-            cached = self._cache.get(cache_key)
-            if cached is not None:
-                self._cache.move_to_end(cache_key)
+            try:
+                cached = self._cache.pop(cache_key)
+            except KeyError:
+                pass
+            else:
+                self._cache[cache_key] = cached
+                if isinstance(cached, MediaLimitError):
+                    raise cached
                 return cached.video_metadata
 
+            future = self._inflight.get(cache_key)
+            if future is None:
+                future = Future()
+                self._inflight[cache_key] = future
+                owns_probe = True
+            else:
+                owns_probe = False
+
+        if not owns_probe:
+            return future.result().video_metadata
+
+        try:
             validated = self._validate_uncached(resolved_path, suffix)
-            self._cache[cache_key] = validated
-            self._cache.move_to_end(cache_key)
-            if len(self._cache) > self._cache_size:
-                self._cache.popitem(last=False)
+        except MediaLimitError as exc:
+            with self._cache_lock:
+                self._cache[cache_key] = exc
+                self._cache.move_to_end(cache_key)
+                self._trim_cache()
+                self._inflight.pop(cache_key, None)
+            future.set_exception(exc)
+            raise
+        except BaseException as exc:
+            with self._cache_lock:
+                self._inflight.pop(cache_key, None)
+            future.set_exception(exc)
+            raise
+        else:
+            with self._cache_lock:
+                self._cache[cache_key] = validated
+                self._cache.move_to_end(cache_key)
+                self._trim_cache()
+                self._inflight.pop(cache_key, None)
+            future.set_result(validated)
             return validated.video_metadata
+
+    def _trim_cache(self) -> None:
+        while len(self._cache) > self._cache_size:
+            self._cache.popitem(last=False)
 
     def validate_video(self, path: Path) -> VideoMetadata:
         if path.suffix.lower() not in _VIDEO_SUFFIXES:
@@ -203,4 +245,14 @@ def _is_positive_finite_real(value: object) -> bool:
         and not isinstance(value, bool)
         and isfinite(float(value))
         and value > 0
+    )
+
+
+def _stat_identity(stat: stat_result) -> _StatIdentity:
+    return (
+        getattr(stat, "st_dev", None),
+        getattr(stat, "st_ino", None),
+        stat.st_size,
+        getattr(stat, "st_mtime_ns", None),
+        getattr(stat, "st_ctime_ns", None),
     )

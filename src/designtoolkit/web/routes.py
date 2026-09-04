@@ -209,6 +209,10 @@ def _chroma_video_error_response(exc: KeyerError) -> ApiError:
     return mapped_error
 
 
+def _media_limit_error_response(exc: MediaLimitError) -> ApiError:
+    return ApiError("media_limit_exceeded", str(exc), 422)
+
+
 def _chroma_preview_url(preview_id: str) -> str:
     return f"/api/chroma-keyer/previews/{preview_id}"
 
@@ -692,7 +696,10 @@ def create_router(
         source_snapshot: _VideoSourceSnapshot,
     ) -> VideoMetadata:
         if media_validator is not None:
-            return media_validator.validate_video(input_path)
+            try:
+                return media_validator.validate_video(input_path)
+            except MediaLimitError as exc:
+                raise _media_limit_error_response(exc) from exc
         return get_cached_video_metadata(
             input_path,
             tuple(sorted(source_snapshot.fingerprint.items())),
@@ -716,7 +723,7 @@ def create_router(
         try:
             media_validator.validate_many(paths)
         except MediaLimitError as exc:
-            raise ApiError("media_limit_exceeded", str(exc), 422) from exc
+            raise _media_limit_error_response(exc) from exc
 
     def resolve_input_path(http_request: Request, reference: str) -> Path:
         path = resolve_hosted_asset(http_request, reference)

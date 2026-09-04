@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import struct
 import threading
 import time
@@ -249,7 +250,7 @@ def test_metadata_cache_is_bounded_lru(tmp_path: Path) -> None:
     ]
 
 
-def test_metadata_cache_serializes_concurrent_validation(tmp_path: Path) -> None:
+def test_metadata_cache_singleflights_concurrent_validation(tmp_path: Path) -> None:
     video_path = tmp_path / "clip.mp4"
     video_path.write_bytes(b"video")
     metadata = _metadata()
@@ -269,6 +270,118 @@ def test_metadata_cache_serializes_concurrent_validation(tmp_path: Path) -> None
 
     assert results == [metadata] * 25
     assert probe_calls == 1
+
+
+def test_metadata_cache_allows_different_probes_to_overlap(tmp_path: Path) -> None:
+    paths = [tmp_path / f"clip-{index}.mp4" for index in range(2)]
+    for path in paths:
+        path.write_bytes(b"video")
+    probes_started = threading.Barrier(2, timeout=1)
+
+    def probe(_path: Path) -> object:
+        probes_started.wait()
+        return _metadata()
+
+    validator = HostedMediaValidator(video_probe=probe)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(validator.validate_video, paths))
+
+    assert results == [_metadata(), _metadata()]
+
+
+def test_metadata_cache_does_not_hold_lock_during_probe(tmp_path: Path) -> None:
+    video_path = tmp_path / "clip.mp4"
+    video_path.write_bytes(b"video")
+    lock_was_available = False
+    validator: HostedMediaValidator
+
+    def probe(_path: Path) -> object:
+        nonlocal lock_was_available
+        lock_was_available = validator._cache_lock.acquire(timeout=0.1)
+        if lock_was_available:
+            validator._cache_lock.release()
+        return _metadata()
+
+    validator = HostedMediaValidator(video_probe=probe)
+
+    validator.validate_video(video_path)
+
+    assert lock_was_available
+
+
+def test_metadata_cache_shares_and_caches_media_limit_error(tmp_path: Path) -> None:
+    video_path = tmp_path / "broken.mp4"
+    video_path.write_bytes(b"video")
+    probe_calls = 0
+    probes_started = threading.Event()
+    release_probe = threading.Event()
+
+    def probe(_path: Path) -> object:
+        nonlocal probe_calls
+        probe_calls += 1
+        probes_started.set()
+        assert release_probe.wait(timeout=1)
+        raise ValueError("unreadable")
+
+    def capture_error() -> MediaLimitError:
+        with pytest.raises(MediaLimitError) as error:
+            validator.validate_video(video_path)
+        return error.value
+
+    validator = HostedMediaValidator(video_probe=probe)
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [executor.submit(capture_error) for _ in range(8)]
+        assert probes_started.wait(timeout=1)
+        release_probe.set()
+        errors = [future.result() for future in futures]
+    cached_error = capture_error()
+
+    assert probe_calls == 1
+    assert all(error is errors[0] for error in [*errors, cached_error])
+
+
+def test_metadata_cache_bounds_negative_entries(tmp_path: Path) -> None:
+    paths = [tmp_path / f"broken-{index}.mp4" for index in range(3)]
+    for path in paths:
+        path.write_bytes(b"video")
+    probe_calls = 0
+
+    def probe(_path: Path) -> object:
+        nonlocal probe_calls
+        probe_calls += 1
+        raise ValueError("unreadable")
+
+    validator = HostedMediaValidator(video_probe=probe, cache_size=2)
+    for path in [paths[0], paths[1], paths[0], paths[2], paths[1]]:
+        with pytest.raises(MediaLimitError):
+            validator.validate_video(path)
+
+    assert probe_calls == 4
+
+
+def test_metadata_cache_reprobes_replaced_file_with_preserved_size_and_mtime(
+    tmp_path: Path,
+) -> None:
+    video_path = tmp_path / "clip.mp4"
+    video_path.write_bytes(b"video-a")
+    original_stat = video_path.stat()
+    probe = StubVideoProbe(_metadata())
+    validator = HostedMediaValidator(video_probe=probe)
+
+    validator.validate_video(video_path)
+    replacement_path = tmp_path / "replacement.mp4"
+    replacement_path.write_bytes(b"video-b")
+    os.utime(
+        replacement_path,
+        ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+    )
+    replacement_path.replace(video_path)
+    replacement_stat = video_path.stat()
+    validator.validate_video(video_path)
+
+    assert replacement_stat.st_size == original_stat.st_size
+    assert replacement_stat.st_mtime_ns == original_stat.st_mtime_ns
+    assert probe.paths == [video_path.resolve(), video_path.resolve()]
 
 
 @pytest.mark.parametrize(

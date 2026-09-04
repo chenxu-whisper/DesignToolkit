@@ -1211,6 +1211,52 @@ def test_hosted_video_preview_endpoints_reject_before_decode(
     assert decoder.decode_calls == 0
 
 
+@pytest.mark.parametrize(
+    ("route", "payload"),
+    [
+        ("/api/chroma-keyer/videos/inspect", {}),
+        ("/api/chroma-keyer/videos/frame", {"timestamp_seconds": 0.0}),
+        (
+            "/api/chroma-keyer/videos/sample",
+            {
+                "timestamp_seconds": 0.0,
+                "x": 0.0,
+                "y": 0.0,
+                "preview_width": 2.0,
+                "preview_height": 1.0,
+            },
+        ),
+        (
+            "/api/chroma-keyer/videos/preview",
+            {
+                "timestamp_seconds": 0.0,
+                "samples": [[0, 255, 0]],
+                "params": {},
+            },
+        ),
+    ],
+)
+def test_hosted_video_preview_endpoints_reject_static_image_with_422(
+    tmp_path: Path,
+    route: str,
+    payload: dict[str, object],
+) -> None:
+    decoder = StubHostedVideoDecoder()
+    with _client(tmp_path, video_decoder=decoder) as client:
+        reference = _upload(client, "image.png", _png_bytes()).json()["reference"]
+        response = client.post(route, json={"input_path": reference, **payload})
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "error": {
+            "code": "media_limit_exceeded",
+            "message": "Media type is not a video",
+        }
+    }
+    assert decoder.probe_calls == 0
+    assert decoder.decode_calls == 0
+
+
 def test_hosted_unreadable_media_returns_clear_422(tmp_path: Path) -> None:
     with _client(tmp_path) as client:
         reference = _upload(client, "broken.png", b"not an image").json()["reference"]
