@@ -190,8 +190,8 @@ class DeterministicRedis(fakeredis.FakeRedis):
         self._recompute_capacity(state_key, index_key)
         return 1
 
-    def _eval_commit_reservation(self, keys, _args):  # noqa: ANN001, ANN202
-        state_key, index_key, token_key = keys
+    def _eval_commit_reservation(self, keys, args):  # noqa: ANN001, ANN202
+        state_key, index_key, token_key, committed_key = keys
         if not self.exists(token_key):
             return 0
         kind = self._text(self.hget(token_key, "kind"))
@@ -212,8 +212,33 @@ class DeterministicRedis(fakeredis.FakeRedis):
                 f"session:{session_id}:committed_bytes",
                 reserved_bytes,
             )
+            self.hset(
+                committed_key,
+                mapping={
+                    "session_id": session_id,
+                    "bytes": reserved_bytes,
+                },
+            )
+            self.pexpire(committed_key, int(args[1]))
         self._recompute_capacity(state_key, index_key)
         return 1
+
+    def _eval_rollback_commit(self, keys, _args):  # noqa: ANN001, ANN202
+        state_key, committed_key = keys
+        if not self.exists(committed_key):
+            return 0
+        session_id = self._text(self.hget(committed_key, "session_id"))
+        committed_bytes = int(self.hget(committed_key, "bytes"))
+        self.delete(committed_key)
+        self._decrement(
+            state_key,
+            f"session:{session_id}:committed_bytes",
+            committed_bytes,
+        )
+        return 1
+
+    def _eval_finalize_commit(self, keys, _args):  # noqa: ANN001, ANN202
+        return self.delete(keys[0])
 
     def _eval_reconcile_reservations(self, keys, args):  # noqa: ANN001, ANN202
         state_key, index_key = keys
@@ -470,6 +495,113 @@ def test_committed_uploads_retain_session_usage_until_cleanup(
     replacement.release()
 
 
+def test_upload_commit_creates_bounded_marker_with_accounting_metadata(
+    redis_connection: DeterministicRedis,
+) -> None:
+    resources = coordinator(
+        redis_connection,
+        reservation_ttl=1,
+        reservation_heartbeat_interval=3,
+    )
+    reservation = resources.reserve_upload(SESSION_A, 4, free_bytes=100)
+
+    reservation.commit()
+
+    marker_key = f"dt:resource:committed:{reservation.token}"
+    assert redis_connection.hgetall(marker_key) == {
+        b"session_id": SESSION_A.encode(),
+        b"bytes": b"4",
+    }
+    assert 0 < redis_connection.pttl(marker_key) <= 6_000
+
+
+def test_rollback_only_removes_its_committed_upload_usage(
+    redis_connection: DeterministicRedis,
+) -> None:
+    resources = coordinator(redis_connection, max_session_bytes=10)
+    first = resources.reserve_upload(SESSION_A, 4, free_bytes=100)
+    second = resources.reserve_upload(SESSION_A, 3, free_bytes=100)
+    first.commit()
+    second.commit()
+
+    first.rollback()
+
+    replacement = resources.reserve_upload(SESSION_A, 7, free_bytes=100)
+    with pytest.raises(ResourceUnavailableError, match="session"):
+        resources.reserve_upload(SESSION_A, 8, free_bytes=100)
+    replacement.release()
+
+
+def test_committed_upload_rollback_is_idempotent_and_session_isolated(
+    redis_connection: DeterministicRedis,
+) -> None:
+    resources = coordinator(redis_connection, max_session_bytes=5)
+    first = resources.reserve_upload(SESSION_A, 5, free_bytes=100)
+    second = resources.reserve_upload(SESSION_B, 5, free_bytes=100)
+    first.commit()
+    second.commit()
+
+    first.rollback()
+    first.rollback()
+
+    resources.reserve_upload(SESSION_A, 5, free_bytes=100).release()
+    with pytest.raises(ResourceUnavailableError, match="session"):
+        resources.reserve_upload(SESSION_B, 1, free_bytes=100)
+
+
+def test_finalize_discards_marker_without_releasing_committed_usage(
+    redis_connection: DeterministicRedis,
+) -> None:
+    resources = coordinator(redis_connection, max_session_bytes=5)
+    reservation = resources.reserve_upload(SESSION_A, 5, free_bytes=100)
+    reservation.commit()
+
+    reservation.finalize()
+    reservation.finalize()
+    reservation.rollback()
+
+    assert not redis_connection.exists(
+        f"dt:resource:committed:{reservation.token}"
+    )
+    with pytest.raises(ResourceUnavailableError, match="session"):
+        resources.reserve_upload(SESSION_A, 1, free_bytes=100)
+
+
+def test_expired_committed_marker_preserves_usage(
+    redis_connection: DeterministicRedis,
+) -> None:
+    resources = coordinator(redis_connection, max_session_bytes=5)
+    reservation = resources.reserve_upload(SESSION_A, 5, free_bytes=100)
+    reservation.commit()
+    redis_connection.delete(f"dt:resource:committed:{reservation.token}")
+
+    reservation.rollback()
+    reservation.finalize()
+
+    with pytest.raises(ResourceUnavailableError, match="session"):
+        resources.reserve_upload(SESSION_A, 1, free_bytes=100)
+
+
+def test_output_commit_does_not_create_rollback_marker(
+    redis_connection: DeterministicRedis,
+) -> None:
+    resources = coordinator(redis_connection)
+    reservation = resources.reserve_output(
+        "task-1",
+        SESSION_A,
+        4,
+        free_bytes=100,
+    )
+
+    reservation.commit()
+    reservation.rollback()
+    reservation.finalize()
+
+    assert not redis_connection.exists(
+        f"dt:resource:committed:{reservation.token}"
+    )
+
+
 def test_failed_upload_release_frees_reserved_session_capacity(
     redis_connection: DeterministicRedis,
 ) -> None:
@@ -721,6 +853,13 @@ def test_real_redis_executes_reservation_scripts(
     with pytest.raises(ResourceUnavailableError, match="session"):
         resources.reserve_upload(SESSION_A, 5, free_bytes=100)
 
+    upload.rollback()
+    finalized = resources.reserve_upload(SESSION_A, 10, free_bytes=100)
+    finalized.commit()
+    finalized.finalize()
+    with pytest.raises(ResourceUnavailableError, match="session"):
+        resources.reserve_upload(SESSION_A, 1, free_bytes=100)
+
     resources.clear_session_usage(SESSION_A)
     released = resources.reserve_upload(SESSION_A, 10, free_bytes=100)
     released.refresh()
@@ -792,6 +931,18 @@ def test_real_redis_ttl_expiry_is_reconciled(
     assert resources.reconcile_reservations() == 1
     replacement = resources.reserve_upload(SESSION_A, 10, free_bytes=100)
     replacement.release()
+
+    committed = resources.reserve_upload(SESSION_A, 10, free_bytes=100)
+    committed.commit()
+    marker_key = f"dt:resource:committed:{committed.token}"
+    deadline = monotonic() + 1
+    while real_redis_connection.exists(marker_key) and monotonic() < deadline:
+        sleep(0.005)
+
+    assert not real_redis_connection.exists(marker_key)
+    committed.rollback()
+    with pytest.raises(ResourceUnavailableError, match="session"):
+        resources.reserve_upload(SESSION_A, 1, free_bytes=100)
 
 
 def test_context_managers_release_reservation_and_session_lease(
