@@ -147,6 +147,48 @@ npm install
 npm run dev
 ```
 
+## 公网部署
+
+默认 Compose 配置面向至少 8 vCPU、16 GiB 内存和 100 GB SSD 的单机部署。
+部署前，将域名的 A/AAAA 记录指向服务器，并确保公网可访问 80 和 443 端口。
+Caddy 会根据 `.env` 中的 `DOMAIN` 自动申请和续期 HTTPS 证书。
+
+首次部署：
+
+```powershell
+Copy-Item .env.example .env
+docker compose up -d --build
+```
+
+部署前应检查 `.env` 中的域名、安全限制和各服务资源限制。默认配置允许两个
+Worker 各预留最多 5 GiB 输出空间，并始终保留 5 GiB 基础余量，因此两个输出
+任务开始前至少需要 15 GiB 可用磁盘空间。
+
+观察服务状态和应用日志：
+
+```powershell
+docker compose ps
+docker compose logs -f app worker-1 worker-2
+```
+
+升级镜像和应用：
+
+```powershell
+docker compose pull
+docker compose up -d --build
+```
+
+停止服务：
+
+```powershell
+docker compose down
+```
+
+`app_data` 保存上传和输出，`redis_data` 保存队列及任务状态，`caddy_data` 和
+`caddy_config` 保存 Caddy 状态。`docker compose down` 默认保留这些命名
+volume；升级或迁移前应备份它们。不要使用 `docker compose down -v`，除非已
+确认可以永久删除持久数据。
+
 ## 验证
 
 ```powershell
