@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-import warnings
+import struct
+import zlib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -46,6 +47,27 @@ def _write_image(path: Path, size: tuple[int, int]) -> Path:
     return path
 
 
+def _write_png_header(path: Path, size: tuple[int, int]) -> Path:
+    width, height = size
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        payload = kind + data
+        return (
+            struct.pack(">I", len(data))
+            + payload
+            + struct.pack(">I", zlib.crc32(payload))
+        )
+
+    header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    path.write_bytes(
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", header)
+        + chunk(b"IDAT", b"")
+        + chunk(b"IEND", b"")
+    )
+    return path
+
+
 def test_hosted_media_limits_are_frozen_with_compiled_defaults() -> None:
     limits = HostedMediaLimits()
 
@@ -81,25 +103,37 @@ def test_rejects_image_above_pixel_limit(tmp_path: Path) -> None:
     assert "100 pixels" in str(error.value)
 
 
-def test_treats_pillow_decompression_bomb_warning_as_limit_rejection(
+def test_accepts_real_image_header_above_pillow_warning_threshold(
+    tmp_path: Path,
+) -> None:
+    image_path = _write_png_header(tmp_path / "allowed.png", (10_000, 9_000))
+
+    assert HostedMediaValidator().validate(image_path) is None
+
+
+def test_rejects_real_image_header_above_hosted_pixel_limit(tmp_path: Path) -> None:
+    image_path = _write_png_header(tmp_path / "too-large.png", (10_001, 10_000))
+
+    with pytest.raises(MediaLimitError) as error:
+        HostedMediaValidator().validate(image_path)
+
+    assert error.value.reason == "image_pixels_exceeded"
+    assert "100000000 pixels" in str(error.value)
+
+
+def test_treats_pillow_decompression_bomb_error_as_limit_rejection(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     image_path = tmp_path / "bomb.png"
     image_path.write_bytes(b"header")
 
-    def warn_on_open(_path: Path) -> None:
-        warnings.warn(
-            "decompression bomb",
-            Image.DecompressionBombWarning,
-            stacklevel=2,
-        )
+    def fail_on_open(_path: Path) -> None:
+        raise Image.DecompressionBombError("decompression bomb")
 
-    monkeypatch.setattr(Image, "open", warn_on_open)
-    validator = HostedMediaValidator()
-
+    monkeypatch.setattr(Image, "open", fail_on_open)
     with pytest.raises(MediaLimitError) as error:
-        validator.validate(image_path)
+        HostedMediaValidator().validate(image_path)
 
     assert error.value.reason == "image_pixels_exceeded"
 

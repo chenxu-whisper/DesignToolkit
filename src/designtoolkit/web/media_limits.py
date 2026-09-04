@@ -63,10 +63,10 @@ class HostedMediaValidator:
     def _validate_image(self, path: Path) -> None:
         try:
             with warnings.catch_warnings():
-                warnings.simplefilter("error", Image.DecompressionBombWarning)
+                warnings.simplefilter("ignore", Image.DecompressionBombWarning)
                 with Image.open(path) as image:
                     width, height = image.size
-        except (Image.DecompressionBombWarning, Image.DecompressionBombError) as exc:
+        except Image.DecompressionBombError as exc:
             raise MediaLimitError(
                 "image_pixels_exceeded",
                 f"Image exceeds the {self.limits.max_image_pixels} pixels limit",
