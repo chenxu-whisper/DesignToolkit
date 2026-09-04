@@ -24,6 +24,7 @@ from designtoolkit.media_resize import (
     resize_media,
 )
 from designtoolkit.video_frames import ExportResult
+from designtoolkit.web import cleanup as cleanup_module
 from designtoolkit.web import worker as worker_module
 from designtoolkit.web.adapters import media_resize_options_list_from_request
 from designtoolkit.web.hosted import HostedSettings, HostedStorage
@@ -1553,25 +1554,126 @@ def test_real_redis_recovers_committed_enqueue_after_acknowledgement_loss(
 ) -> None:
     manager = _manager(real_redis_connection, tmp_path)
     original_enqueue = manager.queue.enqueue
+    original_confirmation = manager._enqueue_has_authoritative_evidence
+    confirmation_calls = 0
 
     def enqueue_then_lose_ack(*args, **kwargs):
         original_enqueue(*args, **kwargs)
         raise RedisConnectionError("enqueue acknowledgement lost")
 
+    def confirmation_disconnect_once(task_id: str) -> bool:
+        nonlocal confirmation_calls
+        confirmation_calls += 1
+        if confirmation_calls == 1:
+            raise RedisConnectionError("enqueue confirmation unavailable")
+        return original_confirmation(task_id)
+
     monkeypatch.setattr(manager.queue, "enqueue", enqueue_then_lose_ack)
+    monkeypatch.setattr(
+        manager,
+        "_enqueue_has_authoritative_evidence",
+        confirmation_disconnect_once,
+    )
 
     task = manager.create_video_frames_task(
         VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
         owner_id="a" * 32,
     )
 
+    assert real_redis_connection.hgetall(
+        f"dt:enqueue-intent:{task.task_id}"
+    ) == {
+        b"task_id": task.task_id.encode(),
+        b"job_id": task.task_id.encode(),
+        b"slot_reserved": b"1",
+        b"state": b"uncertain",
+    }
+    assert manager.reconcile_tasks(grace_seconds=60) == 0
     assert manager.get_task(task.task_id) == task
     assert manager.task_work(task.task_id) is not None
     assert manager.queue.get_job_ids() == [task.task_id]
     assert Job.exists(task.task_id, real_redis_connection)
+    assert real_redis_connection.exists(
+        f"dt:enqueue-intent:{task.task_id}"
+    ) == 0
     assert real_redis_connection.lrange("dt:queue:reservations", 0, -1) == [
         task.task_id.encode()
     ]
+
+
+def test_real_redis_reconcile_fails_uncommitted_ambiguous_enqueue(
+    real_redis_connection: Redis,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(real_redis_connection, tmp_path)
+    original_confirmation = manager._enqueue_has_authoritative_evidence
+    confirmation_calls = 0
+
+    def enqueue_without_commit(*_args, **_kwargs):
+        raise RedisConnectionError("enqueue disconnected before commit")
+
+    def confirmation_disconnect_once(task_id: str) -> bool:
+        nonlocal confirmation_calls
+        confirmation_calls += 1
+        if confirmation_calls == 1:
+            raise RedisConnectionError("enqueue confirmation unavailable")
+        return original_confirmation(task_id)
+
+    monkeypatch.setattr(manager.queue, "enqueue", enqueue_without_commit)
+    monkeypatch.setattr(
+        manager,
+        "_enqueue_has_authoritative_evidence",
+        confirmation_disconnect_once,
+    )
+
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+        owner_id="a" * 32,
+    )
+
+    assert task.status is TaskStatus.QUEUED
+    assert real_redis_connection.hgetall(
+        f"dt:enqueue-intent:{task.task_id}"
+    ) == {
+        b"task_id": task.task_id.encode(),
+        b"job_id": task.task_id.encode(),
+        b"slot_reserved": b"1",
+        b"state": b"uncertain",
+    }
+    assert manager.reconcile_tasks(grace_seconds=60) == 1
+    failed = manager.get_task(task.task_id)
+    assert failed is not None
+    assert failed.status is TaskStatus.FAILED
+    assert failed.error == "Task enqueue could not be confirmed"
+    assert manager.queue.get_job_ids() == []
+    assert real_redis_connection.llen("dt:queue:reservations") == 0
+    assert real_redis_connection.exists(
+        f"dt:enqueue-intent:{task.task_id}"
+    ) == 0
+
+
+def test_cleanup_once_reclaims_orphaned_real_redis_queue_slot(
+    real_redis_connection: Redis,
+    tmp_path: Path,
+) -> None:
+    redis_url = os.environ.get(
+        "DESIGNTOOLKIT_TEST_REDIS_URL",
+        "redis://localhost:6379/15",
+    )
+    real_redis_connection.rpush("dt:queue:reservations", "orphaned-task")
+
+    cleanup_module.cleanup_once(
+        HostedSettings(
+            enabled=True,
+            data_dir=tmp_path,
+            redis_url=redis_url,
+            max_upload_bytes=1024,
+            retention_seconds=60,
+        )
+    )
+
+    assert real_redis_connection.llen("dt:queue:reservations") == 0
 
 
 def test_real_redis_terminal_cas_and_reconciliation(

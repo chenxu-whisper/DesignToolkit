@@ -90,7 +90,6 @@ class _CleanupClaimHeartbeat:
         self._stopped = Event()
         self._failure: BaseException | None = None
         self._committed = False
-        self._lock = RLock()
         self._thread = Thread(target=self._run, daemon=True)
 
     def __enter__(self) -> _CleanupClaimHeartbeat:
@@ -134,20 +133,25 @@ class _CleanupClaimHeartbeat:
             )
 
     def raise_if_failed(self) -> None:
-        with self._lock:
-            self._raise_if_failed()
-
-    def commit[T](self, action: Callable[[], T]) -> T:
-        with self._lock:
-            self.raise_if_failed()
-            self._raise_if_failed()
-            result = action()
-            self._committed = True
-            return result
-
-    def _raise_if_failed(self) -> None:
         if self._failure is not None:
             raise self._failure
+
+    def commit[T](self, action: Callable[[], T]) -> T:
+        # Rename starts only after every periodic refresh has completed. The
+        # synchronous refresh gives the short rename boundary a full claim TTL.
+        self._stopped.set()
+        self._thread.join()
+        self.raise_if_failed()
+        self._coordinator.refresh_cleanup_claim(
+            self._session_id,
+            self._token,
+        )
+        result = action()
+        self._committed = True
+        self._stopped = Event()
+        self._thread = Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return result
 
     def _run(self) -> None:
         while not self._stopped.wait(self._interval):
@@ -159,8 +163,7 @@ class _CleanupClaimHeartbeat:
                     self._token,
                 )
             except BaseException as exc:
-                with self._lock:
-                    self._failure = exc
+                self._failure = exc
                 return
 
 

@@ -41,6 +41,7 @@ def cleanup_once(settings: HostedSettings) -> int:
         max_upload_bytes=settings.max_upload_bytes,
     )
     manager.reconcile_tasks()
+    manager.reconcile_queue_slots()
     coordinator.reconcile_reservations()
     return storage.cleanup_expired(
         retention_seconds=settings.retention_seconds,

@@ -5,6 +5,7 @@ import os
 import shutil
 import subprocess
 from collections.abc import AsyncIterator
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Event
 from time import sleep
@@ -1081,7 +1082,47 @@ def test_cleanup_aborts_before_rename_when_claim_heartbeat_fails(
     assert coordinator.claims == {}
 
 
-def test_cleanup_failure_injected_after_final_check_blocks_rename(
+def test_cleanup_commit_waits_for_in_flight_claim_failure_and_blocks_rename() -> None:
+    entered_refresh = Event()
+    allow_failure = Event()
+    rename_called = Event()
+
+    class InFlightFailureCoordinator(RecordingCleanupCoordinator):
+        cleanup_claim_heartbeat_interval = 0.001
+
+        def refresh_cleanup_claim(self, session_id: str, token: str) -> None:
+            super().refresh_cleanup_claim(session_id, token)
+            if len(self.refresh_calls) == 2:
+                entered_refresh.set()
+                assert allow_failure.wait(timeout=1)
+                raise ResourceUnavailableError(
+                    "Cleanup claim refresh failed in flight"
+                )
+
+    session_id = "a" * 32
+    coordinator = InFlightFailureCoordinator()
+    token = coordinator.claim_session_cleanup(session_id)
+    assert token is not None
+
+    with pytest.raises(
+        ResourceUnavailableError,
+        match="refresh failed in flight",
+    ):
+        with _CleanupClaimHeartbeat(coordinator, session_id, token) as heartbeat:
+            assert entered_refresh.wait(timeout=1)
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                commit = executor.submit(heartbeat.commit, rename_called.set)
+                try:
+                    assert not rename_called.wait(timeout=0.05)
+                    assert not commit.done()
+                finally:
+                    allow_failure.set()
+                commit.result(timeout=1)
+
+    assert rename_called.is_set() is False
+
+
+def test_cleanup_synchronous_refresh_failure_blocks_rename(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1089,39 +1130,34 @@ def test_cleanup_failure_injected_after_final_check_blocks_rename(
     session_id = "a" * 32
     session_dir = tmp_path / "sessions" / session_id
     session_dir.mkdir(parents=True)
-    coordinator = RecordingCleanupCoordinator()
     rename_called = False
-    failure_checks = 0
-    original_raise_if_failed = _CleanupClaimHeartbeat.raise_if_failed
+
+    class FinalRefreshFailureCoordinator(RecordingCleanupCoordinator):
+        cleanup_claim_heartbeat_interval = 10
+
+        def refresh_cleanup_claim(self, session_id: str, token: str) -> None:
+            super().refresh_cleanup_claim(session_id, token)
+            if len(self.refresh_calls) == 2:
+                raise ResourceUnavailableError(
+                    "Cleanup claim failed before rename"
+                )
+
+    coordinator = FinalRefreshFailureCoordinator()
     monkeypatch.setattr("designtoolkit.web.hosted.time", lambda: 10_000.0)
     monkeypatch.setattr(
         "designtoolkit.web.hosted._directory_modified_at",
         lambda _path: 1_000.0,
     )
 
-    def check_then_inject_failure(heartbeat: _CleanupClaimHeartbeat) -> None:
-        nonlocal failure_checks
-        failure_checks += 1
-        original_raise_if_failed(heartbeat)
-        if failure_checks == 2:
-            heartbeat._failure = ResourceUnavailableError(
-                "Cleanup claim failed after final check"
-            )
-
     def record_replace(_source: Path, _destination: Path) -> None:
         nonlocal rename_called
         rename_called = True
 
-    monkeypatch.setattr(
-        _CleanupClaimHeartbeat,
-        "raise_if_failed",
-        check_then_inject_failure,
-    )
     monkeypatch.setattr("designtoolkit.web.hosted.os.replace", record_replace)
 
     with pytest.raises(
         ResourceUnavailableError,
-        match="failed after final check",
+        match="failed before rename",
     ):
         storage.cleanup_expired(
             retention_seconds=2_000,
@@ -1131,6 +1167,41 @@ def test_cleanup_failure_injected_after_final_check_blocks_rename(
     assert rename_called is False
     assert session_dir.is_dir()
     assert coordinator.claims == {}
+
+
+def test_cleanup_restarts_heartbeat_for_committed_recovery(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    entered_recovery_refresh = Event()
+    allow_failure = Event()
+    rename_called = Event()
+
+    class RecoveryFailureCoordinator(RecordingCleanupCoordinator):
+        cleanup_claim_heartbeat_interval = 0.001
+
+        def refresh_cleanup_claim(self, session_id: str, token: str) -> None:
+            super().refresh_cleanup_claim(session_id, token)
+            if len(self.refresh_calls) == 3:
+                entered_recovery_refresh.set()
+                assert allow_failure.wait(timeout=1)
+                raise ResourceUnavailableError(
+                    "Cleanup claim failed during committed recovery"
+                )
+
+    session_id = "a" * 32
+    coordinator = RecoveryFailureCoordinator()
+    token = coordinator.claim_session_cleanup(session_id)
+    assert token is not None
+    caplog.set_level("WARNING", logger="designtoolkit.web.hosted")
+
+    with _CleanupClaimHeartbeat(coordinator, session_id, token) as heartbeat:
+        heartbeat.commit(rename_called.set)
+        assert rename_called.is_set()
+        assert entered_recovery_refresh.wait(timeout=1)
+        allow_failure.set()
+        heartbeat._thread.join(timeout=1)
+
+    assert "heartbeat failed after committed cleanup" in caplog.text
 
 
 def test_cleanup_raises_heartbeat_failure_recorded_during_context_exit() -> None:
@@ -1157,44 +1228,6 @@ def test_cleanup_raises_heartbeat_failure_recorded_during_context_exit() -> None
             assert entered_refresh.wait(timeout=1)
             heartbeat.raise_if_failed()
             allow_failure.set()
-
-
-def test_cleanup_committed_action_downgrades_late_heartbeat_failure(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    entered_refresh = Event()
-    allow_failure = Event()
-    action_calls = 0
-
-    class LateFailureCoordinator(RecordingCleanupCoordinator):
-        cleanup_claim_heartbeat_interval = 0.001
-
-        def refresh_cleanup_claim(self, session_id: str, token: str) -> None:
-            super().refresh_cleanup_claim(session_id, token)
-            if len(self.refresh_calls) == 2:
-                entered_refresh.set()
-                assert allow_failure.wait(timeout=1)
-                raise ResourceUnavailableError("Cleanup claim failed after rename")
-
-    session_id = "a" * 32
-    coordinator = LateFailureCoordinator()
-    token = coordinator.claim_session_cleanup(session_id)
-    assert token is not None
-    caplog.set_level("WARNING", logger="designtoolkit.web.hosted")
-
-    with _CleanupClaimHeartbeat(coordinator, session_id, token) as heartbeat:
-        assert entered_refresh.wait(timeout=1)
-
-        def irreversible_action() -> None:
-            nonlocal action_calls
-            action_calls += 1
-
-        heartbeat.commit(irreversible_action)
-        allow_failure.set()
-        heartbeat._thread.join(timeout=1)
-
-    assert action_calls == 1
-    assert "heartbeat failed after committed cleanup" in caplog.text
 
 
 def test_cleanup_preserves_body_error_and_records_exit_heartbeat_failure(

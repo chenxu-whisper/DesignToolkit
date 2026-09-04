@@ -34,6 +34,10 @@ def test_cleanup_reconciles_stale_tasks_and_reservations_before_storage(
             events.append("tasks")
             return 1
 
+        def reconcile_queue_slots(self) -> int:
+            events.append("queue-slots")
+            return 0
+
     class FakeStorage:
         def __init__(self, root: Path, *, max_upload_bytes: int) -> None:
             assert root == tmp_path
@@ -79,4 +83,4 @@ def test_cleanup_reconciles_stale_tasks_and_reservations_before_storage(
     )
 
     assert result == 2
-    assert events == ["tasks", "reservations", "cleanup"]
+    assert events == ["tasks", "queue-slots", "reservations", "cleanup"]

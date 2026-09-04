@@ -46,6 +46,7 @@ if TYPE_CHECKING:
 
 _QUEUE_NAME = "designtoolkit"
 _TERMINAL_TTL_SECONDS = 2 * 60 * 60
+_UNCERTAIN_ENQUEUE_ERROR = "Task enqueue could not be confirmed"
 _MARK_RUNNING_SCRIPT = """-- mark_task_running
 local value = redis.call("GET", KEYS[1])
 if not value then
@@ -400,6 +401,9 @@ class RedisTaskManager:
             message = task.error or "Task failed"
             if self._finalize_external_failure(task.task_id, message):
                 reconciled += 1
+        for task_id in self._uncertain_enqueue_task_ids():
+            if self._reconcile_uncertain_enqueue(task_id):
+                reconciled += 1
         for task in self._active_tasks():
             job = self.queue.fetch_job(task.task_id)
             status = job.get_status(refresh=True) if job is not None else None
@@ -562,6 +566,13 @@ class RedisTaskManager:
                 enqueue_error.add_note(
                     f"Enqueue recovery failed with: {recovery_error}"
                 )
+                try:
+                    self._mark_enqueue_uncertain(task.task_id)
+                except Exception as intent_error:
+                    enqueue_error.add_note(
+                        f"Enqueue intent could not be persisted: {intent_error}"
+                    )
+                    raise enqueue_error from intent_error
                 return task
             if enqueue_committed:
                 return task
@@ -577,14 +588,111 @@ class RedisTaskManager:
     def _enqueue_has_authoritative_evidence(self, task_id: str) -> bool:
         pipeline = self._redis.pipeline(transaction=False)
         pipeline.exists(Job.key_for(task_id))
-        pipeline.lpos(self.queue.key, task_id)
         pipeline.get(_task_key(task_id))
-        job_exists, queue_position, task_value = pipeline.execute()
-        if job_exists or queue_position is not None:
+        job_exists, task_value = pipeline.execute()
+        if job_exists:
             return True
         if task_value is None:
             return False
         return _decode_task(task_value).status is not TaskStatus.QUEUED
+
+    def _mark_enqueue_uncertain(self, task_id: str) -> None:
+        pipeline = self._redis.pipeline()
+        pipeline.hset(
+            _enqueue_intent_key(task_id),
+            mapping={
+                "task_id": task_id,
+                "job_id": task_id,
+                "slot_reserved": "1",
+                "state": "uncertain",
+            },
+        )
+        pipeline.expire(_enqueue_intent_key(task_id), self.live_task_ttl)
+        pipeline.execute()
+
+    def _uncertain_enqueue_task_ids(self) -> list[str]:
+        task_ids: list[str] = []
+        for key in self._redis.scan_iter(match="dt:enqueue-intent:*"):
+            key_text = key.decode() if isinstance(key, bytes) else key
+            task_id = key_text.removeprefix("dt:enqueue-intent:")
+            metadata = self._redis.hgetall(key)
+            state = metadata.get(b"state", metadata.get("state"))
+            stored_task_id = metadata.get(b"task_id", metadata.get("task_id"))
+            job_id = metadata.get(b"job_id", metadata.get("job_id"))
+            if (
+                _redis_text(state) == "uncertain"
+                and _redis_text(stored_task_id) == task_id
+                and _redis_text(job_id) == task_id
+            ):
+                task_ids.append(task_id)
+        return task_ids
+
+    def _reconcile_uncertain_enqueue(self, task_id: str) -> bool:
+        task_key = _task_key(task_id)
+        intent_key = _enqueue_intent_key(task_id)
+        job_key = Job.key_for(task_id)
+        event = LogEventResponse(
+            task_id=task_id,
+            timestamp=datetime.now(UTC),
+            level=LogLevel.ERROR,
+            phase=LogPhase.FAILED,
+            message=_UNCERTAIN_ENQUEUE_ERROR,
+            details={},
+        )
+        transitioned = False
+        while True:
+            with self._redis.pipeline() as pipeline:
+                try:
+                    pipeline.watch(task_key, intent_key, job_key)
+                    if not pipeline.exists(intent_key):
+                        pipeline.unwatch()
+                        return False
+                    if pipeline.exists(job_key):
+                        pipeline.multi()
+                        pipeline.delete(intent_key)
+                        pipeline.execute()
+                        return False
+                    value = pipeline.get(task_key)
+                    if value is None:
+                        pipeline.multi()
+                        pipeline.lrem(_queue_reservations_key(), 0, task_id)
+                        pipeline.delete(intent_key)
+                        pipeline.execute()
+                        return False
+                    task = _decode_task(value)
+                    if task.status is not TaskStatus.QUEUED:
+                        pipeline.multi()
+                        pipeline.lrem(_queue_reservations_key(), 0, task_id)
+                        pipeline.delete(intent_key)
+                        pipeline.execute()
+                        return False
+                    task.status = TaskStatus.FAILED
+                    task.error = _UNCERTAIN_ENQUEUE_ERROR
+                    task.finished_at = event.timestamp
+                    pipeline.multi()
+                    pipeline.set(
+                        task_key,
+                        _encode_task(task),
+                        ex=_TERMINAL_TTL_SECONDS,
+                    )
+                    pipeline.expire(
+                        _task_work_key(task_id),
+                        _TERMINAL_TTL_SECONDS,
+                    )
+                    pipeline.rpush(_event_key(task_id), event.model_dump_json())
+                    pipeline.expire(
+                        _event_key(task_id),
+                        _TERMINAL_TTL_SECONDS,
+                    )
+                    pipeline.lrem(_queue_reservations_key(), 0, task_id)
+                    pipeline.delete(intent_key)
+                    pipeline.execute()
+                    transitioned = True
+                    break
+                except WatchError:
+                    continue
+        cleaned = self._cleanup_failed_task(task_id)
+        return transitioned or cleaned
 
     def _release_queue_slot(self, task_id: str) -> None:
         self._redis.lrem(_queue_reservations_key(), 0, task_id)
@@ -875,6 +983,10 @@ def _queue_reservations_key() -> str:
     return "dt:queue:reservations"
 
 
+def _enqueue_intent_key(task_id: str) -> str:
+    return f"dt:enqueue-intent:{task_id}"
+
+
 def _task_resources_key(task_id: str) -> str:
     return f"dt:resource:task:{task_id}"
 
@@ -885,6 +997,12 @@ def _task_work_key(task_id: str) -> str:
 
 def _failure_cleanup_key(task_id: str) -> str:
     return f"dt:failure-cleanup:{task_id}"
+
+
+def _redis_text(value: bytes | str | None) -> str | None:
+    if isinstance(value, bytes):
+        return value.decode()
+    return value
 
 
 def handle_job_failure(

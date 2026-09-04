@@ -4,6 +4,7 @@ import shutil
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from pathlib import Path
+from threading import Event
 from time import monotonic, sleep
 from unittest.mock import Mock
 from urllib.parse import quote
@@ -562,7 +563,7 @@ def test_delete_upload_heartbeat_failure_before_start_preserves_asset_and_usage(
     assert not tombstone.exists()
 
 
-def test_delete_upload_heartbeat_failure_after_barrier_blocks_rename(
+def test_delete_upload_heartbeat_failure_after_quiesce_blocks_rename(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -578,18 +579,18 @@ def test_delete_upload_heartbeat_failure_after_barrier_blocks_rename(
         session_id = owner.cookies["dt_session"]
         asset_path = storage.resolve(session_id, reference)
         coordinator = owner.app.state.resource_coordinator
-        original_barrier = routes_module._SessionLeaseHeartbeat.barrier
+        original_stop = routes_module._SessionLeaseHeartbeat.stop
 
-        def barrier_then_fail(heartbeat) -> None:
-            original_barrier(heartbeat)
+        def stop_then_fail(heartbeat) -> None:
+            original_stop(heartbeat)
             heartbeat._failure = ResourceUnavailableError(
-                "Session lease heartbeat failed after barrier"
+                "Session lease heartbeat failed before rename"
             )
 
         monkeypatch.setattr(
             routes_module._SessionLeaseHeartbeat,
-            "barrier",
-            barrier_then_fail,
+            "stop",
+            stop_then_fail,
         )
 
         response = owner.delete(f"/api/uploads/{asset_id}")
@@ -600,7 +601,7 @@ def test_delete_upload_heartbeat_failure_after_barrier_blocks_rename(
     assert coordinator.release_calls == 0
 
 
-def test_delete_upload_surfaces_heartbeat_failure_during_slow_removal(
+def test_delete_upload_has_no_periodic_refresh_during_slow_removal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -620,25 +621,19 @@ def test_delete_upload_surfaces_heartbeat_failure_during_slow_removal(
         coordinator.lease_acquisitions = 0
         coordinator.lease_refresh_calls = 0
         coordinator.lease_release_calls = 0
-        failure_injected = False
+        refreshes_during_removal: list[tuple[int, int]] = []
 
         def slow_rmtree(
             path: Path,
             *args: object,
             **kwargs: object,
         ) -> None:
-            nonlocal failure_injected
-            if Path(path) == tombstone and not failure_injected:
-                failure_injected = True
+            if Path(path) == tombstone:
                 refresh_calls = coordinator.lease_refresh_calls
-                coordinator.fail_lease_refresh = True
-                deadline = monotonic() + 1
-                while (
-                    coordinator.lease_refresh_calls == refresh_calls
-                    and monotonic() < deadline
-                ):
-                    sleep(0.001)
-                assert coordinator.lease_refresh_calls > refresh_calls
+                sleep(0.04)
+                refreshes_during_removal.append(
+                    (refresh_calls, coordinator.lease_refresh_calls)
+                )
             original_rmtree(path, *args, **kwargs)
 
         monkeypatch.setattr(
@@ -647,15 +642,12 @@ def test_delete_upload_surfaces_heartbeat_failure_during_slow_removal(
         )
 
         response = owner.delete(f"/api/uploads/{asset_id}")
-        coordinator.fail_lease_refresh = False
-        retry = owner.delete(f"/api/uploads/{asset_id}")
-
-    assert response.status_code == 503
-    assert response.json()["error"]["code"] == "storage_unavailable"
-    assert retry.status_code == 204
-    assert coordinator.lease_acquisitions == 2
-    assert coordinator.lease_refresh_calls >= 1
-    assert coordinator.lease_release_calls == 2
+    assert response.status_code == 204
+    assert len(refreshes_during_removal) == 1
+    assert refreshes_during_removal[0][0] >= 3
+    assert refreshes_during_removal[0][0] == refreshes_during_removal[0][1]
+    assert coordinator.lease_acquisitions == 1
+    assert coordinator.lease_release_calls == 1
     assert coordinator.active_leases == 0
     assert not tombstone.exists()
     assert coordinator.committed.get(session_id, 0) == 0
@@ -1152,6 +1144,48 @@ def test_hosted_task_holds_session_lease_through_queue_creation(
     assert coordinator.active_leases == 0
 
 
+def test_session_commit_waits_for_in_flight_refresh_failure_and_blocks_action() -> None:
+    entered_refresh = Event()
+    allow_failure = Event()
+    action_called = Event()
+
+    class InFlightFailureLease:
+        def __init__(self) -> None:
+            self.refresh_calls = 0
+
+        def refresh(self) -> None:
+            self.refresh_calls += 1
+            if self.refresh_calls == 1:
+                entered_refresh.set()
+                assert allow_failure.wait(timeout=1)
+                raise ResourceUnavailableError("Session lease refresh failed in flight")
+
+    lease = InFlightFailureLease()
+    heartbeat = routes_module._SessionLeaseHeartbeat(lease, 0.001)
+    executor = ThreadPoolExecutor(max_workers=1)
+    heartbeat.start()
+    try:
+        assert entered_refresh.wait(timeout=1)
+        commit = executor.submit(
+            heartbeat.commit,
+            lambda: action_called.set(),
+        )
+        try:
+            assert not action_called.wait(timeout=0.05)
+            assert not commit.done()
+        finally:
+            allow_failure.set()
+        with pytest.raises(
+            ResourceUnavailableError,
+            match="refresh failed in flight",
+        ):
+            commit.result(timeout=1)
+    finally:
+        allow_failure.set()
+        heartbeat.stop()
+        executor.shutdown(wait=True)
+
+
 def test_hosted_task_returns_success_after_enqueue_when_late_heartbeat_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1173,11 +1207,10 @@ def test_hosted_task_returns_success_after_enqueue_when_late_heartbeat_fails(
 
     def create_then_fail_heartbeat(*args, **kwargs):
         task = original_create(*args, **kwargs)
+        refresh_calls = coordinator.lease_refresh_calls
         coordinator.fail_lease_refresh = True
-        deadline = monotonic() + 1
-        while coordinator.lease_refresh_calls < 2 and monotonic() < deadline:
-            sleep(0.001)
-        assert coordinator.lease_refresh_calls >= 2
+        sleep(0.04)
+        assert coordinator.lease_refresh_calls == refresh_calls
         return task
 
     monkeypatch.setattr(
@@ -1291,7 +1324,7 @@ def test_hosted_task_heartbeat_failure_after_barrier_rolls_back_before_enqueue(
     assert coordinator.active_leases == 0
 
 
-def test_hosted_task_failure_injected_after_barrier_blocks_enqueue(
+def test_hosted_task_failure_injected_after_quiesce_blocks_enqueue(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1308,18 +1341,18 @@ def test_hosted_task_failure_injected_after_barrier_blocks_enqueue(
         max_session_bytes=1024,
         min_free_bytes=0,
     )
-    original_barrier = routes_module._SessionLeaseHeartbeat.barrier
+    original_stop = routes_module._SessionLeaseHeartbeat.stop
 
-    def barrier_then_fail(heartbeat) -> None:
-        original_barrier(heartbeat)
+    def stop_then_fail(heartbeat) -> None:
+        original_stop(heartbeat)
         heartbeat._failure = ResourceUnavailableError(
-            "Session lease heartbeat failed after barrier"
+            "Session lease heartbeat failed before enqueue"
         )
 
     monkeypatch.setattr(
         routes_module._SessionLeaseHeartbeat,
-        "barrier",
-        barrier_then_fail,
+        "stop",
+        stop_then_fail,
     )
     with _client(
         tmp_path,
@@ -1444,7 +1477,7 @@ def test_hosted_task_returns_handle_when_enqueue_and_confirmation_disconnect(
     assert manager.reconcile_tasks(grace_seconds=60) == 0
 
 
-def test_hosted_task_heartbeats_session_during_slow_enqueue(
+def test_hosted_task_refreshes_once_before_slow_enqueue(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1462,16 +1495,15 @@ def test_hosted_task_heartbeats_session_during_slow_enqueue(
         min_free_bytes=0,
     )
     original_enqueue = manager.queue.enqueue
+    refreshes_during_enqueue: list[tuple[int, int]] = []
 
     def slow_enqueue(*args, **kwargs):
         refresh_calls = coordinator.lease_refresh_calls
-        deadline = monotonic() + 1
-        while (
-            coordinator.lease_refresh_calls == refresh_calls
-            and monotonic() < deadline
-        ):
-            sleep(0.001)
-        assert coordinator.lease_refresh_calls > refresh_calls
+        assert refresh_calls >= 1
+        sleep(0.04)
+        refreshes_during_enqueue.append(
+            (refresh_calls, coordinator.lease_refresh_calls)
+        )
         return original_enqueue(*args, **kwargs)
 
     monkeypatch.setattr(manager.queue, "enqueue", slow_enqueue)
@@ -1490,7 +1522,8 @@ def test_hosted_task_heartbeats_session_during_slow_enqueue(
 
     assert response.status_code == 202
     assert manager.queue.count == 1
-    assert coordinator.lease_refresh_calls >= 2
+    assert len(refreshes_during_enqueue) == 1
+    assert refreshes_during_enqueue[0][0] == refreshes_during_enqueue[0][1]
     assert coordinator.active_leases == 0
 
 

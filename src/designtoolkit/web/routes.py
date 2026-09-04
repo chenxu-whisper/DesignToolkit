@@ -16,7 +16,7 @@ from pathlib import Path
 from queue import Empty
 from shutil import disk_usage
 from stat import S_ISREG
-from threading import BoundedSemaphore, Event, Lock, RLock, Thread
+from threading import BoundedSemaphore, Event, Lock, Thread
 from urllib.parse import unquote
 
 import numpy as np
@@ -130,7 +130,6 @@ class _SessionLeaseHeartbeat:
         self._interval = interval
         self._stopped = Event()
         self._failure: BaseException | None = None
-        self._lock = RLock()
         self._thread = Thread(target=self._run, daemon=True)
 
     def start(self) -> None:
@@ -141,24 +140,16 @@ class _SessionLeaseHeartbeat:
         self._thread.join()
 
     def raise_if_failed(self) -> None:
-        with self._lock:
-            self._raise_if_failed()
-
-    def barrier(self) -> None:
-        with self._lock:
-            self._raise_if_failed()
-            self._lease.refresh()
-            self._raise_if_failed()
-
-    def commit[T](self, action: Callable[[], T]) -> T:
-        with self._lock:
-            self.barrier()
-            self._raise_if_failed()
-            return action()
-
-    def _raise_if_failed(self) -> None:
         if self._failure is not None:
             raise self._failure
+
+    def commit[T](self, action: Callable[[], T]) -> T:
+        # Quiescing removes all in-flight refreshes from the irreversible
+        # boundary. Each later commit gets a fresh full lease TTL before action.
+        self.stop()
+        self.raise_if_failed()
+        self._lease.refresh()
+        return action()
 
     def _run(self) -> None:
         while not self._stopped.wait(self._interval):
@@ -167,8 +158,7 @@ class _SessionLeaseHeartbeat:
             try:
                 self._lease.refresh()
             except BaseException as exc:
-                with self._lock:
-                    self._failure = exc
+                self._failure = exc
                 return
 
 
@@ -177,11 +167,6 @@ class _HostedSessionOperation:
     lease: RedisSessionLease | None = None
     heartbeat: _SessionLeaseHeartbeat | None = None
     committed: bool = False
-
-    def barrier(self) -> None:
-        if self.lease is None or self.heartbeat is None:
-            return
-        self.heartbeat.barrier()
 
     def commit[T](self, action: Callable[[], T]) -> T:
         def commit_action() -> T:
