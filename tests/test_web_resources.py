@@ -12,6 +12,7 @@ from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import RedisError
 
 from designtoolkit.web.resources import (
+    CleanupMarker,
     RedisResourceCoordinator,
     ReservationState,
     ResourceUnavailableError,
@@ -368,7 +369,6 @@ class DeterministicRedis(fakeredis.FakeRedis):
             _generation_id,
             committed_bytes,
             marker_prefix,
-            marker_ttl_ms,
             *asset_ids,
         ) = (str(value) for value in args)
         deleting = self.hget(session_state_key, "deleting")
@@ -379,6 +379,28 @@ class DeterministicRedis(fakeredis.FakeRedis):
         ):
             return 3
         if self.exists(generation_key):
+            marker_type = self.type(generation_key)
+            if marker_type == b"string":
+                self.delete(generation_key)
+                self.hset(
+                    generation_key,
+                    mapping={
+                        "session_id": session_id,
+                        "generation_id": _generation_id,
+                    },
+                )
+            elif marker_type == b"hash":
+                if (
+                    self._text(self.hget(generation_key, "session_id"))
+                    != session_id
+                    or self._text(self.hget(generation_key, "generation_id"))
+                    != _generation_id
+                ):
+                    return 4
+                if self.hget(generation_key, "finalized") != b"1":
+                    self.persist(generation_key)
+            else:
+                return 4
             return 0
         committed_bytes = int(committed_bytes)
         field = f"session:{session_id}:committed_bytes"
@@ -390,7 +412,13 @@ class DeterministicRedis(fakeredis.FakeRedis):
             marker_key = f"{marker_prefix}{session_id}:{asset_id}"
             self.delete(marker_key)
             self.srem(marker_index_key, marker_key)
-        self.set(generation_key, "cleared", px=int(marker_ttl_ms))
+        self.hset(
+            generation_key,
+            mapping={
+                "session_id": session_id,
+                "generation_id": _generation_id,
+            },
+        )
         return 1
 
     def _eval_finalize_session_usage_generation(  # noqa: ANN001, ANN202
@@ -400,6 +428,9 @@ class DeterministicRedis(fakeredis.FakeRedis):
     ):
         if not self.exists(keys[0]):
             return 0
+        if self.hget(keys[0], "finalized") == b"1":
+            return 0
+        self.hset(keys[0], "finalized", 1)
         self.pexpire(keys[0], int(args[0]))
         return 1
 
@@ -414,7 +445,6 @@ class DeterministicRedis(fakeredis.FakeRedis):
             claim_token,
             current_committed_bytes,
             legacy_physical_bytes,
-            marker_ttl_ms,
         ) = (str(value) for value in args)
         deleting = self.hget(session_state_key, "deleting")
         if (
@@ -424,6 +454,10 @@ class DeterministicRedis(fakeredis.FakeRedis):
         ):
             return [3]
         if self.exists(tombstone_key):
+            if self.hget(tombstone_key, "session_id") != session_id.encode():
+                return [2]
+            if self.hget(tombstone_key, "finalized") != b"1":
+                self.persist(tombstone_key)
             return [0, int(self.hget(tombstone_key, "legacy_bytes"))]
         current_committed_bytes = int(current_committed_bytes)
         legacy_physical_bytes = int(legacy_physical_bytes)
@@ -444,12 +478,14 @@ class DeterministicRedis(fakeredis.FakeRedis):
                 "legacy_bytes": legacy_bytes,
             },
         )
-        self.pexpire(tombstone_key, int(marker_ttl_ms))
         return [1, legacy_bytes]
 
     def _eval_finalize_legacy_session_usage(self, keys, args):  # noqa: ANN001, ANN202
         if not self.exists(keys[0]):
             return 0
+        if self.hget(keys[0], "finalized") == b"1":
+            return 0
+        self.hset(keys[0], "finalized", 1)
         self.pexpire(keys[0], int(args[0]))
         return 1
 
@@ -1011,7 +1047,11 @@ def test_generation_cleanup_is_idempotent_and_preserves_new_session_usage(
     resources = coordinator(
         redis_connection,
         max_session_bytes=10,
-        release_marker_ttl=20,
+        reservation_ttl=0.02,
+        lease_ttl=0.02,
+        reservation_heartbeat_interval=0.005,
+        lease_heartbeat_interval=0.005,
+        release_marker_ttl=0.05,
     )
     old_upload = resources.reserve_upload(SESSION_A, 4, free_bytes=100)
     old_upload.commit()
@@ -1020,9 +1060,17 @@ def test_generation_cleanup_is_idempotent_and_preserves_new_session_usage(
     old_claim = resources.claim_session_cleanup(SESSION_A)
     assert old_claim is not None
     generation = resources.capture_session_usage(SESSION_A, old_claim)
+    resources.clear_session_usage_generation(
+        SESSION_A,
+        old_claim,
+        generation,
+    )
+    generation_key = f"dt:resource:cleanup-generation:{generation.generation_id}"
+    assert redis_connection.pttl(generation_key) == -1
     resources.release_cleanup_claim(SESSION_A, old_claim)
+    sleep(0.08)
 
-    new_upload = resources.reserve_upload(SESSION_A, 3, free_bytes=100)
+    new_upload = resources.reserve_upload(SESSION_A, 4, free_bytes=100)
     new_upload.commit()
     new_asset_id = "2" * 32
     resources.release_committed_asset(SESSION_A, new_asset_id, 1)
@@ -1039,16 +1087,42 @@ def test_generation_cleanup_is_idempotent_and_preserves_new_session_usage(
         recovery_claim,
         generation,
     )
-    generation_key = f"dt:resource:cleanup-generation:{generation.generation_id}"
 
     assert resources.is_committed_asset_released(SESSION_A, old_asset_id) is False
     assert resources.is_committed_asset_released(SESSION_A, new_asset_id) is True
-    assert redis_connection.pttl(generation_key) > 19_000
-    resources.reserve_upload(SESSION_A, 8, free_bytes=100).release()
+    assert redis_connection.pttl(generation_key) == -1
+    resources.reserve_upload(SESSION_A, 7, free_bytes=100).release()
     with pytest.raises(ResourceUnavailableError, match="session"):
-        resources.reserve_upload(SESSION_A, 9, free_bytes=100)
+        resources.reserve_upload(SESSION_A, 8, free_bytes=100)
     resources.finalize_session_usage_generation(generation.generation_id)
+    assert 0 < redis_connection.pttl(generation_key) <= 50
     resources.release_cleanup_claim(SESSION_A, recovery_claim)
+
+
+def test_generation_cleanup_migrates_expiring_marker_without_releasing_again(
+    redis_connection: DeterministicRedis,
+) -> None:
+    resources = coordinator(redis_connection, max_session_bytes=10)
+    old_upload = resources.reserve_upload(SESSION_A, 4, free_bytes=100)
+    old_upload.commit()
+    claim = resources.claim_session_cleanup(SESSION_A)
+    assert claim is not None
+    generation = resources.capture_session_usage(SESSION_A, claim)
+    generation_key = f"dt:resource:cleanup-generation:{generation.generation_id}"
+    committed_field = f"session:{SESSION_A}:committed_bytes"
+    redis_connection.hdel("dt:resource:state", committed_field)
+    redis_connection.hset("dt:resource:state", committed_field, 3)
+    redis_connection.set(generation_key, "cleared", px=50)
+
+    resources.clear_session_usage_generation(SESSION_A, claim, generation)
+
+    assert redis_connection.hgetall(generation_key) == {
+        b"session_id": SESSION_A.encode(),
+        b"generation_id": generation.generation_id.encode(),
+    }
+    assert redis_connection.pttl(generation_key) == -1
+    assert int(redis_connection.hget("dt:resource:state", committed_field)) == 3
+    resources.release_cleanup_claim(SESSION_A, claim)
 
 
 @pytest.mark.parametrize(
@@ -1604,10 +1678,20 @@ def test_real_redis_executes_reservation_scripts(
     assert claim is not None
     generation = resources.capture_session_usage(SESSION_A, claim)
     resources.clear_session_usage_generation(SESSION_A, claim, generation)
-    assert real_redis_connection.pttl(
+    generation_key = (
         f"dt:resource:cleanup-generation:{generation.generation_id}"
-    ) > 0
+    )
+    assert real_redis_connection.pttl(generation_key) == -1
+    assert resources.pending_cleanup_markers() == (
+        CleanupMarker(
+            session_id=SESSION_A,
+            generation_id=generation.generation_id,
+            legacy=False,
+        ),
+    )
     resources.finalize_session_usage_generation(generation.generation_id)
+    assert real_redis_connection.pttl(generation_key) > 0
+    assert resources.pending_cleanup_markers() == ()
     resources.release_cleanup_claim(SESSION_A, claim)
 
 
@@ -1790,9 +1874,92 @@ def test_legacy_session_usage_reconcile_is_atomic_and_preserves_current_usage(
     ) == current_bytes
     tombstone_key = f"dt:resource:legacy-cleanup:{generation_id}"
     assert redis_connection.hget(tombstone_key, "session_id") == SESSION_A.encode()
-    assert redis_connection.pttl(tombstone_key) > 19_000
+    assert redis_connection.pttl(tombstone_key) == -1
     resources.finalize_legacy_session_usage(generation_id)
     assert redis_connection.pttl(tombstone_key) > 0
+    resources.release_cleanup_claim(SESSION_A, claim)
+
+
+def test_legacy_cleanup_marker_survives_old_ttl_and_preserves_rebuilt_usage(
+    redis_connection: DeterministicRedis,
+) -> None:
+    resources = coordinator(
+        redis_connection,
+        max_session_bytes=20,
+        reservation_ttl=0.02,
+        lease_ttl=0.02,
+        reservation_heartbeat_interval=0.005,
+        lease_heartbeat_interval=0.005,
+        release_marker_ttl=0.05,
+    )
+    state_key = "dt:resource:state"
+    committed_field = f"session:{SESSION_A}:committed_bytes"
+    generation_id = "1" * 32
+    tombstone_key = f"dt:resource:legacy-cleanup:{generation_id}"
+    redis_connection.hset(state_key, committed_field, 4)
+    claim = resources.claim_session_cleanup(SESSION_A)
+    assert claim is not None
+
+    assert resources.reconcile_legacy_session_usage(
+        SESSION_A,
+        claim,
+        generation_id,
+        current_committed_bytes=0,
+        legacy_physical_bytes=4,
+    ) == 4
+    assert redis_connection.pttl(tombstone_key) == -1
+    resources.release_cleanup_claim(SESSION_A, claim)
+    sleep(0.08)
+
+    redis_connection.hset(state_key, committed_field, 3)
+    recovery_claim = resources.claim_session_cleanup(SESSION_A)
+    assert recovery_claim is not None
+    assert resources.reconcile_legacy_session_usage(
+        SESSION_A,
+        recovery_claim,
+        generation_id,
+        current_committed_bytes=3,
+        legacy_physical_bytes=4,
+    ) == 4
+    assert int(redis_connection.hget(state_key, committed_field)) == 3
+    assert redis_connection.pttl(tombstone_key) == -1
+
+    resources.finalize_legacy_session_usage(generation_id)
+    assert 0 < redis_connection.pttl(tombstone_key) <= 50
+    resources.release_cleanup_claim(SESSION_A, recovery_claim)
+
+
+def test_legacy_cleanup_persists_existing_unfinalized_marker(
+    redis_connection: DeterministicRedis,
+) -> None:
+    resources = coordinator(redis_connection, max_session_bytes=20)
+    state_key = "dt:resource:state"
+    committed_field = f"session:{SESSION_A}:committed_bytes"
+    generation_id = "1" * 32
+    tombstone_key = f"dt:resource:legacy-cleanup:{generation_id}"
+    redis_connection.hset(state_key, committed_field, 3)
+    redis_connection.hset(
+        tombstone_key,
+        mapping={
+            "session_id": SESSION_A,
+            "current_bytes": 0,
+            "legacy_bytes": 4,
+        },
+    )
+    redis_connection.pexpire(tombstone_key, 50)
+    claim = resources.claim_session_cleanup(SESSION_A)
+    assert claim is not None
+
+    assert resources.reconcile_legacy_session_usage(
+        SESSION_A,
+        claim,
+        generation_id,
+        current_committed_bytes=3,
+        legacy_physical_bytes=4,
+    ) == 4
+
+    assert redis_connection.pttl(tombstone_key) == -1
+    assert int(redis_connection.hget(state_key, committed_field)) == 3
     resources.release_cleanup_claim(SESSION_A, claim)
 
 
@@ -1852,13 +2019,18 @@ def test_real_redis_reconciles_legacy_session_usage(
             f"session:{SESSION_A}:committed_bytes",
         )
     ) == 3
-    assert real_redis_connection.pttl(
-        f"dt:resource:legacy-cleanup:{generation_id}"
-    ) > 0
+    tombstone_key = f"dt:resource:legacy-cleanup:{generation_id}"
+    assert real_redis_connection.pttl(tombstone_key) == -1
+    assert resources.pending_cleanup_markers() == (
+        CleanupMarker(
+            session_id=SESSION_A,
+            generation_id=generation_id,
+            legacy=True,
+        ),
+    )
     resources.finalize_legacy_session_usage(generation_id)
-    assert real_redis_connection.pttl(
-        f"dt:resource:legacy-cleanup:{generation_id}"
-    ) > 0
+    assert real_redis_connection.pttl(tombstone_key) > 0
+    assert resources.pending_cleanup_markers() == ()
     resources.release_cleanup_claim(SESSION_A, claim)
 
 

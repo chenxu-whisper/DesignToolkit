@@ -143,10 +143,12 @@ class RecordingCleanupCoordinator:
         *,
         active_sessions: set[str] | None = None,
         committed_bytes: dict[str, int] | None = None,
+        cleanup_markers: list[SimpleNamespace] | None = None,
     ) -> None:
         self.cleanup_claim_heartbeat_interval = 0.01
         self.active_sessions = active_sessions or set()
         self.committed_bytes = committed_bytes if committed_bytes is not None else {}
+        self.cleanup_markers = cleanup_markers or []
         self.claims: dict[str, str] = {}
         self.claim_calls: list[str] = []
         self.refresh_calls: list[tuple[str, str]] = []
@@ -154,6 +156,11 @@ class RecordingCleanupCoordinator:
         self.cleared_sessions: list[str] = []
         self.cleared_generations: set[str] = set()
         self.reconciled_legacy: dict[str, int] = {}
+        self.finalized_generations: list[str] = []
+        self.finalized_legacy: list[str] = []
+
+    def pending_cleanup_markers(self) -> tuple[SimpleNamespace, ...]:
+        return tuple(self.cleanup_markers)
 
     def claim_session_cleanup(self, session_id: str) -> str | None:
         self.claim_calls.append(session_id)
@@ -209,6 +216,7 @@ class RecordingCleanupCoordinator:
 
     def finalize_session_usage_generation(self, generation_id: str) -> None:
         assert generation_id in self.cleared_generations
+        self.finalized_generations.append(generation_id)
 
     def reconcile_legacy_session_usage(
         self,
@@ -236,6 +244,7 @@ class RecordingCleanupCoordinator:
 
     def finalize_legacy_session_usage(self, generation_id: str) -> None:
         assert generation_id in self.reconciled_legacy
+        self.finalized_legacy.append(generation_id)
 
 
 async def _chunks(*values: bytes) -> AsyncIterator[bytes]:
@@ -1381,10 +1390,21 @@ def test_cleanup_preserves_orphaned_quarantine_while_new_lease_is_active(
 ) -> None:
     storage = HostedStorage(tmp_path, max_upload_bytes=16)
     session_id = "a" * 32
-    orphan = tmp_path / ".trash" / f"{session_id}-{'1' * 32}"
+    generation_id = "1" * 32
+    orphan = tmp_path / ".trash" / f"{session_id}-{generation_id}"
     orphan.mkdir(parents=True)
     (orphan / "asset.bin").write_bytes(b"old")
-    coordinator = RecordingCleanupCoordinator(active_sessions={session_id})
+    coordinator = RecordingCleanupCoordinator(
+        active_sessions={session_id},
+        cleanup_markers=[
+            SimpleNamespace(
+                session_id=session_id,
+                generation_id=generation_id,
+                legacy=False,
+            )
+        ],
+    )
+    coordinator.cleared_generations.add(generation_id)
 
     removed = storage.cleanup_expired(
         retention_seconds=2_000,
@@ -1395,6 +1415,40 @@ def test_cleanup_preserves_orphaned_quarantine_while_new_lease_is_active(
     assert orphan.is_dir()
     assert coordinator.claim_calls == [session_id]
     assert coordinator.cleared_sessions == []
+    assert coordinator.finalized_generations == []
+
+
+def test_cleanup_finalizes_markers_left_after_quarantine_deletion(
+    tmp_path: Path,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    session_id = "a" * 32
+    generation_id = "1" * 32
+    legacy_generation_id = "2" * 32
+    coordinator = RecordingCleanupCoordinator(
+        cleanup_markers=[
+            SimpleNamespace(
+                session_id=session_id,
+                generation_id=generation_id,
+                legacy=False,
+            ),
+            SimpleNamespace(
+                session_id=session_id,
+                generation_id=legacy_generation_id,
+                legacy=True,
+            ),
+        ]
+    )
+    coordinator.cleared_generations.add(generation_id)
+    coordinator.reconciled_legacy[legacy_generation_id] = 4
+
+    assert storage.cleanup_expired(
+        retention_seconds=2_000,
+        coordinator=coordinator,
+    ) == 0
+
+    assert coordinator.finalized_generations == [generation_id]
+    assert coordinator.finalized_legacy == [legacy_generation_id]
 
 
 def test_cleanup_deletes_legacy_orphan_without_clearing_recreated_session_usage(

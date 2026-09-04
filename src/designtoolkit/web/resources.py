@@ -524,6 +524,28 @@ if redis.call("EXISTS", KEYS[3]) == 0 then
     return 3
 end
 if redis.call("EXISTS", KEYS[5]) == 1 then
+    local marker_type = redis.call("TYPE", KEYS[5])["ok"]
+    if marker_type == "string" then
+        redis.call("DEL", KEYS[5])
+        redis.call(
+            "HMSET",
+            KEYS[5],
+            "session_id",
+            ARGV[1],
+            "generation_id",
+            ARGV[3]
+        )
+    elseif marker_type == "hash" then
+        if redis.call("HGET", KEYS[5], "session_id") ~= ARGV[1]
+            or redis.call("HGET", KEYS[5], "generation_id") ~= ARGV[3] then
+            return 4
+        end
+        if redis.call("HGET", KEYS[5], "finalized") ~= "1" then
+            redis.call("PERSIST", KEYS[5])
+        end
+    else
+        return 4
+    end
     return 0
 end
 
@@ -540,7 +562,7 @@ else
     redis.call("HDEL", KEYS[1], committed_field)
 end
 
-for index = 7, #ARGV do
+for index = 6, #ARGV do
     local asset_id = ARGV[index]
     local marker_key = ARGV[5] .. ARGV[1] .. ":" .. asset_id
     local marker_session = redis.call("HGET", marker_key, "session_id")
@@ -550,7 +572,14 @@ for index = 7, #ARGV do
         redis.call("SREM", KEYS[4], marker_key)
     end
 end
-redis.call("SET", KEYS[5], "cleared", "PX", ARGV[6])
+redis.call(
+    "HMSET",
+    KEYS[5],
+    "session_id",
+    ARGV[1],
+    "generation_id",
+    ARGV[3]
+)
 return 1
 """
 
@@ -558,6 +587,13 @@ _FINALIZE_SESSION_USAGE_GENERATION_SCRIPT = (
     """-- finalize_session_usage_generation
 if redis.call("EXISTS", KEYS[1]) == 0 then
     return 0
+end
+local marker_type = redis.call("TYPE", KEYS[1])["ok"]
+if marker_type == "hash" then
+    if redis.call("HGET", KEYS[1], "finalized") == "1" then
+        return 0
+    end
+    redis.call("HSET", KEYS[1], "finalized", "1")
 end
 redis.call("PEXPIRE", KEYS[1], tonumber(ARGV[1]))
 return 1
@@ -575,6 +611,9 @@ end
 if redis.call("EXISTS", KEYS[4]) == 1 then
     if redis.call("HGET", KEYS[4], "session_id") ~= ARGV[1] then
         return {2}
+    end
+    if redis.call("HGET", KEYS[4], "finalized") ~= "1" then
+        redis.call("PERSIST", KEYS[4])
     end
     return {
         0,
@@ -606,7 +645,6 @@ redis.call(
     "legacy_bytes",
     legacy_bytes
 )
-redis.call("PEXPIRE", KEYS[4], tonumber(ARGV[5]))
 return {1, legacy_bytes}
 """
 
@@ -614,6 +652,10 @@ _FINALIZE_LEGACY_SESSION_USAGE_SCRIPT = """-- finalize_legacy_session_usage
 if redis.call("EXISTS", KEYS[1]) == 0 then
     return 0
 end
+if redis.call("HGET", KEYS[1], "finalized") == "1" then
+    return 0
+end
+redis.call("HSET", KEYS[1], "finalized", "1")
 redis.call("PEXPIRE", KEYS[1], tonumber(ARGV[1]))
 return 1
 """
@@ -900,6 +942,13 @@ class SessionUsageGeneration:
     generation_id: str
     committed_bytes: int
     released_asset_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class CleanupMarker:
+    session_id: str
+    generation_id: str
+    legacy: bool
 
 
 @dataclass
@@ -1344,7 +1393,6 @@ class RedisResourceCoordinator:
                     generation.generation_id,
                     committed_bytes,
                     _RELEASED_ASSET_PREFIX,
-                    self._release_marker_ttl_ms,
                     *asset_ids,
                 ],
             )
@@ -1355,6 +1403,10 @@ class RedisResourceCoordinator:
             )
         if result == 3:
             raise ResourceUnavailableError("Cleanup claim expired")
+        if result == 4:
+            raise ResourceUnavailableError(
+                "Session usage generation marker is invalid"
+            )
 
     def finalize_session_usage_generation(self, generation_id: str) -> None:
         _validate_token(generation_id)
@@ -1395,7 +1447,6 @@ class RedisResourceCoordinator:
                 claim_token,
                 current_committed_bytes,
                 legacy_physical_bytes,
-                self._release_marker_ttl_ms,
             ],
         )
         code = int(result[0])
@@ -1412,6 +1463,50 @@ class RedisResourceCoordinator:
         self._finalize_legacy_session_usage_script(
             keys=[_legacy_cleanup_key(generation_id)],
             args=[self._release_marker_ttl_ms],
+        )
+
+    def pending_cleanup_markers(self) -> tuple[CleanupMarker, ...]:
+        markers: list[CleanupMarker] = []
+        for prefix, legacy in (
+            (_CLEANUP_GENERATION_PREFIX, False),
+            (_LEGACY_CLEANUP_PREFIX, True),
+        ):
+            for raw_key in self._redis.scan_iter(match=f"{prefix}*"):
+                key = raw_key.decode() if isinstance(raw_key, bytes) else raw_key
+                generation_id = key.removeprefix(prefix)
+                if not _TOKEN_PATTERN.fullmatch(generation_id):
+                    continue
+                marker_type = self._redis.type(key)
+                if isinstance(marker_type, bytes):
+                    marker_type = marker_type.decode()
+                if marker_type != "hash":
+                    continue
+                metadata = self._redis.hgetall(key)
+                if _decoded_hash_value(metadata, "finalized") == "1":
+                    continue
+                session_id = _decoded_hash_value(metadata, "session_id")
+                if session_id is None or not _SESSION_PATTERN.fullmatch(session_id):
+                    continue
+                if not legacy and (
+                    _decoded_hash_value(metadata, "generation_id") != generation_id
+                ):
+                    continue
+                markers.append(
+                    CleanupMarker(
+                        session_id=session_id,
+                        generation_id=generation_id,
+                        legacy=legacy,
+                    )
+                )
+        return tuple(
+            sorted(
+                markers,
+                key=lambda marker: (
+                    marker.session_id,
+                    marker.generation_id,
+                    marker.legacy,
+                ),
+            )
         )
 
     def release_committed_asset(

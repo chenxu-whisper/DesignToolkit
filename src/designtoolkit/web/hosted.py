@@ -26,6 +26,7 @@ from designtoolkit.web.heartbeat import (
 )
 from designtoolkit.web.media_limits import HostedMediaLimits
 from designtoolkit.web.resources import (
+    CleanupMarker,
     RedisReservation,
     RedisResourceCoordinator,
     RedisSessionLease,
@@ -668,6 +669,7 @@ class HostedStorage:
         retention_seconds: int,
         coordinator: RedisResourceCoordinator,
     ) -> int:
+        self._finalize_orphaned_cleanup_markers(coordinator)
         removed = self._cleanup_orphaned_quarantine(coordinator)
         sessions_dir = self.root / "sessions"
         if not sessions_dir.is_dir():
@@ -727,6 +729,27 @@ class HostedStorage:
                     coordinator.release_cleanup_claim(session_id, token)
         self._remove_empty_trash()
         return removed
+
+    def _finalize_orphaned_cleanup_markers(
+        self,
+        coordinator: RedisResourceCoordinator,
+    ) -> None:
+        for marker in coordinator.pending_cleanup_markers():
+            quarantine = (
+                self.root
+                / ".trash"
+                / f"{marker.session_id}-{marker.generation_id}"
+            )
+            if (
+                quarantine.exists()
+                or quarantine.is_symlink()
+                or _session_has_cleanup_generation(self.root, marker)
+            ):
+                continue
+            if marker.legacy:
+                coordinator.finalize_legacy_session_usage(marker.generation_id)
+            else:
+                coordinator.finalize_session_usage_generation(marker.generation_id)
 
     def _cleanup_orphaned_quarantine(
         self,
@@ -911,6 +934,24 @@ def _read_session_usage_generation(
         generation_id=generation_id,
         committed_bytes=committed_bytes,
         released_asset_ids=tuple(sorted(set(released_asset_ids))),
+    )
+
+
+def _session_has_cleanup_generation(root: Path, marker: CleanupMarker) -> bool:
+    metadata_path = (
+        root / "sessions" / marker.session_id / _CLEANUP_GENERATION_NAME
+    )
+    if not metadata_path.exists():
+        return False
+    try:
+        payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+        generation_id = payload["generation_id"]
+    except (OSError, KeyError, TypeError, ValueError):
+        return True
+    return (
+        not isinstance(generation_id, str)
+        or not _SESSION_PATTERN.fullmatch(generation_id)
+        or generation_id == marker.generation_id
     )
 
 
