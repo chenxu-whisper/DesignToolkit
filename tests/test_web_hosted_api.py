@@ -10,6 +10,7 @@ from urllib.parse import quote
 import fakeredis
 import numpy as np
 import pytest
+from fastapi.responses import FileResponse
 from fastapi.testclient import TestClient
 from PIL import Image
 from redis.exceptions import ConnectionError as RedisConnectionError
@@ -78,11 +79,18 @@ class StubReservation:
 
 
 class StubLease:
+    def __init__(self, coordinator: StubCoordinator) -> None:
+        self.coordinator = coordinator
+        self.active = True
+
     def refresh(self) -> None:
-        pass
+        if not self.active:
+            raise ResourceUnavailableError("Session lease expired")
 
     def release(self) -> None:
-        pass
+        if self.active:
+            self.active = False
+            self.coordinator.active_leases -= 1
 
 
 class StubCoordinator:
@@ -104,6 +112,8 @@ class StubCoordinator:
         self.finalize_release_calls = 0
         self.finalized_assets: set[tuple[str, str]] = set()
         self.reserve_calls = 0
+        self.active_leases = 0
+        self.lease_acquisitions = 0
 
     def reserve_upload(
         self,
@@ -126,7 +136,9 @@ class StubCoordinator:
         return StubReservation(self, session_id, requested_bytes)
 
     def acquire_session(self, _session_id: str) -> StubLease:
-        return StubLease()
+        self.active_leases += 1
+        self.lease_acquisitions += 1
+        return StubLease(self)
 
     def release_committed_asset(
         self,
@@ -811,6 +823,55 @@ def test_hosted_upload_reference_can_drive_image_inspection(tmp_path: Path) -> N
     assert stranger_preview.status_code == 404
 
 
+def test_hosted_image_inspection_holds_one_session_lease_during_resolution(
+    tmp_path: Path,
+) -> None:
+    coordinator = StubCoordinator(
+        max_upload_concurrency=4,
+        max_session_bytes=1024,
+        min_free_bytes=0,
+    )
+
+    class LeaseCheckingStorage(HostedStorage):
+        def resolve(self, session_id: str, reference: str) -> Path:
+            assert coordinator.active_leases == 1
+            return super().resolve(session_id, reference)
+
+    storage = LeaseCheckingStorage(tmp_path, max_upload_bytes=1024)
+    with _client(
+        tmp_path,
+        resource_coordinator=coordinator,
+        hosted_storage=storage,
+    ) as client:
+        reference = _upload(client, "screen.png", _png_bytes()).json()["reference"]
+        coordinator.lease_acquisitions = 0
+        response = client.post(
+            "/api/chroma-keyer/images/inspect",
+            json={"input_path": reference},
+        )
+
+    assert response.status_code == 200
+    assert coordinator.lease_acquisitions == 1
+    assert coordinator.active_leases == 0
+
+
+def test_hosted_preview_error_releases_session_lease(tmp_path: Path) -> None:
+    coordinator = StubCoordinator(
+        max_upload_concurrency=4,
+        max_session_bytes=1024,
+        min_free_bytes=0,
+    )
+    with _client(tmp_path, resource_coordinator=coordinator) as client:
+        response = client.post(
+            "/api/chroma-keyer/images/inspect",
+            json={"input_path": f"asset:{'f' * 32}"},
+        )
+
+    assert response.status_code == 404
+    assert coordinator.lease_acquisitions == 1
+    assert coordinator.active_leases == 0
+
+
 def test_hosted_mode_rejects_local_picker_and_oversized_upload(
     tmp_path: Path,
 ) -> None:
@@ -902,6 +963,51 @@ def test_hosted_task_uses_uploaded_asset_and_is_session_isolated(
     assert stranger_status.status_code == 404
 
 
+def test_hosted_task_holds_session_lease_through_queue_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = RedisTaskManager(
+        redis_connection=redis_connection,
+        queue=Queue("designtoolkit", connection=redis_connection),
+        data_dir=tmp_path,
+        max_queued_tasks=20,
+        retention_seconds=7200,
+    )
+    coordinator = StubCoordinator(
+        max_upload_concurrency=4,
+        max_session_bytes=1024,
+        min_free_bytes=0,
+    )
+    original_create = manager.create_video_frames_task
+
+    def create_while_leased(*args, **kwargs):
+        assert coordinator.active_leases == 1
+        return original_create(*args, **kwargs)
+
+    monkeypatch.setattr(
+        manager,
+        "create_video_frames_task",
+        create_while_leased,
+    )
+    with _client(
+        tmp_path,
+        task_manager=manager,
+        resource_coordinator=coordinator,
+    ) as client:
+        reference = _upload(client, "clip.mp4", b"video").json()["reference"]
+        coordinator.lease_acquisitions = 0
+        response = client.post(
+            "/api/tasks/video-frames",
+            json={"input_path": reference, "image_format": "png"},
+        )
+
+    assert response.status_code == 200
+    assert coordinator.lease_acquisitions == 1
+    assert coordinator.active_leases == 0
+
+
 def test_hosted_task_download_is_session_isolated(tmp_path: Path) -> None:
     redis_connection = fakeredis.FakeRedis(decode_responses=False)
     manager = RedisTaskManager(
@@ -933,6 +1039,59 @@ def test_hosted_task_download_is_session_isolated(tmp_path: Path) -> None:
     assert download.status_code == 200
     assert download.content == b"result"
     assert stranger_download.status_code == 404
+
+
+def test_hosted_download_releases_lease_after_response_body(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = RedisTaskManager(
+        redis_connection=redis_connection,
+        queue=Queue("designtoolkit", connection=redis_connection),
+        data_dir=tmp_path,
+        max_queued_tasks=20,
+        retention_seconds=7200,
+    )
+    coordinator = StubCoordinator(
+        max_upload_concurrency=4,
+        max_session_bytes=1024,
+        min_free_bytes=0,
+    )
+    observed: list[tuple[str, int]] = []
+    original_call = FileResponse.__call__
+
+    async def call_while_leased(response, scope, receive, send):
+        observed.append(("before", coordinator.active_leases))
+        await original_call(response, scope, receive, send)
+        observed.append(("after", coordinator.active_leases))
+
+    monkeypatch.setattr(FileResponse, "__call__", call_while_leased)
+    result = tmp_path / "result.png"
+    result.write_bytes(b"result")
+    with _client(
+        tmp_path,
+        task_manager=manager,
+        resource_coordinator=coordinator,
+    ) as client:
+        reference = _upload(client, "clip.mp4", b"video").json()["reference"]
+        task_id = client.post(
+            "/api/tasks/video-frames",
+            json={"input_path": reference, "image_format": "png"},
+        ).json()["task_id"]
+        manager.mark_finished(
+            task_id,
+            status=TaskStatus.SUCCEEDED,
+            output_path=f"/api/tasks/{task_id}/download",
+            result_path=str(result),
+        )
+        coordinator.lease_acquisitions = 0
+        response = client.get(f"/api/tasks/{task_id}/download")
+
+    assert response.status_code == 200
+    assert observed == [("before", 1), ("after", 0)]
+    assert coordinator.lease_acquisitions == 1
+    assert coordinator.active_leases == 0
 
 
 def test_hosted_batch_resize_uses_unique_managed_output_directory(

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 from collections.abc import AsyncIterator
 from pathlib import Path
+from time import sleep
 
 import pytest
 from redis.exceptions import ConnectionError as RedisConnectionError
@@ -113,6 +115,37 @@ class RecordingLease:
 
     def refresh(self) -> None:
         self.refresh_count += 1
+
+
+class RecordingCleanupCoordinator:
+    def __init__(self, *, active_sessions: set[str] | None = None) -> None:
+        self.cleanup_claim_heartbeat_interval = 0.01
+        self.active_sessions = active_sessions or set()
+        self.claims: dict[str, str] = {}
+        self.claim_calls: list[str] = []
+        self.refresh_calls: list[tuple[str, str]] = []
+        self.release_calls: list[tuple[str, str]] = []
+        self.cleared_sessions: list[str] = []
+
+    def claim_session_cleanup(self, session_id: str) -> str | None:
+        self.claim_calls.append(session_id)
+        if session_id in self.active_sessions:
+            return None
+        token = f"{len(self.claims) + 1:032x}"
+        self.claims[session_id] = token
+        return token
+
+    def refresh_cleanup_claim(self, session_id: str, token: str) -> None:
+        assert self.claims.get(session_id) == token
+        self.refresh_calls.append((session_id, token))
+
+    def release_cleanup_claim(self, session_id: str, token: str) -> None:
+        self.release_calls.append((session_id, token))
+        if self.claims.get(session_id) == token:
+            del self.claims[session_id]
+
+    def clear_session_usage(self, session_id: str) -> None:
+        self.cleared_sessions.append(session_id)
 
 
 async def _chunks(*values: bytes) -> AsyncIterator[bytes]:
@@ -658,35 +691,46 @@ def test_cleanup_removes_only_expired_session_directories(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     storage = HostedStorage(tmp_path, max_upload_bytes=16)
-    expired = tmp_path / "sessions" / "expired"
-    current = tmp_path / "sessions" / "current"
+    expired = tmp_path / "sessions" / ("a" * 32)
+    current = tmp_path / "sessions" / ("b" * 32)
+    invalid = tmp_path / "sessions" / "invalid"
     expired.mkdir(parents=True)
     current.mkdir(parents=True)
+    invalid.mkdir(parents=True)
     (expired / "asset.bin").write_bytes(b"old")
     (current / "asset.bin").write_bytes(b"new")
+    (invalid / "asset.bin").write_bytes(b"ignored")
+    coordinator = RecordingCleanupCoordinator()
     monkeypatch.setattr(
         "designtoolkit.web.hosted.time",
         lambda: 10_000.0,
     )
     monkeypatch.setattr(
         "designtoolkit.web.hosted._directory_modified_at",
-        lambda path: 1_000.0 if path.name == "expired" else 9_500.0,
+        lambda path: 1_000.0 if path.name == "a" * 32 else 9_500.0,
     )
 
-    removed = storage.cleanup_expired(retention_seconds=2_000)
+    removed = storage.cleanup_expired(
+        retention_seconds=2_000,
+        coordinator=coordinator,
+    )
 
     assert removed == 1
     assert not expired.exists()
     assert current.is_dir()
+    assert invalid.is_dir()
+    assert coordinator.cleared_sessions == ["a" * 32]
+    assert coordinator.claims == {}
 
 
-def test_cleanup_preserves_expired_session_with_active_task(
+def test_cleanup_preserves_expired_session_with_active_lease(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     storage = HostedStorage(tmp_path, max_upload_bytes=16)
     active = tmp_path / "sessions" / ("a" * 32)
     active.mkdir(parents=True)
+    coordinator = RecordingCleanupCoordinator(active_sessions={"a" * 32})
     monkeypatch.setattr("designtoolkit.web.hosted.time", lambda: 10_000.0)
     monkeypatch.setattr(
         "designtoolkit.web.hosted._directory_modified_at",
@@ -695,11 +739,198 @@ def test_cleanup_preserves_expired_session_with_active_task(
 
     removed = storage.cleanup_expired(
         retention_seconds=2_000,
-        protected_sessions={"a" * 32},
+        coordinator=coordinator,
     )
 
     assert removed == 0
     assert active.is_dir()
+    assert coordinator.claim_calls == ["a" * 32]
+
+
+def test_cleanup_rechecks_recursive_mtime_after_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    session_id = "a" * 32
+    session_dir = tmp_path / "sessions" / session_id
+    session_dir.mkdir(parents=True)
+    coordinator = RecordingCleanupCoordinator()
+    mtimes = iter([1_000.0, 9_500.0])
+    monkeypatch.setattr("designtoolkit.web.hosted.time", lambda: 10_000.0)
+    monkeypatch.setattr(
+        "designtoolkit.web.hosted._directory_modified_at",
+        lambda _path: next(mtimes),
+    )
+
+    removed = storage.cleanup_expired(
+        retention_seconds=2_000,
+        coordinator=coordinator,
+    )
+
+    assert removed == 0
+    assert session_dir.is_dir()
+    assert coordinator.release_calls == [(session_id, "0" * 31 + "1")]
+    assert coordinator.cleared_sessions == []
+
+
+def test_cleanup_rename_failure_releases_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    session_id = "a" * 32
+    session_dir = tmp_path / "sessions" / session_id
+    session_dir.mkdir(parents=True)
+    coordinator = RecordingCleanupCoordinator()
+    monkeypatch.setattr("designtoolkit.web.hosted.time", lambda: 10_000.0)
+    monkeypatch.setattr(
+        "designtoolkit.web.hosted._directory_modified_at",
+        lambda _path: 1_000.0,
+    )
+
+    def fail_replace(_source: Path, _destination: Path) -> None:
+        raise OSError("rename failed")
+
+    monkeypatch.setattr("designtoolkit.web.hosted.os.replace", fail_replace)
+
+    with pytest.raises(OSError, match="rename failed"):
+        storage.cleanup_expired(
+            retention_seconds=2_000,
+            coordinator=coordinator,
+        )
+
+    assert session_dir.is_dir()
+    assert coordinator.release_calls == [(session_id, "0" * 31 + "1")]
+    assert coordinator.claims == {}
+
+
+def test_cleanup_retries_orphaned_quarantine_without_session_state(
+    tmp_path: Path,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    orphan = tmp_path / ".trash" / f"{'a' * 32}-{'1' * 32}"
+    orphan.mkdir(parents=True)
+    (orphan / "asset.bin").write_bytes(b"old")
+    coordinator = RecordingCleanupCoordinator()
+
+    removed = storage.cleanup_expired(
+        retention_seconds=2_000,
+        coordinator=coordinator,
+    )
+
+    assert removed == 1
+    assert not orphan.exists()
+    assert coordinator.claim_calls == []
+
+
+def test_cleanup_retries_quarantine_after_transient_delete_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    orphan = tmp_path / ".trash" / f"{'a' * 32}-{'1' * 32}"
+    orphan.mkdir(parents=True)
+    (orphan / "asset.bin").write_bytes(b"old")
+    coordinator = RecordingCleanupCoordinator()
+    original_rmtree = shutil.rmtree
+    attempts = 0
+
+    def transient_failure(path: Path) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("file is busy")
+        original_rmtree(path)
+
+    monkeypatch.setattr(
+        "designtoolkit.web.hosted.shutil.rmtree",
+        transient_failure,
+    )
+
+    first_removed = storage.cleanup_expired(
+        retention_seconds=2_000,
+        coordinator=coordinator,
+    )
+    second_removed = storage.cleanup_expired(
+        retention_seconds=2_000,
+        coordinator=coordinator,
+    )
+
+    assert first_removed == 0
+    assert second_removed == 1
+    assert not orphan.exists()
+
+
+def test_cleanup_refreshes_claim_during_slow_recursive_delete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    session_id = "a" * 32
+    session_dir = tmp_path / "sessions" / session_id
+    session_dir.mkdir(parents=True)
+    coordinator = RecordingCleanupCoordinator()
+    original_rmtree = shutil.rmtree
+    monkeypatch.setattr("designtoolkit.web.hosted.time", lambda: 10_000.0)
+    monkeypatch.setattr(
+        "designtoolkit.web.hosted._directory_modified_at",
+        lambda _path: 1_000.0,
+    )
+
+    def slow_rmtree(path: Path) -> None:
+        sleep(0.04)
+        original_rmtree(path)
+
+    monkeypatch.setattr("designtoolkit.web.hosted.shutil.rmtree", slow_rmtree)
+
+    removed = storage.cleanup_expired(
+        retention_seconds=2_000,
+        coordinator=coordinator,
+    )
+
+    assert removed == 1
+    assert len(coordinator.refresh_calls) >= 2
+
+
+def test_cleanup_recovers_trash_after_crash_following_rename(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    session_id = "a" * 32
+    session_dir = tmp_path / "sessions" / session_id
+    session_dir.mkdir(parents=True)
+
+    class CrashingCoordinator(RecordingCleanupCoordinator):
+        def clear_session_usage(self, session_id: str) -> None:
+            super().clear_session_usage(session_id)
+            raise RuntimeError("cleanup process crashed")
+
+    coordinator = CrashingCoordinator()
+    monkeypatch.setattr("designtoolkit.web.hosted.time", lambda: 10_000.0)
+    monkeypatch.setattr(
+        "designtoolkit.web.hosted._directory_modified_at",
+        lambda _path: 1_000.0,
+    )
+
+    with pytest.raises(RuntimeError, match="cleanup process crashed"):
+        storage.cleanup_expired(
+            retention_seconds=2_000,
+            coordinator=coordinator,
+        )
+
+    assert not session_dir.exists()
+    assert len(list((tmp_path / ".trash").iterdir())) == 1
+    assert coordinator.claims == {}
+
+    removed = storage.cleanup_expired(
+        retention_seconds=2_000,
+        coordinator=RecordingCleanupCoordinator(),
+    )
+
+    assert removed == 1
+    assert not (tmp_path / ".trash").exists()
 
 
 def test_directory_result_is_packaged_as_a_zip(tmp_path: Path) -> None:

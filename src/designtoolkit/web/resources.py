@@ -827,6 +827,8 @@ class RedisResourceCoordinator:
             max(lease_ttl, 2 * lease_heartbeat_interval),
             "lease_ttl",
         )
+        self.session_lease_heartbeat_interval = lease_heartbeat_interval
+        self.cleanup_claim_heartbeat_interval = lease_heartbeat_interval
         marker_ttl = (
             max(reservation_ttl, lease_ttl)
             if release_marker_ttl is None

@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from math import isfinite
 from pathlib import Path
 from stat import S_ISDIR, S_ISLNK, S_ISREG
-from threading import RLock
+from threading import Event, RLock, Thread
 from time import time
 from unicodedata import category
 from urllib.parse import quote
@@ -21,6 +21,7 @@ from redis.exceptions import RedisError
 from designtoolkit.web.media_limits import HostedMediaLimits
 from designtoolkit.web.resources import (
     RedisReservation,
+    RedisResourceCoordinator,
     RedisSessionLease,
     ReservationState,
     ResourceUnavailableError,
@@ -53,6 +54,7 @@ _ALLOWED_SUFFIXES = frozenset(
     }
 )
 _SESSION_PATTERN = re.compile(r"^[a-f0-9]{32}$")
+_QUARANTINE_PATTERN = re.compile(r"^[a-f0-9]{32}-[a-f0-9]{32}$")
 _ASSET_REFERENCE_PATTERN = re.compile(
     r"^asset:(?P<asset_id>[a-f0-9]{32})(?::[^:]*)?$"
 )
@@ -66,6 +68,46 @@ class AssetDeletionStateError(OSError):
     def __init__(self, asset_id: str) -> None:
         super().__init__("Asset deletion state is invalid")
         self.asset_id = asset_id
+
+
+class _CleanupClaimHeartbeat:
+    def __init__(
+        self,
+        coordinator: RedisResourceCoordinator,
+        session_id: str,
+        token: str,
+    ) -> None:
+        self._coordinator = coordinator
+        self._session_id = session_id
+        self._token = token
+        self._interval = coordinator.cleanup_claim_heartbeat_interval
+        self._stopped = Event()
+        self._failure: BaseException | None = None
+        self._thread = Thread(target=self._run, daemon=True)
+
+    def __enter__(self) -> _CleanupClaimHeartbeat:
+        self._coordinator.refresh_cleanup_claim(self._session_id, self._token)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self._stopped.set()
+        self._thread.join()
+
+    def raise_if_failed(self) -> None:
+        if self._failure is not None:
+            raise self._failure
+
+    def _run(self) -> None:
+        while not self._stopped.wait(self._interval):
+            try:
+                self._coordinator.refresh_cleanup_claim(
+                    self._session_id,
+                    self._token,
+                )
+            except BaseException as exc:
+                self._failure = exc
+                return
 
 
 @dataclass(frozen=True)
@@ -431,24 +473,73 @@ class HostedStorage:
         self,
         *,
         retention_seconds: int,
-        protected_sessions: set[str] | None = None,
+        coordinator: RedisResourceCoordinator,
     ) -> int:
+        removed = self._cleanup_orphaned_quarantine()
         sessions_dir = self.root / "sessions"
         if not sessions_dir.is_dir():
-            return 0
+            return removed
         cutoff = time() - retention_seconds
-        protected = protected_sessions or set()
-        removed = 0
         for session_dir in sessions_dir.iterdir():
             if (
-                session_dir.is_dir()
-                and session_dir.name not in protected
-                and _directory_modified_at(session_dir) < cutoff
+                not session_dir.is_dir()
+                or not _SESSION_PATTERN.fullmatch(session_dir.name)
+                or _directory_modified_at(session_dir) >= cutoff
             ):
-                shutil.rmtree(session_dir, ignore_errors=True)
-                if not session_dir.exists():
+                continue
+            session_id = session_dir.name
+            token = coordinator.claim_session_cleanup(session_id)
+            if token is None:
+                continue
+            try:
+                if _directory_modified_at(session_dir) >= cutoff:
+                    continue
+                trash_dir = self.root / ".trash"
+                trash_dir.mkdir(parents=True, exist_ok=True)
+                quarantine = trash_dir / f"{session_id}-{token}"
+                os.replace(session_dir, quarantine)
+                with _CleanupClaimHeartbeat(
+                    coordinator,
+                    session_id,
+                    token,
+                ) as heartbeat:
+                    coordinator.clear_session_usage(session_id)
+                    quarantine_removed = self._delete_quarantine(quarantine)
+                    heartbeat.raise_if_failed()
+                if quarantine_removed:
                     removed += 1
+            finally:
+                coordinator.release_cleanup_claim(session_id, token)
+        self._remove_empty_trash()
         return removed
+
+    def _cleanup_orphaned_quarantine(self) -> int:
+        trash_dir = self.root / ".trash"
+        if not trash_dir.is_dir():
+            return 0
+        removed = 0
+        for quarantine in trash_dir.iterdir():
+            if (
+                quarantine.is_dir()
+                and _QUARANTINE_PATTERN.fullmatch(quarantine.name)
+            ):
+                if self._delete_quarantine(quarantine):
+                    removed += 1
+        self._remove_empty_trash()
+        return removed
+
+    @staticmethod
+    def _delete_quarantine(quarantine: Path) -> bool:
+        try:
+            shutil.rmtree(quarantine)
+        except OSError:
+            return False
+        return not quarantine.exists()
+
+    def _remove_empty_trash(self) -> None:
+        trash_dir = self.root / ".trash"
+        if trash_dir.is_dir() and not any(trash_dir.iterdir()):
+            trash_dir.rmdir()
 
     def _session_dir(self, session_id: str) -> Path:
         return self.root / "sessions" / session_id

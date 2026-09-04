@@ -16,7 +16,7 @@ from pathlib import Path
 from queue import Empty
 from shutil import disk_usage
 from stat import S_ISREG
-from threading import BoundedSemaphore, Lock
+from threading import BoundedSemaphore, Event, Lock, Thread
 from urllib.parse import unquote
 
 import numpy as np
@@ -24,6 +24,7 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from PIL import Image
 from redis.exceptions import RedisError
+from starlette.background import BackgroundTask
 
 from designtoolkit.chroma_keyer.core import key_rgb
 from designtoolkit.chroma_keyer.image_io import (
@@ -68,6 +69,7 @@ from designtoolkit.web.native_picker import (
 from designtoolkit.web.resources import (
     AssetReleaseMismatchError,
     RedisResourceCoordinator,
+    RedisSessionLease,
     ResourceUnavailableError,
 )
 from designtoolkit.web.schemas import (
@@ -120,6 +122,28 @@ _KEYER_ERROR_CODES = {
     "Final output directory already exists": "output_exists",
 }
 _LOGGER = logging.getLogger(__name__)
+
+
+class _SessionLeaseHeartbeat:
+    def __init__(self, lease: RedisSessionLease, interval: float) -> None:
+        self._lease = lease
+        self._interval = interval
+        self._stopped = Event()
+        self._thread = Thread(target=self._run, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stopped.set()
+        self._thread.join()
+
+    def _run(self) -> None:
+        while not self._stopped.wait(self._interval):
+            try:
+                self._lease.refresh()
+            except ResourceUnavailableError:
+                return
 
 
 class _BoundedSingleFlightCache[CacheKey: Hashable, CacheValue]:
@@ -754,6 +778,40 @@ def create_router(
         finally:
             preview_semaphore.release()
 
+    def hosted_session_operation(
+        http_request: Request,
+    ) -> Iterator[RedisSessionLease | None]:
+        if storage is None or resources is None:
+            yield None
+            return
+        try:
+            lease = resources.acquire_session(http_request.state.session_id)
+        except ResourceUnavailableError as exc:
+            raise ApiError("storage_unavailable", str(exc), 503) from exc
+        heartbeat = _SessionLeaseHeartbeat(
+            lease,
+            getattr(resources, "session_lease_heartbeat_interval", 5.0),
+        )
+        heartbeat.start()
+        try:
+            yield lease
+        finally:
+            heartbeat.stop()
+            _release_redis_resource_best_effort(
+                lease.release,
+                "hosted session lease",
+            )
+
+    def release_response_lease(
+        lease: RedisSessionLease,
+        heartbeat: _SessionLeaseHeartbeat,
+    ) -> None:
+        heartbeat.stop()
+        _release_redis_resource_best_effort(
+            lease.release,
+            "download session lease",
+        )
+
     def resolve_input_references(
         http_request: Request,
         references: list[str],
@@ -1089,7 +1147,11 @@ def create_router(
             cancelled=len(paths) == 0,
         )
 
-    @router.post("/tasks/video-frames", response_model=TaskCreateResponse)
+    @router.post(
+        "/tasks/video-frames",
+        response_model=TaskCreateResponse,
+        dependencies=[Depends(hosted_session_operation)],
+    )
     def create_video_frames(
         payload: VideoFramesTaskRequest,
         http_request: Request,
@@ -1109,7 +1171,11 @@ def create_router(
             raise
         return TaskCreateResponse(task_id=task.task_id, status=task.status)
 
-    @router.post("/tasks/media-resize", response_model=TaskCreateResponse)
+    @router.post(
+        "/tasks/media-resize",
+        response_model=TaskCreateResponse,
+        dependencies=[Depends(hosted_session_operation)],
+    )
     def create_media_resize(
         payload: MediaResizeTaskRequest,
         http_request: Request,
@@ -1129,7 +1195,11 @@ def create_router(
             raise
         return TaskCreateResponse(task_id=task.task_id, status=task.status)
 
-    @router.post("/tasks/chroma-keyer", response_model=TaskCreateResponse)
+    @router.post(
+        "/tasks/chroma-keyer",
+        response_model=TaskCreateResponse,
+        dependencies=[Depends(hosted_session_operation)],
+    )
     def create_chroma_keyer(
         payload: ChromaKeyerTaskRequest,
         http_request: Request,
@@ -1149,7 +1219,11 @@ def create_router(
             raise
         return TaskCreateResponse(task_id=task.task_id, status=task.status)
 
-    @router.post("/tasks/chroma-keyer-video", response_model=TaskCreateResponse)
+    @router.post(
+        "/tasks/chroma-keyer-video",
+        response_model=TaskCreateResponse,
+        dependencies=[Depends(hosted_session_operation)],
+    )
     def create_chroma_video_keyer(
         payload: ChromaVideoKeyerTaskRequest,
         http_request: Request,
@@ -1172,7 +1246,10 @@ def create_router(
     @router.post(
         "/chroma-keyer/images/inspect",
         response_model=ChromaImageInspectResponse,
-        dependencies=[Depends(preview_capacity)],
+        dependencies=[
+            Depends(preview_capacity),
+            Depends(hosted_session_operation),
+        ],
     )
     def inspect_chroma_image(
         payload: ChromaImageInspectRequest,
@@ -1207,7 +1284,10 @@ def create_router(
     @router.post(
         "/chroma-keyer/videos/inspect",
         response_model=ChromaVideoInspectResponse,
-        dependencies=[Depends(preview_capacity)],
+        dependencies=[
+            Depends(preview_capacity),
+            Depends(hosted_session_operation),
+        ],
     )
     def inspect_chroma_video(
         payload: ChromaVideoInspectRequest,
@@ -1247,7 +1327,10 @@ def create_router(
     @router.post(
         "/chroma-keyer/videos/frame",
         response_model=ChromaVideoFrameResponse,
-        dependencies=[Depends(preview_capacity)],
+        dependencies=[
+            Depends(preview_capacity),
+            Depends(hosted_session_operation),
+        ],
     )
     def create_chroma_video_frame(
         payload: ChromaVideoFrameRequest,
@@ -1277,7 +1360,10 @@ def create_router(
     @router.post(
         "/chroma-keyer/videos/sample",
         response_model=ChromaVideoSampleResponse,
-        dependencies=[Depends(preview_capacity)],
+        dependencies=[
+            Depends(preview_capacity),
+            Depends(hosted_session_operation),
+        ],
     )
     def sample_chroma_video(
         payload: ChromaVideoSampleRequest,
@@ -1325,7 +1411,10 @@ def create_router(
     @router.post(
         "/chroma-keyer/videos/preview",
         response_model=ChromaVideoPreviewResponse,
-        dependencies=[Depends(preview_capacity)],
+        dependencies=[
+            Depends(preview_capacity),
+            Depends(hosted_session_operation),
+        ],
     )
     def create_chroma_video_preview(
         payload: ChromaVideoPreviewRequest,
@@ -1369,7 +1458,10 @@ def create_router(
     @router.post(
         "/chroma-keyer/images/sample",
         response_model=ChromaSampleResponse,
-        dependencies=[Depends(preview_capacity)],
+        dependencies=[
+            Depends(preview_capacity),
+            Depends(hosted_session_operation),
+        ],
     )
     def sample_chroma_image(
         payload: ChromaSampleRequest,
@@ -1410,12 +1502,18 @@ def create_router(
     @router.post(
         "/chroma-keyer/preview",
         response_model=ChromaPreviewResponse,
-        dependencies=[Depends(preview_capacity)],
+        dependencies=[
+            Depends(preview_capacity),
+            Depends(hosted_session_operation),
+        ],
     )
     @router.post(
         "/chroma-keyer/previews",
         response_model=ChromaPreviewResponse,
-        dependencies=[Depends(preview_capacity)],
+        dependencies=[
+            Depends(preview_capacity),
+            Depends(hosted_session_operation),
+        ],
     )
     def create_chroma_preview(
         payload: ChromaPreviewRequest,
@@ -1483,7 +1581,7 @@ def create_router(
         task_id: str,
         http_request: Request,
     ) -> FileResponse:
-        if storage is None:
+        if storage is None or resources is None:
             raise ApiError("hosted_mode_disabled", "Downloads are unavailable", 404)
         task = task_manager.get_task(
             task_id,
@@ -1492,13 +1590,31 @@ def create_router(
         if task is None or task.status.value != "succeeded":
             raise ApiError("task_not_found", f"Task not found: {task_id}", 404)
         try:
+            lease = resources.acquire_session(http_request.state.session_id)
+        except ResourceUnavailableError as exc:
+            raise ApiError("storage_unavailable", str(exc), 503) from exc
+        heartbeat = _SessionLeaseHeartbeat(
+            lease,
+            getattr(resources, "session_lease_heartbeat_interval", 5.0),
+        )
+        heartbeat.start()
+        try:
             result_path = storage.validated_result_path(task.result_path)
         except UploadRejectedError as exc:
+            release_response_lease(lease, heartbeat)
             raise ApiError("result_not_found", str(exc), 404) from exc
+        except BaseException:
+            release_response_lease(lease, heartbeat)
+            raise
         return FileResponse(
             result_path,
             filename=result_path.name,
             media_type="application/octet-stream",
+            background=BackgroundTask(
+                release_response_lease,
+                lease,
+                heartbeat,
+            ),
         )
 
     @router.get("/tasks/{task_id}/events")

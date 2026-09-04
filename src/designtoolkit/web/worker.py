@@ -4,6 +4,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from shutil import disk_usage, rmtree
+from threading import Event, Thread
 
 from redis import Redis
 from rq import Queue
@@ -292,6 +293,28 @@ class _HeartbeatOutputBudgetGuard(OutputBudgetGuard):
         super().check_tree()
 
 
+class _PeriodicResourceHeartbeat:
+    def __init__(self, heartbeat: Callable[[], None], interval: float) -> None:
+        self._heartbeat = heartbeat
+        self._interval = interval
+        self._stopped = Event()
+        self._thread = Thread(target=self._run, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stopped.set()
+        self._thread.join()
+
+    def _run(self) -> None:
+        while not self._stopped.wait(self._interval):
+            try:
+                self._heartbeat()
+            except Exception:
+                return
+
+
 def _build_resource_coordinator(
     settings: HostedSettings,
     redis_connection: Redis,
@@ -355,6 +378,7 @@ def run_task(task_id: str, job_kind: str, payload: dict[str, object]) -> None:
         return
     lease: RedisSessionLease | None = None
     output: RedisReservation | None = None
+    periodic_heartbeat: _PeriodicResourceHeartbeat | None = None
 
     def heartbeat() -> None:
         if output is not None:
@@ -378,12 +402,19 @@ def run_task(task_id: str, job_kind: str, payload: dict[str, object]) -> None:
             free_bytes=disk_usage(settings.data_dir).free,
             min_free_bytes=settings.min_free_bytes,
         )
+        periodic_heartbeat = _PeriodicResourceHeartbeat(
+            heartbeat,
+            resources.session_lease_heartbeat_interval,
+        )
+        periodic_heartbeat.start()
         request = _task_request(job_kind, payload)
         executor.execute_reserved_task(task, request)
     except Exception as exc:
         executor._discard_partial_output()
         state._finalize_external_failure(task_id, str(exc))
     finally:
+        if periodic_heartbeat is not None:
+            periodic_heartbeat.stop()
         if output is not None:
             output.release()
         if lease is not None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -72,6 +73,7 @@ class TrackingTaskResources:
         self.events: list[str] = []
         self.lease = TrackingHandle("lease", self.events)
         self.output = TrackingHandle("output", self.events)
+        self.session_lease_heartbeat_interval = 5.0
 
     def acquire_session(self, session_id: str, *, task_id: str):
         self.events.append(f"acquire:{task_id}:{session_id}")
@@ -311,6 +313,62 @@ def test_run_task_reserves_refreshes_and_releases_worker_resources(
         "release:lease",
     ]
     assert manager.get_task(task.task_id).status is TaskStatus.SUCCEEDED
+
+
+def test_run_task_heartbeats_resources_during_slow_processing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    settings = _hosted_settings(tmp_path)
+    manager = _manager(redis_connection, tmp_path)
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+        owner_id="a" * 32,
+    )
+    resources = TrackingTaskResources()
+    resources.session_lease_heartbeat_interval = 0.01
+    monkeypatch.setattr(worker_module.HostedSettings, "from_env", lambda: settings)
+    monkeypatch.setattr(
+        worker_module.Redis,
+        "from_url",
+        lambda _url: redis_connection,
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "_build_resource_coordinator",
+        lambda _settings, _connection: resources,
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "disk_usage",
+        lambda _path: type("Usage", (), {"free": 20})(),
+    )
+
+    def execute(executor, reserved_task, _request) -> None:
+        time.sleep(0.04)
+        executor.mark_finished(
+            reserved_task.task_id,
+            status=TaskStatus.SUCCEEDED,
+        )
+
+    monkeypatch.setattr(
+        worker_module.RedisTaskExecutor,
+        "execute_reserved_task",
+        execute,
+    )
+
+    worker_module.run_task(
+        task.task_id,
+        "video_frames",
+        VideoFramesTaskRequest(
+            input_path=str(tmp_path / "clip.mp4")
+        ).model_dump(mode="json"),
+    )
+
+    assert resources.events.count("refresh:lease") >= 2
+    assert resources.events.count("refresh:output") >= 2
+    assert resources.events[-2:] == ["release:output", "release:lease"]
 
 
 def test_run_task_stops_before_resource_mutation_when_start_is_rejected(
