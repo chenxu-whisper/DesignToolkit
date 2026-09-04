@@ -1,3 +1,9 @@
+"""Coordinate hosted resources using standalone Redis Lua scripts.
+
+The scripts target the standalone Redis instance used by Docker Compose. Redis
+Cluster support is intentionally out of scope.
+"""
+
 from __future__ import annotations
 
 import math
@@ -482,8 +488,22 @@ if tonumber(redis.call("HGET", state_key, "active_count") or "0") ~= 0 then
 end
 
 redis.call("HSET", state_key, "deleting", token)
-redis.call("SET", cleanup_key, "1")
+redis.call("SET", cleanup_key, "1", "PX", tonumber(ARGV[2]))
 return 0
+"""
+
+_REFRESH_CLEANUP_SCRIPT = """-- refresh_cleanup
+local state_key = KEYS[1]
+local cleanup_key = KEYS[2]
+local deleting = redis.call("HGET", state_key, "deleting")
+if not deleting or deleting ~= ARGV[1] then
+    return 0
+end
+if redis.call("EXISTS", cleanup_key) == 0 then
+    return 0
+end
+redis.call("PEXPIRE", cleanup_key, tonumber(ARGV[2]))
+return 1
 """
 
 _RELEASE_CLEANUP_SCRIPT = """-- release_cleanup
@@ -519,6 +539,7 @@ class RedisReservation:
         self.coordinator._refresh_reservation(self)
 
     def commit(self) -> None:
+        """Consume this reservation once; repeated or expired commits fail."""
         self.coordinator._commit_reservation(self)
 
     def release(self) -> None:
@@ -617,6 +638,9 @@ class RedisResourceCoordinator:
             _RELEASE_SESSION_SCRIPT
         )
         self._claim_cleanup_script = self._redis.register_script(_CLAIM_CLEANUP_SCRIPT)
+        self._refresh_cleanup_script = self._redis.register_script(
+            _REFRESH_CLEANUP_SCRIPT
+        )
         self._release_cleanup_script = self._redis.register_script(
             _RELEASE_CLEANUP_SCRIPT
         )
@@ -753,6 +777,21 @@ class RedisResourceCoordinator:
         )
         return token if result == 0 else None
 
+    def refresh_cleanup_claim(self, session_id: str, token: str) -> None:
+        _validate_session_id(session_id)
+        refreshed = self._refresh_cleanup_script(
+            keys=[
+                _session_state_key(session_id),
+                _cleanup_key(token),
+            ],
+            args=[
+                token,
+                self._lease_ttl_ms,
+            ],
+        )
+        if not refreshed:
+            raise ResourceUnavailableError("Cleanup claim expired")
+
     def release_cleanup_claim(self, session_id: str, token: str) -> None:
         _validate_session_id(session_id)
         self._release_cleanup_script(
@@ -804,14 +843,20 @@ class RedisResourceCoordinator:
         )
 
     def _commit_reservation(self, reservation: RedisReservation) -> None:
-        self._commit_reservation_script(
-            keys=[
-                _STATE_KEY,
-                _RESERVATION_INDEX_KEY,
-                _reservation_key(reservation.token),
-            ],
-            args=[reservation.token],
+        committed = int(
+            self._commit_reservation_script(
+                keys=[
+                    _STATE_KEY,
+                    _RESERVATION_INDEX_KEY,
+                    _reservation_key(reservation.token),
+                ],
+                args=[reservation.token],
+            )
         )
+        if not committed:
+            raise ResourceUnavailableError(
+                f"{reservation.kind.capitalize()} reservation expired"
+            )
 
     def _refresh_session(self, lease: RedisSessionLease) -> None:
         refreshed = self._refresh_token_script(

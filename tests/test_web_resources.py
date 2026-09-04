@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from concurrent.futures import ThreadPoolExecutor
-from threading import RLock
+from threading import Barrier, RLock
 from time import monotonic, sleep
 
 import fakeredis
@@ -275,7 +275,7 @@ class DeterministicRedis(fakeredis.FakeRedis):
 
     def _eval_claim_cleanup(self, keys, args):  # noqa: ANN001, ANN202
         state_key, leases_key, cleanup_key = keys
-        token, _ttl_ms, lease_prefix, cleanup_prefix = args
+        token, ttl_ms, lease_prefix, cleanup_prefix = args
         self._reconcile_leases(state_key, leases_key, str(lease_prefix))
         deleting = self.hget(state_key, "deleting")
         if deleting is not None:
@@ -287,7 +287,21 @@ class DeterministicRedis(fakeredis.FakeRedis):
             return 1
         self.hset(state_key, "deleting", token)
         self.set(cleanup_key, "1")
+        self.pexpire(cleanup_key, int(ttl_ms))
         return 0
+
+    def _eval_refresh_cleanup(self, keys, args):  # noqa: ANN001, ANN202
+        state_key, cleanup_key = keys
+        token, ttl_ms = args
+        deleting = self.hget(state_key, "deleting")
+        if (
+            deleting is None
+            or self._text(deleting) != str(token)
+            or not self.exists(cleanup_key)
+        ):
+            return 0
+        self.pexpire(cleanup_key, int(ttl_ms))
+        return 1
 
     def _eval_release_cleanup(self, keys, args):  # noqa: ANN001, ANN202
         state_key, cleanup_key = keys
@@ -586,6 +600,66 @@ def test_reservation_refresh_extends_token_ttl(
     assert redis_connection.pttl(token_key) > 1_000
 
 
+def test_expired_reservation_commit_fails_explicitly(
+    redis_connection: DeterministicRedis,
+) -> None:
+    resources = coordinator(redis_connection)
+    reservation = resources.reserve_upload(SESSION_A, 1, free_bytes=100)
+    redis_connection.delete(f"dt:resource:reservation:{reservation.token}")
+
+    with pytest.raises(ResourceUnavailableError, match="expired"):
+        reservation.commit()
+
+
+def test_reservation_commit_is_one_shot(
+    redis_connection: DeterministicRedis,
+) -> None:
+    resources = coordinator(redis_connection)
+    reservation = resources.reserve_upload(SESSION_A, 1, free_bytes=100)
+
+    reservation.commit()
+
+    with pytest.raises(ResourceUnavailableError, match="expired"):
+        reservation.commit()
+
+
+def test_commit_release_race_has_single_accounting_winner(
+    redis_connection: DeterministicRedis,
+) -> None:
+    resources = coordinator(redis_connection, max_session_bytes=4)
+    reservation = resources.reserve_upload(SESSION_A, 4, free_bytes=100)
+    start = Barrier(2)
+
+    def commit() -> str:
+        start.wait()
+        try:
+            reservation.commit()
+        except ResourceUnavailableError:
+            return "released"
+        return "committed"
+
+    def release() -> None:
+        start.wait()
+        reservation.release()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        commit_result = executor.submit(commit)
+        release_result = executor.submit(release)
+        result = commit_result.result()
+        release_result.result()
+
+    if result == "committed":
+        with pytest.raises(ResourceUnavailableError, match="session"):
+            resources.reserve_upload(SESSION_A, 1, free_bytes=100)
+        resources.clear_session_usage(SESSION_A)
+    replacement = resources.reserve_upload(
+        SESSION_A,
+        4,
+        free_bytes=100,
+    )
+    replacement.release()
+
+
 def test_ttls_are_clamped_to_twice_their_heartbeat_intervals(
     redis_connection: DeterministicRedis,
 ) -> None:
@@ -767,16 +841,49 @@ def test_cleanup_claim_blocks_new_leases_until_matching_release(
     resources.acquire_session(SESSION_A).release()
 
 
-def test_cleanup_claim_remains_until_released(
+def test_cleanup_claim_has_bounded_ttl_and_can_be_refreshed(
     redis_connection: DeterministicRedis,
 ) -> None:
-    resources = coordinator(redis_connection, lease_ttl=0.01)
+    resources = coordinator(
+        redis_connection,
+        lease_ttl=2,
+        lease_heartbeat_interval=0.5,
+    )
     claim = resources.claim_session_cleanup(SESSION_A)
     assert claim is not None
-    sleep(0.02)
+    claim_key = f"dt:resource:cleanup:{claim}"
+    assert 0 < redis_connection.pttl(claim_key) <= 2_000
+    redis_connection.pexpire(claim_key, 10)
 
-    with pytest.raises(SessionDeletingError):
-        resources.acquire_session(SESSION_A)
+    resources.refresh_cleanup_claim(SESSION_A, claim)
+
+    assert redis_connection.pttl(claim_key) > 1_000
+
+
+def test_abandoned_cleanup_claim_expires_and_allows_recovery(
+    redis_connection: DeterministicRedis,
+) -> None:
+    resources = coordinator(redis_connection)
+    claim = resources.claim_session_cleanup(SESSION_A)
+    assert claim is not None
+    redis_connection.delete(f"dt:resource:cleanup:{claim}")
+
+    resources.acquire_session(SESSION_A).release()
+    replacement = resources.claim_session_cleanup(SESSION_A)
+
+    assert replacement is not None
+    resources.release_cleanup_claim(SESSION_A, replacement)
+
+
+def test_cleanup_claim_refresh_is_token_scoped(
+    redis_connection: DeterministicRedis,
+) -> None:
+    resources = coordinator(redis_connection)
+    claim = resources.claim_session_cleanup(SESSION_A)
+    assert claim is not None
+
+    with pytest.raises(ResourceUnavailableError, match="expired"):
+        resources.refresh_cleanup_claim(SESSION_A, "0" * 32)
 
     resources.release_cleanup_claim(SESSION_A, claim)
 
@@ -809,6 +916,29 @@ def test_expired_session_lease_is_reconciled_before_cleanup_claim(
 
     assert claim is not None
     resources.release_cleanup_claim(SESSION_A, claim)
+
+
+def test_real_redis_cleanup_claim_ttl_expires_and_recovers(
+    real_redis_connection: Redis,
+) -> None:
+    resources = coordinator(
+        real_redis_connection,
+        lease_ttl=0.02,
+        lease_heartbeat_interval=0.005,
+    )
+    claim = resources.claim_session_cleanup(SESSION_A)
+    assert claim is not None
+    claim_key = f"dt:resource:cleanup:{claim}"
+
+    deadline = monotonic() + 1
+    while real_redis_connection.exists(claim_key) and monotonic() < deadline:
+        sleep(0.005)
+
+    assert not real_redis_connection.exists(claim_key)
+    resources.acquire_session(SESSION_A).release()
+    replacement = resources.claim_session_cleanup(SESSION_A)
+    assert replacement is not None
+    resources.release_cleanup_claim(SESSION_A, replacement)
 
 
 @pytest.mark.parametrize("requested_bytes", [0, -1])
