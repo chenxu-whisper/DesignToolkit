@@ -20,21 +20,50 @@ def anyio_backend() -> str:
 
 
 class RecordingReservation:
-    def __init__(self, *, fail_commit: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        root: Path | None = None,
+        fail_commit: bool = False,
+    ) -> None:
+        self.root = root
         self.committed = False
+        self.rolled_back = False
+        self.finalized = False
         self.released = False
         self.refresh_count = 0
         self.fail_commit = fail_commit
+        self.operations: list[str] = []
+        self.hidden_at_commit: list[Path] = []
+        self.visible_at_commit: list[Path] = []
 
     def refresh(self) -> None:
         self.refresh_count += 1
 
     def commit(self) -> None:
+        self.operations.append("commit")
+        if self.root is not None:
+            self.hidden_at_commit = list(self.root.rglob(".uploading"))
+            self.visible_at_commit = [
+                path
+                for path in self.root.rglob("*")
+                if path.is_file() and path.name != ".uploading"
+            ]
         if self.fail_commit:
             raise ResourceUnavailableError("Upload reservation expired")
         self.committed = True
 
+    def rollback(self) -> None:
+        self.operations.append("rollback")
+        self.rolled_back = True
+        self.committed = False
+
+    def finalize(self) -> None:
+        self.operations.append("finalize")
+        self.finalized = True
+
     def release(self) -> None:
+        self.operations.append("release")
         self.released = True
 
 
@@ -73,10 +102,21 @@ def test_hosted_settings_use_public_deployment_defaults(tmp_path: Path) -> None:
 
 
 @pytest.mark.anyio
-async def test_upload_is_streamed_to_an_opaque_session_asset(tmp_path: Path) -> None:
+async def test_upload_is_streamed_to_an_opaque_session_asset(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     storage = HostedStorage(tmp_path, max_upload_bytes=16)
-    reservation = RecordingReservation()
+    reservation = RecordingReservation(root=tmp_path)
     lease = RecordingLease()
+    original_replace = Path.replace
+
+    def record_publication(source: Path, target: Path) -> Path:
+        assert reservation.committed is True
+        reservation.operations.append("rename")
+        return original_replace(source, target)
+
+    monkeypatch.setattr(Path, "replace", record_publication)
 
     asset = await storage.store_stream(
         "a" * 32,
@@ -94,6 +134,10 @@ async def test_upload_is_streamed_to_an_opaque_session_asset(tmp_path: Path) -> 
     assert reservation.refresh_count == 2
     assert lease.refresh_count == 2
     assert reservation.committed is True
+    assert reservation.finalized is True
+    assert reservation.operations == ["commit", "rename", "finalize"]
+    assert len(reservation.hidden_at_commit) == 1
+    assert reservation.visible_at_commit == []
     assert reservation.released is False
     with pytest.raises(UploadRejectedError, match="not available"):
         storage.resolve("b" * 32, asset.reference)
@@ -168,7 +212,7 @@ async def test_upload_removes_unpublished_asset_when_commit_fails(
     tmp_path: Path,
 ) -> None:
     storage = HostedStorage(tmp_path, max_upload_bytes=16)
-    reservation = RecordingReservation(fail_commit=True)
+    reservation = RecordingReservation(root=tmp_path, fail_commit=True)
 
     with pytest.raises(ResourceUnavailableError, match="expired"):
         await storage.store_stream(
@@ -180,6 +224,46 @@ async def test_upload_removes_unpublished_asset_when_commit_fails(
         )
 
     assert reservation.released is True
+    assert reservation.committed is False
+    assert reservation.rolled_back is False
+    assert reservation.finalized is False
+    assert reservation.operations == ["commit", "release"]
+    assert len(reservation.hidden_at_commit) == 1
+    assert reservation.visible_at_commit == []
+    assert list(tmp_path.rglob("*")) == []
+
+
+@pytest.mark.anyio
+async def test_upload_rolls_back_commit_when_publication_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    reservation = RecordingReservation(root=tmp_path)
+
+    def fail_publication(source: Path, target: Path) -> Path:
+        assert source.name == ".uploading"
+        assert target.name == "screen.png"
+        assert reservation.committed is True
+        reservation.operations.append("rename")
+        raise OSError("publication failed")
+
+    monkeypatch.setattr(Path, "replace", fail_publication)
+
+    with pytest.raises(OSError, match="publication failed"):
+        await storage.store_stream(
+            "a" * 32,
+            filename="screen.png",
+            content_length=4,
+            chunks=_chunks(b"1234"),
+            reservation=reservation,
+        )
+
+    assert reservation.operations == ["commit", "rename", "rollback"]
+    assert reservation.committed is False
+    assert reservation.rolled_back is True
+    assert reservation.finalized is False
+    assert reservation.released is False
     assert list(tmp_path.rglob("*")) == []
 
 

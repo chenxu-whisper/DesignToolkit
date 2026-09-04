@@ -204,6 +204,7 @@ class HostedStorage:
         temporary_path = asset_dir / ".uploading"
         final_path = asset_dir / filename
         size = 0
+        committed = False
         try:
             asset_dir.mkdir(parents=True, exist_ok=False)
             with temporary_path.open("xb") as destination:
@@ -227,13 +228,20 @@ class HostedStorage:
                 raise UploadRejectedError(
                     "Upload size does not match declared Content-Length"
                 )
-            temporary_path.replace(final_path)
             os.utime(self._session_dir(session_id), None)
             reservation.commit()
+            committed = True
+            temporary_path.replace(final_path)
+            reservation.finalize()
         except Exception:
-            shutil.rmtree(asset_dir, ignore_errors=True)
-            self._remove_empty_session(session_id)
-            reservation.release()
+            try:
+                if committed:
+                    reservation.rollback()
+                else:
+                    reservation.release()
+            finally:
+                shutil.rmtree(asset_dir, ignore_errors=True)
+                self._remove_empty_session(session_id)
             raise
 
         return UploadedAsset(

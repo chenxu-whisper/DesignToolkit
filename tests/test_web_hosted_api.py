@@ -29,6 +29,7 @@ class StubReservation:
         self.session_id = session_id
         self.reserved_bytes = reserved_bytes
         self.active = True
+        self.rollback_eligible = False
 
     def refresh(self) -> None:
         if not self.active:
@@ -43,6 +44,23 @@ class StubReservation:
             self.coordinator.committed.get(self.session_id, 0)
             + self.reserved_bytes
         )
+        self.rollback_eligible = True
+
+    def rollback(self) -> None:
+        if not self.rollback_eligible:
+            return
+        self.rollback_eligible = False
+        remaining = (
+            self.coordinator.committed.get(self.session_id, 0)
+            - self.reserved_bytes
+        )
+        if remaining:
+            self.coordinator.committed[self.session_id] = remaining
+        else:
+            self.coordinator.committed.pop(self.session_id, None)
+
+    def finalize(self) -> None:
+        self.rollback_eligible = False
 
     def release(self) -> None:
         if self.active:
