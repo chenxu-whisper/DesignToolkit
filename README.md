@@ -152,8 +152,16 @@ npm run dev
 默认 Compose 配置面向至少 8 vCPU、16 GiB 内存和 100 GB SSD 的单机部署。
 部署前，将域名的 A/AAAA 记录指向服务器，并确保公网可访问 80 和 443 端口。
 Caddy 会根据 `.env` 中的 `DOMAIN` 自动申请和续期 HTTPS 证书。
+部署需要 Docker Compose v2.6.0 或更高版本。
 
-首次部署：
+首次部署（Linux VPS，Bash）：
+
+```bash
+cp .env.example .env
+docker compose up -d --build
+```
+
+首次部署（Windows PowerShell）：
 
 ```powershell
 Copy-Item .env.example .env
@@ -173,10 +181,13 @@ docker compose logs -f app worker-1 worker-2
 
 升级镜像和应用：
 
-```powershell
-docker compose pull
+```bash
+docker compose pull redis caddy
 docker compose up -d --build
 ```
+
+`redis` 和 `caddy` 使用远端镜像；`app` 在本地构建
+`designtoolkit:latest`，`worker-1`、`worker-2` 和 `cleanup` 复用该本地镜像。
 
 停止服务：
 
