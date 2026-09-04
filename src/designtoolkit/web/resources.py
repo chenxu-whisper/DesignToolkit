@@ -19,7 +19,7 @@ _STATE_KEY = "dt:resource:state"
 _RESERVATION_INDEX_KEY = "dt:resource:reservations"
 _RESERVATION_PREFIX = "dt:resource:reservation:"
 _COMMITTED_PREFIX = "dt:resource:committed:"
-_RELEASED_ASSETS_KEY = "dt:resource:released-assets"
+_RELEASED_ASSET_PREFIX = "dt:resource:asset-released:"
 _LEASE_PREFIX = "dt:resource:lease:"
 _CLEANUP_PREFIX = "dt:resource:cleanup:"
 _SESSION_PATTERN = re.compile(r"^[a-f0-9]{32}$")
@@ -446,17 +446,6 @@ return removed
 """
 
 _CLEAR_SESSION_USAGE_SCRIPT = """-- clear_session_usage
-local asset_ids = redis.call("SMEMBERS", KEYS[2])
-for _, asset_id in ipairs(asset_ids) do
-    local metadata = redis.call("HGET", KEYS[3], asset_id)
-    if metadata then
-        local marker_session = string.match(metadata, "^([^|]+)|")
-        if marker_session == ARGV[1] then
-            redis.call("HDEL", KEYS[3], asset_id)
-        end
-    end
-end
-redis.call("DEL", KEYS[2])
 redis.call(
     "HDEL",
     KEYS[1],
@@ -470,20 +459,16 @@ local session_id = ARGV[1]
 local asset_id = ARGV[2]
 local released_bytes = tonumber(ARGV[3])
 local marker_ttl_ms = tonumber(ARGV[4])
-local existing = redis.call("HGET", KEYS[2], asset_id)
-if existing then
-    local marker_session, marker_bytes = string.match(
-        existing,
-        "^([^|]+)|(%d+)$"
-    )
-    if marker_session ~= session_id then
+if redis.call("EXISTS", KEYS[2]) == 1 then
+    local marker_session = redis.call("HGET", KEYS[2], "session_id")
+    local marker_asset = redis.call("HGET", KEYS[2], "asset_id")
+    local marker_bytes = tonumber(redis.call("HGET", KEYS[2], "bytes"))
+    if marker_session ~= session_id or marker_asset ~= asset_id then
         return 2
     end
-    if released_bytes ~= 0 and tonumber(marker_bytes) ~= released_bytes then
+    if released_bytes ~= 0 and marker_bytes ~= released_bytes then
         return 3
     end
-    redis.call("PEXPIRE", KEYS[2], marker_ttl_ms)
-    redis.call("PEXPIRE", KEYS[3], marker_ttl_ms)
     return 0
 end
 
@@ -502,28 +487,28 @@ else
     redis.call("HDEL", KEYS[1], field)
 end
 redis.call(
-    "HSET",
+    "HMSET",
     KEYS[2],
+    "session_id",
+    session_id,
+    "asset_id",
     asset_id,
-    session_id .. "|" .. released_bytes
+    "bytes",
+    released_bytes
 )
-redis.call("SADD", KEYS[3], asset_id)
 redis.call("PEXPIRE", KEYS[2], marker_ttl_ms)
-redis.call("PEXPIRE", KEYS[3], marker_ttl_ms)
 return 1
 """
 
 _IS_COMMITTED_ASSET_RELEASED_SCRIPT = """-- is_committed_asset_released
-local existing = redis.call("HGET", KEYS[1], ARGV[2])
-if not existing then
+if redis.call("EXISTS", KEYS[1]) == 0 then
     return 0
 end
-local marker_session = string.match(existing, "^([^|]+)|%d+$")
-if marker_session ~= ARGV[1] then
+local marker_session = redis.call("HGET", KEYS[1], "session_id")
+local marker_asset = redis.call("HGET", KEYS[1], "asset_id")
+if marker_session ~= ARGV[1] or marker_asset ~= ARGV[2] then
     return 0
 end
-redis.call("PEXPIRE", KEYS[1], tonumber(ARGV[3]))
-redis.call("PEXPIRE", KEYS[2], tonumber(ARGV[3]))
 return 1
 """
 
@@ -989,11 +974,7 @@ class RedisResourceCoordinator:
     def clear_session_usage(self, session_id: str) -> None:
         _validate_session_id(session_id)
         self._clear_session_usage_script(
-            keys=[
-                _STATE_KEY,
-                _session_released_assets_key(session_id),
-                _RELEASED_ASSETS_KEY,
-            ],
+            keys=[_STATE_KEY],
             args=[session_id],
         )
 
@@ -1010,8 +991,7 @@ class RedisResourceCoordinator:
             self._release_committed_asset_script(
                 keys=[
                     _STATE_KEY,
-                    _RELEASED_ASSETS_KEY,
-                    _session_released_assets_key(session_id),
+                    _released_asset_key(session_id, asset_id),
                 ],
                 args=[
                     session_id,
@@ -1040,14 +1020,10 @@ class RedisResourceCoordinator:
         _validate_asset_id(asset_id)
         return bool(
             self._is_committed_asset_released_script(
-                keys=[
-                    _RELEASED_ASSETS_KEY,
-                    _session_released_assets_key(session_id),
-                ],
+                keys=[_released_asset_key(session_id, asset_id)],
                 args=[
                     session_id,
                     asset_id,
-                    self._release_marker_ttl_ms,
                 ],
             )
         )
@@ -1184,8 +1160,8 @@ def _session_leases_key(session_id: str) -> str:
     return f"dt:resource:session:{session_id}:leases"
 
 
-def _session_released_assets_key(session_id: str) -> str:
-    return f"dt:resource:session:{session_id}:released-assets"
+def _released_asset_key(session_id: str, asset_id: str) -> str:
+    return f"{_RELEASED_ASSET_PREFIX}{session_id}:{asset_id}"
 
 
 def _validate_session_id(value: str) -> str:

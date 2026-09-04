@@ -98,6 +98,7 @@ class StubCoordinator:
         self.released_assets: dict[str, tuple[str, int]] = {}
         self.release_calls = 0
         self.release_query_calls = 0
+        self.reserve_calls = 0
 
     def reserve_upload(
         self,
@@ -106,6 +107,7 @@ class StubCoordinator:
         *,
         free_bytes: int,
     ) -> StubReservation:
+        self.reserve_calls += 1
         if self.active_uploads >= self.max_upload_concurrency:
             raise ResourceUnavailableError("Upload concurrency limit reached")
         if (
@@ -309,6 +311,25 @@ def test_hosted_upload_rejects_decoded_control_filename(
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "invalid_upload"
     assert list(tmp_path.rglob(".uploading")) == []
+
+
+@pytest.mark.parametrize("filename", [".screen.png", ".", ".."])
+def test_hosted_upload_rejects_hidden_filename_before_reservation(
+    tmp_path: Path,
+    filename: str,
+) -> None:
+    coordinator = StubCoordinator(
+        max_upload_concurrency=4,
+        max_session_bytes=10,
+        min_free_bytes=0,
+    )
+    with _client(tmp_path, resource_coordinator=coordinator) as client:
+        response = _upload(client, filename, b"image")
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_upload"
+    assert coordinator.reserve_calls == 0
+    assert list(tmp_path.rglob("*")) == []
 
 
 def test_successful_upload_ignores_redis_cleanup_failures(

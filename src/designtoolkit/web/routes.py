@@ -52,6 +52,7 @@ from designtoolkit.web.hosted import (
     HostedSettings,
     HostedStorage,
     UploadRejectedError,
+    _safe_filename,
 )
 from designtoolkit.web.local_paths import resolve_dropped_file_paths
 from designtoolkit.web.native_picker import (
@@ -1534,6 +1535,7 @@ def _upload_filename(value: str | None) -> str:
             "X-Upload-Filename must contain URI-encoded UTF-8",
             400,
         ) from exc
-    if not filename:
-        raise ApiError("invalid_upload", "File name is invalid", 400)
-    return filename
+    try:
+        return _safe_filename(filename)
+    except UploadRejectedError as exc:
+        raise ApiError("invalid_upload", str(exc), 400) from exc

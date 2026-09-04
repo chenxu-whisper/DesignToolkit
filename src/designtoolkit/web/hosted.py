@@ -581,7 +581,7 @@ def _safe_filename(value: str | None) -> str:
     if any(category(character) == "Cc" for character in raw_filename):
         raise UploadRejectedError("File name is invalid")
     filename = Path(raw_filename.replace("\\", "/")).name.strip()
-    if not filename or filename in {".", ".."}:
+    if not filename or filename.startswith("."):
         raise UploadRejectedError("File name is invalid")
     return filename
 

@@ -258,6 +258,28 @@ async def test_upload_rejects_control_characters_in_filename(
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("filename", [".screen.png", ".", ".."])
+async def test_upload_rejects_hidden_or_dot_filenames_before_creating_files(
+    tmp_path: Path,
+    filename: str,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    reservation = RecordingReservation()
+
+    with pytest.raises(UploadRejectedError, match="File name is invalid"):
+        await storage.store_stream(
+            "a" * 32,
+            filename=filename,
+            content_length=4,
+            chunks=_chunks(b"1234"),
+            reservation=reservation,
+        )
+
+    assert reservation.released is True
+    assert list(tmp_path.rglob("*")) == []
+
+
+@pytest.mark.anyio
 async def test_upload_validates_type_and_declared_size_before_creating_files(
     tmp_path: Path,
 ) -> None:
