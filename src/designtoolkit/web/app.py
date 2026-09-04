@@ -77,6 +77,11 @@ def create_app(
             lease_ttl=settings.lease_ttl_seconds,
             reservation_heartbeat_interval=settings.reservation_heartbeat_seconds,
             lease_heartbeat_interval=settings.lease_heartbeat_seconds,
+            release_marker_ttl=max(
+                settings.retention_seconds * 2,
+                settings.reservation_ttl_seconds,
+                settings.lease_ttl_seconds,
+            ),
         )
     log_store = manager.log_store
     decoder = video_decoder if video_decoder is not None else ImageioVideoDecoder()

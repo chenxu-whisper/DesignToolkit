@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shutil
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from pathlib import Path
 from urllib.parse import quote
@@ -95,6 +96,8 @@ class StubCoordinator:
         self.active_uploads = 0
         self.committed: dict[str, int] = {}
         self.released_assets: dict[str, tuple[str, int]] = {}
+        self.release_calls = 0
+        self.release_query_calls = 0
 
     def reserve_upload(
         self,
@@ -124,6 +127,7 @@ class StubCoordinator:
         asset_id: str,
         released_bytes: int,
     ) -> None:
+        self.release_calls += 1
         released = self.released_assets.get(asset_id)
         if released is not None:
             if released[0] != session_id:
@@ -143,6 +147,11 @@ class StubCoordinator:
             self.committed.pop(session_id, None)
         self.released_assets[asset_id] = (session_id, released_bytes)
 
+    def is_committed_asset_released(self, session_id: str, asset_id: str) -> bool:
+        self.release_query_calls += 1
+        released = self.released_assets.get(asset_id)
+        return released is not None and released[0] == session_id
+
 
 def _png_bytes() -> bytes:
     output = BytesIO()
@@ -160,6 +169,7 @@ def _client(
     task_manager: TaskManager | RedisTaskManager | None = None,
     upload_requests_per_hour: int = 30,
     resource_coordinator: StubCoordinator | None = None,
+    hosted_storage: HostedStorage | None = None,
 ) -> TestClient:
     if task_manager is None:
         redis_connection = fakeredis.FakeRedis(decode_responses=False)
@@ -190,7 +200,8 @@ def _client(
         create_app(
             task_manager=task_manager,
             hosted_settings=settings,
-            hosted_storage=HostedStorage(tmp_path, max_upload_bytes=max_bytes),
+            hosted_storage=hosted_storage
+            or HostedStorage(tmp_path, max_upload_bytes=max_bytes),
             resource_coordinator=coordinator,
         )
     )
@@ -465,6 +476,124 @@ def test_delete_upload_retries_tombstone_removal_without_double_release(
     assert retry.status_code == 204
     assert overflow.status_code == 413
     assert removal_attempts == 2
+    assert not tombstone.exists()
+
+
+def test_delete_upload_recovers_when_rmtree_removed_metadata_before_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    removal_attempts = 0
+    with _client(tmp_path, max_session_bytes=5) as owner:
+        uploaded = _upload(owner, "screen.png", b"image")
+        asset_id = uploaded.json()["reference"].split(":", 2)[1]
+        session_id = owner.cookies["dt_session"]
+        tombstone = tmp_path / "sessions" / session_id / ".trash" / asset_id
+        metadata = tombstone / ".deletion.json"
+        coordinator = owner.app.state.resource_coordinator
+        original_rmtree = shutil.rmtree
+
+        def delete_metadata_then_fail_once(
+            path: Path,
+            *args: object,
+            **kwargs: object,
+        ) -> None:
+            nonlocal removal_attempts
+            if Path(path) == tombstone:
+                removal_attempts += 1
+                if removal_attempts == 1:
+                    metadata.unlink()
+                    raise OSError("partial removal")
+            original_rmtree(path, *args, **kwargs)
+
+        monkeypatch.setattr(
+            "designtoolkit.web.hosted.shutil.rmtree",
+            delete_metadata_then_fail_once,
+        )
+
+        first_delete = owner.delete(f"/api/uploads/{asset_id}")
+        assert first_delete.status_code == 503
+        assert tombstone.is_dir()
+        assert not metadata.exists()
+
+        retry = owner.delete(f"/api/uploads/{asset_id}")
+        replacement = _upload(owner, "replacement.png", b"12345")
+
+    assert retry.status_code == 204
+    assert replacement.status_code == 201
+    assert coordinator.release_calls == 1
+    assert coordinator.release_query_calls == 1
+    assert coordinator.committed[session_id] == 5
+    assert not tombstone.exists()
+
+
+def test_delete_upload_retains_invalid_tombstone_without_release_marker(
+    tmp_path: Path,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=5)
+    with _client(
+        tmp_path,
+        max_session_bytes=5,
+        hosted_storage=storage,
+    ) as owner:
+        uploaded = _upload(owner, "screen.png", b"image")
+        reference = uploaded.json()["reference"]
+        asset_id = reference.split(":", 2)[1]
+        session_id = owner.cookies["dt_session"]
+        tombstone = tmp_path / "sessions" / session_id / ".trash" / asset_id
+        storage.delete_asset(session_id, reference)
+        (tombstone / ".deletion.json").unlink()
+
+        rejected = owner.delete(f"/api/uploads/{asset_id}")
+
+    assert rejected.status_code == 503
+    assert tombstone.is_dir()
+    assert owner.app.state.resource_coordinator.committed[session_id] == 5
+
+
+def test_concurrent_retries_recover_partial_tombstone_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _client(tmp_path, max_session_bytes=5) as owner:
+        uploaded = _upload(owner, "screen.png", b"image")
+        asset_id = uploaded.json()["reference"].split(":", 2)[1]
+        session_id = owner.cookies["dt_session"]
+        tombstone = tmp_path / "sessions" / session_id / ".trash" / asset_id
+        metadata = tombstone / ".deletion.json"
+        original_rmtree = shutil.rmtree
+        failed = False
+
+        def fail_after_metadata_once(
+            path: Path,
+            *args: object,
+            **kwargs: object,
+        ) -> None:
+            nonlocal failed
+            if Path(path) == tombstone and not failed:
+                failed = True
+                metadata.unlink()
+                raise OSError("partial removal")
+            original_rmtree(path, *args, **kwargs)
+
+        monkeypatch.setattr(
+            "designtoolkit.web.hosted.shutil.rmtree",
+            fail_after_metadata_once,
+        )
+        assert owner.delete(f"/api/uploads/{asset_id}").status_code == 503
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            statuses = list(
+                executor.map(
+                    lambda _index: owner.delete(
+                        f"/api/uploads/{asset_id}"
+                    ).status_code,
+                    range(2),
+                )
+            )
+
+    assert statuses == [204, 204]
+    assert owner.app.state.resource_coordinator.release_calls == 1
     assert not tombstone.exists()
 
 

@@ -48,6 +48,7 @@ from designtoolkit.media_resize import MediaResizeError
 from designtoolkit.video_frames import VideoFrameError
 from designtoolkit.web.chroma_previews import ChromaPreviewEntry, ChromaPreviewStore
 from designtoolkit.web.hosted import (
+    AssetDeletionStateError,
     HostedSettings,
     HostedStorage,
     UploadRejectedError,
@@ -897,18 +898,27 @@ def create_router(
         lease = None
         try:
             lease = resources.acquire_session(http_request.state.session_id)
-            deletion = storage.delete_asset(
-                http_request.state.session_id,
-                f"asset:{asset_id}",
-            )
-            resources.release_committed_asset(
-                http_request.state.session_id,
-                deletion.asset_id,
-                deletion.size,
-            )
+            try:
+                deletion = storage.delete_asset(
+                    http_request.state.session_id,
+                    f"asset:{asset_id}",
+                )
+            except AssetDeletionStateError as exc:
+                if not resources.is_committed_asset_released(
+                    http_request.state.session_id,
+                    exc.asset_id,
+                ):
+                    raise
+                deletion = None
+            if deletion is not None:
+                resources.release_committed_asset(
+                    http_request.state.session_id,
+                    deletion.asset_id,
+                    deletion.size,
+                )
             storage.finalize_asset_deletion(
                 http_request.state.session_id,
-                deletion.asset_id,
+                asset_id,
             )
         except UploadRejectedError as exc:
             raise ApiError("asset_not_found", str(exc), 404) from exc

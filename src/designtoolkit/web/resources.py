@@ -469,6 +469,7 @@ _RELEASE_COMMITTED_ASSET_SCRIPT = """-- release_committed_asset
 local session_id = ARGV[1]
 local asset_id = ARGV[2]
 local released_bytes = tonumber(ARGV[3])
+local marker_ttl_ms = tonumber(ARGV[4])
 local existing = redis.call("HGET", KEYS[2], asset_id)
 if existing then
     local marker_session, marker_bytes = string.match(
@@ -481,6 +482,8 @@ if existing then
     if released_bytes ~= 0 and tonumber(marker_bytes) ~= released_bytes then
         return 3
     end
+    redis.call("PEXPIRE", KEYS[2], marker_ttl_ms)
+    redis.call("PEXPIRE", KEYS[3], marker_ttl_ms)
     return 0
 end
 
@@ -505,6 +508,22 @@ redis.call(
     session_id .. "|" .. released_bytes
 )
 redis.call("SADD", KEYS[3], asset_id)
+redis.call("PEXPIRE", KEYS[2], marker_ttl_ms)
+redis.call("PEXPIRE", KEYS[3], marker_ttl_ms)
+return 1
+"""
+
+_IS_COMMITTED_ASSET_RELEASED_SCRIPT = """-- is_committed_asset_released
+local existing = redis.call("HGET", KEYS[1], ARGV[2])
+if not existing then
+    return 0
+end
+local marker_session = string.match(existing, "^([^|]+)|%d+$")
+if marker_session ~= ARGV[1] then
+    return 0
+end
+redis.call("PEXPIRE", KEYS[1], tonumber(ARGV[3]))
+redis.call("PEXPIRE", KEYS[2], tonumber(ARGV[3]))
 return 1
 """
 
@@ -722,6 +741,7 @@ class RedisResourceCoordinator:
         lease_ttl: float,
         reservation_heartbeat_interval: float = _DEFAULT_HEARTBEAT_INTERVAL,
         lease_heartbeat_interval: float = _DEFAULT_HEARTBEAT_INTERVAL,
+        release_marker_ttl: float | None = None,
     ) -> None:
         self._redis = redis_connection
         self.max_upload_concurrency = _positive_int(
@@ -750,6 +770,16 @@ class RedisResourceCoordinator:
         self._lease_ttl_ms = _ttl_milliseconds(
             max(lease_ttl, 2 * lease_heartbeat_interval),
             "lease_ttl",
+        )
+        marker_ttl = (
+            max(reservation_ttl, lease_ttl)
+            if release_marker_ttl is None
+            else _positive_seconds(release_marker_ttl, "release_marker_ttl")
+        )
+        self._release_marker_ttl_ms = max(
+            _ttl_milliseconds(marker_ttl, "release_marker_ttl"),
+            self._reservation_ttl_ms,
+            self._lease_ttl_ms,
         )
         self._reserve_upload_script = self._redis.register_script(
             _RESERVE_UPLOAD_SCRIPT
@@ -781,6 +811,9 @@ class RedisResourceCoordinator:
         )
         self._release_committed_asset_script = self._redis.register_script(
             _RELEASE_COMMITTED_ASSET_SCRIPT
+        )
+        self._is_committed_asset_released_script = self._redis.register_script(
+            _IS_COMMITTED_ASSET_RELEASED_SCRIPT
         )
         self._acquire_session_script = self._redis.register_script(
             _ACQUIRE_SESSION_SCRIPT
@@ -980,7 +1013,12 @@ class RedisResourceCoordinator:
                     _RELEASED_ASSETS_KEY,
                     _session_released_assets_key(session_id),
                 ],
-                args=[session_id, asset_id, released_bytes],
+                args=[
+                    session_id,
+                    asset_id,
+                    released_bytes,
+                    self._release_marker_ttl_ms,
+                ],
             )
         )
         if result == 2:
@@ -992,6 +1030,27 @@ class RedisResourceCoordinator:
                 "Asset release bytes do not match committed usage"
             )
         return result == 1
+
+    def is_committed_asset_released(
+        self,
+        session_id: str,
+        asset_id: str,
+    ) -> bool:
+        _validate_session_id(session_id)
+        _validate_asset_id(asset_id)
+        return bool(
+            self._is_committed_asset_released_script(
+                keys=[
+                    _RELEASED_ASSETS_KEY,
+                    _session_released_assets_key(session_id),
+                ],
+                args=[
+                    session_id,
+                    asset_id,
+                    self._release_marker_ttl_ms,
+                ],
+            )
+        )
 
     def reconcile_reservations(self) -> int:
         return int(

@@ -7,6 +7,7 @@ import shutil
 from collections.abc import AsyncIterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from threading import RLock
 from time import time
 from unicodedata import category
 from urllib.parse import quote
@@ -55,6 +56,12 @@ _ASSET_REFERENCE_PATTERN = re.compile(
 
 class UploadRejectedError(ValueError):
     pass
+
+
+class AssetDeletionStateError(OSError):
+    def __init__(self, asset_id: str) -> None:
+        super().__init__("Asset deletion state is invalid")
+        self.asset_id = asset_id
 
 
 @dataclass(frozen=True)
@@ -190,6 +197,7 @@ class HostedStorage:
         self.max_upload_bytes = max_upload_bytes
         self.max_session_bytes = max_session_bytes
         self.min_free_bytes = min_free_bytes
+        self._deletion_lock = RLock()
 
     async def store_stream(
         self,
@@ -337,11 +345,11 @@ class HostedStorage:
         session_id = _validate_session_id(session_id)
         asset_id = _asset_id(f"asset:{asset_id}")
         tombstone = self._session_dir(session_id) / ".trash" / asset_id
-        try:
-            shutil.rmtree(tombstone)
-        except FileNotFoundError:
-            return
-        self._remove_empty_session(session_id)
+        with self._deletion_lock:
+            shutil.rmtree(tombstone, ignore_errors=True)
+            if tombstone.exists():
+                raise OSError("Asset tombstone removal failed")
+            self._remove_empty_session(session_id)
 
     def create_task_dir(self, session_id: str) -> Path:
         session_id = _validate_session_id(session_id)
@@ -564,7 +572,7 @@ def _read_asset_deletion(tombstone: Path, asset_id: str) -> AssetDeletion:
         ):
             raise ValueError
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-        raise OSError("Asset deletion state is invalid") from exc
+        raise AssetDeletionStateError(asset_id) from exc
     return AssetDeletion(asset_id=asset_id, reference=reference, size=size)
 
 

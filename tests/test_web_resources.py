@@ -304,7 +304,7 @@ class DeterministicRedis(fakeredis.FakeRedis):
 
     def _eval_release_committed_asset(self, keys, args):  # noqa: ANN001, ANN202
         state_key, released_key, session_released_key = keys
-        session_id, asset_id, released_bytes = args
+        session_id, asset_id, released_bytes, marker_ttl_ms = args
         released_bytes = int(released_bytes)
         existing = self.hget(released_key, asset_id)
         if existing is not None:
@@ -327,7 +327,20 @@ class DeterministicRedis(fakeredis.FakeRedis):
             self.hdel(state_key, field)
         self.hset(released_key, asset_id, f"{session_id}|{released_bytes}")
         self.sadd(session_released_key, asset_id)
+        self.pexpire(released_key, int(marker_ttl_ms))
+        self.pexpire(session_released_key, int(marker_ttl_ms))
         return 1
+
+    def _eval_is_committed_asset_released(  # noqa: ANN001, ANN202
+        self,
+        keys,
+        args,
+    ):
+        existing = self.hget(keys[0], args[1])
+        if existing is None:
+            return 0
+        existing_session, _existing_bytes = self._text(existing).split("|")
+        return int(existing_session == args[0])
 
     def _eval_acquire_session(self, keys, args):  # noqa: ANN001, ANN202
         state_key, leases_key, lease_key = keys
@@ -468,6 +481,7 @@ def coordinator(
     lease_ttl: float = 10,
     reservation_heartbeat_interval: float = 5,
     lease_heartbeat_interval: float = 5,
+    release_marker_ttl: float | None = None,
 ) -> RedisResourceCoordinator:
     return RedisResourceCoordinator(
         redis_connection=redis_connection,
@@ -478,6 +492,7 @@ def coordinator(
         lease_ttl=lease_ttl,
         reservation_heartbeat_interval=reservation_heartbeat_interval,
         lease_heartbeat_interval=lease_heartbeat_interval,
+        release_marker_ttl=release_marker_ttl,
     )
 
 
@@ -579,6 +594,9 @@ def test_release_committed_asset_is_idempotent_and_session_scoped(
 
     resources.release_committed_asset(SESSION_A, asset_id, 4)
     resources.release_committed_asset(SESSION_A, asset_id, 4)
+    assert resources.is_committed_asset_released(SESSION_A, asset_id) is True
+    assert resources.is_committed_asset_released(SESSION_B, asset_id) is False
+    assert resources.is_committed_asset_released(SESSION_A, "2" * 32) is False
     with pytest.raises(ResourceUnavailableError, match="session"):
         resources.reserve_upload(SESSION_A, 8, free_bytes=100)
     resources.reserve_upload(SESSION_A, 7, free_bytes=100).release()
@@ -589,6 +607,32 @@ def test_release_committed_asset_is_idempotent_and_session_scoped(
         resources.release_committed_asset(SESSION_A, asset_id, 3)
     with pytest.raises(ResourceUnavailableError, match="session"):
         resources.reserve_upload(SESSION_B, 5, free_bytes=100)
+
+
+def test_asset_release_marker_outlives_retention_recovery_boundary(
+    redis_connection: DeterministicRedis,
+) -> None:
+    resources = coordinator(
+        redis_connection,
+        reservation_ttl=1,
+        lease_ttl=2,
+        reservation_heartbeat_interval=0.25,
+        lease_heartbeat_interval=0.25,
+        release_marker_ttl=20,
+    )
+    reservation = resources.reserve_upload(SESSION_A, 4, free_bytes=100)
+    reservation.commit()
+
+    resources.release_committed_asset(SESSION_A, "1" * 32, 4)
+
+    released_ttl = redis_connection.pttl("dt:resource:released-assets")
+    session_ttl = redis_connection.pttl(
+        f"dt:resource:session:{SESSION_A}:released-assets"
+    )
+    assert 19_000 <= released_ttl <= 20_000
+    assert 19_000 <= session_ttl <= 20_000
+    assert released_ttl > resources._reservation_ttl_ms
+    assert released_ttl > resources._lease_ttl_ms
 
 
 def test_concurrent_asset_release_decrements_committed_usage_once(
