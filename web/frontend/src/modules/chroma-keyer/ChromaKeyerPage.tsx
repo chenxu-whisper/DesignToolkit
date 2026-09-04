@@ -863,7 +863,7 @@ export function ChromaKeyerPage() {
       <div className="module-header">
         <h1 id="chroma-keyer-title">
           <Pipette aria-hidden="true" size={22} />
-          Studio Chroma Keyer
+          色键抠图
         </h1>
         {showOutcome && status === 'succeeded' && resultPath ? <p className="task-result">输出：{resultPath}</p> : null}
         {showOutcome && status === 'failed' && taskError ? (

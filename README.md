@@ -110,9 +110,9 @@ uv run designtoolkit web
 - 实时任务状态追踪
 - 任务执行日志实时查看（SSE 推送），包含单个素材和任务总耗时
 
-### Studio Chroma Keyer
+### 色键抠图
 
-在以上命令启动的本地 Web GUI 中，点击侧边栏的 `Studio Chroma Keyer`：
+在以上命令启动的本地 Web GUI 中，点击侧边栏的 `色键抠图`：
 
 - 接受一张本地 PNG、JPG、JPEG 图片，或一个 MOV、MP4、M4V、WebM、MKV、AVI
   视频；视频是否可读取取决于随应用分发的 FFmpeg 解码能力

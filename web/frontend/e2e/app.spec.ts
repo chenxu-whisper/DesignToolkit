@@ -14,12 +14,12 @@ test('smoke test: navigate and switch modules', async ({ page }) => {
   await expect(page.getByText('输入视频路径')).toBeVisible()
 })
 
-test('opens Studio Chroma Keyer with disabled initial sampling and export controls', async ({ page }) => {
+test('opens 色键抠图 with disabled initial sampling and export controls', async ({ page }) => {
   await page.goto('/')
 
-  await page.getByRole('button', { exact: true, name: 'Studio Chroma Keyer' }).click()
+  await page.getByRole('button', { exact: true, name: '色键抠图' }).click()
 
-  await expect(page.getByRole('heading', { name: 'Studio Chroma Keyer' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: '色键抠图' })).toBeVisible()
   await expect(page.getByRole('textbox', { name: '输入图片或视频路径' })).toBeVisible()
   await expect(page.getByRole('button', { name: '清除全部采样点' })).toBeDisabled()
   await expect(page.getByRole('button', { name: '导出 PNG' })).toBeDisabled()
@@ -75,7 +75,7 @@ test('contains a loaded Chroma sample in the mobile workspace', async ({ page })
   })
 
   await page.goto('/')
-  await page.getByRole('button', { exact: true, name: 'Studio Chroma Keyer' }).click()
+  await page.getByRole('button', { exact: true, name: '色键抠图' }).click()
   const inputPath = page.getByRole('textbox', { name: '输入图片或视频路径' })
   const picker = page.getByRole('button', { name: '指定输入图片或视频路径' })
   await inputPath.fill('E:\\media\\screen.png')
@@ -200,7 +200,7 @@ test('auto-loads the image selected by the native picker exactly once', async ({
   await page.route('**/api/chroma-keyer/previews/*.svg', fulfillPreviewSvg)
 
   await page.goto('/')
-  await page.getByRole('button', { exact: true, name: 'Studio Chroma Keyer' }).click()
+  await page.getByRole('button', { exact: true, name: '色键抠图' }).click()
   await expect(page.getByRole('button', { name: '加载图片' })).toHaveCount(0)
 
   await page.getByRole('button', { name: '指定输入图片或视频路径' }).click()
@@ -292,7 +292,7 @@ test('streams live slider previews without blocking controls and keeps the lates
   await page.route('**/api/chroma-keyer/previews/*.svg', fulfillPreviewSvg)
 
   await page.goto('/')
-  await page.getByRole('button', { exact: true, name: 'Studio Chroma Keyer' }).click()
+  await page.getByRole('button', { exact: true, name: '色键抠图' }).click()
   await page.getByRole('button', { name: '指定输入图片或视频路径' }).click()
   const canvas = page.getByRole('button', { name: '抠像预览' })
   await expect(canvas).toHaveAttribute('src', inspectPreviewUrl)
@@ -411,7 +411,7 @@ test('contains every slider and value pair at desktop and mobile viewport widths
       'width=device-width,initial-scale=1',
     )
     await expect(page.locator('html')).toHaveAttribute('lang', 'zh-CN')
-    await page.getByRole('button', { exact: true, name: 'Studio Chroma Keyer' }).click()
+    await page.getByRole('button', { exact: true, name: '色键抠图' }).click()
 
     const viewportLayout = await page.evaluate(() => ({
       bodyClientWidth: document.body.clientWidth,
@@ -638,7 +638,7 @@ test('runs the complete chroma video timeline and PNG sequence export workflow',
   })
 
   await page.goto('/')
-  await page.getByRole('button', { exact: true, name: 'Studio Chroma Keyer' }).click()
+  await page.getByRole('button', { exact: true, name: '色键抠图' }).click()
   const input = page.getByRole('textbox', { name: '输入图片或视频路径' })
   await input.fill(videoInputPath)
   await input.press('Enter')
@@ -925,7 +925,7 @@ test('keeps the loaded video editor within desktop and 390px mobile layouts', as
   ]) {
     await page.setViewportSize(viewport)
     await page.goto('/')
-    await page.getByRole('button', { exact: true, name: 'Studio Chroma Keyer' }).click()
+    await page.getByRole('button', { exact: true, name: '色键抠图' }).click()
     const input = page.getByRole('textbox', { name: '输入图片或视频路径' })
     await input.fill(videoInputPath)
     await input.press('Enter')

@@ -6,5 +6,5 @@ import type { ToolModule } from './types'
 export const toolModules: ToolModule[] = [
   { id: 'video_frames', label: '视频转序列', component: VideoFramesPage },
   { id: 'media_resize', label: '媒体尺寸修改', component: MediaResizePage },
-  { id: 'chroma_keyer', label: 'Studio Chroma Keyer', component: ChromaKeyerPage },
+  { id: 'chroma_keyer', label: '色键抠图', component: ChromaKeyerPage },
 ]
