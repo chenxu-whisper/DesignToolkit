@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import struct
+import threading
+import time
 import zlib
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -47,6 +51,15 @@ def _write_image(path: Path, size: tuple[int, int]) -> Path:
     return path
 
 
+def _write_animated_gif(path: Path) -> Path:
+    frames = [
+        Image.new("RGB", (2, 2), color)
+        for color in ((255, 0, 0), (0, 255, 0))
+    ]
+    frames[0].save(path, save_all=True, append_images=frames[1:], duration=10)
+    return path
+
+
 def _write_png_header(path: Path, size: tuple[int, int]) -> Path:
     width, height = size
 
@@ -88,6 +101,42 @@ def test_accepts_image_at_exact_pixel_limit(tmp_path: Path) -> None:
     )
 
     assert validator.validate(image_path) is None
+
+
+@pytest.mark.parametrize("suffix", [".gif", ".webp"])
+def test_accepts_static_multiframe_capable_image(
+    tmp_path: Path,
+    suffix: str,
+) -> None:
+    image_path = _write_image(tmp_path / f"static{suffix}", (2, 2))
+
+    assert HostedMediaValidator().validate(image_path) is None
+
+
+def test_rejects_animated_gif_from_header_metadata(tmp_path: Path) -> None:
+    image_path = _write_animated_gif(tmp_path / "animated.gif")
+
+    with pytest.raises(MediaLimitError) as error:
+        HostedMediaValidator().validate(image_path)
+
+    assert error.value.reason == "animated_image"
+
+
+@pytest.mark.parametrize("suffix", [".png", ".webp"])
+def test_rejects_simulated_animated_image_header(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    suffix: str,
+) -> None:
+    image_path = tmp_path / f"animated{suffix}"
+    image_path.write_bytes(b"header")
+    header = SimpleNamespace(size=(2, 2), n_frames=2)
+    monkeypatch.setattr(Image, "open", lambda _path: nullcontext(header))
+
+    with pytest.raises(MediaLimitError) as error:
+        HostedMediaValidator().validate(image_path)
+
+    assert error.value.reason == "animated_image"
 
 
 def test_rejects_image_above_pixel_limit(tmp_path: Path) -> None:
@@ -146,6 +195,80 @@ def test_accepts_video_at_exact_limits(tmp_path: Path) -> None:
 
     assert validator.validate(video_path) is probe.metadata
     assert probe.paths == [video_path]
+
+
+def test_validate_many_deduplicates_identical_resolved_paths(
+    tmp_path: Path,
+) -> None:
+    video_path = tmp_path / "exact.mp4"
+    video_path.write_bytes(b"video")
+    probe = StubVideoProbe(_metadata())
+    validator = HostedMediaValidator(video_probe=probe)
+    aliases = [video_path] * 25
+
+    results = validator.validate_many(aliases)
+
+    assert results == [probe.metadata] * 25
+    assert probe.paths == [video_path.resolve()]
+
+
+def test_validate_video_reuses_cached_metadata_until_stat_changes(
+    tmp_path: Path,
+) -> None:
+    video_path = tmp_path / "clip.mp4"
+    video_path.write_bytes(b"video")
+    probe = StubVideoProbe(_metadata())
+    validator = HostedMediaValidator(video_probe=probe)
+
+    assert validator.validate_video(video_path) is probe.metadata
+    assert validator.validate_video(video_path) is probe.metadata
+    video_path.write_bytes(b"changed-video")
+    assert validator.validate_video(video_path) is probe.metadata
+
+    assert probe.paths == [video_path.resolve(), video_path.resolve()]
+
+
+def test_metadata_cache_is_bounded_lru(tmp_path: Path) -> None:
+    paths = [tmp_path / f"clip-{index}.mp4" for index in range(3)]
+    for path in paths:
+        path.write_bytes(b"video")
+    probe = StubVideoProbe(_metadata())
+    validator = HostedMediaValidator(video_probe=probe, cache_size=2)
+
+    validator.validate(paths[0])
+    validator.validate(paths[1])
+    validator.validate(paths[0])
+    validator.validate(paths[2])
+    validator.validate(paths[1])
+
+    assert probe.paths == [
+        paths[0].resolve(),
+        paths[1].resolve(),
+        paths[2].resolve(),
+        paths[1].resolve(),
+    ]
+
+
+def test_metadata_cache_serializes_concurrent_validation(tmp_path: Path) -> None:
+    video_path = tmp_path / "clip.mp4"
+    video_path.write_bytes(b"video")
+    metadata = _metadata()
+    probe_calls = 0
+    probe_lock = threading.Lock()
+
+    def probe(_path: Path) -> object:
+        nonlocal probe_calls
+        with probe_lock:
+            probe_calls += 1
+        time.sleep(0.01)
+        return metadata
+
+    validator = HostedMediaValidator(video_probe=probe)
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(validator.validate_video, [video_path] * 25))
+
+    assert results == [metadata] * 25
+    assert probe_calls == 1
 
 
 @pytest.mark.parametrize(

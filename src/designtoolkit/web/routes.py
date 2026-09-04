@@ -655,6 +655,19 @@ def create_router(
     chroma_preview_store = ChromaPreviewStore()
     chroma_preview_owners: OrderedDict[str, str] = OrderedDict()
     chroma_preview_owners_lock = Lock()
+    media_validator = (
+        HostedMediaValidator(
+            HostedMediaLimits(
+                max_image_pixels=settings.max_image_pixels,
+                max_video_width=settings.max_video_width,
+                max_video_height=settings.max_video_height,
+                max_video_duration_seconds=settings.max_video_duration_seconds,
+            ),
+            video_probe=decoder.probe,
+        )
+        if storage is not None
+        else None
+    )
     video_metadata_cache = _BoundedSingleFlightCache[
         tuple[
             Path,
@@ -678,25 +691,13 @@ def create_router(
         input_path: Path,
         source_snapshot: _VideoSourceSnapshot,
     ) -> VideoMetadata:
+        if media_validator is not None:
+            return media_validator.validate_video(input_path)
         return get_cached_video_metadata(
             input_path,
             tuple(sorted(source_snapshot.fingerprint.items())),
             source_snapshot.version,
         )
-
-    media_validator = (
-        HostedMediaValidator(
-            HostedMediaLimits(
-                max_image_pixels=settings.max_image_pixels,
-                max_video_width=settings.max_video_width,
-                max_video_height=settings.max_video_height,
-                max_video_duration_seconds=settings.max_video_duration_seconds,
-            ),
-            video_probe=decoder.probe,
-        )
-        if storage is not None
-        else None
-    )
 
     def resolve_hosted_asset(http_request: Request, reference: str) -> Path:
         if storage is None:
@@ -706,23 +707,6 @@ def create_router(
         except UploadRejectedError as exc:
             raise ApiError("asset_not_found", str(exc), 404) from exc
 
-    def record_validated_video_metadata(
-        http_request: Request,
-        path: Path,
-        metadata: VideoMetadata | None,
-    ) -> None:
-        if metadata is None:
-            return
-        request_metadata = getattr(
-            http_request.state,
-            "validated_video_metadata",
-            None,
-        )
-        if request_metadata is None:
-            request_metadata = {}
-            http_request.state.validated_video_metadata = request_metadata
-        request_metadata[path] = metadata
-
     def validate_hosted_paths(
         http_request: Request,
         paths: list[Path],
@@ -730,34 +714,14 @@ def create_router(
         if media_validator is None:
             return
         try:
-            metadata_items = media_validator.validate_many(paths)
+            media_validator.validate_many(paths)
         except MediaLimitError as exc:
             raise ApiError("media_limit_exceeded", str(exc), 422) from exc
-        for path, metadata in zip(paths, metadata_items, strict=True):
-            record_validated_video_metadata(http_request, path, metadata)
 
     def resolve_input_path(http_request: Request, reference: str) -> Path:
         path = resolve_hosted_asset(http_request, reference)
         validate_hosted_paths(http_request, [path])
         return path
-
-    def video_metadata_for_request(
-        http_request: Request,
-    ) -> Callable[[Path, _VideoSourceSnapshot], VideoMetadata]:
-        def request_metadata(
-            input_path: Path,
-            source_snapshot: _VideoSourceSnapshot,
-        ) -> VideoMetadata:
-            validated = getattr(
-                http_request.state,
-                "validated_video_metadata",
-                {},
-            ).get(input_path)
-            if validated is not None:
-                return validated
-            return get_video_metadata(input_path, source_snapshot)
-
-        return request_metadata
 
     def owned_preview_url(http_request: Request, preview_id: str) -> str:
         if storage is not None:
@@ -1250,7 +1214,7 @@ def create_router(
                     input_path,
                     "video_inspect",
                     0.0,
-                    video_metadata_for_request(http_request),
+                    get_video_metadata,
                     read_video_preview_frame,
                     make_preview_png,
                 )
@@ -1290,7 +1254,7 @@ def create_router(
                     input_path,
                     "video_frame",
                     payload.timestamp_seconds,
-                    video_metadata_for_request(http_request),
+                    get_video_metadata,
                     read_video_preview_frame,
                     make_preview_png,
                 )
@@ -1317,7 +1281,7 @@ def create_router(
             metadata, timestamp_seconds, rgb = _read_stable_video_frame(
                 input_path,
                 payload.timestamp_seconds,
-                video_metadata_for_request(http_request),
+                get_video_metadata,
                 read_video_frame,
             )
         except KeyerError as exc:
@@ -1379,7 +1343,7 @@ def create_router(
                     input_path,
                     "video_generated",
                     payload.timestamp_seconds,
-                    video_metadata_for_request(http_request),
+                    get_video_metadata,
                     read_video_preview_frame,
                     create_preview_png,
                     samples=payload.samples,

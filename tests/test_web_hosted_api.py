@@ -219,6 +219,22 @@ def _png_bytes(size: tuple[int, int] = (2, 1)) -> bytes:
     return output.getvalue()
 
 
+def _animated_gif_bytes() -> bytes:
+    output = BytesIO()
+    frames = [
+        Image.new("RGB", (2, 2), color)
+        for color in ((255, 0, 0), (0, 255, 0))
+    ]
+    frames[0].save(
+        output,
+        format="GIF",
+        save_all=True,
+        append_images=frames[1:],
+        duration=10,
+    )
+    return output.getvalue()
+
+
 def _client(
     tmp_path: Path,
     *,
@@ -1212,18 +1228,130 @@ def test_hosted_unreadable_media_returns_clear_422(tmp_path: Path) -> None:
     }
 
 
-def test_hosted_video_inspection_reuses_validation_probe(tmp_path: Path) -> None:
+def test_hosted_animated_image_rejected_before_video_probe(tmp_path: Path) -> None:
     decoder = StubHostedVideoDecoder()
     with _client(tmp_path, video_decoder=decoder) as client:
-        reference = _upload(client, "clip.mp4", b"video").json()["reference"]
+        reference = _upload(
+            client,
+            "animated.gif",
+            _animated_gif_bytes(),
+        ).json()["reference"]
         response = client.post(
             "/api/chroma-keyer/videos/inspect",
             json={"input_path": reference},
         )
 
-    assert response.status_code == 200
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "media_limit_exceeded"
+    assert decoder.probe_calls == 0
+    assert decoder.decode_calls == 0
+
+
+def test_hosted_repeated_video_preview_reuses_validation_probe(
+    tmp_path: Path,
+) -> None:
+    decoder = StubHostedVideoDecoder()
+    with _client(tmp_path, video_decoder=decoder) as client:
+        reference = _upload(client, "clip.mp4", b"video").json()["reference"]
+        first = client.post(
+            "/api/chroma-keyer/videos/preview",
+            json={
+                "input_path": reference,
+                "timestamp_seconds": 0.0,
+                "samples": [[0, 255, 0]],
+                "params": {},
+            },
+        )
+        second = client.post(
+            "/api/chroma-keyer/videos/preview",
+            json={
+                "input_path": reference,
+                "timestamp_seconds": 0.0,
+                "samples": [[0, 255, 0]],
+                "params": {},
+            },
+        )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
     assert decoder.probe_calls == 1
     assert decoder.decode_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("route", "payload", "expected_status"),
+    [
+        ("/api/chroma-keyer/videos/inspect", {}, 200),
+        ("/api/chroma-keyer/videos/frame", {"timestamp_seconds": 0.0}, 200),
+        (
+            "/api/chroma-keyer/videos/sample",
+            {
+                "timestamp_seconds": 0.0,
+                "x": 0.0,
+                "y": 0.0,
+                "preview_width": 2.0,
+                "preview_height": 2.0,
+            },
+            400,
+        ),
+        (
+            "/api/chroma-keyer/videos/preview",
+            {
+                "timestamp_seconds": 0.0,
+                "samples": [[0, 255, 0]],
+                "params": {},
+            },
+            200,
+        ),
+    ],
+)
+def test_hosted_video_preview_routes_do_not_reprobe_after_validation(
+    tmp_path: Path,
+    route: str,
+    payload: dict[str, object],
+    expected_status: int,
+) -> None:
+    decoder = StubHostedVideoDecoder()
+    with _client(tmp_path, video_decoder=decoder) as client:
+        reference = _upload(client, "clip.mp4", b"video").json()["reference"]
+        response = client.post(route, json={"input_path": reference, **payload})
+
+    assert response.status_code == expected_status
+    assert decoder.probe_calls == 1
+    assert decoder.decode_calls == 1
+
+
+def test_hosted_video_stat_change_reprobes_and_regenerates_preview(
+    tmp_path: Path,
+) -> None:
+    decoder = StubHostedVideoDecoder()
+    with _client(tmp_path, video_decoder=decoder) as client:
+        reference = _upload(client, "clip.mp4", b"video").json()["reference"]
+        first = client.post(
+            "/api/chroma-keyer/videos/preview",
+            json={
+                "input_path": reference,
+                "timestamp_seconds": 0.0,
+                "samples": [[0, 255, 0]],
+                "params": {},
+            },
+        )
+        stored_path = next(tmp_path.glob("sessions/*/assets/*/clip.mp4"))
+        stored_path.write_bytes(b"changed-video")
+        second = client.post(
+            "/api/chroma-keyer/videos/preview",
+            json={
+                "input_path": reference,
+                "timestamp_seconds": 0.0,
+                "samples": [[0, 255, 0]],
+                "params": {},
+            },
+        )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert decoder.probe_calls == 2
+    assert decoder.decode_calls == 2
 
 
 def test_local_mode_does_not_apply_hosted_media_limits(tmp_path: Path) -> None:
