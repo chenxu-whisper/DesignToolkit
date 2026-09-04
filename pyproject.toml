@@ -29,9 +29,11 @@ build-backend = "uv_build"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra"
+addopts = "-ra --basetemp=.temp/pytest-tmp"
+cache_dir = ".temp/pytest/cache"
 
 [tool.ruff]
+cache-dir = ".temp/ruff/cache"
 target-version = "py312"
 line-length = 88
 src = ["src", "tests"]
