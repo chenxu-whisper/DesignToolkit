@@ -8,7 +8,11 @@ import pytest
 from rq import Queue
 
 from designtoolkit.chroma_keyer.models import KeyerError, KeyImageResult
-from designtoolkit.media_resize import MediaResizeResult
+from designtoolkit.media_resize import (
+    MediaResizeResult,
+    ResizeBackendResult,
+    resize_media,
+)
 from designtoolkit.video_frames import ExportResult
 from designtoolkit.web.adapters import media_resize_options_list_from_request
 from designtoolkit.web.redis_tasks import RedisLogStore, RedisTaskManager
@@ -203,6 +207,121 @@ def test_worker_executor_runs_reserved_task_and_persists_success(
     assert Path(completed.result_path).is_file()
 
 
+def test_worker_rejects_zip_larger_than_budget_after_packaging(
+    tmp_path: Path,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    state = _manager(redis_connection, tmp_path)
+    input_path = tmp_path / "assets" / "clip.mp4"
+    input_path.parent.mkdir()
+    input_path.write_bytes(b"input")
+    output_dir = tmp_path / "frames"
+    request = VideoFramesTaskRequest(
+        input_path=str(input_path),
+        output_dir=str(output_dir),
+    )
+    task = state.create_video_frames_task(request, owner_id="a" * 32)
+    executor = RedisTaskExecutor(state, max_output_bytes=129)
+
+    def export(_options, _backend) -> ExportResult:
+        output_dir.mkdir()
+        (output_dir / "frame.bin").write_bytes(bytes(range(128)))
+        return ExportResult(
+            output_dir=output_dir,
+            output_pattern=output_dir / "clip_%06d.png",
+            command=("ffmpeg",),
+        )
+
+    executor._exporter = export
+
+    executor.execute_reserved_task(task, request)
+
+    completed = state.get_task(task.task_id, owner_id="a" * 32)
+    assert completed is not None
+    assert completed.status is TaskStatus.FAILED
+    assert completed.error is not None
+    assert "129-byte limit" in completed.error
+    assert not output_dir.exists()
+    assert not (tmp_path / f"{task.task_id}.zip").exists()
+    assert input_path.read_bytes() == b"input"
+
+
+@pytest.mark.parametrize("failure_mode", ["nonzero", "exception"])
+def test_worker_removes_partial_ffmpeg_output_after_any_failure(
+    tmp_path: Path,
+    failure_mode: str,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    state = _manager(redis_connection, tmp_path)
+    input_path = tmp_path / "assets" / "clip.mp4"
+    input_path.parent.mkdir()
+    input_path.write_bytes(b"input")
+    output_root = tmp_path / "task-output"
+    output_root.mkdir()
+    request = MediaResizeTaskRequest(
+        input_paths=[str(input_path)],
+        output_dir=str(output_root),
+        size="100x100",
+    )
+    task = state.create_media_resize_task(request, owner_id="a" * 32)
+    executor = RedisTaskExecutor(state)
+
+    class PartialFailureBackend:
+        def get_ffmpeg_exe(self) -> str:
+            return "ffmpeg"
+
+        def run(self, command) -> ResizeBackendResult:
+            Path(command[-1]).write_bytes(b"partial")
+            if failure_mode == "exception":
+                raise RuntimeError("FFmpeg process failed")
+            return ResizeBackendResult(returncode=1, stderr="encode failed")
+
+    executor._media_resizer = resize_media
+    executor._backend_factory = PartialFailureBackend
+
+    executor.execute_reserved_task(task, request)
+
+    completed = state.get_task(task.task_id, owner_id="a" * 32)
+    assert completed is not None
+    assert completed.status is TaskStatus.FAILED
+    assert not output_root.exists()
+    assert input_path.read_bytes() == b"input"
+
+
+def test_worker_failure_cleanup_preserves_input_inside_output_root(
+    tmp_path: Path,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    state = _manager(redis_connection, tmp_path)
+    output_root = tmp_path / "task-output"
+    output_root.mkdir()
+    input_path = output_root / "clip.mp4"
+    input_path.write_bytes(b"input")
+    request = MediaResizeTaskRequest(
+        input_paths=[str(input_path)],
+        output_dir=str(output_root),
+        size="100x100",
+    )
+    task = state.create_media_resize_task(request, owner_id="a" * 32)
+    executor = RedisTaskExecutor(state)
+
+    class PartialFailureBackend:
+        def get_ffmpeg_exe(self) -> str:
+            return "ffmpeg"
+
+        def run(self, command) -> ResizeBackendResult:
+            Path(command[-1]).write_bytes(b"partial")
+            return ResizeBackendResult(returncode=1, stderr="encode failed")
+
+    executor._media_resizer = resize_media
+    executor._backend_factory = PartialFailureBackend
+
+    executor.execute_reserved_task(task, request)
+
+    assert input_path.read_bytes() == b"input"
+    assert sorted(path.name for path in output_root.iterdir()) == ["clip.mp4"]
+
+
 def test_worker_aborts_batch_when_aggregate_output_exceeds_budget(
     tmp_path: Path,
 ) -> None:
@@ -222,9 +341,11 @@ def test_worker_aborts_batch_when_aggregate_output_exceeds_budget(
     task = state.create_media_resize_task(request, owner_id="a" * 32)
     executor = RedisTaskExecutor(state, max_output_bytes=8)
     backend_limits: list[int | None] = []
+    backends: list[object] = []
 
     def resize(options, backend) -> MediaResizeResult:
         assert backend._output_guard is not None
+        backends.append(backend)
         backend_limits.append(backend._max_file_bytes)
         assert options.output_path is not None
         options.output_path.write_bytes(b"1234")
@@ -242,6 +363,8 @@ def test_worker_aborts_batch_when_aggregate_output_exceeds_budget(
     assert not output_root.exists()
     assert all(path.read_bytes() == b"input" for path in inputs)
     assert backend_limits == [7, 3]
+    assert backends[0] is not backends[1]
+    assert backends[0]._output_guard is backends[1]._output_guard
 
 
 def test_worker_aborts_chroma_video_from_progress_accounting(

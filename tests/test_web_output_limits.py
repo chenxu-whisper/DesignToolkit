@@ -4,6 +4,7 @@ import os
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Event
 from typing import Any
 
 import pytest
@@ -12,7 +13,11 @@ from designtoolkit.video_frames.ffmpeg_backend import (
     FfmpegBackend,
     _file_size_limit_preexec,
 )
-from designtoolkit.web.output_limits import OutputBudgetGuard, OutputLimitExceeded
+from designtoolkit.web.output_limits import (
+    OutputBudgetGuard,
+    OutputLimitExceeded,
+    OutputTargetMonitor,
+)
 
 
 def test_budget_rejects_aggregate_files_at_safety_boundary(tmp_path: Path) -> None:
@@ -69,6 +74,43 @@ def test_account_is_thread_safe_for_distinct_files(tmp_path: Path) -> None:
     assert guard.used_bytes == 200
 
 
+def test_account_same_growing_file_cannot_restore_stale_size(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    guard = OutputBudgetGuard(tmp_path, max_bytes=100)
+    output = tmp_path / "output.bin"
+    output.write_bytes(b"1234")
+    first_observed = Event()
+    second_observed = Event()
+    release_first = Event()
+    original_identity = guard._identity
+
+    def controlled_identity(path: Path, device: int, inode: int):
+        if not first_observed.is_set():
+            first_observed.set()
+            assert release_first.wait(timeout=5)
+        else:
+            second_observed.set()
+        return original_identity(path, device, inode)
+
+    monkeypatch.setattr(guard, "_identity", controlled_identity)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        stale_account = executor.submit(guard.account, output)
+        assert first_observed.wait(timeout=5)
+        output.write_bytes(b"1234567")
+        current_account = executor.submit(guard.account, output)
+        if second_observed.wait(timeout=0.2):
+            current_account.result(timeout=5)
+        release_first.set()
+        stale_account.result(timeout=5)
+        current_account.result(timeout=5)
+
+    guard.account(output)
+
+    assert guard.used_bytes == 7
+
+
 def test_account_rejects_path_outside_root(tmp_path: Path) -> None:
     root = tmp_path / "root"
     root.mkdir()
@@ -120,6 +162,77 @@ def test_hard_links_are_not_double_counted(tmp_path: Path) -> None:
     guard.account(alias)
 
     assert guard.used_bytes == 4
+
+
+def test_single_output_monitor_accounts_only_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    guard = OutputBudgetGuard(tmp_path, max_bytes=100)
+    target = tmp_path / "output.mp4"
+    unrelated = tmp_path / "sidecar.bin"
+    target.write_bytes(b"1234")
+    unrelated.write_bytes(b"ignored")
+    accounted: list[Path] = []
+    original_account = guard.account
+
+    def account(path: Path) -> None:
+        original_account(path)
+        accounted.append(path)
+
+    monkeypatch.setattr(guard, "account", account)
+    monitor = OutputTargetMonitor(guard, target)
+
+    monitor.poll()
+    target.write_bytes(b"123456")
+    monitor.poll()
+
+    assert accounted == [target, target]
+    assert guard.used_bytes == 6
+
+
+def test_sequence_monitor_only_accounts_new_contiguous_frames(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    guard = OutputBudgetGuard(tmp_path, max_bytes=100)
+    pattern = tmp_path / "clip%%take_%06d.png"
+    first = tmp_path / "clip%take_000001.png"
+    second = tmp_path / "clip%take_000002.png"
+    third = tmp_path / "clip%take_000003.png"
+    first.write_bytes(b"1")
+    second.write_bytes(b"22")
+    accounted: list[Path] = []
+    original_account = guard.account
+
+    def account(path: Path) -> None:
+        original_account(path)
+        accounted.append(path)
+
+    monkeypatch.setattr(guard, "account", account)
+    monitor = OutputTargetMonitor(guard, pattern)
+
+    monitor.poll()
+    monitor.poll()
+    third.write_bytes(b"333")
+    monitor.poll()
+
+    assert accounted == [first, second, third]
+    assert guard.used_bytes == 6
+
+
+def test_sequence_monitor_leaves_gap_for_final_tree_check(tmp_path: Path) -> None:
+    guard = OutputBudgetGuard(tmp_path, max_bytes=6, safety_bytes=1)
+    pattern = tmp_path / "clip_%06d.png"
+    (tmp_path / "clip_000001.png").write_bytes(b"1")
+    (tmp_path / "clip_000003.png").write_bytes(b"12345")
+    monitor = OutputTargetMonitor(guard, pattern)
+
+    monitor.poll()
+    assert guard.used_bytes == 1
+
+    with pytest.raises(OutputLimitExceeded, match="6-byte limit"):
+        monitor.finish()
 
 
 class FakePopen:
@@ -212,6 +325,35 @@ def test_ffmpeg_backend_polls_guard_between_timeouts() -> None:
     assert result.returncode == 0
     assert guard_calls == 1
     assert not process.terminate_called
+
+
+def test_ffmpeg_backend_runs_full_tree_check_after_process_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = FakePopen([("", "")])
+    target = tmp_path / "clip_000001.png"
+    target.write_bytes(b"1")
+    (tmp_path / "unmonitored.bin").write_bytes(b"12345")
+    guard = OutputBudgetGuard(tmp_path, max_bytes=6, safety_bytes=1)
+    check_calls = 0
+    original_check_tree = guard.check_tree
+
+    def check_tree() -> None:
+        nonlocal check_calls
+        check_calls += 1
+        original_check_tree()
+
+    monkeypatch.setattr(guard, "check_tree", check_tree)
+    backend = FfmpegBackend(
+        output_guard=guard,
+        popen=_popen_factory(process, []),
+    )
+
+    with pytest.raises(OutputLimitExceeded, match="6-byte limit"):
+        backend.run(["ffmpeg", str(tmp_path / "clip_%06d.png")])
+
+    assert check_calls == 1
 
 
 def test_ffmpeg_backend_terminates_when_guard_rejects() -> None:

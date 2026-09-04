@@ -10,6 +10,7 @@ from pathlib import Path
 import imageio_ffmpeg
 
 from designtoolkit.video_frames.core import BackendResult, BackendUnavailableError
+from designtoolkit.web.output_limits import OutputBudgetGuard, OutputTargetMonitor
 
 PopenFactory = Callable[..., subprocess.Popen[str]]
 
@@ -46,7 +47,7 @@ class FfmpegBackend:
     def __init__(
         self,
         *,
-        output_guard: Callable[[], None] | None = None,
+        output_guard: OutputBudgetGuard | Callable[[], None] | None = None,
         poll_interval: float = 0.25,
         popen: PopenFactory = subprocess.Popen,
         max_file_bytes: int | None = None,
@@ -102,6 +103,11 @@ class FfmpegBackend:
         return float(duration_seconds)
 
     def run(self, command: Sequence[str]) -> BackendResult:
+        monitor = (
+            OutputTargetMonitor(self._output_guard, command[-1])
+            if isinstance(self._output_guard, OutputBudgetGuard)
+            else None
+        )
         popen_kwargs: dict[str, object] = {
             "stdout": subprocess.PIPE,
             "stderr": subprocess.PIPE,
@@ -123,11 +129,16 @@ class FfmpegBackend:
                 if self._output_guard is None:
                     continue
                 try:
-                    self._output_guard()
+                    if monitor is not None:
+                        monitor.poll()
+                    else:
+                        self._output_guard()
                 except Exception:
                     self._stop_process(process)
                     raise
                 continue
+            if monitor is not None:
+                monitor.finish()
             return BackendResult(
                 returncode=process.returncode if process.returncode is not None else 1,
                 stderr=stderr or "",

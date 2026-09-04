@@ -360,7 +360,6 @@ class TaskManager:
                     )
                 material_started_at = self._clock()
                 result = self._exporter(options, self._backend_factory())
-                self._check_output_tree()
                 material_elapsed = self._elapsed_seconds(material_started_at)
                 results.append(result)
                 self.log_store.append(

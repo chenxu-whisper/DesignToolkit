@@ -37,6 +37,7 @@ class RedisTaskExecutor(TaskManager):
         self._max_output_bytes = max_output_bytes
         self._output_guard: OutputBudgetGuard | None = None
         self._output_root: Path | None = None
+        self._input_paths: set[Path] = set()
         self._backend_factory = self._guarded_backend
 
     def execute_reserved_task(
@@ -51,6 +52,7 @@ class RedisTaskExecutor(TaskManager):
     ) -> None:
         output_root = _request_output_root(request)
         self._output_root = output_root.resolve() if output_root is not None else None
+        self._input_paths = _request_input_paths(request)
         self._output_guard = (
             OutputBudgetGuard(self._output_root, self._max_output_bytes)
             if self._output_root is not None
@@ -95,9 +97,9 @@ class RedisTaskExecutor(TaskManager):
             self._output_guard.check_tree()
 
     def _handle_task_failure(self, task_id: str, exc: Exception) -> None:
+        self._discard_partial_output()
         output_limit_error = _find_output_limit_error(exc)
         if output_limit_error is not None:
-            self._discard_partial_output()
             self._mark_failed(task_id, str(output_limit_error))
             return
         super()._handle_task_failure(task_id, exc)
@@ -110,6 +112,7 @@ class RedisTaskExecutor(TaskManager):
         elapsed_seconds: float | None = None,
         frame_count: int | None = None,
     ) -> None:
+        artifact: Path | None = None
         try:
             self._check_output_tree()
             artifact = prepare_download_artifact(
@@ -117,9 +120,16 @@ class RedisTaskExecutor(TaskManager):
                 output_path,
                 max_output_bytes=self._max_output_bytes,
             )
-        except OutputLimitExceeded as exc:
+            self._validate_artifact(artifact)
+        except Exception as exc:
+            if artifact is not None:
+                artifact.unlink(missing_ok=True)
             self._discard_partial_output()
-            self._mark_failed(task_id, str(exc))
+            output_limit_error = _find_output_limit_error(exc)
+            self._mark_failed(
+                task_id,
+                str(output_limit_error or exc),
+            )
             return
         download_url = f"/api/tasks/{task_id}/download"
         task = self._state.get_task(task_id)
@@ -153,17 +163,68 @@ class RedisTaskExecutor(TaskManager):
         if self._output_guard is None:
             return FfmpegBackend()
         return FfmpegBackend(
-            output_guard=self._output_guard.check_tree,
+            output_guard=self._output_guard,
             max_file_bytes=self._output_guard.remaining_bytes,
         )
+
+    def _validate_artifact(self, artifact: Path) -> None:
+        artifact_guard = OutputBudgetGuard(
+            artifact.parent,
+            self._max_output_bytes,
+            safety_bytes=0,
+        )
+        artifact_guard.account(artifact)
 
     def _discard_partial_output(self) -> None:
         if self._output_root is None:
             return
-        if self._output_root.is_dir():
+        protected = {
+            path
+            for path in self._input_paths
+            if path == self._output_root or path.is_relative_to(self._output_root)
+        }
+        if not protected and self._output_root.is_dir():
             rmtree(self._output_root, ignore_errors=True)
-        else:
-            self._output_root.unlink(missing_ok=True)
+            return
+        if self._output_root.is_file():
+            if self._output_root not in protected:
+                self._output_root.unlink(missing_ok=True)
+            return
+        if not self._output_root.is_dir():
+            return
+        for path in sorted(
+            self._output_root.rglob("*"),
+            key=lambda candidate: len(candidate.parts),
+            reverse=True,
+        ):
+            if path.is_file() and path.resolve() not in protected:
+                path.unlink(missing_ok=True)
+            elif path.is_dir():
+                try:
+                    path.rmdir()
+                except OSError:
+                    pass
+        try:
+            self._output_root.rmdir()
+        except OSError:
+            pass
+
+
+def _request_input_paths(
+    request: (
+        VideoFramesTaskRequest
+        | MediaResizeTaskRequest
+        | ChromaKeyerTaskRequest
+        | ChromaVideoKeyerTaskRequest
+    ),
+) -> set[Path]:
+    input_paths = getattr(request, "input_paths", None)
+    if input_paths is not None:
+        return {Path(path).resolve() for path in input_paths}
+    input_path = getattr(request, "input_path", None)
+    if input_path is None:
+        return set()
+    return {Path(input_path).resolve()}
 
 
 def run_task(task_id: str, job_kind: str, payload: dict[str, object]) -> None:
