@@ -4,6 +4,7 @@ import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from threading import Lock, Thread
 from time import perf_counter
 from uuid import uuid4
@@ -92,6 +93,8 @@ class TaskRecord:
     input_path: str
     output_path: str | None
     error: str | None
+    owner_id: str | None = None
+    result_path: str | None = None
 
     def to_response(self) -> TaskResponse:
         return TaskResponse(
@@ -166,9 +169,17 @@ class TaskManager:
         )
         return task
 
-    def get_task(self, task_id: str) -> TaskRecord | None:
+    def get_task(
+        self,
+        task_id: str,
+        *,
+        owner_id: str | None = None,
+    ) -> TaskRecord | None:
         with self._lock:
-            return self._records.get(task_id)
+            task = self._records.get(task_id)
+            if task is not None and owner_id is not None and task.owner_id != owner_id:
+                return None
+            return task
 
     def mark_finished(
         self,
@@ -177,6 +188,7 @@ class TaskManager:
         status: TaskStatus,
         output_path: str | None = None,
         error: str | None = None,
+        result_path: str | None = None,
     ) -> TaskRecord:
         with self._lock:
             task = self._records[task_id]
@@ -185,6 +197,9 @@ class TaskManager:
                 output_path if output_path is not None else task.output_path
             )
             task.error = error
+            task.result_path = (
+                result_path if result_path is not None else task.result_path
+            )
             task.finished_at = datetime.now(UTC)
             if self._active_task_id == task_id:
                 self._active_task_id = None
@@ -193,6 +208,8 @@ class TaskManager:
     def create_video_frames_task(
         self,
         request: VideoFramesTaskRequest,
+        *,
+        owner_id: str | None = None,
     ) -> TaskRecord:
         options_list = video_frame_options_list_from_request(request)
         task = self.reserve_task(
@@ -209,6 +226,8 @@ class TaskManager:
     def create_media_resize_task(
         self,
         request: MediaResizeTaskRequest,
+        *,
+        owner_id: str | None = None,
     ) -> TaskRecord:
         options_list = media_resize_options_list_from_request(request)
         task = self.reserve_task(
@@ -225,6 +244,8 @@ class TaskManager:
     def create_chroma_keyer_task(
         self,
         request: ChromaKeyerTaskRequest,
+        *,
+        owner_id: str | None = None,
     ) -> TaskRecord:
         options, model, params = chroma_keyer_options_from_request(request)
         output_path = options.output_path or default_output_path(options.input_path)
@@ -246,6 +267,8 @@ class TaskManager:
     def create_chroma_video_keyer_task(
         self,
         request: ChromaVideoKeyerTaskRequest,
+        *,
+        owner_id: str | None = None,
     ) -> TaskRecord:
         options, model, params = chroma_video_keyer_options_from_request(request)
         output_root = options.output_root or options.input_path.parent
@@ -272,6 +295,35 @@ class TaskManager:
         except Exception as exc:
             self._mark_failed(task.task_id, str(exc))
         return self.get_task(task.task_id) or task
+
+    def execute_reserved_task(
+        self,
+        task: TaskRecord,
+        request: (
+            VideoFramesTaskRequest
+            | MediaResizeTaskRequest
+            | ChromaKeyerTaskRequest
+            | ChromaVideoKeyerTaskRequest
+        ),
+    ) -> None:
+        if isinstance(request, VideoFramesTaskRequest):
+            self._run_video_frames(
+                task,
+                video_frame_options_list_from_request(request),
+            )
+            return
+        if isinstance(request, MediaResizeTaskRequest):
+            self._run_media_resize(
+                task,
+                media_resize_options_list_from_request(request),
+            )
+            return
+        if isinstance(request, ChromaVideoKeyerTaskRequest):
+            options, model, params = chroma_video_keyer_options_from_request(request)
+            self._run_chroma_video_keyer(task, options, model, params)
+            return
+        options, model, params = chroma_keyer_options_from_request(request)
+        self._run_chroma_keyer(task, options, model, params)
 
     def _start(self, task: TaskRecord, runner: Callable[[], None]) -> None:
         if self._run_async:
@@ -308,6 +360,7 @@ class TaskManager:
                     )
                 material_started_at = self._clock()
                 result = self._exporter(options, self._backend_factory())
+                self._check_output_tree()
                 material_elapsed = self._elapsed_seconds(material_started_at)
                 results.append(result)
                 self.log_store.append(
@@ -327,7 +380,7 @@ class TaskManager:
                     },
                 )
         except Exception as exc:
-            self._mark_failed(task.task_id, str(exc))
+            self._handle_task_failure(task.task_id, exc)
             return
         self._mark_succeeded(
             task.task_id,
@@ -364,6 +417,7 @@ class TaskManager:
                     )
                 material_started_at = self._clock()
                 result = self._media_resizer(options, self._backend_factory())
+                self._account_output(result.output_path)
                 material_elapsed = self._elapsed_seconds(material_started_at)
                 results.append(result)
                 message = (
@@ -386,7 +440,7 @@ class TaskManager:
                     },
                 )
         except Exception as exc:
-            self._mark_failed(task.task_id, str(exc))
+            self._handle_task_failure(task.task_id, exc)
             return
         self._mark_succeeded(
             task.task_id,
@@ -407,6 +461,7 @@ class TaskManager:
             if self._keyer is None:
                 raise RuntimeError("chroma keyer is not configured")
             result = self._keyer(options, model, params)
+            self._account_output(result.output_path)
             elapsed_seconds = self._elapsed_seconds(task_started_at)
             self.log_store.append(
                 task_id=task.task_id,
@@ -420,7 +475,7 @@ class TaskManager:
                 },
             )
         except Exception as exc:
-            self._mark_failed(task.task_id, str(exc))
+            self._handle_task_failure(task.task_id, exc)
             return
         self._mark_succeeded(
             task.task_id,
@@ -448,6 +503,7 @@ class TaskManager:
             force: bool = False,
         ) -> None:
             nonlocal last_reported_frames
+            self._account_output(Path(current_path))
             if processed_frames <= last_reported_frames:
                 return
             interval = max(1, estimated_total // 100) if estimated_total else 30
@@ -534,7 +590,7 @@ class TaskManager:
                 },
             )
         except Exception as exc:
-            self._mark_failed(task.task_id, str(exc))
+            self._handle_task_failure(task.task_id, exc)
             return
         self._mark_succeeded(
             task.task_id,
@@ -583,6 +639,15 @@ class TaskManager:
 
     def _elapsed_seconds(self, started_at: float) -> float:
         return round(self._clock() - started_at, 3)
+
+    def _account_output(self, path: Path) -> None:
+        del path
+
+    def _check_output_tree(self) -> None:
+        pass
+
+    def _handle_task_failure(self, task_id: str, exc: Exception) -> None:
+        self._mark_failed(task_id, str(exc))
 
     def _mark_failed(self, task_id: str, message: str) -> None:
         self.mark_finished(

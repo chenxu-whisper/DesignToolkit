@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import subprocess
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from functools import partial
 from importlib import resources
+from os import name as os_name
 from pathlib import Path
 
 import imageio_ffmpeg
 
 from designtoolkit.video_frames.core import BackendResult, BackendUnavailableError
+
+PopenFactory = Callable[..., subprocess.Popen[str]]
 
 
 def _bundled_binary_dir() -> Path:
@@ -22,7 +26,36 @@ def _is_relative_to(path: Path, directory: Path) -> bool:
     return True
 
 
+def _set_file_size_limit(max_bytes: int) -> None:
+    import resource
+
+    resource.setrlimit(resource.RLIMIT_FSIZE, (max_bytes, max_bytes))
+
+
+def _file_size_limit_preexec(
+    max_bytes: int | None,
+    *,
+    os_name: str = os_name,
+) -> Callable[[], None] | None:
+    if os_name != "posix" or max_bytes is None:
+        return None
+    return partial(_set_file_size_limit, max_bytes)
+
+
 class FfmpegBackend:
+    def __init__(
+        self,
+        *,
+        output_guard: Callable[[], None] | None = None,
+        poll_interval: float = 0.25,
+        popen: PopenFactory = subprocess.Popen,
+        max_file_bytes: int | None = None,
+    ) -> None:
+        self._output_guard = output_guard
+        self._poll_interval = poll_interval
+        self._popen = popen
+        self._max_file_bytes = max_file_bytes
+
     def get_ffmpeg_exe(self) -> str:
         try:
             ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
@@ -69,15 +102,41 @@ class FfmpegBackend:
         return float(duration_seconds)
 
     def run(self, command: Sequence[str]) -> BackendResult:
-        completed = subprocess.run(
+        popen_kwargs: dict[str, object] = {
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
+        }
+        preexec_fn = _file_size_limit_preexec(self._max_file_bytes)
+        if preexec_fn is not None:
+            popen_kwargs["preexec_fn"] = preexec_fn
+        process = self._popen(
             list(command),
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=False,
+            **popen_kwargs,
         )
-        return BackendResult(
-            returncode=completed.returncode,
-            stderr=completed.stderr or "",
-        )
+        while True:
+            try:
+                _stdout, stderr = process.communicate(timeout=self._poll_interval)
+            except subprocess.TimeoutExpired:
+                if self._output_guard is None:
+                    continue
+                try:
+                    self._output_guard()
+                except Exception:
+                    self._stop_process(process)
+                    raise
+                continue
+            return BackendResult(
+                returncode=process.returncode if process.returncode is not None else 1,
+                stderr=stderr or "",
+            )
+
+    def _stop_process(self, process: subprocess.Popen[str]) -> None:
+        process.terminate()
+        try:
+            process.wait(timeout=self._poll_interval)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
