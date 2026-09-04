@@ -517,20 +517,24 @@ def prepare_download_artifact(
         return paths[0]
 
     archive_path = paths[0].parent / f"{task_id}.zip"
-    with ZipFile(archive_path, "w", compression=ZIP_DEFLATED) as archive:
-        for path in paths:
-            if path.is_file():
-                archive.write(path, arcname=path.name)
-                path.unlink()
-                continue
-            for child in sorted(path.rglob("*")):
-                if child.is_file():
-                    archive.write(
-                        child,
-                        arcname=str(Path(path.name) / child.relative_to(path)),
-                    )
-                    child.unlink()
-            shutil.rmtree(path, ignore_errors=True)
+    try:
+        with ZipFile(archive_path, "w", compression=ZIP_DEFLATED) as archive:
+            for path in paths:
+                if path.is_file():
+                    archive.write(path, arcname=path.name)
+                    path.unlink()
+                    continue
+                for child in sorted(path.rglob("*")):
+                    if child.is_file():
+                        archive.write(
+                            child,
+                            arcname=str(Path(path.name) / child.relative_to(path)),
+                        )
+                        child.unlink()
+                shutil.rmtree(path, ignore_errors=True)
+    except Exception:
+        archive_path.unlink(missing_ok=True)
+        raise
     return archive_path
 
 

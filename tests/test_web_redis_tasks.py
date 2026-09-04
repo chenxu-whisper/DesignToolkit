@@ -246,6 +246,51 @@ def test_worker_rejects_zip_larger_than_budget_after_packaging(
     assert input_path.read_bytes() == b"input"
 
 
+def test_worker_removes_zip_candidate_when_preparation_raises(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    state = _manager(redis_connection, tmp_path)
+    input_path = tmp_path / "clip.mp4"
+    input_path.write_bytes(b"input")
+    output_dir = tmp_path / "frames"
+    request = VideoFramesTaskRequest(
+        input_path=str(input_path),
+        output_dir=str(output_dir),
+    )
+    task = state.create_video_frames_task(request, owner_id="a" * 32)
+    executor = RedisTaskExecutor(state)
+    archive_path = tmp_path / f"{task.task_id}.zip"
+
+    def export(_options, _backend) -> ExportResult:
+        output_dir.mkdir()
+        (output_dir / "frame.png").write_bytes(b"png")
+        return ExportResult(
+            output_dir=output_dir,
+            output_pattern=output_dir / "clip_%06d.png",
+            command=("ffmpeg",),
+        )
+
+    def fail_preparation(*_args, **_kwargs) -> Path:
+        archive_path.write_bytes(b"partial zip")
+        raise OSError("zip close failed")
+
+    executor._exporter = export
+    monkeypatch.setattr(
+        "designtoolkit.web.worker.prepare_download_artifact",
+        fail_preparation,
+    )
+
+    executor.execute_reserved_task(task, request)
+
+    completed = state.get_task(task.task_id, owner_id="a" * 32)
+    assert completed is not None
+    assert completed.status is TaskStatus.FAILED
+    assert completed.error == "zip close failed"
+    assert not archive_path.exists()
+
+
 @pytest.mark.parametrize("failure_mode", ["nonzero", "exception"])
 def test_worker_removes_partial_ffmpeg_output_after_any_failure(
     tmp_path: Path,

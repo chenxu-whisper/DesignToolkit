@@ -712,6 +712,44 @@ def test_directory_result_is_packaged_as_a_zip(tmp_path: Path) -> None:
     assert not output_dir.exists()
 
 
+@pytest.mark.parametrize("failure_mode", ["write", "close"])
+def test_partial_zip_is_removed_after_packaging_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_mode: str,
+) -> None:
+    output_dir = tmp_path / "frames"
+    output_dir.mkdir()
+    source = output_dir / "frame_000001.png"
+    source.write_bytes(b"png")
+    archive_path = tmp_path / "task-1.zip"
+
+    class FailingZipFile:
+        def __init__(self, path: Path, *_args, **_kwargs) -> None:
+            self.path = path
+
+        def __enter__(self):
+            self.path.write_bytes(b"partial zip")
+            return self
+
+        def write(self, _path: Path, *, arcname: str) -> None:
+            del arcname
+            if failure_mode == "write":
+                raise OSError("zip write failed")
+
+        def __exit__(self, _exc_type, _exc, _traceback) -> None:
+            if failure_mode == "close":
+                raise OSError("zip close failed")
+
+    monkeypatch.setattr("designtoolkit.web.hosted.ZipFile", FailingZipFile)
+
+    with pytest.raises(OSError, match=f"zip {failure_mode} failed"):
+        prepare_download_artifact("task-1", str(output_dir))
+
+    assert not archive_path.exists()
+    assert source.exists() is (failure_mode == "write")
+
+
 def test_oversized_task_result_is_removed(tmp_path: Path) -> None:
     output = tmp_path / "result.png"
     output.write_bytes(b"12345")

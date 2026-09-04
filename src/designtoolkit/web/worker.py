@@ -113,6 +113,9 @@ class RedisTaskExecutor(TaskManager):
         frame_count: int | None = None,
     ) -> None:
         artifact: Path | None = None
+        archive_candidate = (
+            Path(output_path.split("; ", 1)[0]).parent / f"{task_id}.zip"
+        )
         try:
             self._check_output_tree()
             artifact = prepare_download_artifact(
@@ -124,6 +127,7 @@ class RedisTaskExecutor(TaskManager):
         except Exception as exc:
             if artifact is not None:
                 artifact.unlink(missing_ok=True)
+            archive_candidate.unlink(missing_ok=True)
             self._discard_partial_output()
             output_limit_error = _find_output_limit_error(exc)
             self._mark_failed(
