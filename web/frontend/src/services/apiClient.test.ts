@@ -122,6 +122,77 @@ describe('apiClient', () => {
     expect(progress).toEqual([20, 50, 100])
   })
 
+  it('deletes earlier uploads without masking a later upload error', async () => {
+    const requests: MockUploadRequest[] = []
+
+    class MockUploadRequest {
+      status = 201
+      response: unknown = null
+      listeners = new Map<string, () => void>()
+      upload = {
+        addEventListener: () => undefined,
+      }
+
+      constructor() {
+        requests.push(this)
+      }
+
+      open() {}
+
+      setRequestHeader() {}
+
+      addEventListener(type: string, listener: () => void) {
+        this.listeners.set(type, listener)
+      }
+
+      send() {}
+    }
+
+    vi.stubGlobal('XMLHttpRequest', MockUploadRequest)
+    const cleanup = vi
+      .spyOn(globalThis, 'fetch')
+      .mockRejectedValue(new Error('cleanup unavailable'))
+    const pending = uploadFiles(
+      [
+        new File(['first'], 'first.png'),
+        new File(['second'], 'second.png'),
+        new File(['third'], 'third.png'),
+      ],
+      () => undefined,
+    )
+    const firstId = '1'.repeat(32)
+    const secondId = '2'.repeat(32)
+
+    requests[0].response = {
+      filename: 'first.png',
+      reference: `asset:${firstId}:first.png`,
+      size: 5,
+    }
+    requests[0].listeners.get('load')?.()
+    await Promise.resolve()
+    requests[1].response = {
+      filename: 'second.png',
+      reference: `asset:${secondId}:second.png`,
+      size: 6,
+    }
+    requests[1].listeners.get('load')?.()
+    await Promise.resolve()
+    requests[2].status = 413
+    requests[2].response = {
+      error: { code: 'upload_too_large', message: 'Third upload rejected' },
+    }
+    requests[2].listeners.get('load')?.()
+
+    await expect(pending).rejects.toThrow('Third upload rejected')
+    expect(cleanup).toHaveBeenCalledTimes(2)
+    expect(cleanup).toHaveBeenCalledWith(`/api/uploads/${firstId}`, {
+      method: 'DELETE',
+    })
+    expect(cleanup).toHaveBeenCalledWith(`/api/uploads/${secondId}`, {
+      method: 'DELETE',
+    })
+  })
+
   it('models chroma payloads with exactly one RGB sample', () => {
     expectTypeOf<ChromaKeyerPayload['samples']>().toEqualTypeOf<readonly [ChromaKeyerRgbSample]>()
     expectTypeOf<ChromaVideoKeyerPayload['samples']>().toEqualTypeOf<readonly [ChromaKeyerRgbSample]>()

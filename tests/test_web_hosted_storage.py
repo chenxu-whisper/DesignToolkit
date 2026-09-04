@@ -182,6 +182,70 @@ async def test_upload_is_streamed_to_an_opaque_session_asset(
 
 
 @pytest.mark.anyio
+async def test_delete_asset_is_owned_exact_and_idempotent(tmp_path: Path) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    owner = "a" * 32
+    stranger = "b" * 32
+    asset = await storage.store_stream(
+        owner,
+        filename="screen.png",
+        content_length=5,
+        chunks=_chunks(b"image"),
+        reservation=RecordingReservation(),
+    )
+
+    with pytest.raises(UploadRejectedError, match="not available"):
+        storage.delete_asset(stranger, asset.reference)
+
+    assert storage.delete_asset(owner, asset.reference) == 5
+    assert storage.delete_asset(owner, asset.reference) == 0
+    with pytest.raises(UploadRejectedError, match="not available"):
+        storage.resolve(owner, asset.reference)
+    assert list(tmp_path.rglob("screen.png")) == []
+
+
+@pytest.mark.parametrize(
+    "reference",
+    [
+        "",
+        "asset:not-a-uuid",
+        "other:11111111111111111111111111111111",
+        "asset:11111111111111111111111111111111:bad:name.png",
+    ],
+)
+def test_delete_asset_rejects_malformed_references(
+    tmp_path: Path,
+    reference: str,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+
+    with pytest.raises(UploadRejectedError, match="not available"):
+        storage.delete_asset("a" * 32, reference)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("filename", ["bad\x00name.png", "bad\x1fname.png"])
+async def test_upload_rejects_control_characters_in_filename(
+    tmp_path: Path,
+    filename: str,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    reservation = RecordingReservation()
+
+    with pytest.raises(UploadRejectedError, match="File name is invalid"):
+        await storage.store_stream(
+            "a" * 32,
+            filename=filename,
+            content_length=4,
+            chunks=_chunks(b"1234"),
+            reservation=reservation,
+        )
+
+    assert reservation.released is True
+    assert list(tmp_path.rglob("*")) == []
+
+
+@pytest.mark.anyio
 async def test_upload_validates_type_and_declared_size_before_creating_files(
     tmp_path: Path,
 ) -> None:

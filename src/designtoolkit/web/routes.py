@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from collections import OrderedDict
@@ -22,6 +23,7 @@ import numpy as np
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from PIL import Image
+from redis.exceptions import RedisError
 
 from designtoolkit.chroma_keyer.core import key_rgb
 from designtoolkit.chroma_keyer.image_io import (
@@ -109,6 +111,7 @@ _KEYER_ERROR_CODES = {
     "Output path already exists": "output_exists",
     "Final output directory already exists": "output_exists",
 }
+_LOGGER = logging.getLogger(__name__)
 
 
 class _BoundedSingleFlightCache[CacheKey: Hashable, CacheValue]:
@@ -796,6 +799,18 @@ def create_router(
             }
         )
 
+    def discard_failed_hosted_task_dir(
+        http_request: Request,
+        payload: object,
+    ) -> None:
+        if storage is None:
+            return
+        for field in ("output_dir", "output_path", "output_root"):
+            storage.discard_empty_task_dir(
+                http_request.state.session_id,
+                getattr(payload, field, None),
+            )
+
     @router.get("/health")
     def health() -> dict[str, str]:
         return {"status": "ok"}
@@ -859,14 +874,54 @@ def create_router(
             ) from exc
         finally:
             if lease is not None:
-                lease.release()
+                _release_redis_resource_best_effort(
+                    lease.release,
+                    "upload session lease",
+                )
             if reservation is not None:
-                reservation.release()
+                _release_redis_resource_best_effort(
+                    reservation.release,
+                    "upload reservation",
+                )
         return UploadResponse(
             reference=asset.reference,
             filename=asset.filename,
             size=asset.size,
         )
+
+    @router.delete("/uploads/{asset_id}", status_code=204)
+    def delete_upload(http_request: Request, asset_id: str) -> Response:
+        if storage is None or resources is None:
+            raise ApiError("hosted_mode_disabled", "Uploads are unavailable", 404)
+        lease = None
+        try:
+            lease = resources.acquire_session(http_request.state.session_id)
+            deleted_bytes = storage.delete_asset(
+                http_request.state.session_id,
+                f"asset:{asset_id}",
+            )
+            if deleted_bytes:
+                resources.release_committed_usage(
+                    http_request.state.session_id,
+                    deleted_bytes,
+                )
+        except UploadRejectedError as exc:
+            raise ApiError("asset_not_found", str(exc), 404) from exc
+        except (RedisError, ResourceUnavailableError) as exc:
+            raise ApiError("storage_unavailable", str(exc), 503) from exc
+        except OSError as exc:
+            raise ApiError(
+                "storage_unavailable",
+                "Server storage is temporarily unavailable",
+                503,
+            ) from exc
+        finally:
+            if lease is not None:
+                _release_redis_resource_best_effort(
+                    lease.release,
+                    "upload deletion session lease",
+                )
+        return Response(status_code=204)
 
     @router.post(
         "/local-paths/resolve-dropped-files",
@@ -955,15 +1010,19 @@ def create_router(
         payload: VideoFramesTaskRequest,
         http_request: Request,
     ) -> TaskCreateResponse:
+        hosted_payload = hosted_video_frames_request(http_request, payload)
         try:
             task = task_manager.create_video_frames_task(
-                hosted_video_frames_request(http_request, payload),
+                hosted_payload,
                 owner_id=getattr(http_request.state, "session_id", None),
             )
-        except TaskConflictError as exc:
-            raise ApiError("task_conflict", str(exc), 409) from exc
-        except _INVALID_REQUEST_ERRORS as exc:
-            raise ApiError("invalid_request", str(exc), 400) from exc
+        except Exception as exc:
+            discard_failed_hosted_task_dir(http_request, hosted_payload)
+            if isinstance(exc, TaskConflictError):
+                raise ApiError("task_conflict", str(exc), 409) from exc
+            if isinstance(exc, _INVALID_REQUEST_ERRORS):
+                raise ApiError("invalid_request", str(exc), 400) from exc
+            raise
         return TaskCreateResponse(task_id=task.task_id, status=task.status)
 
     @router.post("/tasks/media-resize", response_model=TaskCreateResponse)
@@ -971,15 +1030,19 @@ def create_router(
         payload: MediaResizeTaskRequest,
         http_request: Request,
     ) -> TaskCreateResponse:
+        hosted_payload = hosted_media_resize_request(http_request, payload)
         try:
             task = task_manager.create_media_resize_task(
-                hosted_media_resize_request(http_request, payload),
+                hosted_payload,
                 owner_id=getattr(http_request.state, "session_id", None),
             )
-        except TaskConflictError as exc:
-            raise ApiError("task_conflict", str(exc), 409) from exc
-        except _INVALID_REQUEST_ERRORS as exc:
-            raise ApiError("invalid_request", str(exc), 400) from exc
+        except Exception as exc:
+            discard_failed_hosted_task_dir(http_request, hosted_payload)
+            if isinstance(exc, TaskConflictError):
+                raise ApiError("task_conflict", str(exc), 409) from exc
+            if isinstance(exc, _INVALID_REQUEST_ERRORS):
+                raise ApiError("invalid_request", str(exc), 400) from exc
+            raise
         return TaskCreateResponse(task_id=task.task_id, status=task.status)
 
     @router.post("/tasks/chroma-keyer", response_model=TaskCreateResponse)
@@ -987,15 +1050,19 @@ def create_router(
         payload: ChromaKeyerTaskRequest,
         http_request: Request,
     ) -> TaskCreateResponse:
+        hosted_payload = hosted_chroma_keyer_request(http_request, payload)
         try:
             task = task_manager.create_chroma_keyer_task(
-                hosted_chroma_keyer_request(http_request, payload),
+                hosted_payload,
                 owner_id=getattr(http_request.state, "session_id", None),
             )
-        except TaskConflictError as exc:
-            raise ApiError("task_conflict", str(exc), 409) from exc
-        except KeyerError as exc:
-            raise _chroma_keyer_error_response(exc) from exc
+        except Exception as exc:
+            discard_failed_hosted_task_dir(http_request, hosted_payload)
+            if isinstance(exc, TaskConflictError):
+                raise ApiError("task_conflict", str(exc), 409) from exc
+            if isinstance(exc, KeyerError):
+                raise _chroma_keyer_error_response(exc) from exc
+            raise
         return TaskCreateResponse(task_id=task.task_id, status=task.status)
 
     @router.post("/tasks/chroma-keyer-video", response_model=TaskCreateResponse)
@@ -1003,15 +1070,19 @@ def create_router(
         payload: ChromaVideoKeyerTaskRequest,
         http_request: Request,
     ) -> TaskCreateResponse:
+        hosted_payload = hosted_chroma_video_request(http_request, payload)
         try:
             task = task_manager.create_chroma_video_keyer_task(
-                hosted_chroma_video_request(http_request, payload),
+                hosted_payload,
                 owner_id=getattr(http_request.state, "session_id", None),
             )
-        except TaskConflictError as exc:
-            raise ApiError("task_conflict", str(exc), 409) from exc
-        except KeyerError as exc:
-            raise _chroma_video_error_response(exc) from exc
+        except Exception as exc:
+            discard_failed_hosted_task_dir(http_request, hosted_payload)
+            if isinstance(exc, TaskConflictError):
+                raise ApiError("task_conflict", str(exc), 409) from exc
+            if isinstance(exc, KeyerError):
+                raise _chroma_video_error_response(exc) from exc
+            raise
         return TaskCreateResponse(task_id=task.task_id, status=task.status)
 
     @router.post(
@@ -1390,6 +1461,20 @@ def create_router(
         )
 
     return router
+
+
+def _release_redis_resource_best_effort(
+    release: Callable[[], None],
+    resource_name: str,
+) -> None:
+    try:
+        release()
+    except RedisError:
+        _LOGGER.warning(
+            "Failed to release %s; expiry will reconcile it",
+            resource_name,
+            exc_info=True,
+        )
 
 
 def _upload_content_length(value: str | None) -> int:

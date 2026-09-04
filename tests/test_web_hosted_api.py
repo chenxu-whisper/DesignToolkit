@@ -8,6 +8,7 @@ import fakeredis
 import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
+from redis.exceptions import ConnectionError as RedisConnectionError
 from rq import Queue
 
 from designtoolkit.web.app import create_app
@@ -111,6 +112,17 @@ class StubCoordinator:
 
     def acquire_session(self, _session_id: str) -> StubLease:
         return StubLease()
+
+    def release_committed_usage(
+        self,
+        session_id: str,
+        released_bytes: int,
+    ) -> None:
+        remaining = max(0, self.committed.get(session_id, 0) - released_bytes)
+        if remaining:
+            self.committed[session_id] = remaining
+        else:
+            self.committed.pop(session_id, None)
 
 
 def _png_bytes() -> bytes:
@@ -248,6 +260,62 @@ def test_hosted_upload_requires_valid_filename_header(
     assert response.json()["error"]["code"] == "invalid_upload"
 
 
+@pytest.mark.parametrize("filename", ["bad%00name.png", "bad%1Fname.png"])
+def test_hosted_upload_rejects_decoded_control_filename(
+    tmp_path: Path,
+    filename: str,
+) -> None:
+    with _client(tmp_path) as client:
+        response = client.post(
+            "/api/uploads",
+            content=b"image",
+            headers={
+                "content-length": "5",
+                "x-upload-filename": filename,
+            },
+        )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_upload"
+    assert list(tmp_path.rglob(".uploading")) == []
+
+
+def test_successful_upload_ignores_redis_cleanup_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ExecuteThenRaiseLease:
+        release_count = 0
+
+        def refresh(self) -> None:
+            pass
+
+        def release(self) -> None:
+            self.release_count += 1
+            raise RedisConnectionError("lease release acknowledgement lost")
+
+    lease = ExecuteThenRaiseLease()
+
+    def fail_reservation_release(_reservation: StubReservation) -> None:
+        raise RedisConnectionError("reservation release unavailable")
+
+    monkeypatch.setattr(StubReservation, "release", fail_reservation_release)
+    with _client(tmp_path) as client:
+        coordinator = client.app.state.resource_coordinator
+        monkeypatch.setattr(
+            coordinator,
+            "acquire_session",
+            lambda _session_id: lease,
+        )
+
+        response = _upload(client, "screen.png", b"image")
+
+    assert response.status_code == 201
+    assert response.json()["size"] == 5
+    assert lease.release_count == 1
+    assert len(list(tmp_path.rglob("screen.png"))) == 1
+
+
 def test_hosted_upload_rejects_declared_actual_length_mismatch(
     tmp_path: Path,
 ) -> None:
@@ -279,6 +347,40 @@ def test_hosted_upload_session_quota_returns_413(tmp_path: Path) -> None:
     assert first.status_code == 201
     assert second.status_code == 413
     assert second.json()["error"]["code"] == "upload_too_large"
+
+
+def test_delete_upload_is_owner_scoped_idempotent_and_reclaims_quota(
+    tmp_path: Path,
+) -> None:
+    with _client(tmp_path, max_session_bytes=5) as owner:
+        uploaded = _upload(owner, "screen.png", b"image")
+        reference = uploaded.json()["reference"]
+        asset_id = reference.split(":", 2)[1]
+        first_delete = owner.delete(f"/api/uploads/{asset_id}")
+        second_delete = owner.delete(f"/api/uploads/{asset_id}")
+        replacement = _upload(owner, "replacement.png", b"12345")
+
+    assert first_delete.status_code == 204
+    assert second_delete.status_code == 204
+    assert replacement.status_code == 201
+
+
+def test_delete_upload_cannot_remove_another_sessions_asset(tmp_path: Path) -> None:
+    with _client(tmp_path) as owner:
+        uploaded = _upload(owner, "screen.png", _png_bytes())
+        reference = uploaded.json()["reference"]
+        asset_id = reference.split(":", 2)[1]
+
+        with _client(tmp_path) as stranger:
+            rejected = stranger.delete(f"/api/uploads/{asset_id}")
+
+        inspection = owner.post(
+            "/api/chroma-keyer/images/inspect",
+            json={"input_path": reference},
+        )
+
+    assert rejected.status_code == 404
+    assert inspection.status_code == 200
 
 
 def test_hosted_upload_reference_can_drive_image_inspection(tmp_path: Path) -> None:
@@ -451,3 +553,29 @@ def test_hosted_batch_resize_uses_unique_managed_output_directory(
     payload = job.args[2]
     assert payload["output_dir"].startswith(str(tmp_path))
     assert payload["output_path"] is None
+
+
+def test_hosted_queue_rejection_removes_empty_task_directory(
+    tmp_path: Path,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = RedisTaskManager(
+        redis_connection=redis_connection,
+        queue=Queue("designtoolkit", connection=redis_connection),
+        data_dir=tmp_path,
+        max_queued_tasks=0,
+        retention_seconds=7200,
+    )
+    with _client(tmp_path, task_manager=manager) as client:
+        reference = _upload(client, "clip.mp4", b"video").json()["reference"]
+        response = client.post(
+            "/api/tasks/video-frames",
+            json={
+                "input_path": reference,
+                "image_format": "png",
+                "overwrite": False,
+            },
+        )
+
+    assert response.status_code == 409
+    assert list(tmp_path.glob("sessions/*/tasks/*")) == []

@@ -452,6 +452,18 @@ redis.call(
 return 1
 """
 
+_RELEASE_COMMITTED_USAGE_SCRIPT = """-- release_committed_usage
+local field = "session:" .. ARGV[1] .. ":committed_bytes"
+local current = tonumber(redis.call("HGET", KEYS[1], field) or "0")
+local remaining = math.max(0, current - tonumber(ARGV[2]))
+if remaining > 0 then
+    redis.call("HSET", KEYS[1], field, remaining)
+else
+    redis.call("HDEL", KEYS[1], field)
+end
+return remaining
+"""
+
 _ACQUIRE_SESSION_SCRIPT = """-- acquire_session
 local state_key = KEYS[1]
 local leases_key = KEYS[2]
@@ -719,6 +731,9 @@ class RedisResourceCoordinator:
         self._clear_session_usage_script = self._redis.register_script(
             _CLEAR_SESSION_USAGE_SCRIPT
         )
+        self._release_committed_usage_script = self._redis.register_script(
+            _RELEASE_COMMITTED_USAGE_SCRIPT
+        )
         self._acquire_session_script = self._redis.register_script(
             _ACQUIRE_SESSION_SCRIPT
         )
@@ -895,6 +910,14 @@ class RedisResourceCoordinator:
         self._clear_session_usage_script(
             keys=[_STATE_KEY],
             args=[session_id],
+        )
+
+    def release_committed_usage(self, session_id: str, released_bytes: int) -> None:
+        _validate_session_id(session_id)
+        released_bytes = _nonnegative_int(released_bytes, "released_bytes")
+        self._release_committed_usage_script(
+            keys=[_STATE_KEY],
+            args=[session_id, released_bytes],
         )
 
     def reconcile_reservations(self) -> int:

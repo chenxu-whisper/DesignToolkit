@@ -7,6 +7,7 @@ from collections.abc import AsyncIterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from time import time
+from unicodedata import category
 from urllib.parse import quote
 from uuid import UUID, uuid4
 from zipfile import ZIP_DEFLATED, ZipFile
@@ -45,6 +46,9 @@ _ALLOWED_SUFFIXES = frozenset(
     }
 )
 _SESSION_PATTERN = re.compile(r"^[a-f0-9]{32}$")
+_ASSET_REFERENCE_PATTERN = re.compile(
+    r"^asset:(?P<asset_id>[a-f0-9]{32})(?::[^:]*)?$"
+)
 
 
 class UploadRejectedError(ValueError):
@@ -210,7 +214,7 @@ class HostedStorage:
             if content_length > self.max_upload_bytes:
                 raise UploadRejectedError("File exceeds the configured file limit")
         except Exception:
-            reservation.release()
+            _release_best_effort(reservation)
             raise
 
         asset_id = uuid4().hex
@@ -285,12 +289,68 @@ class HostedStorage:
         os.utime(self._session_dir(session_id), None)
         return matches[0]
 
+    def delete_asset(self, session_id: str, reference: str) -> int:
+        session_id = _validate_session_id(session_id)
+        asset_id = _asset_id(reference)
+        assets_dir = self._session_dir(session_id) / "assets"
+        asset_dir = assets_dir / asset_id
+        tombstone = assets_dir / ".deleted" / asset_id
+        if tombstone.is_dir():
+            return 0
+        if not asset_dir.is_dir():
+            if self._asset_belongs_to_other_session(session_id, asset_id):
+                raise UploadRejectedError("Uploaded asset is not available")
+            return 0
+
+        tombstone.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            asset_dir.replace(tombstone)
+        except FileNotFoundError:
+            if tombstone.is_dir():
+                return 0
+            raise UploadRejectedError("Uploaded asset is not available") from None
+
+        deleted_bytes = _directory_size(tombstone)
+        for child in tombstone.iterdir():
+            if child.is_dir():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+        os.utime(self._session_dir(session_id), None)
+        return deleted_bytes
+
     def create_task_dir(self, session_id: str) -> Path:
         session_id = _validate_session_id(session_id)
         task_dir = self._session_dir(session_id) / "tasks" / uuid4().hex
         task_dir.mkdir(parents=True, exist_ok=False)
         os.utime(self._session_dir(session_id), None)
         return task_dir
+
+    def discard_empty_task_dir(
+        self,
+        session_id: str,
+        candidate: str | Path | None,
+    ) -> None:
+        if candidate is None:
+            return
+        session_id = _validate_session_id(session_id)
+        tasks_dir = self._session_dir(session_id) / "tasks"
+        try:
+            relative = Path(candidate).resolve().relative_to(tasks_dir.resolve())
+        except ValueError:
+            return
+        if not relative.parts:
+            return
+        task_id = relative.parts[0]
+        if not _SESSION_PATTERN.fullmatch(task_id):
+            return
+        task_dir = tasks_dir / task_id
+        if not task_dir.is_dir() or any(path.is_file() for path in task_dir.rglob("*")):
+            return
+        shutil.rmtree(task_dir)
+        if tasks_dir.is_dir() and not any(tasks_dir.iterdir()):
+            tasks_dir.rmdir()
+        self._remove_empty_session(session_id)
 
     def touch_session(self, session_id: str) -> None:
         session_dir = self._session_dir(_validate_session_id(session_id))
@@ -345,6 +405,24 @@ class HostedStorage:
     def _discard_asset(self, session_id: str, asset_dir: Path) -> None:
         shutil.rmtree(asset_dir, ignore_errors=True)
         self._remove_empty_session(session_id)
+
+    def _asset_belongs_to_other_session(
+        self,
+        session_id: str,
+        asset_id: str,
+    ) -> bool:
+        sessions_dir = self.root / "sessions"
+        if not sessions_dir.is_dir():
+            return False
+        return any(
+            candidate.name != session_id
+            and (
+                (candidate / "assets" / asset_id).is_dir()
+                or (candidate / "assets" / ".deleted" / asset_id).is_dir()
+            )
+            for candidate in sessions_dir.iterdir()
+            if candidate.is_dir()
+        )
 
 
 def new_session_id() -> str:
@@ -403,10 +481,10 @@ def _validate_session_id(value: str) -> str:
 
 
 def _asset_id(reference: str) -> str:
-    prefix, separator, remainder = reference.partition(":")
-    if prefix != "asset" or separator != ":":
+    match = _ASSET_REFERENCE_PATTERN.fullmatch(reference)
+    if match is None:
         raise UploadRejectedError("Uploaded asset is not available")
-    value = remainder.partition(":")[0]
+    value = match.group("asset_id")
     try:
         parsed = UUID(value)
     except ValueError as exc:
@@ -417,7 +495,10 @@ def _asset_id(reference: str) -> str:
 
 
 def _safe_filename(value: str | None) -> str:
-    filename = Path((value or "").replace("\\", "/")).name.strip()
+    raw_filename = value or ""
+    if any(category(character) == "Cc" for character in raw_filename):
+        raise UploadRejectedError("File name is invalid")
+    filename = Path(raw_filename.replace("\\", "/")).name.strip()
     if not filename or filename in {".", ".."}:
         raise UploadRejectedError("File name is invalid")
     return filename

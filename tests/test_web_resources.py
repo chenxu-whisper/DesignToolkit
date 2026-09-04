@@ -291,6 +291,18 @@ class DeterministicRedis(fakeredis.FakeRedis):
         )
         return 1
 
+    def _eval_release_committed_usage(self, keys, args):  # noqa: ANN001, ANN202
+        state_key = keys[0]
+        field = f"session:{args[0]}:committed_bytes"
+        released_bytes = int(args[1])
+        current = self._number(state_key, field)
+        remaining = max(0, current - released_bytes)
+        if remaining:
+            self.hset(state_key, field, remaining)
+        else:
+            self.hdel(state_key, field)
+        return remaining
+
     def _eval_acquire_session(self, keys, args):  # noqa: ANN001, ANN202
         state_key, leases_key, lease_key = keys
         token, session_id, ttl_ms, lease_prefix, cleanup_prefix = args
@@ -527,6 +539,26 @@ def test_committed_uploads_retain_session_usage_until_cleanup(
     resources.clear_session_usage(SESSION_A)
     replacement = resources.reserve_upload(SESSION_A, 10, free_bytes=100)
     replacement.release()
+
+
+def test_release_committed_usage_is_session_scoped_and_clamped_at_zero(
+    redis_connection: DeterministicRedis,
+) -> None:
+    resources = coordinator(redis_connection, max_session_bytes=10)
+    first = resources.reserve_upload(SESSION_A, 7, free_bytes=100)
+    second = resources.reserve_upload(SESSION_B, 6, free_bytes=100)
+    first.commit()
+    second.commit()
+
+    resources.release_committed_usage(SESSION_A, 4)
+    with pytest.raises(ResourceUnavailableError, match="session"):
+        resources.reserve_upload(SESSION_A, 8, free_bytes=100)
+    resources.reserve_upload(SESSION_A, 7, free_bytes=100).release()
+
+    resources.release_committed_usage(SESSION_A, 99)
+    resources.reserve_upload(SESSION_A, 10, free_bytes=100).release()
+    with pytest.raises(ResourceUnavailableError, match="session"):
+        resources.reserve_upload(SESSION_B, 5, free_bytes=100)
 
 
 def test_upload_commit_creates_bounded_marker_with_accounting_metadata(

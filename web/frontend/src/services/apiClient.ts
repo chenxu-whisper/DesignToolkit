@@ -228,15 +228,30 @@ export async function uploadFiles(
   files: readonly File[],
   onProgress: (percentage: number) => void,
 ): Promise<readonly string[]> {
-  const references: string[] = []
-  for (let index = 0; index < files.length; index += 1) {
-    const file = files[index]
-    const response = await uploadFile(file, (fileProgress) => {
-      onProgress(Math.round(((index + fileProgress) / files.length) * 100))
-    })
-    references.push(response.reference)
+  const uploaded: UploadResponse[] = []
+  try {
+    for (let index = 0; index < files.length; index += 1) {
+      const file = files[index]
+      const response = await uploadFile(file, (fileProgress) => {
+        onProgress(Math.round(((index + fileProgress) / files.length) * 100))
+      })
+      uploaded.push(response)
+    }
+  } catch (error) {
+    await Promise.allSettled(
+      uploaded.map(({ reference }) => deleteUploadedAsset(reference)),
+    )
+    throw error
   }
-  return references
+  return uploaded.map(({ reference }) => reference)
+}
+
+async function deleteUploadedAsset(reference: string): Promise<void> {
+  const assetId = /^asset:([a-f0-9]{32})(?::|$)/.exec(reference)?.[1]
+  if (!assetId) {
+    return
+  }
+  await fetch(`/api/uploads/${assetId}`, { method: 'DELETE' })
 }
 
 function uploadFile(
