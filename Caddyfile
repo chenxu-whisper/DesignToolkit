@@ -1,3 +1,11 @@
+{
+	servers {
+		timeouts {
+			read_body 30m
+		}
+	}
+}
+
 {$DOMAIN} {
 	encode zstd gzip
 

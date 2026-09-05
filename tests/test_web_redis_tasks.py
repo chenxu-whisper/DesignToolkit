@@ -25,6 +25,7 @@ from designtoolkit.media_resize import (
 )
 from designtoolkit.video_frames import ExportResult
 from designtoolkit.web import cleanup as cleanup_module
+from designtoolkit.web import redis_tasks as redis_tasks_module
 from designtoolkit.web import worker as worker_module
 from designtoolkit.web.adapters import media_resize_options_list_from_request
 from designtoolkit.web.hosted import HostedSettings, HostedStorage
@@ -129,13 +130,18 @@ def _manager(
     )
 
 
-def _hosted_settings(tmp_path: Path) -> HostedSettings:
+def _hosted_settings(
+    tmp_path: Path,
+    *,
+    task_timeout_seconds: int = 7200,
+) -> HostedSettings:
     return HostedSettings(
         enabled=True,
         data_dir=tmp_path,
         redis_url="redis://unused/0",
         max_output_bytes=10,
         min_free_bytes=5,
+        task_timeout_seconds=task_timeout_seconds,
     )
 
 
@@ -213,6 +219,44 @@ def test_redis_manager_enqueues_and_isolates_task_records(tmp_path: Path) -> Non
     job = manager.queue.fetch_job(task.task_id)
     assert job is not None
     assert job.func_name == "designtoolkit.web.worker.run_task"
+
+
+def test_rq_job_timeout_is_independent_from_artifact_retention(
+    tmp_path: Path,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = RedisTaskManager(
+        redis_connection=redis_connection,
+        queue=Queue("designtoolkit", connection=redis_connection),
+        data_dir=tmp_path,
+        max_queued_tasks=20,
+        retention_seconds=300,
+        task_timeout_seconds=9000,
+    )
+
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+        owner_id="a" * 32,
+    )
+
+    job = manager.queue.fetch_job(task.task_id)
+    assert job is not None
+    assert job.timeout == 9000
+    assert job.result_ttl == 300
+    assert job.failure_ttl == 300
+
+
+def test_callback_manager_uses_configured_task_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    settings = _hosted_settings(tmp_path, task_timeout_seconds=9000)
+    monkeypatch.setattr(HostedSettings, "from_env", lambda: settings)
+
+    manager = redis_tasks_module._callback_manager(redis_connection)
+
+    assert manager.task_timeout_seconds == 9000
 
 
 def test_enqueue_registers_importable_rq_failure_and_stopped_callbacks(
@@ -881,14 +925,22 @@ def test_run_task_reserves_refreshes_and_releases_worker_resources(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     redis_connection = fakeredis.FakeRedis(decode_responses=False)
-    settings = _hosted_settings(tmp_path)
+    settings = _hosted_settings(tmp_path, task_timeout_seconds=9000)
     manager = _manager(redis_connection, tmp_path)
     task = manager.create_video_frames_task(
         VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
         owner_id="a" * 32,
     )
     resources = TrackingTaskResources()
+    manager_options: dict[str, object] = {}
+    manager_type = worker_module.RedisTaskManager
+
+    def create_manager(**kwargs):
+        manager_options.update(kwargs)
+        return manager_type(**kwargs)
+
     monkeypatch.setattr(worker_module.HostedSettings, "from_env", lambda: settings)
+    monkeypatch.setattr(worker_module, "RedisTaskManager", create_manager)
     monkeypatch.setattr(
         worker_module.Redis,
         "from_url",
@@ -937,6 +989,7 @@ def test_run_task_reserves_refreshes_and_releases_worker_resources(
     assert resources.events.count("refresh:output") >= 2
     assert resources.events.count("refresh:lease") >= 3
     assert resources.events[-2:] == ["release:output", "release:lease"]
+    assert manager_options["task_timeout_seconds"] == 9000
     assert manager.get_task(task.task_id).status is TaskStatus.SUCCEEDED
 
 

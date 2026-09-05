@@ -11,6 +11,8 @@ import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 README_TEXT = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+CADDYFILE_TEXT = (PROJECT_ROOT / "Caddyfile").read_text(encoding="utf-8")
+ENV_EXAMPLE_TEXT = (PROJECT_ROOT / ".env.example").read_text(encoding="utf-8")
 MINIMUM_COMPOSE_VERSION = (2, 6, 0)
 RESOURCE_VARIABLES = (
     "APP_CPUS",
@@ -29,6 +31,16 @@ RESOURCE_VARIABLES = (
     "CADDY_MEMORY",
     "CADDY_PIDS",
 )
+HOSTED_TIMEOUT_DEFAULTS = {
+    "DESIGNTOOLKIT_REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS": "5.0",
+    "DESIGNTOOLKIT_REDIS_SOCKET_TIMEOUT_SECONDS": "5.0",
+    "DESIGNTOOLKIT_RESERVATION_TTL_SECONDS": "60.0",
+    "DESIGNTOOLKIT_RESERVATION_HEARTBEAT_SECONDS": "5.0",
+    "DESIGNTOOLKIT_LEASE_TTL_SECONDS": "60.0",
+    "DESIGNTOOLKIT_LEASE_HEARTBEAT_SECONDS": "5.0",
+    "DESIGNTOOLKIT_TASK_TIMEOUT_SECONDS": "7200",
+}
+HOSTED_SERVICES = ("app", "worker-1", "worker-2", "cleanup")
 
 
 def test_readme_documents_cross_platform_environment_setup() -> None:
@@ -44,6 +56,23 @@ def test_readme_upgrade_pulls_only_remote_images() -> None:
     assert "docker compose pull" not in commands
     assert "docker compose pull redis caddy" in commands
     assert "docker compose up -d --build" in commands
+
+
+def test_caddy_limits_request_body_size_and_read_time() -> None:
+    assert re.search(
+        r"servers\s*\{\s*timeouts\s*\{\s*read_body\s+30m\s*\}\s*\}",
+        CADDYFILE_TEXT,
+    )
+    assert re.search(
+        r"request_body\s*\{\s*max_size\s+525MB\s*\}",
+        CADDYFILE_TEXT,
+    )
+
+
+def test_hosted_timeout_defaults_are_documented() -> None:
+    for name, value in HOSTED_TIMEOUT_DEFAULTS.items():
+        assert f"{name}={value}" in ENV_EXAMPLE_TEXT
+        assert name in README_TEXT
 
 
 def test_resolved_compose_skips_unsupported_compose_version(
@@ -130,6 +159,7 @@ def _resolved_compose(
     environment = os.environ.copy()
     environment["DOMAIN"] = "tools.example.com"
     environment.update(dict.fromkeys(RESOURCE_VARIABLES, ""))
+    environment.update(dict.fromkeys(HOSTED_TIMEOUT_DEFAULTS, ""))
     environment.update(overrides or {})
     result = subprocess.run(
         ["docker", "compose", "config", "--format", "json"],
@@ -171,3 +201,26 @@ def test_compose_resource_limits_allow_environment_overrides() -> None:
     services = _resolved_compose({"APP_CPUS": "1.5"})["services"]
 
     assert services["app"]["cpus"] == 1.5
+
+
+def test_compose_forwards_hosted_timeout_defaults() -> None:
+    services = _resolved_compose()["services"]
+
+    for service_name in HOSTED_SERVICES:
+        environment = services[service_name]["environment"]
+        assert {
+            name: environment.get(name) for name in HOSTED_TIMEOUT_DEFAULTS
+        } == HOSTED_TIMEOUT_DEFAULTS
+
+
+def test_compose_allows_hosted_timeout_overrides() -> None:
+    overrides = {
+        name: str(index)
+        for index, name in enumerate(HOSTED_TIMEOUT_DEFAULTS, start=11)
+    }
+
+    services = _resolved_compose(overrides)["services"]
+
+    for service_name in HOSTED_SERVICES:
+        environment = services[service_name]["environment"]
+        assert {name: environment.get(name) for name in overrides} == overrides

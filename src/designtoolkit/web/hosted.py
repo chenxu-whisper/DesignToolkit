@@ -41,6 +41,7 @@ _DEFAULT_MAX_OUTPUT_BYTES = 5 * 1024 * 1024 * 1024
 _DEFAULT_MIN_FREE_BYTES = 5 * 1024 * 1024 * 1024
 _DEFAULT_MAX_QUEUED_TASKS = 20
 _DEFAULT_RETENTION_SECONDS = 2 * 60 * 60
+_DEFAULT_TASK_TIMEOUT_SECONDS = 2 * 60 * 60
 _UPLOAD_CHUNK_BYTES = 1024 * 1024
 _RESOURCE_RECOVERY_ATTEMPTS = 3
 _DELETION_METADATA_NAME = ".deletion.json"
@@ -306,6 +307,7 @@ class HostedSettings:
     upload_requests_per_hour: int = 30
     api_requests_per_minute: int = 120
     retention_seconds: int = _DEFAULT_RETENTION_SECONDS
+    task_timeout_seconds: int = _DEFAULT_TASK_TIMEOUT_SECONDS
     secure_cookies: bool = True
 
     @classmethod
@@ -414,6 +416,11 @@ class HostedSettings:
                 values,
                 "DESIGNTOOLKIT_RETENTION_SECONDS",
                 _DEFAULT_RETENTION_SECONDS,
+            ),
+            task_timeout_seconds=_read_positive_int(
+                values,
+                "DESIGNTOOLKIT_TASK_TIMEOUT_SECONDS",
+                _DEFAULT_TASK_TIMEOUT_SECONDS,
             ),
             secure_cookies=_read_bool(
                 values,
@@ -675,60 +682,106 @@ class HostedStorage:
         if not sessions_dir.is_dir():
             return removed
         cutoff = time() - retention_seconds
-        for session_dir in sessions_dir.iterdir():
-            if (
-                not session_dir.is_dir()
-                or not _SESSION_PATTERN.fullmatch(session_dir.name)
-                or _directory_modified_at(session_dir) >= cutoff
-            ):
-                continue
-            session_id = session_dir.name
-            token = coordinator.claim_session_cleanup(session_id)
-            if token is None:
-                continue
-            heartbeat = _CleanupClaimHeartbeat(
-                coordinator,
-                session_id,
-                token,
+        try:
+            session_dirs = tuple(sessions_dir.iterdir())
+        except OSError:
+            _LOGGER.warning(
+                "Failed to scan hosted sessions",
+                extra={"sessions_dir": str(sessions_dir)},
+                exc_info=True,
             )
+            return removed
+        for session_dir in session_dirs:
             try:
-                with heartbeat:
-                    if _directory_modified_at(session_dir) >= cutoff:
-                        continue
-                    heartbeat.raise_if_failed()
-                    trash_dir = self.root / ".trash"
-                    trash_dir.mkdir(parents=True, exist_ok=True)
-                    quarantine = trash_dir / f"{session_id}-{token}"
-                    generation = coordinator.capture_session_usage(
-                        session_id,
-                        token,
+                expired = (
+                    session_dir.is_dir()
+                    and _SESSION_PATTERN.fullmatch(session_dir.name) is not None
+                    and _directory_modified_at(session_dir) < cutoff
+                )
+            except OSError:
+                self._log_session_scan_failure(session_dir)
+                continue
+            if expired:
+                try:
+                    removed += self._cleanup_expired_session(
+                        session_dir,
+                        cutoff=cutoff,
+                        coordinator=coordinator,
                     )
-                    _write_session_usage_generation(session_dir, generation)
-                    heartbeat.commit(
-                        lambda source=session_dir, destination=quarantine: os.replace(
-                            source,
-                            destination,
-                        )
-                    )
-                    heartbeat.raise_if_failed()
-                    coordinator.clear_session_usage_generation(
-                        session_id,
-                        token,
-                        generation,
-                    )
-                    heartbeat.raise_if_failed()
-                    quarantine_removed = self._delete_quarantine(quarantine)
-                    heartbeat.raise_if_failed()
-                if quarantine_removed:
-                    coordinator.finalize_session_usage_generation(
-                        generation.generation_id
-                    )
-                    removed += 1
-            finally:
-                if heartbeat.quiesced:
-                    coordinator.release_cleanup_claim(session_id, token)
+                except Exception:
+                    self._log_session_scan_failure(session_dir)
         self._remove_empty_trash()
         return removed
+
+    def _cleanup_expired_session(
+        self,
+        session_dir: Path,
+        *,
+        cutoff: float,
+        coordinator: RedisResourceCoordinator,
+    ) -> int:
+        session_id = session_dir.name
+        token = coordinator.claim_session_cleanup(session_id)
+        if token is None:
+            return 0
+        heartbeat = _CleanupClaimHeartbeat(
+            coordinator,
+            session_id,
+            token,
+        )
+        try:
+            with heartbeat:
+                try:
+                    modified_at = _directory_modified_at(session_dir)
+                except OSError:
+                    self._log_session_scan_failure(session_dir)
+                    return 0
+                if modified_at >= cutoff:
+                    return 0
+                heartbeat.raise_if_failed()
+                trash_dir = self.root / ".trash"
+                trash_dir.mkdir(parents=True, exist_ok=True)
+                quarantine = trash_dir / f"{session_id}-{token}"
+                generation = coordinator.capture_session_usage(
+                    session_id,
+                    token,
+                )
+                _write_session_usage_generation(session_dir, generation)
+                heartbeat.commit(
+                    lambda source=session_dir, destination=quarantine: os.replace(
+                        source,
+                        destination,
+                    )
+                )
+                heartbeat.raise_if_failed()
+                coordinator.clear_session_usage_generation(
+                    session_id,
+                    token,
+                    generation,
+                )
+                heartbeat.raise_if_failed()
+                quarantine_removed = self._delete_quarantine(quarantine)
+                heartbeat.raise_if_failed()
+            if quarantine_removed:
+                coordinator.finalize_session_usage_generation(
+                    generation.generation_id
+                )
+                return 1
+            return 0
+        finally:
+            if heartbeat.quiesced:
+                coordinator.release_cleanup_claim(session_id, token)
+
+    @staticmethod
+    def _log_session_scan_failure(session_dir: Path) -> None:
+        _LOGGER.warning(
+            "Failed to inspect or clean hosted session",
+            extra={
+                "session_dir": str(session_dir),
+                "session_id": session_dir.name,
+            },
+            exc_info=True,
+        )
 
     def _finalize_orphaned_cleanup_markers(
         self,

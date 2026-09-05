@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from argparse import ArgumentParser
 from time import sleep
 
@@ -13,6 +14,8 @@ from designtoolkit.web.hosted import (
 )
 from designtoolkit.web.redis_tasks import RedisTaskManager
 from designtoolkit.web.resources import RedisResourceCoordinator
+
+_LOGGER = logging.getLogger(__name__)
 
 
 def cleanup_once(settings: HostedSettings) -> int:
@@ -42,6 +45,7 @@ def cleanup_once(settings: HostedSettings) -> int:
         data_dir=settings.data_dir,
         max_queued_tasks=settings.max_queued_tasks,
         retention_seconds=settings.retention_seconds,
+        task_timeout_seconds=settings.task_timeout_seconds,
         resource_coordinator=coordinator,
         heartbeat_stop_timeout_seconds=settings.heartbeat_stop_timeout_seconds,
     )
@@ -58,6 +62,15 @@ def cleanup_once(settings: HostedSettings) -> int:
     )
 
 
+def run_cleanup_loop(settings: HostedSettings, *, interval: int) -> None:
+    while True:
+        try:
+            cleanup_once(settings)
+        except Exception:
+            _LOGGER.exception("Hosted cleanup iteration failed")
+        sleep(max(1, interval))
+
+
 def main() -> int:
     parser = ArgumentParser()
     parser.add_argument("--once", action="store_true")
@@ -67,9 +80,7 @@ def main() -> int:
     if args.once:
         cleanup_once(settings)
         return 0
-    while True:
-        cleanup_once(settings)
-        sleep(max(1, args.interval))
+    run_cleanup_loop(settings, interval=args.interval)
 
 
 if __name__ == "__main__":

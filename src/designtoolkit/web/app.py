@@ -65,6 +65,7 @@ def create_app(
             data_dir=settings.data_dir,
             max_queued_tasks=settings.max_queued_tasks,
             retention_seconds=settings.retention_seconds,
+            task_timeout_seconds=settings.task_timeout_seconds,
             heartbeat_stop_timeout_seconds=settings.heartbeat_stop_timeout_seconds,
         )
     else:

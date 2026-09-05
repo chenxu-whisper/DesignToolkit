@@ -19,6 +19,7 @@ from redis.exceptions import ConnectionError as RedisConnectionError
 from rq import Queue
 
 from designtoolkit.chroma_keyer.video_models import VideoMetadata
+from designtoolkit.web import app as app_module
 from designtoolkit.web import routes as routes_module
 from designtoolkit.web.app import create_app
 from designtoolkit.web.hosted import (
@@ -2312,3 +2313,39 @@ def test_local_mode_does_not_apply_hosted_media_limits(tmp_path: Path) -> None:
 
     assert response.status_code == 200
     assert response.json()["width"] == 2
+
+
+def test_create_app_passes_independent_task_timeout_to_redis_manager(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    monkeypatch.setattr(
+        app_module.Redis,
+        "from_url",
+        lambda _url, **_kwargs: redis_connection,
+    )
+    settings = HostedSettings(
+        enabled=True,
+        data_dir=tmp_path,
+        redis_url="redis://unused",
+        retention_seconds=300,
+        task_timeout_seconds=9000,
+    )
+    coordinator = StubCoordinator(
+        max_upload_concurrency=4,
+        max_session_bytes=settings.max_session_bytes,
+        min_free_bytes=settings.min_free_bytes,
+    )
+
+    app = create_app(
+        hosted_settings=settings,
+        hosted_storage=HostedStorage(
+            tmp_path,
+            max_upload_bytes=settings.max_upload_bytes,
+        ),
+        resource_coordinator=coordinator,
+    )
+
+    assert app.state.task_manager.retention_seconds == 300
+    assert app.state.task_manager.task_timeout_seconds == 9000

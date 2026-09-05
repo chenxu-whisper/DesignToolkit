@@ -397,6 +397,7 @@ class RedisTaskManager:
         data_dir: Path,
         max_queued_tasks: int,
         retention_seconds: int,
+        task_timeout_seconds: int = 2 * 60 * 60,
         resource_coordinator: RedisResourceCoordinator | None = None,
         enqueue_intent_ttl: float = _ENQUEUE_INTENT_TTL_SECONDS,
         enqueue_intent_heartbeat_interval: float = (
@@ -414,11 +415,14 @@ class RedisTaskManager:
             )
         if heartbeat_stop_timeout_seconds <= 0:
             raise ValueError("heartbeat_stop_timeout_seconds must be positive")
+        if task_timeout_seconds <= 0:
+            raise ValueError("task_timeout_seconds must be positive")
         self._redis = redis_connection
         self.queue = queue or Queue(_QUEUE_NAME, connection=redis_connection)
         self.data_dir = data_dir
         self.max_queued_tasks = max_queued_tasks
         self.retention_seconds = retention_seconds
+        self.task_timeout_seconds = task_timeout_seconds
         self.resource_coordinator = resource_coordinator
         self.live_task_ttl = max(retention_seconds * 2, 24 * 60 * 60)
         self.enqueue_intent_heartbeat_interval = (
@@ -802,7 +806,7 @@ class RedisTaskManager:
                     request.model_dump(mode="json"),
                 ),
                 job_id=task.task_id,
-                timeout=self.retention_seconds,
+                timeout=self.task_timeout_seconds,
                 result_ttl=self.retention_seconds,
                 failure_ttl=self.retention_seconds,
                 meta={"owner_id": owner_id},
@@ -1858,6 +1862,7 @@ def _callback_manager(connection: Redis) -> RedisTaskManager:
         data_dir=settings.data_dir,
         max_queued_tasks=settings.max_queued_tasks,
         retention_seconds=_TERMINAL_TTL_SECONDS,
+        task_timeout_seconds=settings.task_timeout_seconds,
         resource_coordinator=resources,
         heartbeat_stop_timeout_seconds=settings.heartbeat_stop_timeout_seconds,
     )

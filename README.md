@@ -172,6 +172,19 @@ docker compose up -d --build
 Worker 各预留最多 5 GiB 输出空间，并始终保留 5 GiB 基础余量，因此两个输出
 任务开始前至少需要 15 GiB 可用磁盘空间。
 
+托管超时与租约设置：
+
+- `DESIGNTOOLKIT_TASK_TIMEOUT_SECONDS` 默认 7200 秒，仅控制 RQ 任务执行上限；
+  artifact 保留时间由独立的 `DESIGNTOOLKIT_RETENTION_SECONDS` 控制。
+- `DESIGNTOOLKIT_REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS` 和
+  `DESIGNTOOLKIT_REDIS_SOCKET_TIMEOUT_SECONDS` 默认均为 5 秒。
+- `DESIGNTOOLKIT_RESERVATION_TTL_SECONDS` 与
+  `DESIGNTOOLKIT_RESERVATION_HEARTBEAT_SECONDS` 默认分别为 60 秒和 5 秒。
+- `DESIGNTOOLKIT_LEASE_TTL_SECONDS` 与
+  `DESIGNTOOLKIT_LEASE_HEARTBEAT_SECONDS` 默认分别为 60 秒和 5 秒。
+
+Caddy 对请求体保留 525 MB 上限，并将完整请求体读取时间限制为 30 分钟。
+
 观察服务状态和应用日志：
 
 ```powershell

@@ -283,8 +283,24 @@ def test_hosted_settings_use_public_deployment_defaults(tmp_path: Path) -> None:
     assert settings.lease_ttl_seconds >= 2 * settings.lease_heartbeat_seconds
     assert settings.max_queued_tasks == 20
     assert settings.retention_seconds == 2 * 60 * 60
+    assert settings.task_timeout_seconds == 2 * 60 * 60
     assert settings.redis_socket_connect_timeout_seconds == 5.0
     assert settings.redis_socket_timeout_seconds == 5.0
+
+
+def test_hosted_settings_keep_task_timeout_independent_from_retention(
+    tmp_path: Path,
+) -> None:
+    settings = HostedSettings.from_env(
+        {
+            "DESIGNTOOLKIT_DATA_DIR": str(tmp_path),
+            "DESIGNTOOLKIT_RETENTION_SECONDS": "300",
+            "DESIGNTOOLKIT_TASK_TIMEOUT_SECONDS": "9000",
+        }
+    )
+
+    assert settings.retention_seconds == 300
+    assert settings.task_timeout_seconds == 9000
 
 
 def test_hosted_settings_read_redis_socket_timeouts(tmp_path: Path) -> None:
@@ -940,6 +956,107 @@ def test_cleanup_removes_only_expired_session_directories(
     assert coordinator.claims == {}
 
 
+@pytest.mark.parametrize("error_type", [FileNotFoundError, OSError])
+def test_cleanup_skips_unreadable_session_and_continues(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    error_type: type[OSError],
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    unreadable_id = "a" * 32
+    expired_id = "b" * 32
+    unreadable = tmp_path / "sessions" / unreadable_id
+    expired = tmp_path / "sessions" / expired_id
+    unreadable.mkdir(parents=True)
+    expired.mkdir(parents=True)
+    coordinator = RecordingCleanupCoordinator()
+    monkeypatch.setattr("designtoolkit.web.hosted.time", lambda: 10_000.0)
+
+    def session_mtime(path: Path) -> float:
+        if path.name == unreadable_id:
+            raise error_type("session changed during cleanup")
+        return 1_000.0
+
+    monkeypatch.setattr(
+        "designtoolkit.web.hosted._directory_modified_at",
+        session_mtime,
+    )
+    caplog.set_level("WARNING", logger="designtoolkit.web.hosted")
+
+    removed = storage.cleanup_expired(
+        retention_seconds=2_000,
+        coordinator=coordinator,
+    )
+
+    assert removed == 1
+    assert unreadable.is_dir()
+    assert not expired.exists()
+    assert "Failed to inspect or clean hosted session" in caplog.text
+    assert coordinator.claim_calls == [expired_id]
+
+
+def test_cleanup_logs_failed_session_and_continues_with_next_item(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    failed_id = "a" * 32
+    expired_id = "b" * 32
+    failed = tmp_path / "sessions" / failed_id
+    expired = tmp_path / "sessions" / expired_id
+    failed.mkdir(parents=True)
+    expired.mkdir(parents=True)
+    coordinator = RecordingCleanupCoordinator()
+    original_cleanup = HostedStorage._cleanup_expired_session
+    original_iterdir = Path.iterdir
+    monkeypatch.setattr("designtoolkit.web.hosted.time", lambda: 10_000.0)
+    monkeypatch.setattr(
+        "designtoolkit.web.hosted._directory_modified_at",
+        lambda _path: 1_000.0,
+    )
+
+    def ordered_iterdir(path: Path):
+        if path == failed.parent:
+            return iter((failed, expired))
+        return original_iterdir(path)
+
+    def fail_first_cleanup(
+        instance: HostedStorage,
+        session_dir: Path,
+        *,
+        cutoff: float,
+        coordinator: RecordingCleanupCoordinator,
+    ) -> int:
+        if session_dir == failed:
+            raise RuntimeError("session cleanup failed")
+        return original_cleanup(
+            instance,
+            session_dir,
+            cutoff=cutoff,
+            coordinator=coordinator,
+        )
+
+    monkeypatch.setattr(Path, "iterdir", ordered_iterdir)
+    monkeypatch.setattr(
+        HostedStorage,
+        "_cleanup_expired_session",
+        fail_first_cleanup,
+    )
+    caplog.set_level("WARNING", logger="designtoolkit.web.hosted")
+
+    removed = storage.cleanup_expired(
+        retention_seconds=2_000,
+        coordinator=coordinator,
+    )
+
+    assert removed == 1
+    assert failed.is_dir()
+    assert not expired.exists()
+    assert "Failed to inspect or clean hosted session" in caplog.text
+
+
 def test_cleanup_preserves_expired_session_with_active_lease(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1096,8 +1213,9 @@ def test_cleanup_aborts_before_rename_when_claim_heartbeat_fails(
     monkeypatch.setattr("designtoolkit.web.hosted.os.replace", record_replace)
 
     with pytest.raises(ResourceUnavailableError, match="Cleanup claim expired"):
-        storage.cleanup_expired(
-            retention_seconds=2_000,
+        storage._cleanup_expired_session(
+            session_dir,
+            cutoff=8_000.0,
             coordinator=coordinator,
         )
 
@@ -1183,8 +1301,9 @@ def test_cleanup_synchronous_refresh_failure_blocks_rename(
         ResourceUnavailableError,
         match="failed before rename",
     ):
-        storage.cleanup_expired(
-            retention_seconds=2_000,
+        storage._cleanup_expired_session(
+            session_dir,
+            cutoff=8_000.0,
             coordinator=coordinator,
         )
 
@@ -1311,8 +1430,9 @@ def test_cleanup_rename_failure_releases_claim(
     monkeypatch.setattr("designtoolkit.web.hosted.os.replace", fail_replace)
 
     with pytest.raises(OSError, match="rename failed"):
-        storage.cleanup_expired(
-            retention_seconds=2_000,
+        storage._cleanup_expired_session(
+            session_dir,
+            cutoff=8_000.0,
             coordinator=coordinator,
         )
 
@@ -1663,8 +1783,9 @@ def test_cleanup_recovers_trash_after_crash_following_rename(
     )
 
     with pytest.raises(RuntimeError, match="cleanup process crashed"):
-        storage.cleanup_expired(
-            retention_seconds=2_000,
+        storage._cleanup_expired_session(
+            session_dir,
+            cutoff=8_000.0,
             coordinator=coordinator,
         )
 
