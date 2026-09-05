@@ -4,6 +4,7 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier, RLock
 from time import monotonic, sleep
+from types import SimpleNamespace
 
 import fakeredis
 import pytest
@@ -59,6 +60,16 @@ class DeterministicRedis(fakeredis.FakeRedis):
         requested = int(requested)
         free_bytes = int(free_bytes)
         min_free_bytes = int(min_free_bytes)
+        if self.exists(token_key):
+            expected = {
+                b"kind": b"upload",
+                b"owner_id": str(session_id).encode(),
+                b"session_id": str(session_id).encode(),
+                b"bytes": str(requested).encode(),
+                b"free_bytes": str(free_bytes).encode(),
+                b"min_free_bytes": str(min_free_bytes).encode(),
+            }
+            return 4 if self.hgetall(token_key) == expected else 5
         if self._number(state_key, "upload_count") >= int(max_uploads):
             return 1
         if self._number(
@@ -722,19 +733,43 @@ class DeterministicRedis(fakeredis.FakeRedis):
         return value.decode() if isinstance(value, bytes) else value
 
 
-class ExecuteThenRaiseRedis(DeterministicRedis):
-    def __init__(self, operation: str) -> None:
-        super().__init__()
+class ExecuteThenRaiseRedis:
+    def __init__(
+        self,
+        operation: str,
+        redis_connection: Redis | None = None,
+        *,
+        execute_before_raise: bool = True,
+        raise_once: bool = True,
+    ) -> None:
+        self._redis = redis_connection or DeterministicRedis()
         self.operation = operation
+        self.execute_before_raise = execute_before_raise
+        self.raise_once = raise_once
         self.raised = False
+        self.attempt_tokens: list[str] = []
 
-    def eval(self, script, numkeys, *keys_and_args):  # noqa: ANN001, ANN201
-        result = super().eval(script, numkeys, *keys_and_args)
+    def register_script(self, script):  # noqa: ANN001, ANN201
+        execute = self._redis.register_script(script)
         operation = script.splitlines()[0].removeprefix("-- ")
-        if operation == self.operation and not self.raised:
+
+        def execute_then_raise(*, keys, args):
+            if operation != self.operation:
+                return execute(keys=keys, args=args)
+            if args:
+                self.attempt_tokens.append(str(args[0]))
+            should_raise = not self.raised or not self.raise_once
+            if not should_raise:
+                return execute(keys=keys, args=args)
             self.raised = True
+            if self.execute_before_raise:
+                execute(keys=keys, args=args)
             raise RedisConnectionError(f"{operation} acknowledgement lost")
-        return result
+
+        return execute_then_raise
+
+    def __getattr__(self, name: str):
+        return getattr(self._redis, name)
 
 
 @pytest.fixture
@@ -1490,6 +1525,71 @@ def test_commit_execute_then_raise_can_be_retried_without_double_charging() -> N
         resources.reserve_upload(SESSION_A, 1, free_bytes=100)
 
 
+def test_upload_reserve_recovers_lost_ack_without_double_reserving(
+    real_redis_connection: Redis,
+) -> None:
+    redis_connection = ExecuteThenRaiseRedis(
+        "reserve_upload",
+        real_redis_connection,
+    )
+    resources = coordinator(
+        redis_connection,
+        max_uploads=2,
+        max_session_bytes=10,
+    )
+
+    reservation = resources.reserve_upload(SESSION_A, 4, free_bytes=100)
+
+    assert redis_connection.attempt_tokens == [
+        reservation.token,
+        reservation.token,
+    ]
+    assert real_redis_connection.hget("dt:resource:state", "reserved_bytes") == b"4"
+    assert real_redis_connection.hget("dt:resource:state", "upload_count") == b"1"
+    assert (
+        real_redis_connection.hget(
+            "dt:resource:state",
+            f"session:{SESSION_A}:reserved_bytes",
+        )
+        == b"4"
+    )
+    reservation.release()
+
+    assert real_redis_connection.hget("dt:resource:state", "upload_count") is None
+    assert real_redis_connection.hget("dt:resource:state", "reserved_bytes") is None
+    assert (
+        real_redis_connection.hget(
+            "dt:resource:state",
+            f"session:{SESSION_A}:reserved_bytes",
+        )
+        is None
+    )
+
+
+def test_upload_reserve_rejects_conflicting_existing_token_metadata(
+    real_redis_connection: Redis,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token = "1" * 32
+    monkeypatch.setattr(
+        "designtoolkit.web.resources.uuid4",
+        lambda: SimpleNamespace(hex=token),
+    )
+    resources = coordinator(
+        real_redis_connection,
+        max_uploads=3,
+        max_session_bytes=10,
+    )
+    reservation = resources.reserve_upload(SESSION_A, 3, free_bytes=100)
+
+    with pytest.raises(ResourceUnavailableError, match="metadata conflict"):
+        resources.reserve_upload(SESSION_A, 4, free_bytes=100)
+
+    assert real_redis_connection.hget("dt:resource:state", "reserved_bytes") == b"3"
+    assert real_redis_connection.hget("dt:resource:state", "upload_count") == b"1"
+    reservation.release()
+
+
 def test_rollback_execute_then_raise_is_idempotently_resolved() -> None:
     redis_connection = ExecuteThenRaiseRedis("rollback_commit")
     resources = coordinator(redis_connection, max_session_bytes=4)
@@ -1693,6 +1793,41 @@ def test_real_redis_executes_reservation_scripts(
     assert real_redis_connection.pttl(generation_key) > 0
     assert resources.pending_cleanup_markers() == ()
     resources.release_cleanup_claim(SESSION_A, claim)
+
+
+def test_real_redis_upload_reservation_failure_before_execution_creates_no_state(
+    real_redis_connection: Redis,
+) -> None:
+    failing_redis = ExecuteThenRaiseRedis(
+        "reserve_upload",
+        real_redis_connection,
+        execute_before_raise=False,
+        raise_once=False,
+    )
+    resources = coordinator(
+        failing_redis,
+        max_uploads=1,
+        max_session_bytes=4,
+    )
+
+    with pytest.raises(RedisConnectionError, match="acknowledgement lost"):
+        resources.reserve_upload(SESSION_A, 4, free_bytes=100)
+
+    assert len(failing_redis.attempt_tokens) >= 2
+    assert len(set(failing_redis.attempt_tokens)) == 1
+    assert list(
+        real_redis_connection.scan_iter(match="dt:resource:reservation:*")
+    ) == []
+    assert real_redis_connection.hlen("dt:resource:reservations") == 0
+    assert real_redis_connection.hget("dt:resource:state", "upload_count") is None
+    assert real_redis_connection.hget("dt:resource:state", "reserved_bytes") is None
+    assert (
+        real_redis_connection.hget(
+            "dt:resource:state",
+            f"session:{SESSION_A}:reserved_bytes",
+        )
+        is None
+    )
 
 
 def test_real_redis_ttl_expiry_is_reconciled(
