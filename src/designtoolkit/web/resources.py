@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
 from time import time
@@ -137,6 +138,18 @@ local free_bytes = tonumber(ARGV[5])
 local min_free_bytes = tonumber(ARGV[6])
 local ttl_ms = tonumber(ARGV[7])
 local heartbeat_at = ARGV[8]
+
+if redis.call("EXISTS", token_key) == 1 then
+    if redis.call("HGET", token_key, "kind") == "output"
+        and redis.call("HGET", token_key, "owner_id") == task_id
+        and redis.call("HGET", token_key, "session_id") == session_id
+        and redis.call("HGET", token_key, "bytes") == ARGV[4]
+        and redis.call("HGET", token_key, "free_bytes") == ARGV[5]
+        and redis.call("HGET", token_key, "min_free_bytes") == ARGV[6] then
+        return 2
+    end
+    return 3
+end
 
 local reserved_bytes = tonumber(
     redis.call("HGET", state_key, "reserved_bytes") or "0"
@@ -1153,18 +1166,21 @@ class RedisResourceCoordinator:
             _RELEASE_CLEANUP_SCRIPT
         )
 
-    def _execute_upload_reservation_script(
+    def _execute_reservation_script(
         self,
+        script: Callable[..., object],
         *,
         keys: list[str],
         args: list[object],
         token: str,
         expected_metadata: dict[str, str],
+        reserved_result: int,
+        conflict_result: int,
     ) -> int:
         last_transport_error: RedisConnectionError | RedisTimeoutError | None = None
         for _attempt in range(_RESERVATION_RECOVERY_ATTEMPTS):
             try:
-                return int(self._reserve_upload_script(keys=keys, args=args))
+                return int(script(keys=keys, args=args))
             except _REDIS_TRANSPORT_ERRORS as exc:
                 last_transport_error = exc
 
@@ -1172,13 +1188,13 @@ class RedisResourceCoordinator:
             raise RuntimeError("Reservation recovery lost its transport error")
         try:
             metadata = self._redis.hgetall(_reservation_key(token))
-        except _REDIS_TRANSPORT_ERRORS:
-            return 4
+        except _REDIS_TRANSPORT_ERRORS as query_error:
+            raise last_transport_error from query_error
         if not metadata:
             raise last_transport_error
         if _reservation_metadata_matches(metadata, expected_metadata):
-            return 4
-        return 5
+            return reserved_result
+        return conflict_result
 
     def reserve_upload(
         self,
@@ -1213,7 +1229,8 @@ class RedisResourceCoordinator:
             self.min_free_bytes,
             self._reservation_ttl_ms,
         ]
-        result = self._execute_upload_reservation_script(
+        result = self._execute_reservation_script(
+            self._reserve_upload_script,
             keys=keys,
             args=args,
             token=token,
@@ -1225,6 +1242,8 @@ class RedisResourceCoordinator:
                 "free_bytes": str(free_bytes),
                 "min_free_bytes": str(self.min_free_bytes),
             },
+            reserved_result=4,
+            conflict_result=5,
         )
         if result == 1:
             raise ResourceUnavailableError("Upload concurrency limit reached")
@@ -1255,35 +1274,50 @@ class RedisResourceCoordinator:
             _nonnegative_int(min_free_bytes, "min_free_bytes"),
         )
         token = uuid4().hex
-        result = int(
-            self._reserve_output_script(
-                keys=[
-                    _STATE_KEY,
-                    _RESERVATION_INDEX_KEY,
-                    _reservation_key(token),
-                    _task_resource_key(task_id),
-                ],
-                args=[
-                    token,
-                    task_id,
-                    session_id,
-                    requested_bytes,
-                    free_bytes,
-                    min_free_bytes,
-                    self._reservation_ttl_ms,
-                    time(),
-                ],
-            )
-        )
-        if result != 0:
-            raise ResourceUnavailableError("Insufficient free disk capacity")
-        return RedisReservation(
+        reservation = RedisReservation(
             coordinator=self,
             kind="output",
             token=token,
             owner_id=task_id,
             reserved_bytes=requested_bytes,
         )
+        result = self._execute_reservation_script(
+            self._reserve_output_script,
+            keys=[
+                _STATE_KEY,
+                _RESERVATION_INDEX_KEY,
+                _reservation_key(token),
+                _task_resource_key(task_id),
+            ],
+            args=[
+                token,
+                task_id,
+                session_id,
+                requested_bytes,
+                free_bytes,
+                min_free_bytes,
+                self._reservation_ttl_ms,
+                time(),
+            ],
+            token=token,
+            expected_metadata={
+                "kind": "output",
+                "owner_id": task_id,
+                "session_id": session_id,
+                "bytes": str(requested_bytes),
+                "free_bytes": str(free_bytes),
+                "min_free_bytes": str(min_free_bytes),
+            },
+            reserved_result=2,
+            conflict_result=3,
+        )
+        if result == 1:
+            raise ResourceUnavailableError("Insufficient free disk capacity")
+        if result == 3:
+            raise ResourceUnavailableError(
+                "Output reservation token metadata conflict"
+            )
+        return reservation
 
     def acquire_session(
         self,

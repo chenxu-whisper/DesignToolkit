@@ -1553,17 +1553,8 @@ def test_upload_reserve_recovers_lost_ack_without_double_reserving(
         )
         == b"4"
     )
-    reservation.release()
-
-    assert real_redis_connection.hget("dt:resource:state", "upload_count") is None
-    assert real_redis_connection.hget("dt:resource:state", "reserved_bytes") is None
-    assert (
-        real_redis_connection.hget(
-            "dt:resource:state",
-            f"session:{SESSION_A}:reserved_bytes",
-        )
-        is None
-    )
+    reservation.commit()
+    assert reservation.state() is ReservationState.COMMITTED
 
 
 def test_upload_reserve_rejects_conflicting_existing_token_metadata(
@@ -1587,6 +1578,82 @@ def test_upload_reserve_rejects_conflicting_existing_token_metadata(
 
     assert real_redis_connection.hget("dt:resource:state", "reserved_bytes") == b"3"
     assert real_redis_connection.hget("dt:resource:state", "upload_count") == b"1"
+    reservation.release()
+
+
+def test_output_reserve_recovers_lost_ack_without_double_reserving(
+    real_redis_connection: Redis,
+) -> None:
+    redis_connection = ExecuteThenRaiseRedis(
+        "reserve_output",
+        real_redis_connection,
+    )
+    resources = coordinator(redis_connection)
+
+    reservation = resources.reserve_output(
+        "task-1",
+        SESSION_A,
+        4,
+        free_bytes=100,
+    )
+
+    assert redis_connection.attempt_tokens == [
+        reservation.token,
+        reservation.token,
+    ]
+    assert real_redis_connection.hget("dt:resource:state", "reserved_bytes") == b"4"
+    assert (
+        real_redis_connection.hget(
+            "dt:resource:state",
+            "output_reserved_bytes",
+        )
+        == b"4"
+    )
+    reservation.release()
+    assert real_redis_connection.hget("dt:resource:state", "reserved_bytes") is None
+    assert (
+        real_redis_connection.hget(
+            "dt:resource:state",
+            "output_reserved_bytes",
+        )
+        is None
+    )
+
+
+def test_output_reserve_rejects_conflicting_existing_token_metadata(
+    real_redis_connection: Redis,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token = "2" * 32
+    monkeypatch.setattr(
+        "designtoolkit.web.resources.uuid4",
+        lambda: SimpleNamespace(hex=token),
+    )
+    resources = coordinator(real_redis_connection)
+    reservation = resources.reserve_output(
+        "task-1",
+        SESSION_A,
+        3,
+        free_bytes=100,
+    )
+
+    with pytest.raises(ResourceUnavailableError, match="metadata conflict"):
+        resources.reserve_output(
+            "task-2",
+            SESSION_A,
+            3,
+            free_bytes=100,
+        )
+
+    assert real_redis_connection.hget("dt:resource:state", "reserved_bytes") == b"3"
+    assert (
+        real_redis_connection.hget(
+            "dt:resource:state",
+            "output_reserved_bytes",
+        )
+        == b"3"
+    )
+    assert not real_redis_connection.exists("dt:resource:task:task-2")
     reservation.release()
 
 
