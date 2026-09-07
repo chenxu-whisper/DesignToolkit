@@ -106,10 +106,12 @@ from designtoolkit.web.schemas import (
     LocalPathPickResponse,
     LocalSaveFilePickRequest,
     LogEventResponse,
+    LogLevel,
     LogPhase,
     MediaResizeTaskRequest,
     TaskCreateResponse,
     TaskResponse,
+    TaskStatus,
     UploadResponse,
     VideoFramesTaskRequest,
 )
@@ -794,6 +796,29 @@ def _sse_line(event) -> str:
 
 def _is_terminal_event(event: LogEventResponse) -> bool:
     return event.phase in _TERMINAL_PHASES
+
+
+def _terminal_event_from_task(task: TaskRecord | None) -> LogEventResponse | None:
+    if task is None or task.finished_at is None:
+        return None
+    if task.status is TaskStatus.SUCCEEDED:
+        level = LogLevel.SUCCESS
+        phase = LogPhase.COMPLETED
+        message = "Task completed"
+    elif task.status is TaskStatus.FAILED:
+        level = LogLevel.ERROR
+        phase = LogPhase.FAILED
+        message = task.error or "Task failed"
+    else:
+        return None
+    return LogEventResponse(
+        task_id=task.task_id,
+        timestamp=task.finished_at,
+        level=level,
+        phase=phase,
+        message=message,
+        details={"source": "task_state", "status": task.status.value},
+    )
 
 
 def _picker_accepts_allowed_suffixes(picker: LocalPathPicker) -> bool:
@@ -2019,9 +2044,10 @@ def create_router(
         task_id: str,
         http_request: Request,
     ) -> StreamingResponse:
+        owner_id = getattr(http_request.state, "session_id", None)
         task = task_manager.get_task(
             task_id,
-            owner_id=getattr(http_request.state, "session_id", None),
+            owner_id=owner_id,
         )
         if task is None:
             raise ApiError("task_not_found", f"Task not found: {task_id}", 404)
@@ -2040,6 +2066,12 @@ def create_router(
                     try:
                         event = subscriber.get(timeout=0.25)
                     except Empty:
+                        terminal_event = _terminal_event_from_task(
+                            task_manager.get_task(task_id, owner_id=owner_id)
+                        )
+                        if terminal_event is not None:
+                            yield _sse_line(terminal_event)
+                            terminal_event_seen = True
                         continue
 
                     yield _sse_line(event)

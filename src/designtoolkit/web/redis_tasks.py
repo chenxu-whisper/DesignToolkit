@@ -73,6 +73,36 @@ _ASSET_READ_PIN_PREFIX = "dt:resource:asset-read-pin:"
 _ASSET_READERS_PREFIX = "dt:resource:asset-readers:"
 _ASSET_READ_PIN_TTL_SECONDS = 60.0
 _ASSET_READ_PIN_HEARTBEAT_SECONDS = 10.0
+_APPEND_EVENT_SCRIPT = """-- append_task_event
+local generation = redis.call("GET", KEYS[2])
+if redis.call("EXISTS", KEYS[1]) == 0 or not generation then
+    generation = ARGV[3]
+    redis.call("SET", KEYS[2], generation)
+end
+redis.call("RPUSH", KEYS[1], ARGV[1])
+redis.call("EXPIRE", KEYS[1], ARGV[2])
+redis.call("EXPIRE", KEYS[2], ARGV[2])
+return generation
+"""
+_READ_EVENT_LOG_SCRIPT = """-- read_task_event_log
+if redis.call("EXISTS", KEYS[1]) == 0 then
+    return {"", {}}
+end
+
+local generation = redis.call("GET", KEYS[2])
+if not generation then
+    generation = ARGV[1]
+    local ttl_ms = redis.call("PTTL", KEYS[1])
+    redis.call("SET", KEYS[2], generation)
+    if ttl_ms > 0 then
+        redis.call("PEXPIRE", KEYS[2], ttl_ms)
+    else
+        redis.call("EXPIRE", KEYS[1], ARGV[2])
+        redis.call("EXPIRE", KEYS[2], ARGV[2])
+    end
+end
+return {generation, redis.call("LRANGE", KEYS[1], 0, -1)}
+"""
 _RESERVE_ENQUEUE_SCRIPT = """-- reserve_enqueue_intent
 local queue_key = KEYS[1]
 local intent_key = KEYS[2]
@@ -184,7 +214,15 @@ if redis.call("HGET", KEYS[5], "owner_token") ~= owner_token then
     return 0
 end
 redis.call("LREM", KEYS[1], 0, task_id)
-redis.call("DEL", KEYS[2], KEYS[3], KEYS[4], KEYS[5], KEYS[8])
+redis.call(
+    "DEL",
+    KEYS[2],
+    KEYS[3],
+    KEYS[4],
+    KEYS[5],
+    KEYS[8],
+    KEYS[9]
+)
 if owner_id ~= "" then
     local pin_session = redis.call("HGET", KEYS[6], "session_id")
     local pin_task = redis.call("HGET", KEYS[6], "task_id")
@@ -366,8 +404,13 @@ task.started_at = ARGV[2]
 local encoded = cjson.encode(task)
 redis.call("SET", KEYS[1], encoded, "EX", ARGV[3])
 redis.call("LREM", KEYS[2], 0, ARGV[1])
+local generation = redis.call("GET", KEYS[4])
+if redis.call("EXISTS", KEYS[3]) == 0 or not generation then
+    redis.call("SET", KEYS[4], ARGV[5])
+end
 redis.call("RPUSH", KEYS[3], ARGV[4])
 redis.call("EXPIRE", KEYS[3], ARGV[3])
+redis.call("EXPIRE", KEYS[4], ARGV[3])
 return {1, encoded}
 """
 _TERMINAL_TRANSITION_SCRIPT = """-- transition_task_terminal
@@ -401,9 +444,21 @@ if redis.call("EXISTS", KEYS[2]) == 1 then
     redis.call("EXPIRE", KEYS[2], ARGV[9])
 end
 if ARGV[10] == "1" then
+    local generation = redis.call("GET", KEYS[4])
+    if redis.call("EXISTS", KEYS[3]) == 0 or not generation then
+        redis.call("SET", KEYS[4], ARGV[12])
+    end
     redis.call("RPUSH", KEYS[3], ARGV[11])
 end
-redis.call("EXPIRE", KEYS[3], ARGV[9])
+if redis.call("EXISTS", KEYS[3]) == 1 then
+    if redis.call("EXISTS", KEYS[4]) == 0 then
+        redis.call("SET", KEYS[4], ARGV[12])
+    end
+    redis.call("EXPIRE", KEYS[3], ARGV[9])
+    redis.call("EXPIRE", KEYS[4], ARGV[9])
+else
+    redis.call("DEL", KEYS[4])
+end
 return {1, encoded}
 """
 
@@ -471,16 +526,21 @@ class RedisEventSubscriber:
         self,
         store: RedisLogStore,
         task_id: str,
+        generation: str | None,
         offset: int,
     ) -> None:
         self._store = store
         self._task_id = task_id
+        self._generation = generation
         self._offset = offset
 
     def get(self, timeout: float) -> LogEventResponse:
         deadline = monotonic() + timeout
         while monotonic() < deadline:
-            events = self._store.history(self._task_id)
+            generation, events = self._store._snapshot(self._task_id)
+            if generation is not None and generation != self._generation:
+                self._generation = generation
+                self._offset = 0
             if self._offset < len(events):
                 event = events[self._offset]
                 self._offset += 1
@@ -498,6 +558,12 @@ class RedisLogStore:
     ) -> None:
         self._redis = redis_connection
         self._retention_seconds = retention_seconds
+        self._append_event_script = self._redis.register_script(
+            _APPEND_EVENT_SCRIPT
+        )
+        self._read_event_log_script = self._redis.register_script(
+            _READ_EVENT_LOG_SCRIPT
+        )
 
     def append(
         self,
@@ -516,23 +582,40 @@ class RedisLogStore:
             message=message,
             details=dict(details or {}),
         )
-        key = _event_key(task_id)
-        pipeline = self._redis.pipeline()
-        pipeline.rpush(key, event.model_dump_json())
-        pipeline.expire(key, self._retention_seconds)
-        pipeline.execute()
+        event_json = event.model_dump_json()
+        try:
+            self._append_event_script(
+                keys=[
+                    _event_key(task_id),
+                    _event_generation_key(task_id),
+                ],
+                args=[
+                    event_json,
+                    self._retention_seconds,
+                    uuid4().hex,
+                ],
+            )
+        except ResponseError as error_response:
+            if "unknown command" not in str(error_response).lower():
+                raise
+            self._append_without_lua(task_id, event_json)
         return event
 
     def history(self, task_id: str) -> list[LogEventResponse]:
-        values = self._redis.lrange(_event_key(task_id), 0, -1)
-        return [LogEventResponse.model_validate_json(value) for value in values]
+        _generation, events = self._snapshot(task_id)
+        return events
 
     def history_and_subscribe(
         self,
         task_id: str,
     ) -> tuple[list[LogEventResponse], RedisEventSubscriber]:
-        history = self.history(task_id)
-        return history, RedisEventSubscriber(self, task_id, len(history))
+        generation, history = self._snapshot(task_id)
+        return history, RedisEventSubscriber(
+            self,
+            task_id,
+            generation,
+            len(history),
+        )
 
     def unsubscribe(
         self,
@@ -540,6 +623,90 @@ class RedisLogStore:
         subscriber: RedisEventSubscriber,
     ) -> None:
         del task_id, subscriber
+
+    def _snapshot(
+        self,
+        task_id: str,
+    ) -> tuple[str | None, list[LogEventResponse]]:
+        try:
+            generation, values = self._read_event_log_script(
+                keys=[
+                    _event_key(task_id),
+                    _event_generation_key(task_id),
+                ],
+                args=[uuid4().hex, self._retention_seconds],
+            )
+        except ResponseError as error_response:
+            if "unknown command" not in str(error_response).lower():
+                raise
+            generation, values = self._snapshot_without_lua(task_id)
+        generation_text = _redis_text(generation) or None
+        events = [
+            LogEventResponse.model_validate_json(value) for value in values
+        ]
+        return generation_text, events
+
+    def _append_without_lua(self, task_id: str, event_json: str) -> None:
+        event_key = _event_key(task_id)
+        generation_key = _event_generation_key(task_id)
+        candidate = uuid4().hex
+        while True:
+            with self._redis.pipeline() as pipeline:
+                try:
+                    pipeline.watch(event_key, generation_key)
+                    generation = pipeline.get(generation_key)
+                    event_log_exists = bool(pipeline.exists(event_key))
+                    pipeline.multi()
+                    if not event_log_exists or generation is None:
+                        pipeline.set(generation_key, candidate)
+                    pipeline.rpush(event_key, event_json)
+                    pipeline.expire(event_key, self._retention_seconds)
+                    pipeline.expire(generation_key, self._retention_seconds)
+                    pipeline.execute()
+                    return
+                except WatchError:
+                    continue
+
+    def _snapshot_without_lua(
+        self,
+        task_id: str,
+    ) -> tuple[bytes | str | None, list[bytes | str]]:
+        event_key = _event_key(task_id)
+        generation_key = _event_generation_key(task_id)
+        candidate = uuid4().hex
+        while True:
+            with self._redis.pipeline() as pipeline:
+                try:
+                    pipeline.watch(event_key, generation_key)
+                    if not pipeline.exists(event_key):
+                        pipeline.unwatch()
+                        return None, []
+                    generation = pipeline.get(generation_key)
+                    ttl_ms = (
+                        pipeline.pttl(event_key)
+                        if generation is None
+                        else None
+                    )
+                    pipeline.multi()
+                    if generation is None:
+                        generation = candidate
+                        pipeline.set(generation_key, generation)
+                        if ttl_ms is not None and ttl_ms > 0:
+                            pipeline.pexpire(generation_key, ttl_ms)
+                        else:
+                            pipeline.expire(
+                                event_key,
+                                self._retention_seconds,
+                            )
+                            pipeline.expire(
+                                generation_key,
+                                self._retention_seconds,
+                            )
+                    pipeline.lrange(event_key, 0, -1)
+                    values = pipeline.execute()[-1]
+                    return generation, values
+                except WatchError:
+                    continue
 
 
 class RedisAssetReadPin:
@@ -813,12 +980,14 @@ class RedisTaskManager:
                     _task_key(task_id),
                     _queue_reservations_key(),
                     _event_key(task_id),
+                    _event_generation_key(task_id),
                 ],
                 args=[
                     task_id,
                     started_at.isoformat(),
                     self.live_task_ttl,
                     event.model_dump_json(),
+                    uuid4().hex,
                 ],
             )
         except ResponseError as error_response:
@@ -1736,6 +1905,7 @@ class RedisTaskManager:
                         _task_pin_key(task_id),
                         session_task_pins_key,
                         _enqueue_owner_key(task_id),
+                        _event_generation_key(task_id),
                     ],
                     args=[task_id, owner, owner_token, _ASSET_TASK_PREFIX],
                 )
@@ -1767,6 +1937,7 @@ class RedisTaskManager:
                     pipeline.delete(
                         _task_key(task_id),
                         _event_key(task_id),
+                        _event_generation_key(task_id),
                         _task_work_key(task_id),
                         _enqueue_intent_key(task_id),
                         _enqueue_owner_key(task_id),
@@ -2072,7 +2243,16 @@ class RedisTaskManager:
         while True:
             with self._redis.pipeline() as pipeline:
                 try:
-                    pipeline.watch(task_key, intent_key, owner_key, job_key)
+                    event_key = _event_key(task_id)
+                    generation_key = _event_generation_key(task_id)
+                    pipeline.watch(
+                        task_key,
+                        intent_key,
+                        owner_key,
+                        job_key,
+                        event_key,
+                        generation_key,
+                    )
                     metadata = pipeline.hgetall(intent_key)
                     if not metadata:
                         pipeline.unwatch()
@@ -2133,6 +2313,8 @@ class RedisTaskManager:
                     task.status = TaskStatus.FAILED
                     task.error = _UNCERTAIN_ENQUEUE_ERROR
                     task.finished_at = event.timestamp
+                    event_log_exists = bool(pipeline.exists(event_key))
+                    generation = pipeline.get(generation_key)
                     pipeline.multi()
                     pipeline.set(
                         task_key,
@@ -2143,11 +2325,11 @@ class RedisTaskManager:
                         _task_work_key(task_id),
                         self.retention_seconds,
                     )
-                    pipeline.rpush(_event_key(task_id), event.model_dump_json())
-                    pipeline.expire(
-                        _event_key(task_id),
-                        self.retention_seconds,
-                    )
+                    if not event_log_exists or generation is None:
+                        pipeline.set(generation_key, uuid4().hex)
+                    pipeline.rpush(event_key, event.model_dump_json())
+                    pipeline.expire(event_key, self.retention_seconds)
+                    pipeline.expire(generation_key, self.retention_seconds)
                     pipeline.lrem(_queue_reservations_key(), 0, task_id)
                     pipeline.delete(intent_key, owner_key)
                     pipeline.execute()
@@ -2277,7 +2459,9 @@ class RedisTaskManager:
         while True:
             with self._redis.pipeline() as pipeline:
                 try:
-                    pipeline.watch(key)
+                    event_key = _event_key(task_id)
+                    generation_key = _event_generation_key(task_id)
+                    pipeline.watch(key, event_key, generation_key)
                     value = pipeline.get(key)
                     if value is None:
                         raise KeyError(task_id)
@@ -2287,6 +2471,8 @@ class RedisTaskManager:
                         return task, RunningTransitionResult.REJECTED
                     task.status = TaskStatus.RUNNING
                     task.started_at = started_at
+                    event_log_exists = bool(pipeline.exists(event_key))
+                    generation = pipeline.get(generation_key)
                     pipeline.multi()
                     pipeline.set(
                         key,
@@ -2294,8 +2480,11 @@ class RedisTaskManager:
                         ex=self.live_task_ttl,
                     )
                     pipeline.lrem(_queue_reservations_key(), 0, task_id)
-                    pipeline.rpush(_event_key(task_id), event.model_dump_json())
-                    pipeline.expire(_event_key(task_id), self.live_task_ttl)
+                    if not event_log_exists or generation is None:
+                        pipeline.set(generation_key, uuid4().hex)
+                    pipeline.rpush(event_key, event.model_dump_json())
+                    pipeline.expire(event_key, self.live_task_ttl)
+                    pipeline.expire(generation_key, self.live_task_ttl)
                     pipeline.execute()
                     return task, RunningTransitionResult.APPLIED
                 except WatchError:
@@ -2321,6 +2510,7 @@ class RedisTaskManager:
                     _task_key(task_id),
                     _task_work_key(task_id),
                     _event_key(task_id),
+                    _event_generation_key(task_id),
                 ],
                 args=[
                     status.value,
@@ -2334,6 +2524,7 @@ class RedisTaskManager:
                     self.retention_seconds,
                     "1" if terminal_event is not None else "0",
                     event_json,
+                    uuid4().hex,
                 ],
             )
         except ResponseError as error_response:
@@ -2375,7 +2566,9 @@ class RedisTaskManager:
         while True:
             with self._redis.pipeline() as pipeline:
                 try:
-                    pipeline.watch(key)
+                    event_key = _event_key(task_id)
+                    generation_key = _event_generation_key(task_id)
+                    pipeline.watch(key, event_key, generation_key)
                     value = pipeline.get(key)
                     if value is None:
                         raise KeyError(task_id)
@@ -2391,6 +2584,8 @@ class RedisTaskManager:
                     if result_path is not None:
                         task.result_path = result_path
                     task.finished_at = finished_at
+                    event_log_exists = bool(pipeline.exists(event_key))
+                    generation = pipeline.get(generation_key)
                     pipeline.multi()
                     pipeline.set(
                         key,
@@ -2402,14 +2597,23 @@ class RedisTaskManager:
                         self.retention_seconds,
                     )
                     if terminal_event is not None:
+                        if not event_log_exists or generation is None:
+                            pipeline.set(generation_key, uuid4().hex)
                         pipeline.rpush(
-                            _event_key(task_id),
+                            event_key,
                             terminal_event.model_dump_json(),
                         )
-                    pipeline.expire(
-                        _event_key(task_id),
-                        self.retention_seconds,
-                    )
+                        event_log_exists = True
+                    if event_log_exists:
+                        if generation is None and terminal_event is None:
+                            pipeline.set(generation_key, uuid4().hex)
+                        pipeline.expire(event_key, self.retention_seconds)
+                        pipeline.expire(
+                            generation_key,
+                            self.retention_seconds,
+                        )
+                    else:
+                        pipeline.delete(generation_key)
                     pipeline.execute()
                     self.release_task_pin(task_id)
                     return task, TerminalTransitionResult.APPLIED
@@ -2543,6 +2747,10 @@ def _task_key(task_id: str) -> str:
 
 def _event_key(task_id: str) -> str:
     return f"dt:task:{task_id}:events"
+
+
+def _event_generation_key(task_id: str) -> str:
+    return f"dt:event-generation:{task_id}"
 
 
 def _queue_reservations_key() -> str:

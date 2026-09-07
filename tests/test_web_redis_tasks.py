@@ -6,6 +6,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from queue import Empty
 from threading import Barrier, Event, Lock
 
 import fakeredis
@@ -299,6 +300,7 @@ def test_real_redis_terminal_keys_use_configured_retention(
         f"dt:task:{task.task_id}",
         f"dt:task-work:{task.task_id}",
         f"dt:task:{task.task_id}:events",
+        f"dt:event-generation:{task.task_id}",
         f"dt:failure-cleanup:{task.task_id}",
     ):
         _assert_ttl_matches(real_redis_connection, key, retention_seconds)
@@ -345,6 +347,7 @@ def test_real_redis_callback_uses_configured_retention(
         f"dt:task:{task.task_id}",
         f"dt:task-work:{task.task_id}",
         f"dt:task:{task.task_id}:events",
+        f"dt:event-generation:{task.task_id}",
         f"dt:failure-cleanup:{task.task_id}",
     ):
         _assert_ttl_matches(real_redis_connection, key, retention_seconds)
@@ -371,6 +374,52 @@ def test_real_redis_terminal_transition_refreshes_existing_event_retention(
 
     assert real_redis_connection.llen(event_key) == 1
     _assert_ttl_matches(real_redis_connection, event_key, retention_seconds)
+    _assert_ttl_matches(
+        real_redis_connection,
+        f"dt:event-generation:{task.task_id}",
+        retention_seconds,
+    )
+
+
+def test_real_redis_terminal_event_is_idempotent_after_acknowledgement_loss(
+    real_redis_connection: Redis,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(real_redis_connection, tmp_path, retention_seconds=60)
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+        owner_id="a" * 32,
+    )
+    transition = manager._terminal_transition_script
+
+    def transition_then_lose_ack(*args, **kwargs):
+        transition(*args, **kwargs)
+        raise RedisConnectionError("terminal acknowledgement lost")
+
+    monkeypatch.setattr(
+        manager,
+        "_terminal_transition_script",
+        transition_then_lose_ack,
+    )
+    with pytest.raises(RedisConnectionError, match="acknowledgement lost"):
+        manager._finalize_external_failure(task.task_id, "worker failed")
+
+    monkeypatch.setattr(manager, "_terminal_transition_script", transition)
+    assert manager._finalize_external_failure(task.task_id, "worker failed")
+
+    terminal_events = [
+        event
+        for event in manager.log_store.history(task.task_id)
+        if event.phase is LogPhase.FAILED
+    ]
+    assert len(terminal_events) == 1
+    event_key = f"dt:task:{task.task_id}:events"
+    generation_key = f"dt:event-generation:{task.task_id}"
+    assert abs(
+        real_redis_connection.pttl(event_key)
+        - real_redis_connection.pttl(generation_key)
+    ) < 100
 
 
 def test_enqueue_registers_importable_rq_failure_and_stopped_callbacks(
@@ -710,6 +759,7 @@ def test_real_redis_repeated_terminal_does_not_shorten_ttl_or_resurrect(
         f"dt:task:{task.task_id}",
         f"dt:task-work:{task.task_id}",
         f"dt:task:{task.task_id}:events",
+        f"dt:event-generation:{task.task_id}",
         f"dt:failure-cleanup:{task.task_id}",
     )
     for key in keys:
@@ -1901,6 +1951,145 @@ def test_redis_log_store_persists_events_for_other_processes() -> None:
     assert events[0].details == {"position": 1}
 
 
+def test_real_redis_subscriber_recovers_after_event_log_expiry(
+    real_redis_connection: Redis,
+    tmp_path: Path,
+) -> None:
+    manager = RedisTaskManager(
+        redis_connection=real_redis_connection,
+        queue=Queue("designtoolkit", connection=real_redis_connection),
+        data_dir=tmp_path,
+        max_queued_tasks=20,
+        retention_seconds=1,
+        task_timeout_seconds=60,
+    )
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+        owner_id="a" * 32,
+    )
+    history, subscriber = manager.log_store.history_and_subscribe(task.task_id)
+    assert len(history) == 1
+
+    event_key = f"dt:task:{task.task_id}:events"
+    generation_key = f"dt:event-generation:{task.task_id}"
+    real_redis_connection.pexpire(event_key, 1)
+    real_redis_connection.pexpire(generation_key, 1)
+    deadline = time.monotonic() + 1
+    while real_redis_connection.exists(event_key) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert not real_redis_connection.exists(event_key)
+
+    assert manager._finalize_external_failure(task.task_id, "worker timed out")
+
+    terminal = subscriber.get(timeout=0.5)
+    assert terminal.phase is LogPhase.FAILED
+    assert terminal.message == "worker timed out"
+    assert manager.get_task(task.task_id).status is TaskStatus.FAILED
+
+
+def test_real_redis_subscriber_does_not_repeat_events_without_generation_change(
+    real_redis_connection: Redis,
+) -> None:
+    store = RedisLogStore(real_redis_connection, retention_seconds=60)
+    task_id = "stable-events"
+    store.append(
+        task_id=task_id,
+        level=LogLevel.INFO,
+        phase=LogPhase.CREATED,
+        message="queued",
+    )
+    history, subscriber = store.history_and_subscribe(task_id)
+    store.append(
+        task_id=task_id,
+        level=LogLevel.PROGRESS,
+        phase=LogPhase.RUNNING,
+        message="first",
+    )
+    store.append(
+        task_id=task_id,
+        level=LogLevel.PROGRESS,
+        phase=LogPhase.RUNNING,
+        message="second",
+    )
+
+    assert [event.message for event in history] == ["queued"]
+    assert subscriber.get(timeout=0.2).message == "first"
+    assert subscriber.get(timeout=0.2).message == "second"
+    with pytest.raises(Empty):
+        subscriber.get(timeout=0.05)
+
+
+def test_real_redis_event_generation_ttl_matches_event_list(
+    real_redis_connection: Redis,
+) -> None:
+    store = RedisLogStore(real_redis_connection, retention_seconds=60)
+    task_id = "event-ttl"
+
+    store.append(
+        task_id=task_id,
+        level=LogLevel.INFO,
+        phase=LogPhase.CREATED,
+        message="queued",
+    )
+
+    event_ttl = real_redis_connection.pttl(f"dt:task:{task_id}:events")
+    generation_ttl = real_redis_connection.pttl(
+        f"dt:event-generation:{task_id}"
+    )
+    assert abs(event_ttl - generation_ttl) < 100
+    assert generation_ttl > 0
+
+
+def test_real_redis_history_adopts_legacy_event_list_generation(
+    real_redis_connection: Redis,
+) -> None:
+    store = RedisLogStore(real_redis_connection, retention_seconds=60)
+    task_id = "legacy-events"
+    expected = store.append(
+        task_id=task_id,
+        level=LogLevel.INFO,
+        phase=LogPhase.CREATED,
+        message="legacy event",
+    )
+    generation_key = f"dt:event-generation:{task_id}"
+    real_redis_connection.delete(generation_key)
+
+    assert store.history(task_id) == [expected]
+
+    event_ttl = real_redis_connection.pttl(f"dt:task:{task_id}:events")
+    generation_ttl = real_redis_connection.pttl(generation_key)
+    assert abs(event_ttl - generation_ttl) < 100
+
+
+def test_real_redis_concurrent_event_appends_preserve_each_writer_order(
+    real_redis_connection: Redis,
+) -> None:
+    store = RedisLogStore(real_redis_connection, retention_seconds=60)
+    task_id = "concurrent-events"
+    barrier = Barrier(8)
+
+    def append_pair(worker: int) -> None:
+        barrier.wait()
+        for sequence in range(2):
+            store.append(
+                task_id=task_id,
+                level=LogLevel.PROGRESS,
+                phase=LogPhase.RUNNING,
+                message=f"{worker}:{sequence}",
+            )
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [executor.submit(append_pair, worker) for worker in range(8)]
+        for future in futures:
+            future.result(timeout=5)
+
+    messages = [event.message for event in store.history(task_id)]
+    assert len(messages) == 16
+    for worker in range(8):
+        assert messages.index(f"{worker}:0") < messages.index(f"{worker}:1")
+    assert real_redis_connection.exists(f"dt:event-generation:{task_id}")
+
+
 def test_worker_status_updates_are_visible_to_api_manager(tmp_path: Path) -> None:
     redis_connection = fakeredis.FakeRedis(decode_responses=False)
     api_manager = _manager(redis_connection, tmp_path)
@@ -2441,6 +2630,7 @@ def test_real_redis_reconcile_uses_configured_retention(
         f"dt:task:{task.task_id}",
         f"dt:task-work:{task.task_id}",
         f"dt:task:{task.task_id}:events",
+        f"dt:event-generation:{task.task_id}",
         f"dt:failure-cleanup:{task.task_id}",
     ):
         _assert_ttl_matches(real_redis_connection, key, retention_seconds)
@@ -2769,6 +2959,7 @@ def test_real_redis_reconcile_fails_uncommitted_ambiguous_enqueue(
         f"dt:task:{task.task_id}",
         f"dt:task-work:{task.task_id}",
         f"dt:task:{task.task_id}:events",
+        f"dt:event-generation:{task.task_id}",
         f"dt:failure-cleanup:{task.task_id}",
     ):
         _assert_ttl_matches(real_redis_connection, key, retention_seconds)

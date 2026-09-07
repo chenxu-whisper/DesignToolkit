@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 from concurrent.futures import ThreadPoolExecutor
@@ -38,7 +39,7 @@ from designtoolkit.web.resources import (
     AssetReleaseMismatchError,
     ResourceUnavailableError,
 )
-from designtoolkit.web.schemas import TaskStatus
+from designtoolkit.web.schemas import LogLevel, LogPhase, TaskKind, TaskStatus
 from designtoolkit.web.tasks import TaskManager
 
 
@@ -350,6 +351,93 @@ def _upload(
             "x-upload-filename": quote(filename, safe=""),
         },
     )
+
+
+@pytest.mark.parametrize(
+    ("status", "error", "expected_level", "expected_phase", "expected_message"),
+    [
+        (
+            TaskStatus.SUCCEEDED,
+            None,
+            LogLevel.SUCCESS,
+            LogPhase.COMPLETED,
+            "Task completed",
+        ),
+        (
+            TaskStatus.FAILED,
+            "worker failed",
+            LogLevel.ERROR,
+            LogPhase.FAILED,
+            "worker failed",
+        ),
+    ],
+)
+def test_task_event_stream_synthesizes_terminal_event_from_task_state(
+    tmp_path: Path,
+    status: TaskStatus,
+    error: str | None,
+    expected_level: LogLevel,
+    expected_phase: LogPhase,
+    expected_message: str,
+) -> None:
+    class EmptyThenFailSubscriber:
+        calls = 0
+
+        def get(self, timeout: float):
+            del timeout
+            type(self).calls += 1
+            if type(self).calls == 1:
+                raise routes_module.Empty
+            raise AssertionError("terminal task stream did not close")
+
+    class MissingTerminalLogStore(LogStore):
+        def history_and_subscribe(self, task_id: str):
+            return self.history(task_id), EmptyThenFailSubscriber()
+
+        def unsubscribe(self, task_id: str, subscriber) -> None:
+            del task_id, subscriber
+
+    manager = TaskManager(
+        log_store=MissingTerminalLogStore(),
+        run_async=False,
+    )
+    with _client(tmp_path, task_manager=manager) as client:
+        client.get("/api/config")
+        task = manager.reserve_task(
+            kind=TaskKind.VIDEO_FRAMES,
+            input_path="clip.mp4",
+            output_path=None,
+            owner_id=client.cookies["dt_session"],
+        )
+        manager.mark_finished(task.task_id, status=status, error=error)
+
+        response = client.get(f"/api/tasks/{task.task_id}/events")
+
+    payloads = [
+        json.loads(line.removeprefix("data: "))
+        for line in response.text.splitlines()
+        if line.startswith("data: ")
+    ]
+    terminal = payloads[-1]
+    assert terminal == {
+        "task_id": task.task_id,
+        "timestamp": task.finished_at.isoformat().replace("+00:00", "Z"),
+        "level": expected_level.value,
+        "phase": expected_phase.value,
+        "message": expected_message,
+        "details": {
+            "source": "task_state",
+            "status": status.value,
+        },
+    }
+    assert len(
+        [
+            payload
+            for payload in payloads
+            if payload["phase"] in {"completed", "failed"}
+        ]
+    ) == 1
+    assert EmptyThenFailSubscriber.calls == 1
 
 
 def test_hosted_config_and_upload_issue_anonymous_session(tmp_path: Path) -> None:
