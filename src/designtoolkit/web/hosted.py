@@ -18,6 +18,7 @@ from urllib.parse import quote
 from uuid import UUID, uuid4
 from zipfile import ZIP_DEFLATED, ZipFile
 
+from anyio import to_thread
 from redis.exceptions import RedisError
 
 from designtoolkit.web.heartbeat import (
@@ -254,17 +255,16 @@ class _UploadResourceHeartbeat:
         self._failure: BaseException | None = None
         self._thread = Thread(target=self._run, daemon=True)
 
-    def __enter__(self) -> _UploadResourceHeartbeat:
-        self._refresh()
+    async def __aenter__(self) -> _UploadResourceHeartbeat:
         self._thread.start()
         return self
 
-    def __exit__(
+    async def __aexit__(
         self,
         _exc_type: type[BaseException] | None,
         *_args: object,
     ) -> None:
-        self.seal()
+        await to_thread.run_sync(self.seal)
 
     def seal(self) -> None:
         try:
@@ -296,6 +296,11 @@ class _UploadResourceHeartbeat:
             self._refresh_generation()
 
     def _run(self) -> None:
+        try:
+            self._refresh()
+        except BaseException as exc:
+            self._failure = exc
+            return
         while not self._stopped.wait(self._interval):
             try:
                 self._refresh()
@@ -559,7 +564,7 @@ class HostedStorage:
             if content_length > self.max_upload_bytes:
                 raise UploadRejectedError("File exceeds the configured file limit")
         except Exception:
-            _release_best_effort(reservation)
+            await to_thread.run_sync(_release_best_effort, reservation)
             raise
 
         session_dir = self._session_dir(session_id)
@@ -584,7 +589,7 @@ class HostedStorage:
                     registration.token,
                 )
 
-            with _UploadResourceHeartbeat(
+            async with _UploadResourceHeartbeat(
                 reservation,
                 lease,
                 registration,
@@ -594,7 +599,6 @@ class HostedStorage:
                     self._raise_if_upload_cancelled(
                         session_id,
                         asset_id,
-                        registration,
                     )
                     try:
                         asset_dir.mkdir(parents=True, exist_ok=False)
@@ -614,7 +618,6 @@ class HostedStorage:
                         self._raise_if_upload_cancelled(
                             session_id,
                             asset_id,
-                            registration,
                         )
                         if not chunk:
                             continue
@@ -636,28 +639,26 @@ class HostedStorage:
                 self._raise_if_upload_cancelled(
                     session_id,
                     asset_id,
-                    registration,
                 )
                 os.utime(self._session_dir(session_id), None)
-                heartbeat.seal()
-                self._raise_if_upload_cancelled(
+                await to_thread.run_sync(heartbeat.seal)
+                await to_thread.run_sync(
+                    self._raise_if_upload_cancelled,
                     session_id,
                     asset_id,
                     registration,
                 )
-                _commit_with_recovery(reservation)
+                await to_thread.run_sync(_commit_with_recovery, reservation)
                 committed = True
                 with self._deletion_lock:
                     self._raise_if_upload_cancelled(
                         session_id,
                         asset_id,
-                        registration,
                     )
                     temporary_path.replace(final_path)
                     self._raise_if_upload_cancelled(
                         session_id,
                         asset_id,
-                        registration,
                     )
         except HeartbeatStopTimeoutError:
             if owns_asset_dir:
@@ -667,16 +668,19 @@ class HostedStorage:
             raise
         except Exception:
             if committed:
-                if _rollback_with_recovery(reservation):
+                if await to_thread.run_sync(
+                    _rollback_with_recovery,
+                    reservation,
+                ):
                     if owns_asset_dir:
                         self._discard_asset(session_id, asset_dir)
             else:
-                _release_best_effort(reservation)
+                await to_thread.run_sync(_release_best_effort, reservation)
                 if owns_asset_dir:
                     self._discard_asset(session_id, asset_dir)
             raise
 
-        _finalize_best_effort(reservation)
+        await to_thread.run_sync(_finalize_best_effort, reservation)
         return UploadedAsset(
             reference=f"asset:{asset_id}:{quote(filename, safe='')}",
             filename=filename,
@@ -947,6 +951,7 @@ class HostedStorage:
         retention_seconds: int,
         coordinator: RedisResourceCoordinator,
     ) -> int:
+        self._finalize_pending_asset_releases(coordinator)
         self._finalize_orphaned_cleanup_markers(coordinator)
         removed = self._cleanup_orphaned_quarantine(coordinator)
         sessions_dir = self.root / "sessions"
@@ -1053,6 +1058,17 @@ class HostedStorage:
             },
             exc_info=True,
         )
+
+    @staticmethod
+    def _finalize_pending_asset_releases(
+        coordinator: RedisResourceCoordinator,
+    ) -> None:
+        for release in coordinator.pending_asset_releases():
+            coordinator.finalize_asset_release(
+                release.session_id,
+                release.asset_id,
+                release.generation_id,
+            )
 
     def _finalize_orphaned_cleanup_markers(
         self,

@@ -27,6 +27,7 @@ _COMMITTED_PREFIX = "dt:resource:committed:"
 _COMMITTED_UPLOAD_PREFIX = "dt:resource:committed-upload:"
 _RELEASED_ASSET_PREFIX = "dt:resource:asset-released:"
 _PENDING_ASSET_RELEASE_PREFIX = "dt:resource:asset-release-pending:"
+_PENDING_ASSET_RELEASE_INDEX_KEY = "dt:resource:asset-releases-pending"
 _LEASE_PREFIX = "dt:resource:lease:"
 _CLEANUP_PREFIX = "dt:resource:cleanup:"
 _CLEANUP_GENERATION_PREFIX = "dt:resource:cleanup-generation:"
@@ -890,6 +891,7 @@ for _, marker_key in ipairs(marker_keys) do
         local pending_key = ARGV[2] .. ARGV[1] .. ":" .. marker_asset
         if redis.call("GET", pending_key) == marker_generation then
             redis.call("DEL", pending_key)
+            redis.call("SREM", KEYS[4], pending_key)
         end
     end
     redis.call("DEL", marker_key)
@@ -900,6 +902,9 @@ for _, ledger_key in ipairs(ledger_keys) do
     redis.call("DEL", ledger_key)
 end
 redis.call("DEL", KEYS[3])
+if redis.call("SCARD", KEYS[4]) == 0 then
+    redis.call("DEL", KEYS[4])
+end
 redis.call(
     "HDEL",
     KEYS[1],
@@ -1033,8 +1038,12 @@ for index = 0, generation_marker_count - 1 do
         local pending_key = ARGV[6] .. ARGV[1] .. ":" .. asset_id
         if redis.call("GET", pending_key) == generation_id then
             redis.call("DEL", pending_key)
+            redis.call("SREM", KEYS[7], pending_key)
         end
     end
+end
+if redis.call("SCARD", KEYS[7]) == 0 then
+    redis.call("DEL", KEYS[7])
 end
 redis.call(
     "HMSET",
@@ -1128,6 +1137,18 @@ _RELEASE_LEGACY_COMMITTED_ASSET_SCRIPT = """-- release_legacy_committed_asset
 local session_id = ARGV[1]
 local asset_id = ARGV[2]
 local released_bytes = tonumber(ARGV[3])
+local marker_ttl_ms = tonumber(ARGV[5])
+local function retain_index_member()
+    local marker_ttl = redis.call("PTTL", KEYS[2])
+    if marker_ttl < 0 then
+        marker_ttl = marker_ttl_ms
+        redis.call("PEXPIRE", KEYS[2], marker_ttl)
+    end
+    redis.call("SADD", KEYS[3], KEYS[2])
+    if redis.call("PTTL", KEYS[3]) < marker_ttl then
+        redis.call("PEXPIRE", KEYS[3], marker_ttl)
+    end
+end
 local expected_remaining = nil
 if ARGV[4] ~= "" then
     expected_remaining = tonumber(ARGV[4])
@@ -1143,7 +1164,7 @@ if redis.call("EXISTS", KEYS[2]) == 1 then
         return 3
     end
     if redis.call("HGET", KEYS[2], "finalized") ~= "1" then
-        redis.call("SADD", KEYS[3], KEYS[2])
+        retain_index_member()
     end
     return 0
 end
@@ -1183,7 +1204,8 @@ redis.call(
     "bytes",
     released_bytes
 )
-redis.call("SADD", KEYS[3], KEYS[2])
+redis.call("PEXPIRE", KEYS[2], marker_ttl_ms)
+retain_index_member()
 return 1
 """
 
@@ -1192,6 +1214,23 @@ _RELEASE_COMMITTED_UPLOAD_GENERATION_SCRIPT = (
 local session_id = ARGV[1]
 local asset_id = ARGV[2]
 local generation_id = ARGV[3]
+local marker_ttl_ms = tonumber(ARGV[4])
+local function retain_recovery_state()
+    local marker_ttl = redis.call("PTTL", KEYS[4])
+    if marker_ttl < 0 then
+        marker_ttl = marker_ttl_ms
+        redis.call("PEXPIRE", KEYS[4], marker_ttl)
+    end
+    redis.call("SADD", KEYS[5], KEYS[4])
+    if redis.call("PTTL", KEYS[5]) < marker_ttl then
+        redis.call("PEXPIRE", KEYS[5], marker_ttl)
+    end
+    redis.call("SET", KEYS[6], generation_id, "PX", marker_ttl)
+    redis.call("SADD", KEYS[7], KEYS[6])
+    if redis.call("PTTL", KEYS[7]) < marker_ttl then
+        redis.call("PEXPIRE", KEYS[7], marker_ttl)
+    end
+end
 if redis.call("EXISTS", KEYS[4]) == 1 then
     if redis.call("HGET", KEYS[4], "session_id") ~= session_id
         or redis.call("HGET", KEYS[4], "asset_id") ~= asset_id
@@ -1199,8 +1238,7 @@ if redis.call("EXISTS", KEYS[4]) == 1 then
         return 2
     end
     if redis.call("HGET", KEYS[4], "finalized") ~= "1" then
-        redis.call("SADD", KEYS[5], KEYS[4])
-        redis.call("SET", KEYS[6], generation_id)
+        retain_recovery_state()
     end
     return 0
 end
@@ -1241,8 +1279,8 @@ redis.call(
     "bytes",
     committed_bytes
 )
-redis.call("SADD", KEYS[5], KEYS[4])
-redis.call("SET", KEYS[6], generation_id)
+redis.call("PEXPIRE", KEYS[4], marker_ttl_ms)
+retain_recovery_state()
 return 1
 """
 )
@@ -1283,11 +1321,16 @@ if marker_session ~= ARGV[1] or marker_asset ~= ARGV[2] then
     return 2
 end
 redis.call("SREM", KEYS[2], KEYS[1])
+if redis.call("SCARD", KEYS[2]) == 0 then
+    redis.call("DEL", KEYS[2])
+end
 if redis.call("HGET", KEYS[1], "finalized") == "1" then
     return 0
 end
 redis.call("HSET", KEYS[1], "finalized", "1")
-redis.call("PEXPIRE", KEYS[1], tonumber(ARGV[3]))
+if redis.call("PTTL", KEYS[1]) < 0 then
+    redis.call("PEXPIRE", KEYS[1], tonumber(ARGV[3]))
+end
 return 1
 """
 
@@ -1302,14 +1345,23 @@ if redis.call("HGET", KEYS[1], "session_id") ~= ARGV[1]
     return 2
 end
 redis.call("SREM", KEYS[2], KEYS[1])
+if redis.call("SCARD", KEYS[2]) == 0 then
+    redis.call("DEL", KEYS[2])
+end
 if redis.call("GET", KEYS[3]) == ARGV[3] then
     redis.call("DEL", KEYS[3])
+    redis.call("SREM", KEYS[4], KEYS[3])
+    if redis.call("SCARD", KEYS[4]) == 0 then
+        redis.call("DEL", KEYS[4])
+    end
 end
 if redis.call("HGET", KEYS[1], "finalized") == "1" then
     return 0
 end
 redis.call("HSET", KEYS[1], "finalized", "1")
-redis.call("PEXPIRE", KEYS[1], tonumber(ARGV[4]))
+if redis.call("PTTL", KEYS[1]) < 0 then
+    redis.call("PEXPIRE", KEYS[1], tonumber(ARGV[4]))
+end
 return 1
 """
 )
@@ -1538,6 +1590,13 @@ class CleanupMarker:
     session_id: str
     generation_id: str
     legacy: bool
+
+
+@dataclass(frozen=True)
+class PendingAssetRelease:
+    session_id: str
+    asset_id: str
+    generation_id: str
 
 
 @dataclass
@@ -1964,6 +2023,21 @@ class RedisResourceCoordinator:
             return registration
         if last_transport_error is None:
             raise RuntimeError("Upload registration recovery lost its error")
+        registration_key = _upload_inflight_key(session_id, upload_id)
+        try:
+            metadata = self._redis.hgetall(registration_key)
+        except _REDIS_TRANSPORT_ERRORS as query_error:
+            raise last_transport_error from query_error
+        owner = _decoded_hash_value(metadata, "token")
+        state = _decoded_hash_value(metadata, "state")
+        if owner == token:
+            if state in {"inflight", "cancelled"}:
+                return registration
+            raise ResourceUnavailableError(
+                "Upload registration state is invalid"
+            )
+        if owner is not None:
+            raise ResourceUnavailableError("Upload is already in progress")
         raise last_transport_error
 
     def cancel_upload(self, session_id: str, upload_id: str) -> bool:
@@ -2188,6 +2262,7 @@ class RedisResourceCoordinator:
                 _STATE_KEY,
                 _session_released_assets_key(session_id),
                 _session_committed_uploads_key(session_id),
+                _PENDING_ASSET_RELEASE_INDEX_KEY,
             ],
             args=[
                 session_id,
@@ -2324,6 +2399,7 @@ class RedisResourceCoordinator:
                     _session_released_assets_key(session_id),
                     _cleanup_generation_key(generation.generation_id),
                     _session_committed_uploads_key(session_id),
+                    _PENDING_ASSET_RELEASE_INDEX_KEY,
                 ],
                 args=[
                     session_id,
@@ -2468,6 +2544,71 @@ class RedisResourceCoordinator:
             )
         )
 
+    def pending_asset_releases(self) -> tuple[PendingAssetRelease, ...]:
+        releases: list[PendingAssetRelease] = []
+        for raw_key in self._redis.smembers(
+            _PENDING_ASSET_RELEASE_INDEX_KEY
+        ):
+            key = raw_key.decode() if isinstance(raw_key, bytes) else raw_key
+            if not key.startswith(_PENDING_ASSET_RELEASE_PREFIX):
+                self._redis.srem(_PENDING_ASSET_RELEASE_INDEX_KEY, raw_key)
+                continue
+            parts = key.removeprefix(_PENDING_ASSET_RELEASE_PREFIX).split(":")
+            if (
+                len(parts) != 2
+                or not _SESSION_PATTERN.fullmatch(parts[0])
+                or not _ASSET_PATTERN.fullmatch(parts[1])
+            ):
+                self._redis.srem(_PENDING_ASSET_RELEASE_INDEX_KEY, raw_key)
+                continue
+            session_id, asset_id = parts
+            raw_generation = self._redis.get(key)
+            generation_id = (
+                raw_generation.decode()
+                if isinstance(raw_generation, bytes)
+                else raw_generation
+            )
+            if (
+                generation_id is None
+                or not _TOKEN_PATTERN.fullmatch(generation_id)
+            ):
+                self._redis.srem(_PENDING_ASSET_RELEASE_INDEX_KEY, raw_key)
+                continue
+            marker_key = _released_upload_generation_key(
+                session_id,
+                asset_id,
+                generation_id,
+            )
+            metadata = self._redis.hgetall(marker_key)
+            if (
+                _decoded_hash_value(metadata, "session_id") != session_id
+                or _decoded_hash_value(metadata, "asset_id") != asset_id
+                or _decoded_hash_value(metadata, "generation_id")
+                != generation_id
+            ):
+                self._redis.delete(key)
+                self._redis.srem(_PENDING_ASSET_RELEASE_INDEX_KEY, raw_key)
+                continue
+            releases.append(
+                PendingAssetRelease(
+                    session_id=session_id,
+                    asset_id=asset_id,
+                    generation_id=generation_id,
+                )
+            )
+        if not self._redis.scard(_PENDING_ASSET_RELEASE_INDEX_KEY):
+            self._redis.delete(_PENDING_ASSET_RELEASE_INDEX_KEY)
+        return tuple(
+            sorted(
+                releases,
+                key=lambda release: (
+                    release.session_id,
+                    release.asset_id,
+                    release.generation_id,
+                ),
+            )
+        )
+
     def release_committed_asset(
         self,
         session_id: str,
@@ -2507,11 +2648,13 @@ class RedisResourceCoordinator:
                     ),
                     _session_released_assets_key(session_id),
                     _pending_asset_release_key(session_id, asset_id),
+                    _PENDING_ASSET_RELEASE_INDEX_KEY,
                 ],
                 args=[
                     session_id,
                     asset_id,
                     generation_id,
+                    self._release_marker_ttl_ms,
                 ],
             )
         )
@@ -2557,6 +2700,7 @@ class RedisResourceCoordinator:
                         if expected_remaining_bytes is None
                         else expected_remaining_bytes
                     ),
+                    self._release_marker_ttl_ms,
                 ],
             )
         )
@@ -2650,6 +2794,7 @@ class RedisResourceCoordinator:
                         ),
                         _session_released_assets_key(session_id),
                         _pending_asset_release_key(session_id, asset_id),
+                        _PENDING_ASSET_RELEASE_INDEX_KEY,
                     ],
                     args=[
                         session_id,

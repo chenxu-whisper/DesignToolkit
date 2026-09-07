@@ -20,6 +20,7 @@ from redis.exceptions import ConnectionError as RedisConnectionError
 from designtoolkit.web.hosted import (
     HostedSettings,
     HostedStorage,
+    UploadConflictError,
     UploadRejectedError,
     _CleanupClaimHeartbeat,
     prepare_download_artifact,
@@ -179,6 +180,17 @@ class RecordingCleanupCoordinator:
 
     def pending_cleanup_markers(self) -> tuple[SimpleNamespace, ...]:
         return tuple(self.cleanup_markers)
+
+    def pending_asset_releases(self) -> tuple[SimpleNamespace, ...]:
+        return ()
+
+    def finalize_asset_release(
+        self,
+        _session_id: str,
+        _asset_id: str,
+        _generation_id: str,
+    ) -> bool:
+        return True
 
     def claim_session_cleanup(self, session_id: str) -> str | None:
         self.claim_calls.append(session_id)
@@ -699,7 +711,7 @@ async def test_upload_registration_heartbeat_aborts_cancelled_upload(
         await asyncio.sleep(0.03)
         yield b"ag"
 
-    with pytest.raises(UploadRejectedError, match="cancelled"):
+    with pytest.raises(UploadConflictError, match="cancelled"):
         await storage.store_stream(
             "a" * 32,
             asset_id="1" * 32,
@@ -714,6 +726,90 @@ async def test_upload_registration_heartbeat_aborts_cancelled_upload(
     assert reservation.committed is False
     assert reservation.released is True
     assert list(tmp_path.rglob("screen.png")) == []
+
+
+@pytest.mark.anyio
+async def test_upload_registration_refresh_count_is_not_per_chunk(
+    tmp_path: Path,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=200)
+    reservation = RecordingReservation()
+    registration = RecordingUploadRegistration()
+    session_id = "a" * 32
+    upload_id = "1" * 32
+    storage.claim_upload_generation(
+        session_id,
+        upload_id,
+        token=registration.token,
+    )
+
+    async def many_chunks() -> AsyncIterator[bytes]:
+        for _index in range(100):
+            yield b"x"
+
+    await storage.store_stream(
+        session_id,
+        asset_id=upload_id,
+        filename="screen.png",
+        content_length=100,
+        chunks=many_chunks(),
+        reservation=reservation,
+        registration=registration,
+    )
+
+    assert registration.refresh_count < 10
+
+
+@pytest.mark.anyio
+async def test_slow_registration_refresh_does_not_block_event_loop(
+    tmp_path: Path,
+) -> None:
+    refresh_gate = Event()
+
+    class SlowRegistration(RecordingUploadRegistration):
+        def __init__(self) -> None:
+            super().__init__()
+            self.first_refresh_unblocked: bool | None = None
+
+        def refresh(self) -> bool:
+            self.refresh_count += 1
+            unblocked = refresh_gate.wait(timeout=0.2)
+            if self.first_refresh_unblocked is None:
+                self.first_refresh_unblocked = unblocked
+            return self.cancelled
+
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    reservation = RecordingReservation()
+    registration = SlowRegistration()
+    session_id = "a" * 32
+    upload_id = "1" * 32
+    storage.claim_upload_generation(
+        session_id,
+        upload_id,
+        token=registration.token,
+    )
+
+    async def open_refresh_gate() -> None:
+        await asyncio.sleep(0.01)
+        refresh_gate.set()
+
+    async def delayed_chunk() -> AsyncIterator[bytes]:
+        await asyncio.sleep(0.02)
+        yield b"data"
+
+    gate_task = asyncio.create_task(open_refresh_gate())
+    await storage.store_stream(
+        session_id,
+        asset_id=upload_id,
+        filename="screen.png",
+        content_length=4,
+        chunks=delayed_chunk(),
+        reservation=reservation,
+        registration=registration,
+    )
+    await gate_task
+
+    assert registration.first_refresh_unblocked is True
 
 
 @pytest.mark.anyio
