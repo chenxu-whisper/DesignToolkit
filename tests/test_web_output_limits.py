@@ -787,7 +787,7 @@ def test_ffmpeg_backend_uses_taskkill_when_job_assignment_fails_and_root_exits(
             self.signals.append(sent_signal)
 
     process = GroupedPopen()
-    taskkill_calls: list[list[str]] = []
+    taskkill_calls: list[tuple[int, float]] = []
     ctrl_break = 1
     monkeypatch.setattr(ffmpeg_backend, "os_name", "nt")
     monkeypatch.setattr(signal, "CTRL_BREAK_EVENT", ctrl_break, raising=False)
@@ -798,9 +798,9 @@ def test_ffmpeg_backend_uses_taskkill_when_job_assignment_fails_and_root_exits(
         raising=False,
     )
     monkeypatch.setattr(
-        subprocess,
-        "run",
-        lambda command, **_kwargs: taskkill_calls.append(command),
+        ffmpeg_backend,
+        "_run_windows_taskkill",
+        lambda pid, timeout_seconds: taskkill_calls.append((pid, timeout_seconds)) or 0,
     )
     backend = FfmpegBackend(popen=_popen_factory(process, []))
 
@@ -809,9 +809,7 @@ def test_ffmpeg_backend_uses_taskkill_when_job_assignment_fails_and_root_exits(
 
     assert exc_info.value is timeout
     assert process.signals == [ctrl_break]
-    assert taskkill_calls == [
-        ["taskkill", "/PID", str(process.pid), "/T", "/F"],
-    ]
+    assert taskkill_calls == [(process.pid, 5.0)]
     assert process.wait_calls == [
         ffmpeg_backend._PROCESS_CLEANUP_TIMEOUT_SECONDS,
         ffmpeg_backend._PROCESS_CLEANUP_TIMEOUT_SECONDS,
@@ -834,16 +832,16 @@ def test_ffmpeg_backend_falls_back_when_windows_taskkill_times_out(
             self.signals.append(sent_signal)
 
     process = GroupedPopen()
-    taskkill_calls: list[tuple[list[str], dict[str, Any]]] = []
+    taskkill_calls: list[tuple[int, float]] = []
     ctrl_break = 1
 
-    def taskkill(command: list[str], **kwargs: Any) -> None:
-        taskkill_calls.append((command, kwargs))
-        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+    def taskkill(pid: int, timeout_seconds: float) -> int:
+        taskkill_calls.append((pid, timeout_seconds))
+        raise subprocess.TimeoutExpired("taskkill", timeout_seconds)
 
     monkeypatch.setattr(ffmpeg_backend, "os_name", "nt")
     monkeypatch.setattr(signal, "CTRL_BREAK_EVENT", ctrl_break, raising=False)
-    monkeypatch.setattr(subprocess, "run", taskkill)
+    monkeypatch.setattr(ffmpeg_backend, "_run_windows_taskkill", taskkill)
     backend = FfmpegBackend(
         poll_interval=0.01,
         popen=_popen_factory(process, []),
@@ -854,18 +852,176 @@ def test_ffmpeg_backend_falls_back_when_windows_taskkill_times_out(
 
     assert exc_info.value is timeout
     assert process.signals == [ctrl_break]
-    assert taskkill_calls[0][0] == [
-        "taskkill",
-        "/PID",
-        str(process.pid),
-        "/T",
-        "/F",
-    ]
-    cleanup_timeout = taskkill_calls[0][1]["timeout"]
+    assert taskkill_calls == [(process.pid, 5.0), (process.pid, 10.0)]
+    cleanup_timeout = ffmpeg_backend._PROCESS_CLEANUP_TIMEOUT_SECONDS
     assert cleanup_timeout > backend._poll_interval
-    assert taskkill_calls[0][1]["check"] is False
     assert process.kill_called
     assert process.wait_calls == [cleanup_timeout, cleanup_timeout]
+
+
+def test_windows_tree_terminates_captured_descendant_after_root_exits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Identity:
+        def __init__(
+            self,
+            pid: int,
+            parent_pid: int,
+            creation_time: int,
+        ) -> None:
+            self.pid = pid
+            self.parent_pid = parent_pid
+            self.creation_time = creation_time
+            self.handle = f"handle-{pid}"
+
+    class FakeWindowsProcessApi:
+        def __init__(self) -> None:
+            self.identities = {
+                4321: Identity(4321, 1, 100),
+                5432: Identity(5432, 4321, 200),
+                6543: Identity(6543, 5432, 225),
+            }
+            self.active = {4321, 5432, 6543}
+            self.terminated: list[int] = []
+            self.closed: list[str] = []
+
+        def snapshot(self) -> list[Identity]:
+            return list(self.identities.values())
+
+        def open_process(self, pid: int) -> Identity | None:
+            return self.identities.get(pid)
+
+        def exit_time(self, identity: Identity) -> int | None:
+            if identity.pid == 4321 and identity.pid not in self.active:
+                return 250
+            return None
+
+        def is_active(self, identity: Identity) -> bool:
+            return identity.pid in self.active
+
+        def terminate(self, identity: Identity) -> None:
+            self.terminated.append(identity.pid)
+            self.active.discard(identity.pid)
+
+        def wait(self, identity: Identity, timeout_seconds: float) -> None:
+            del identity, timeout_seconds
+
+        def close(self, identity: Identity) -> None:
+            self.closed.append(identity.handle)
+
+    api = FakeWindowsProcessApi()
+    taskkill_timeouts: list[float] = []
+
+    def time_out_taskkill(pid: int, timeout_seconds: float) -> int:
+        assert pid == 4321
+        taskkill_timeouts.append(timeout_seconds)
+        api.active.discard(pid)
+        api.identities[7654] = Identity(7654, 4321, 300)
+        api.active.add(7654)
+        raise subprocess.TimeoutExpired("taskkill", timeout_seconds)
+
+    monkeypatch.setattr(
+        ffmpeg_backend,
+        "_run_windows_taskkill",
+        time_out_taskkill,
+        raising=False,
+    )
+    tree = ffmpeg_backend._WindowsProcessTree(  # type: ignore[attr-defined]
+        4321,
+        api=api,
+        poll_interval=60,
+    )
+
+    tree.terminate()
+    tree.close()
+
+    assert taskkill_timeouts == [5.0, 10.0]
+    assert api.terminated == [6543, 5432]
+    assert sorted(set(api.closed)) == [
+        "handle-4321",
+        "handle-5432",
+        "handle-6543",
+        "handle-7654",
+    ]
+    assert api.closed.count("handle-7654") == 2
+
+
+def test_windows_taskkill_timeout_kills_and_reaps_taskkill(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class HungTaskkill:
+        returncode = 1
+
+        def __init__(self) -> None:
+            self.kill_called = False
+            self.wait_calls: list[float] = []
+
+        def wait(self, timeout: float) -> int:
+            self.wait_calls.append(timeout)
+            if not self.kill_called:
+                raise subprocess.TimeoutExpired("taskkill", timeout)
+            return self.returncode
+
+        def kill(self) -> None:
+            self.kill_called = True
+
+    taskkill = HungTaskkill()
+    popen_calls: list[tuple[list[str], dict[str, Any]]] = []
+
+    def create(command: list[str], **kwargs: Any) -> HungTaskkill:
+        popen_calls.append((command, kwargs))
+        return taskkill
+
+    monkeypatch.setattr(subprocess, "Popen", create)
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        ffmpeg_backend._run_windows_taskkill(4321, 5.0)  # type: ignore[attr-defined]
+
+    assert taskkill.kill_called
+    assert taskkill.wait_calls == [5.0, 5.0]
+    assert popen_calls[0][0] == ["taskkill", "/PID", "4321", "/T", "/F"]
+    assert popen_calls[0][1]["stdout"] is subprocess.DEVNULL
+    assert popen_calls[0][1]["stderr"] is subprocess.DEVNULL
+
+
+def test_windows_tree_closes_candidate_handle_when_capture_fails() -> None:
+    class Identity:
+        def __init__(self, pid: int, parent_pid: int) -> None:
+            self.pid = pid
+            self.parent_pid = parent_pid
+            self.creation_time = pid
+            self.handle = f"handle-{pid}"
+
+    class FailingWindowsProcessApi:
+        def __init__(self) -> None:
+            self.identities = {
+                100: Identity(100, 1),
+                200: Identity(200, 100),
+            }
+            self.closed: list[str] = []
+
+        def snapshot(self) -> list[Identity]:
+            return list(self.identities.values())
+
+        def open_process(self, pid: int) -> Identity:
+            return self.identities[pid]
+
+        def exit_time(self, identity: Identity) -> int | None:
+            del identity
+            raise OSError("GetProcessTimes failed")
+
+        def close(self, identity: Identity) -> None:
+            self.closed.append(identity.handle)
+
+    api = FailingWindowsProcessApi()
+
+    with pytest.raises(OSError, match="GetProcessTimes failed"):
+        ffmpeg_backend._WindowsProcessTree(  # type: ignore[attr-defined]
+            100,
+            api=api,
+        )
+
+    assert sorted(api.closed) == ["handle-100", "handle-200"]
 
 
 def _windows_process_is_active(pid: int) -> bool:
@@ -932,6 +1088,79 @@ def test_ffmpeg_backend_job_kills_descendant_that_ignores_break(
         while _windows_process_is_active(child_pid) and time.monotonic() < deadline:
             time.sleep(0.05)
         assert not _windows_process_is_active(child_pid)
+    finally:
+        if child_pid is not None and _windows_process_is_active(child_pid):
+            subprocess.run(
+                ["taskkill", "/PID", str(child_pid), "/T", "/F"],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows process handles")
+def test_ffmpeg_backend_fallback_kills_child_after_root_exits_during_taskkill(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    child_pid_path = tmp_path / "fallback-child.pid"
+    child_script = (
+        "import os, signal, sys, time; "
+        "signal.signal(signal.SIGBREAK, signal.SIG_IGN); "
+        "open(sys.argv[1], 'w', encoding='ascii').write(str(os.getpid())); "
+        "time.sleep(60)"
+    )
+    parent_script = (
+        "import os, signal, subprocess, sys, time; "
+        "signal.signal(signal.SIGBREAK, lambda *_args: os._exit(0)); "
+        f"subprocess.Popen([sys.executable, '-c', {child_script!r}, sys.argv[1]]); "
+        "time.sleep(60)"
+    )
+    taskkill_calls: list[tuple[int, float]] = []
+
+    def timeout_after_break(pid: int, timeout_seconds: float) -> int:
+        taskkill_calls.append((pid, timeout_seconds))
+        if len(taskkill_calls) == 1:
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/F"],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            deadline = time.monotonic() + 2
+            while _windows_process_is_active(pid) and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert not _windows_process_is_active(pid)
+        raise subprocess.TimeoutExpired("taskkill", timeout_seconds)
+
+    def reject_when_child_is_ready() -> None:
+        if child_pid_path.exists():
+            raise OutputLimitExceeded("fallback must retain child ownership")
+
+    monkeypatch.setattr(ffmpeg_backend, "_create_windows_job", lambda _process: None)
+    monkeypatch.setattr(
+        ffmpeg_backend,
+        "_run_windows_taskkill",
+        timeout_after_break,
+    )
+    backend = FfmpegBackend(
+        output_guard=reject_when_child_is_ready,
+        poll_interval=0.05,
+    )
+    child_pid: int | None = None
+    try:
+        with pytest.raises(
+            OutputLimitExceeded,
+            match="fallback must retain child ownership",
+        ):
+            backend.run([sys.executable, "-c", parent_script, str(child_pid_path)])
+        child_pid = int(child_pid_path.read_text(encoding="ascii"))
+        deadline = time.monotonic() + 2
+        while _windows_process_is_active(child_pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not _windows_process_is_active(child_pid)
+        root_pid = taskkill_calls[0][0]
+        assert taskkill_calls == [(root_pid, 5.0), (root_pid, 10.0)]
     finally:
         if child_pid is not None and _windows_process_is_active(child_pid):
             subprocess.run(
