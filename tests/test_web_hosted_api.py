@@ -31,6 +31,7 @@ from designtoolkit.web.hosted import (
     HostedStorage,
     UploadRejectedError,
 )
+from designtoolkit.web.logs import LogStore
 from designtoolkit.web.redis_tasks import RedisTaskManager
 from designtoolkit.web.resources import (
     AssetReleaseMismatchError,
@@ -1286,6 +1287,30 @@ def test_hosted_task_uses_uploaded_asset_and_is_session_isolated(
     assert own_status.status_code == 200
     assert own_status.json()["input_path"] == "clip.mp4"
     assert stranger_status.status_code == 404
+
+
+def test_in_memory_hosted_task_retains_session_owner(tmp_path: Path) -> None:
+    manager = TaskManager(
+        log_store=LogStore(),
+        exporter=None,
+        run_async=False,
+    )
+    with _client(tmp_path, task_manager=manager) as owner:
+        reference = _upload(owner, "clip.mp4", b"video").json()["reference"]
+        created = owner.post(
+            "/api/tasks/video-frames",
+            json={"input_path": reference, "image_format": "png"},
+        )
+        task_id = created.json()["task_id"]
+        own_status = owner.get(f"/api/tasks/{task_id}")
+
+    with _client(tmp_path, task_manager=manager) as stranger:
+        stranger_status = stranger.get(f"/api/tasks/{task_id}")
+
+    assert created.status_code == 202
+    assert own_status.status_code == 200
+    assert stranger_status.status_code == 404
+    assert manager.get_task(task_id) is not None
 
 
 @pytest.mark.parametrize("status", [TaskStatus.QUEUED, TaskStatus.RUNNING])

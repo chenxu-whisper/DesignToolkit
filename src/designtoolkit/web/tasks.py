@@ -143,6 +143,7 @@ class TaskManager:
         kind: TaskKind,
         input_path: str,
         output_path: str | None,
+        owner_id: str | None = None,
     ) -> TaskRecord:
         with self._lock:
             if self._active_task_id is not None:
@@ -157,6 +158,7 @@ class TaskManager:
                 input_path=input_path,
                 output_path=output_path,
                 error=None,
+                owner_id=owner_id,
             )
             self._records[task.task_id] = task
             self._active_task_id = task.task_id
@@ -216,6 +218,7 @@ class TaskManager:
             kind=TaskKind.VIDEO_FRAMES,
             input_path="\n".join(str(options.input_path) for options in options_list),
             output_path=request.output_dir,
+            owner_id=owner_id,
         )
         try:
             self._start(task, lambda: self._run_video_frames(task, options_list))
@@ -234,6 +237,7 @@ class TaskManager:
             kind=TaskKind.MEDIA_RESIZE,
             input_path="\n".join(str(options.input_path) for options in options_list),
             output_path=request.output_path,
+            owner_id=owner_id,
         )
         try:
             self._start(task, lambda: self._run_media_resize(task, options_list))
@@ -254,6 +258,7 @@ class TaskManager:
             kind=TaskKind.CHROMA_KEYER,
             input_path=str(options.input_path),
             output_path=str(output_path),
+            owner_id=owner_id,
         )
         try:
             self._start(
@@ -281,6 +286,7 @@ class TaskManager:
             kind=TaskKind.CHROMA_KEYER,
             input_path=str(options.input_path),
             output_path=str(output_dir),
+            owner_id=owner_id,
         )
         try:
             self._start(
