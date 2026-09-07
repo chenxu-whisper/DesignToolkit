@@ -30,6 +30,7 @@ PositiveFloat = Annotated[
     float,
     Field(strict=True, gt=0, allow_inf_nan=False),
 ]
+MAX_TASK_INPUT_PATHS = 100
 
 
 class TaskKind(StrEnum):
@@ -249,7 +250,10 @@ class ChromaVideoPreviewResponse(ChromaPreviewResponse):
 
 class VideoFramesTaskRequest(BaseModel):
     input_path: str | None = Field(default=None, min_length=1)
-    input_paths: list[str] | None = None
+    input_paths: list[str] | None = Field(
+        default=None,
+        max_length=MAX_TASK_INPUT_PATHS,
+    )
     output_dir: str | None = None
     image_format: Literal["png", "jpg", "jpeg"] = "png"
     size: str | None = None
@@ -282,7 +286,10 @@ class VideoFramesTaskRequest(BaseModel):
 
 class MediaResizeTaskRequest(BaseModel):
     input_path: str | None = Field(default=None, min_length=1)
-    input_paths: list[str] | None = None
+    input_paths: list[str] | None = Field(
+        default=None,
+        max_length=MAX_TASK_INPUT_PATHS,
+    )
     output_path: str | None = None
     output_dir: str | None = None
     size: str = Field(min_length=1)

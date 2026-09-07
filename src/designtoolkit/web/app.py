@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from functools import partial
 from pathlib import Path
 from threading import BoundedSemaphore
 
+import anyio
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
@@ -121,14 +123,17 @@ def create_app(
             )
             rate_limits = _rate_limits_for_request(request, settings)
             try:
-                rate_limited = isinstance(
-                    manager, RedisTaskManager
-                ) and _is_rate_limited(
-                    manager,
-                    client_host=client_host,
-                    session_id=session_id,
-                    rate_limits=rate_limits,
-                )
+                rate_limited = False
+                if isinstance(manager, RedisTaskManager) and rate_limits:
+                    rate_limited = await anyio.to_thread.run_sync(
+                        partial(
+                            _is_rate_limited,
+                            manager,
+                            client_host=client_host,
+                            session_id=session_id,
+                            rate_limits=rate_limits,
+                        )
+                    )
             except RedisError as exc:
                 if not is_redis_unavailable(exc):
                     raise
@@ -189,9 +194,20 @@ def create_app(
     @app.exception_handler(RequestValidationError)
     def handle_request_validation_error(
         _request: Request,
-        _exc: RequestValidationError,
+        exc: RequestValidationError,
     ) -> JSONResponse:
-        return error_response(ApiError("invalid_request", "Invalid request body.", 400))
+        status_code = (
+            422
+            if any(
+                error["type"] == "too_long"
+                and error["loc"][-1:] == ("input_paths",)
+                for error in exc.errors()
+            )
+            else 400
+        )
+        return error_response(
+            ApiError("invalid_request", "Invalid request body.", status_code)
+        )
 
     app.include_router(
         create_router(

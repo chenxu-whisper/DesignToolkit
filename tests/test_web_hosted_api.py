@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import shutil
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import ContextVar
 from io import BytesIO
 from pathlib import Path
-from threading import BoundedSemaphore, Event
+from threading import BoundedSemaphore, Event, Timer
 from time import monotonic, sleep
 from unittest.mock import Mock
 from urllib.parse import quote
@@ -17,6 +19,7 @@ import numpy as np
 import pytest
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.testclient import TestClient
+from httpx import ASGITransport, AsyncClient
 from PIL import Image
 from redis import Redis
 from redis.exceptions import (
@@ -739,6 +742,32 @@ def test_delete_before_upload_returns_404_and_prevents_later_publication(
     assert list(tmp_path.rglob("screen.png")) == []
 
 
+@pytest.mark.parametrize(
+    "asset_id",
+    [
+        "1" * 31,
+        "1" * 33,
+        "A" * 32,
+        "g" * 32,
+        "11111111-1111-1111-1111-111111111111",
+    ],
+)
+def test_delete_upload_returns_stable_404_for_noncanonical_asset_id(
+    tmp_path: Path,
+    asset_id: str,
+) -> None:
+    with _client(tmp_path) as client:
+        response = client.delete(f"/api/uploads/{asset_id}")
+
+    assert response.status_code == 404
+    assert response.json() == {
+        "error": {
+            "code": "asset_not_found",
+            "message": "Uploaded asset is not available",
+        }
+    }
+
+
 def test_delete_in_progress_upload_returns_409_with_cancellation_marker(
     tmp_path: Path,
 ) -> None:
@@ -1445,6 +1474,72 @@ def test_hosted_static_frontend_and_health_are_not_rate_limited(
         ]
 
     assert [response.status_code for response in responses] == [200, 200, 200, 200]
+
+
+def test_slow_rate_limit_does_not_block_exempt_requests(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _client(tmp_path)
+    manager = client.app.state.task_manager
+    entered = Event()
+    release = Event()
+    request_context: ContextVar[str | None] = ContextVar(
+        "request_context",
+        default=None,
+    )
+
+    def slow_allow_request(_bucket: str, *, limit: int, window: int) -> bool:
+        assert limit > 0
+        assert window > 0
+        assert request_context.get() == "rate-limited-request"
+        entered.set()
+        assert release.wait(timeout=2)
+        return True
+
+    async def get_before_release(
+        async_client: AsyncClient,
+        path: str,
+    ) -> tuple[int, bool]:
+        response = await async_client.get(path)
+        return response.status_code, not release.is_set()
+
+    async def exercise() -> tuple[tuple[int, bool], tuple[int, bool]]:
+        transport = ASGITransport(app=client.app)
+        async with AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+        ) as async_client:
+            async def get_rate_limited() -> None:
+                token = request_context.set("rate-limited-request")
+                try:
+                    await async_client.get("/api/config")
+                finally:
+                    request_context.reset(token)
+
+            rate_limited = asyncio.create_task(get_rate_limited())
+            health = asyncio.create_task(
+                get_before_release(async_client, "/api/health")
+            )
+            static = asyncio.create_task(get_before_release(async_client, "/"))
+            health_result, static_result = await asyncio.gather(health, static)
+            await rate_limited
+            return health_result, static_result
+
+    monkeypatch.setattr(manager, "allow_request", slow_allow_request)
+    timer = Timer(1, release.set)
+    timer.start()
+    try:
+        health_result, static_result = asyncio.run(exercise())
+    finally:
+        release.set()
+        timer.cancel()
+        timer.join()
+        client.close()
+
+    assert entered.is_set()
+    assert health_result == (200, True)
+    assert static_result == (200, True)
 
 
 @pytest.mark.parametrize(
@@ -2772,6 +2867,53 @@ def test_hosted_batch_resize_uses_unique_managed_output_directory(
     payload = job.args[2]
     assert payload["output_dir"].startswith(str(tmp_path))
     assert payload["output_path"] is None
+
+
+@pytest.mark.parametrize(
+    ("route", "extra_payload"),
+    [
+        ("/api/tasks/video-frames", {"image_format": "png"}),
+        ("/api/tasks/media-resize", {"size": "100x100"}),
+    ],
+)
+def test_hosted_batch_input_paths_have_hard_request_limit(
+    tmp_path: Path,
+    route: str,
+    extra_payload: dict[str, object],
+) -> None:
+    repeated_reference = f"asset:{'1' * 32}:input.bin"
+    unique_references = [
+        f"asset:{index:032x}:input.bin" for index in range(101)
+    ]
+
+    with _client(tmp_path) as client:
+        at_limit = client.post(
+            route,
+            json={
+                "input_paths": [repeated_reference] * 100,
+                **extra_payload,
+            },
+        )
+        over_limit = client.post(
+            route,
+            json={"input_paths": unique_references, **extra_payload},
+        )
+        repeated_over_limit = client.post(
+            route,
+            json={
+                "input_paths": [repeated_reference] * 101,
+                **extra_payload,
+            },
+        )
+        manager = client.app.state.task_manager
+
+    assert at_limit.status_code == 404
+    assert at_limit.json()["error"]["code"] == "asset_not_found"
+    assert over_limit.status_code == 422
+    assert over_limit.json()["error"]["code"] == "invalid_request"
+    assert repeated_over_limit.status_code == 422
+    assert repeated_over_limit.json()["error"]["code"] == "invalid_request"
+    assert manager.queue.count == 0
 
 
 @pytest.mark.parametrize(

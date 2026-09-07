@@ -3122,7 +3122,7 @@ def test_real_redis_failure_cas_races_mark_running_without_resurrection(
         assert manager.get_task(task.task_id).status is TaskStatus.FAILED
 
 
-def test_rate_limit_is_atomic_per_bucket(tmp_path: Path) -> None:
+def test_rate_limit_is_scoped_per_bucket(tmp_path: Path) -> None:
     redis_connection = fakeredis.FakeRedis(decode_responses=False)
     manager = _manager(redis_connection, tmp_path)
 
@@ -3130,6 +3130,50 @@ def test_rate_limit_is_atomic_per_bucket(tmp_path: Path) -> None:
     assert manager.allow_request("client:upload", limit=2, window=60)
     assert not manager.allow_request("client:upload", limit=2, window=60)
     assert manager.allow_request("other:upload", limit=2, window=60)
+
+
+def test_rate_limit_counter_gets_ttl_atomically_with_increment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = _manager(redis_connection, tmp_path)
+    monkeypatch.setattr(
+        redis_connection,
+        "expire",
+        lambda *_args, **_kwargs: pytest.fail(
+            "rate limiting must not issue a separate EXPIRE command"
+        ),
+    )
+
+    assert manager.allow_request("client:api", limit=2, window=60)
+
+    keys = list(redis_connection.scan_iter(match="dt:rate:client:api:*"))
+    assert len(keys) == 1
+    assert 0 < redis_connection.ttl(keys[0]) <= 61
+
+
+def test_real_redis_rate_limit_has_ttl_and_exact_concurrent_limit(
+    real_redis_connection: Redis,
+    tmp_path: Path,
+) -> None:
+    manager = _manager(real_redis_connection, tmp_path)
+    workers = 40
+    limit = 17
+    barrier = Barrier(workers)
+
+    def allow_request() -> bool:
+        barrier.wait()
+        return manager.allow_request("concurrent:api", limit=limit, window=60)
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        allowed = list(executor.map(lambda _index: allow_request(), range(workers)))
+
+    keys = list(real_redis_connection.scan_iter(match="dt:rate:concurrent:api:*"))
+    assert sum(allowed) == limit
+    assert len(keys) == 1
+    assert int(real_redis_connection.get(keys[0])) == workers
+    assert 0 < real_redis_connection.ttl(keys[0]) <= 61
 
 
 def test_batch_resize_disambiguates_duplicate_input_names(tmp_path: Path) -> None:

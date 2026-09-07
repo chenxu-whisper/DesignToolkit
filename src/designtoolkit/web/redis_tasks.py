@@ -73,6 +73,13 @@ _ASSET_READ_PIN_PREFIX = "dt:resource:asset-read-pin:"
 _ASSET_READERS_PREFIX = "dt:resource:asset-readers:"
 _ASSET_READ_PIN_TTL_SECONDS = 60.0
 _ASSET_READ_PIN_HEARTBEAT_SECONDS = 10.0
+_ALLOW_REQUEST_SCRIPT = """-- allow_request
+local count = redis.call("INCR", KEYS[1])
+if count == 1 then
+    redis.call("EXPIRE", KEYS[1], ARGV[1])
+end
+return count
+"""
 _APPEND_EVENT_SCRIPT = """-- append_task_event
 local generation = redis.call("GET", KEYS[2])
 if redis.call("EXISTS", KEYS[1]) == 0 or not generation then
@@ -812,6 +819,9 @@ class RedisTaskManager:
                 * 1000
             ),
         )
+        self._allow_request_script = self._redis.register_script(
+            _ALLOW_REQUEST_SCRIPT
+        )
         self._reserve_enqueue_script = self._redis.register_script(
             _RESERVE_ENQUEUE_SCRIPT
         )
@@ -1157,10 +1167,34 @@ class RedisTaskManager:
     def allow_request(self, bucket: str, *, limit: int, window: int) -> bool:
         window_id = int(time() // window)
         key = f"dt:rate:{bucket}:{window_id}"
-        count = self._redis.incr(key)
-        if count == 1:
-            self._redis.expire(key, window + 1)
+        try:
+            count = int(
+                self._allow_request_script(
+                    keys=[key],
+                    args=[window + 1],
+                )
+            )
+        except ResponseError as error_response:
+            if "unknown command" not in str(error_response).lower():
+                raise
+            count = self._allow_request_without_lua(key, window)
         return count <= limit
+
+    def _allow_request_without_lua(self, key: str, window: int) -> int:
+        while True:
+            with self._redis.pipeline() as pipeline:
+                try:
+                    pipeline.watch(key)
+                    current = pipeline.get(key)
+                    count = int(current or 0) + 1
+                    pipeline.multi()
+                    pipeline.incr(key)
+                    if current is None:
+                        pipeline.expire(key, window + 1)
+                    pipeline.execute()
+                    return count
+                except WatchError:
+                    continue
 
     def acquire_asset_read_pin(
         self,

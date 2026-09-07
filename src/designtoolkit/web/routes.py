@@ -128,6 +128,7 @@ _CHROMA_SNAPSHOT_READ_ATTEMPTS = 3
 _CHROMA_VIDEO_HASH_CHUNK_SIZE = 1024 * 1024
 _CHROMA_VIDEO_HASH_CACHE_SIZE = 32
 _CHROMA_VIDEO_METADATA_CACHE_SIZE = 32
+_HOSTED_ID_PATTERN = re.compile(r"[a-f0-9]{32}")
 _KEYER_ERROR_CODES = {
     "Input image could not be read": "invalid_image",
     "samples must not be empty": "missing_samples",
@@ -1369,6 +1370,7 @@ def create_router(
     def delete_upload(http_request: Request, asset_id: str) -> Response:
         if storage is None or resources is None:
             raise ApiError("hosted_mode_disabled", "Uploads are unavailable", 404)
+        asset_id = _delete_asset_id(asset_id)
         operation = http_request.state.hosted_session_operation
         session_id = http_request.state.session_id
         deletion_claim: str | None = None
@@ -2217,10 +2219,20 @@ def _upload_filename(value: str | None) -> str:
 
 
 def _upload_id(value: str | None) -> str:
-    if value is None or re.fullmatch(r"[a-f0-9]{32}", value) is None:
+    if value is None or _HOSTED_ID_PATTERN.fullmatch(value) is None:
         raise ApiError(
             "invalid_upload",
             "X-Upload-Id must be 32 lowercase hexadecimal characters",
             400,
+        )
+    return value
+
+
+def _delete_asset_id(value: str) -> str:
+    if _HOSTED_ID_PATTERN.fullmatch(value) is None:
+        raise ApiError(
+            "asset_not_found",
+            "Uploaded asset is not available",
+            404,
         )
     return value
