@@ -1326,6 +1326,8 @@ def create_router(
                 http_request.state.session_id,
                 content_length,
                 free_bytes=disk_usage(settings.data_dir).free,
+                asset_id=upload_id,
+                generation_id=registration.token,
             )
             lease = resources.acquire_session(http_request.state.session_id)
             asset = await storage.store_stream(
@@ -1394,6 +1396,7 @@ def create_router(
         operation = http_request.state.hosted_session_operation
         session_id = http_request.state.session_id
         deletion_claim: str | None = None
+        release_generation: str | None = None
         try:
             inflight = operation.commit(
                 lambda: resources.cancel_upload(session_id, asset_id)
@@ -1403,10 +1406,19 @@ def create_router(
                 asset_id,
             )
             if not inflight and not has_local_state:
-                already_released = operation.commit(
-                    lambda: resources.is_committed_asset_released(
+                release_generation = operation.commit(
+                    lambda: resources.pending_asset_release_generation(
                         session_id,
                         asset_id,
+                    )
+                )
+                already_released = operation.commit(
+                    lambda: (
+                        release_generation is not None
+                        or resources.is_committed_asset_released(
+                            session_id,
+                            asset_id,
+                        )
                     )
                 )
                 if already_released:
@@ -1417,12 +1429,21 @@ def create_router(
                         )
                     )
                     try:
-                        operation.commit(
-                            lambda: resources.finalize_asset_release(
-                                session_id,
-                                asset_id,
+                        if release_generation is None:
+                            operation.commit(
+                                lambda: resources.finalize_asset_release(
+                                    session_id,
+                                    asset_id,
+                                )
                             )
-                        )
+                        else:
+                            operation.commit(
+                                lambda: resources.finalize_asset_release(
+                                    session_id,
+                                    asset_id,
+                                    release_generation,
+                                )
+                            )
                     except RedisError:
                         _LOGGER.warning(
                             "Failed to finalize release marker for absent asset",
@@ -1450,10 +1471,19 @@ def create_router(
                 )
             except AssetDeletionStateError as exc:
                 invalid_asset_id = exc.asset_id
-                if not operation.commit(
-                    lambda: resources.is_committed_asset_released(
+                release_generation = operation.commit(
+                    lambda: resources.pending_asset_release_generation(
                         session_id,
                         invalid_asset_id,
+                    )
+                )
+                if (
+                    release_generation is None
+                    and not operation.commit(
+                        lambda: resources.is_committed_asset_released(
+                            session_id,
+                            invalid_asset_id,
+                        )
                     )
                 ):
                     raise
@@ -1467,10 +1497,20 @@ def create_router(
                     "Upload cancellation is pending",
                     409,
                 )
+            if deletion is not None:
+                release_generation = deletion.generation_id
             if deletion is not None and deletion.size > 0:
-                if deletion.expected_remaining_bytes is None:
+                if release_generation is not None:
                     operation.commit(
                         lambda: resources.release_committed_asset(
+                            session_id,
+                            deletion.asset_id,
+                            release_generation,
+                        )
+                    )
+                elif deletion.expected_remaining_bytes is None:
+                    operation.commit(
+                        lambda: resources.release_legacy_committed_asset(
                             session_id,
                             deletion.asset_id,
                             deletion.size,
@@ -1478,7 +1518,7 @@ def create_router(
                     )
                 else:
                     operation.commit(
-                        lambda: resources.release_committed_asset(
+                        lambda: resources.release_legacy_committed_asset(
                             session_id,
                             deletion.asset_id,
                             deletion.size,
@@ -1493,12 +1533,21 @@ def create_router(
                     asset_id,
                 )
             )
-            operation.commit(
-                lambda: resources.finalize_asset_release(
-                    session_id,
-                    asset_id,
+            if release_generation is None:
+                operation.commit(
+                    lambda: resources.finalize_asset_release(
+                        session_id,
+                        asset_id,
+                    )
                 )
-            )
+            else:
+                operation.commit(
+                    lambda: resources.finalize_asset_release(
+                        session_id,
+                        asset_id,
+                        release_generation,
+                    )
+                )
         except UploadRejectedError as exc:
             raise ApiError("asset_not_found", str(exc), 404) from exc
         except AssetReleaseMismatchError as exc:

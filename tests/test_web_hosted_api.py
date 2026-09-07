@@ -61,10 +61,14 @@ class StubReservation:
         coordinator: StubCoordinator,
         session_id: str,
         reserved_bytes: int,
+        asset_id: str | None = None,
+        generation_id: str | None = None,
     ) -> None:
         self.coordinator = coordinator
         self.session_id = session_id
         self.reserved_bytes = reserved_bytes
+        self.asset_id = asset_id
+        self.generation_id = generation_id
         self.active = True
         self.rollback_eligible = False
 
@@ -81,6 +85,10 @@ class StubReservation:
             self.coordinator.committed.get(self.session_id, 0)
             + self.reserved_bytes
         )
+        if self.asset_id is not None and self.generation_id is not None:
+            self.coordinator.committed_generations[
+                (self.session_id, self.asset_id, self.generation_id)
+            ] = self.reserved_bytes
         self.rollback_eligible = True
 
     def rollback(self) -> None:
@@ -95,6 +103,11 @@ class StubReservation:
             self.coordinator.committed[self.session_id] = remaining
         else:
             self.coordinator.committed.pop(self.session_id, None)
+        if self.asset_id is not None and self.generation_id is not None:
+            self.coordinator.committed_generations.pop(
+                (self.session_id, self.asset_id, self.generation_id),
+                None,
+            )
 
     def finalize(self) -> None:
         self.rollback_eligible = False
@@ -158,6 +171,9 @@ class StubCoordinator:
         self.min_free_bytes = min_free_bytes
         self.active_uploads = 0
         self.committed: dict[str, int] = {}
+        self.committed_generations: dict[tuple[str, str, str], int] = {}
+        self.released_generations: set[tuple[str, str, str]] = set()
+        self.pending_release_generations: dict[tuple[str, str], str] = {}
         self.released_assets: dict[str, tuple[str, int]] = {}
         self.release_calls = 0
         self.release_query_calls = 0
@@ -188,6 +204,8 @@ class StubCoordinator:
                 raise ResourceUnavailableError("Upload deletion is still pending")
             self.released_assets.pop(upload_id)
             self.finalized_assets.discard(key)
+        if key in self.pending_release_generations:
+            raise ResourceUnavailableError("Upload deletion is still pending")
         self.inflight[key] = False
         return StubUploadRegistration(self, session_id, upload_id)
 
@@ -204,6 +222,8 @@ class StubCoordinator:
         requested_bytes: int,
         *,
         free_bytes: int,
+        asset_id: str | None = None,
+        generation_id: str | None = None,
     ) -> StubReservation:
         self.reserve_calls += 1
         if self.active_uploads >= self.max_upload_concurrency:
@@ -216,7 +236,13 @@ class StubCoordinator:
         if free_bytes - requested_bytes < self.min_free_bytes:
             raise ResourceUnavailableError("Insufficient free disk capacity")
         self.active_uploads += 1
-        return StubReservation(self, session_id, requested_bytes)
+        return StubReservation(
+            self,
+            session_id,
+            requested_bytes,
+            asset_id,
+            generation_id,
+        )
 
     def acquire_session(self, _session_id: str) -> StubLease:
         self.active_leases += 1
@@ -227,11 +253,32 @@ class StubCoordinator:
         self,
         session_id: str,
         asset_id: str,
-        released_bytes: int,
+        generation_or_released_bytes: str | int,
         *,
         expected_remaining_bytes: int | None = None,
     ) -> None:
         self.release_calls += 1
+        if isinstance(generation_or_released_bytes, str):
+            generation_id = generation_or_released_bytes
+            key = (session_id, asset_id, generation_id)
+            if key in self.released_generations:
+                return
+            released_bytes = self.committed_generations.pop(key, None)
+            if released_bytes is None:
+                return
+            current = self.committed.get(session_id, 0)
+            remaining = current - released_bytes
+            if remaining:
+                self.committed[session_id] = remaining
+            else:
+                self.committed.pop(session_id, None)
+            self.released_generations.add(key)
+            self.pending_release_generations[(session_id, asset_id)] = (
+                generation_id
+            )
+            self.released_assets[asset_id] = (session_id, released_bytes)
+            return
+        released_bytes = generation_or_released_bytes
         released = self.released_assets.get(asset_id)
         if released is not None:
             if released[0] != session_id:
@@ -261,13 +308,54 @@ class StubCoordinator:
             self.committed.pop(session_id, None)
         self.released_assets[asset_id] = (session_id, released_bytes)
 
-    def is_committed_asset_released(self, session_id: str, asset_id: str) -> bool:
+    def release_legacy_committed_asset(
+        self,
+        session_id: str,
+        asset_id: str,
+        released_bytes: int,
+        *,
+        expected_remaining_bytes: int | None = None,
+    ) -> None:
+        self.release_committed_asset(
+            session_id,
+            asset_id,
+            released_bytes,
+            expected_remaining_bytes=expected_remaining_bytes,
+        )
+
+    def is_committed_asset_released(
+        self,
+        session_id: str,
+        asset_id: str,
+        generation_id: str | None = None,
+    ) -> bool:
         self.release_query_calls += 1
+        if generation_id is not None:
+            return (session_id, asset_id, generation_id) in (
+                self.released_generations
+            )
         released = self.released_assets.get(asset_id)
         return released is not None and released[0] == session_id
 
-    def finalize_asset_release(self, session_id: str, asset_id: str) -> None:
+    def pending_asset_release_generation(
+        self,
+        session_id: str,
+        asset_id: str,
+    ) -> str | None:
+        self.release_query_calls += 1
+        return self.pending_release_generations.get((session_id, asset_id))
+
+    def finalize_asset_release(
+        self,
+        session_id: str,
+        asset_id: str,
+        generation_id: str | None = None,
+    ) -> None:
         self.finalize_release_calls += 1
+        if generation_id is not None:
+            key = (session_id, asset_id)
+            if self.pending_release_generations.get(key) == generation_id:
+                self.pending_release_generations.pop(key)
         released = self.released_assets.get(asset_id)
         if released is not None and released[0] == session_id:
             self.finalized_assets.add((session_id, asset_id))
@@ -791,22 +879,36 @@ def test_reused_upload_id_releases_each_generation_quota(tmp_path: Path) -> None
             upload_id=upload_id,
         )
         first_delete = client.delete(f"/api/uploads/{upload_id}")
+        first_generation = next(
+            generation_id
+            for release_session, release_asset, generation_id in (
+                client.app.state.resource_coordinator.released_generations
+            )
+            if release_session == client.cookies["dt_session"]
+            and release_asset == upload_id
+        )
         second_upload = _upload(
             client,
             "second.png",
             b"other",
             upload_id=upload_id,
         )
-        second_delete = client.delete(f"/api/uploads/{upload_id}")
         session_id = client.cookies["dt_session"]
         coordinator = client.app.state.resource_coordinator
+        coordinator.release_committed_asset(
+            session_id,
+            upload_id,
+            first_generation,
+        )
+        assert coordinator.committed[session_id] == 5
+        second_delete = client.delete(f"/api/uploads/{upload_id}")
 
     assert first_upload.status_code == 201
     assert first_delete.status_code == 204
     assert second_upload.status_code == 201
     assert second_delete.status_code == 204
     assert coordinator.committed.get(session_id, 0) == 0
-    assert coordinator.release_calls == 2
+    assert coordinator.release_calls == 3
 
 
 def test_random_delete_returns_404_without_blocking_later_upload(
@@ -923,6 +1025,8 @@ def test_delete_reclaims_upload_crashed_after_quota_commit_before_publish(
         session_id,
         5,
         free_bytes=10**12,
+        asset_id=upload_id,
+        generation_id=registration.token,
     )
     lease = coordinator.acquire_session(session_id)
     with monkeypatch.context() as crash:
@@ -1025,6 +1129,16 @@ def test_delete_reclaims_precommit_partial_without_releasing_published_quota(
         )
         generation.parent.mkdir(exist_ok=True)
         generation.write_text("3" * 32, encoding="ascii")
+        (stale_dir / ".asset.json").write_text(
+            json.dumps(
+                {
+                    "asset_id": stale_upload_id,
+                    "bytes": 5,
+                    "generation_id": "3" * 32,
+                }
+            ),
+            encoding="utf-8",
+        )
         os.utime(generation, (1.0, 1.0))
 
         deleted = client.delete(f"/api/uploads/{stale_upload_id}")
@@ -1066,8 +1180,8 @@ def test_delete_reclaims_multiple_stale_partials_and_reuses_their_ids(
         max_session_bytes=9,
         min_free_bytes=0,
     )
-    coordinator.committed[session_id] = 9
-    for upload_id, content in uploads.items():
+    coordinator.committed[session_id] = 4
+    for index, (upload_id, content) in enumerate(uploads.items()):
         asset_dir = tmp_path / "sessions" / session_id / "assets" / upload_id
         asset_dir.mkdir(parents=True)
         (asset_dir / ".uploading").write_bytes(content)
@@ -1079,7 +1193,22 @@ def test_delete_reclaims_multiple_stale_partials_and_reuses_their_ids(
             / upload_id
         )
         generation.parent.mkdir(exist_ok=True)
-        generation.write_text(uuid4().hex, encoding="ascii")
+        generation_id = f"{index + 3:032x}"
+        generation.write_text(generation_id, encoding="ascii")
+        (asset_dir / ".asset.json").write_text(
+            json.dumps(
+                {
+                    "asset_id": upload_id,
+                    "bytes": len(content),
+                    "generation_id": generation_id,
+                }
+            ),
+            encoding="utf-8",
+        )
+        if index == 0:
+            coordinator.committed_generations[
+                (session_id, upload_id, generation_id)
+            ] = len(content)
         os.utime(generation, (1.0, 1.0))
 
     with _client(

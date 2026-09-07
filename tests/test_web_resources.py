@@ -47,7 +47,7 @@ class DeterministicRedis(fakeredis.FakeRedis):
         return execute
 
     def _eval_register_upload(self, keys, args):  # noqa: ANN001, ANN202
-        key, marker_key, marker_index_key = keys
+        key, marker_key, marker_index_key, pending_release_key = keys
         token, ttl_ms, session_id, asset_id = args
         if self.exists(key):
             if self.hget(key, "token") != str(token).encode():
@@ -66,6 +66,8 @@ class DeterministicRedis(fakeredis.FakeRedis):
                 return 3
             self.delete(marker_key)
             self.srem(marker_index_key, marker_key)
+        if self.exists(pending_release_key):
+            return 3
         self.hset(
             key,
             mapping={
@@ -110,6 +112,8 @@ class DeterministicRedis(fakeredis.FakeRedis):
             min_free_bytes,
             ttl_ms,
             receipt_ttl_ms,
+            asset_id,
+            generation_id,
         ) = args
         requested = int(requested)
         free_bytes = int(free_bytes)
@@ -121,6 +125,8 @@ class DeterministicRedis(fakeredis.FakeRedis):
             b"bytes": str(requested).encode(),
             b"free_bytes": str(free_bytes).encode(),
             b"min_free_bytes": str(min_free_bytes).encode(),
+            b"asset_id": str(asset_id).encode(),
+            b"generation_id": str(generation_id).encode(),
         }
         index_metadata = (
             f"upload|{session_id}|{requested}|{free_bytes}|{min_free_bytes}"
@@ -178,6 +184,8 @@ class DeterministicRedis(fakeredis.FakeRedis):
                 "bytes": requested,
                 "free_bytes": free_bytes,
                 "min_free_bytes": min_free_bytes,
+                "asset_id": asset_id,
+                "generation_id": generation_id,
             },
         )
         self.pexpire(token_key, int(ttl_ms))
@@ -353,6 +361,8 @@ class DeterministicRedis(fakeredis.FakeRedis):
             byte_count,
             free_bytes,
             min_free_bytes,
+            asset_id,
+            generation_id,
         ) = (str(value) for value in args)
         expected = {
             b"kind": kind.encode(),
@@ -362,6 +372,13 @@ class DeterministicRedis(fakeredis.FakeRedis):
             b"free_bytes": free_bytes.encode(),
             b"min_free_bytes": min_free_bytes.encode(),
         }
+        if kind == "upload":
+            expected.update(
+                {
+                    b"asset_id": asset_id.encode(),
+                    b"generation_id": generation_id.encode(),
+                }
+            )
         if not self.exists(receipt_key):
             return 0
         receipt = self.hgetall(receipt_key)
@@ -442,7 +459,15 @@ class DeterministicRedis(fakeredis.FakeRedis):
         return 1
 
     def _eval_commit_reservation(self, keys, args):  # noqa: ANN001, ANN202
-        state_key, index_key, token_key, committed_key, receipt_key = keys
+        (
+            state_key,
+            index_key,
+            token_key,
+            committed_key,
+            receipt_key,
+            committed_upload_key,
+            committed_upload_index_key,
+        ) = keys
         if self.hget(committed_key, "state") == b"committed":
             return 2
         if not self.exists(token_key):
@@ -455,6 +480,15 @@ class DeterministicRedis(fakeredis.FakeRedis):
         kind = self._text(self.hget(token_key, "kind"))
         session_id = self._text(self.hget(token_key, "session_id"))
         reserved_bytes = int(self.hget(token_key, "bytes"))
+        asset_id = self._text(self.hget(token_key, "asset_id"))
+        generation_id = self._text(self.hget(token_key, "generation_id"))
+        if (
+            kind == "upload"
+            and asset_id
+            and generation_id
+            and self.exists(committed_upload_key)
+        ):
+            return 3
         self.delete(token_key)
         self.hdel(index_key, token_key.rsplit(":", 1)[-1])
         if self.exists(receipt_key):
@@ -473,21 +507,45 @@ class DeterministicRedis(fakeredis.FakeRedis):
                 f"session:{session_id}:committed_bytes",
                 reserved_bytes,
             )
-        self.hset(
-            committed_key,
-            mapping={
-                "state": "committed",
-                "kind": kind,
-                "session_id": session_id,
-                "bytes": reserved_bytes,
-            },
-        )
+            if asset_id and generation_id:
+                self.hset(
+                    committed_upload_key,
+                    mapping={
+                        "session_id": session_id,
+                        "asset_id": asset_id,
+                        "generation_id": generation_id,
+                        "bytes": reserved_bytes,
+                    },
+                )
+                self.sadd(
+                    committed_upload_index_key,
+                    committed_upload_key,
+                )
+        committed_metadata = {
+            "state": "committed",
+            "kind": kind,
+            "session_id": session_id,
+            "bytes": reserved_bytes,
+        }
+        if asset_id and generation_id:
+            committed_metadata.update(
+                {
+                    "asset_id": asset_id,
+                    "generation_id": generation_id,
+                }
+            )
+        self.hset(committed_key, mapping=committed_metadata)
         self.pexpire(committed_key, int(args[1]))
         self._recompute_capacity(state_key, index_key)
         return 1
 
     def _eval_rollback_commit(self, keys, args):  # noqa: ANN001, ANN202
-        state_key, committed_key = keys
+        (
+            state_key,
+            committed_key,
+            committed_upload_key,
+            committed_upload_index_key,
+        ) = keys
         if not self.exists(committed_key):
             return 0
         if self.hget(committed_key, "state") == b"rolled_back":
@@ -501,6 +559,16 @@ class DeterministicRedis(fakeredis.FakeRedis):
                 f"session:{session_id}:committed_bytes",
                 committed_bytes,
             )
+            asset_id = self._text(self.hget(committed_key, "asset_id"))
+            generation_id = self._text(
+                self.hget(committed_key, "generation_id")
+            )
+            if asset_id and generation_id:
+                self.delete(committed_upload_key)
+                self.srem(
+                    committed_upload_index_key,
+                    committed_upload_key,
+                )
         self.hset(committed_key, "state", "rolled_back")
         self.pexpire(committed_key, int(args[0]))
         return 1
@@ -554,12 +622,27 @@ class DeterministicRedis(fakeredis.FakeRedis):
         return removed
 
     def _eval_clear_session_usage(self, keys, args):  # noqa: ANN001, ANN202
-        state_key, marker_index_key = keys
+        state_key, marker_index_key, ledger_index_key = keys
         session_id = str(args[0])
+        pending_release_prefix = str(args[1])
         marker_keys = self.smembers(marker_index_key)
+        for marker_key in marker_keys:
+            marker_asset = self.hget(marker_key, "asset_id")
+            marker_generation = self.hget(marker_key, "generation_id")
+            if marker_asset is not None and marker_generation is not None:
+                pending_key = (
+                    f"{pending_release_prefix}{session_id}:"
+                    f"{self._text(marker_asset)}"
+                )
+                if self.get(pending_key) == marker_generation:
+                    self.delete(pending_key)
         if marker_keys:
             self.delete(*marker_keys)
         self.delete(marker_index_key)
+        ledger_keys = self.smembers(ledger_index_key)
+        if ledger_keys:
+            self.delete(*ledger_keys)
+        self.delete(ledger_index_key)
         self.hdel(
             state_key,
             f"session:{session_id}:committed_bytes",
@@ -567,7 +650,13 @@ class DeterministicRedis(fakeredis.FakeRedis):
         return 1
 
     def _eval_capture_session_usage(self, keys, args):  # noqa: ANN001, ANN202
-        state_key, session_state_key, marker_index_key, cleanup_key = keys
+        (
+            state_key,
+            session_state_key,
+            marker_index_key,
+            cleanup_key,
+            ledger_index_key,
+        ) = keys
         session_id, claim_token = (str(value) for value in args)
         deleting = self.hget(session_state_key, "deleting")
         if (
@@ -582,12 +671,18 @@ class DeterministicRedis(fakeredis.FakeRedis):
             for marker_key in self.smembers(marker_index_key)
             if self._text(marker_key).startswith(marker_prefix)
         )
+        ledger_keys = sorted(
+            self._text(ledger_key)
+            for ledger_key in self.smembers(ledger_index_key)
+        )
         return [
             1,
             self._number(
                 state_key,
                 f"session:{session_id}:committed_bytes",
             ),
+            len(ledger_keys),
+            *ledger_keys,
             *marker_keys,
         ]
 
@@ -602,6 +697,7 @@ class DeterministicRedis(fakeredis.FakeRedis):
             cleanup_key,
             marker_index_key,
             generation_key,
+            ledger_index_key,
         ) = keys
         (
             session_id,
@@ -609,8 +705,35 @@ class DeterministicRedis(fakeredis.FakeRedis):
             _generation_id,
             committed_bytes,
             marker_prefix,
-            *asset_ids,
+            pending_release_prefix,
+            ledger_prefix,
+            legacy_marker_count,
+            generation_marker_count,
+            ledger_count,
+            *marker_arguments,
         ) = (str(value) for value in args)
+        legacy_marker_count = int(legacy_marker_count)
+        generation_marker_count = int(generation_marker_count)
+        ledger_count = int(ledger_count)
+        asset_ids = marker_arguments[:legacy_marker_count]
+        generation_start = legacy_marker_count
+        generation_end = generation_start + (2 * generation_marker_count)
+        upload_generations = tuple(
+            zip(
+                marker_arguments[generation_start:generation_end:2],
+                marker_arguments[generation_start + 1 : generation_end : 2],
+                strict=True,
+            )
+        )
+        committed_upload_generations = tuple(
+            zip(
+                marker_arguments[generation_end::2],
+                marker_arguments[generation_end + 1 :: 2],
+                strict=True,
+            )
+        )
+        if len(committed_upload_generations) != ledger_count:
+            return 5
         deleting = self.hget(session_state_key, "deleting")
         if (
             deleting is None
@@ -647,11 +770,38 @@ class DeterministicRedis(fakeredis.FakeRedis):
         current = self._number(state_key, field)
         if committed_bytes > current:
             return 2
+        ledger_keys: list[str] = []
+        for asset_id, generation_id in committed_upload_generations:
+            ledger_key = (
+                f"{ledger_prefix}{session_id}:{asset_id}:{generation_id}"
+            )
+            if (
+                self._text(self.hget(ledger_key, "session_id")) != session_id
+                or self._text(self.hget(ledger_key, "asset_id")) != asset_id
+                or self._text(self.hget(ledger_key, "generation_id"))
+                != generation_id
+            ):
+                return 5
+            ledger_keys.append(ledger_key)
         self._decrement(state_key, field, committed_bytes)
+        if ledger_keys:
+            self.delete(*ledger_keys)
+            self.srem(ledger_index_key, *ledger_keys)
         for asset_id in asset_ids:
             marker_key = f"{marker_prefix}{session_id}:{asset_id}"
             self.delete(marker_key)
             self.srem(marker_index_key, marker_key)
+        for asset_id, generation_id in upload_generations:
+            marker_key = (
+                f"{marker_prefix}{session_id}:{asset_id}:{generation_id}"
+            )
+            self.delete(marker_key)
+            self.srem(marker_index_key, marker_key)
+            pending_key = (
+                f"{pending_release_prefix}{session_id}:{asset_id}"
+            )
+            if self.get(pending_key) == generation_id.encode():
+                self.delete(pending_key)
         self.hset(
             generation_key,
             mapping={
@@ -729,7 +879,11 @@ class DeterministicRedis(fakeredis.FakeRedis):
         self.pexpire(keys[0], int(args[0]))
         return 1
 
-    def _eval_release_committed_asset(self, keys, args):  # noqa: ANN001, ANN202
+    def _eval_release_legacy_committed_asset(  # noqa: ANN001, ANN202
+        self,
+        keys,
+        args,
+    ):
         state_key, marker_key, marker_index_key = keys
         session_id, asset_id, released_bytes, expected_remaining = args
         released_bytes = int(released_bytes)
@@ -779,6 +933,64 @@ class DeterministicRedis(fakeredis.FakeRedis):
         self.sadd(marker_index_key, marker_key)
         return 1
 
+    def _eval_release_committed_upload_generation(  # noqa: ANN001, ANN202
+        self,
+        keys,
+        args,
+    ):
+        (
+            state_key,
+            ledger_key,
+            ledger_index_key,
+            marker_key,
+            marker_index_key,
+            pending_release_key,
+        ) = keys
+        session_id, asset_id, generation_id = (str(value) for value in args)
+        if self.exists(marker_key):
+            if (
+                self._text(self.hget(marker_key, "session_id")) != session_id
+                or self._text(self.hget(marker_key, "asset_id")) != asset_id
+                or self._text(self.hget(marker_key, "generation_id"))
+                != generation_id
+            ):
+                return 2
+            if self.hget(marker_key, "finalized") != b"1":
+                self.sadd(marker_index_key, marker_key)
+                self.set(pending_release_key, generation_id)
+            return 0
+        if not self.exists(ledger_key):
+            return 0
+        if (
+            self._text(self.hget(ledger_key, "session_id")) != session_id
+            or self._text(self.hget(ledger_key, "asset_id")) != asset_id
+            or self._text(self.hget(ledger_key, "generation_id"))
+            != generation_id
+        ):
+            return 2
+        committed_bytes = int(self.hget(ledger_key, "bytes") or 0)
+        field = f"session:{session_id}:committed_bytes"
+        if committed_bytes <= 0 or committed_bytes > self._number(
+            state_key,
+            field,
+        ):
+            return 3
+        self._decrement(state_key, field, committed_bytes)
+        self.delete(ledger_key)
+        self.srem(ledger_index_key, ledger_key)
+        self.hset(
+            marker_key,
+            mapping={
+                "session_id": session_id,
+                "asset_id": asset_id,
+                "generation_id": generation_id,
+                "bytes": committed_bytes,
+            },
+        )
+        self.sadd(marker_index_key, marker_key)
+        self.set(pending_release_key, generation_id)
+        return 1
+
     def _eval_is_committed_asset_released(  # noqa: ANN001, ANN202
         self,
         keys,
@@ -791,6 +1003,20 @@ class DeterministicRedis(fakeredis.FakeRedis):
         existing_asset = self._text(self.hget(marker_key, "asset_id"))
         return int(existing_session == args[0] and existing_asset == args[1])
 
+    def _eval_is_committed_upload_generation_released(  # noqa: ANN001, ANN202
+        self,
+        keys,
+        args,
+    ):
+        marker_key = keys[0]
+        session_id, asset_id, generation_id = (str(value) for value in args)
+        return int(
+            self._text(self.hget(marker_key, "session_id")) == session_id
+            and self._text(self.hget(marker_key, "asset_id")) == asset_id
+            and self._text(self.hget(marker_key, "generation_id"))
+            == generation_id
+        )
+
     def _eval_finalize_asset_release(self, keys, args):  # noqa: ANN001, ANN202
         marker_key, marker_index_key = keys
         session_id, asset_id, marker_ttl_ms = args
@@ -801,6 +1027,31 @@ class DeterministicRedis(fakeredis.FakeRedis):
         if existing_session != session_id or existing_asset != asset_id:
             return 2
         self.srem(marker_index_key, marker_key)
+        if self.hget(marker_key, "finalized") == b"1":
+            return 0
+        self.hset(marker_key, "finalized", 1)
+        self.pexpire(marker_key, int(marker_ttl_ms))
+        return 1
+
+    def _eval_finalize_upload_generation_release(  # noqa: ANN001, ANN202
+        self,
+        keys,
+        args,
+    ):
+        marker_key, marker_index_key, pending_release_key = keys
+        session_id, asset_id, generation_id, marker_ttl_ms = args
+        if not self.exists(marker_key):
+            return 0
+        if (
+            self._text(self.hget(marker_key, "session_id")) != session_id
+            or self._text(self.hget(marker_key, "asset_id")) != asset_id
+            or self._text(self.hget(marker_key, "generation_id"))
+            != generation_id
+        ):
+            return 2
+        self.srem(marker_index_key, marker_key)
+        if self.get(pending_release_key) == str(generation_id).encode():
+            self.delete(pending_release_key)
         if self.hget(marker_key, "finalized") == b"1":
             return 0
         self.hset(marker_key, "finalized", 1)
@@ -1332,6 +1583,164 @@ def test_release_committed_asset_is_idempotent_and_session_scoped(
         resources.reserve_upload(SESSION_B, 5, free_bytes=100)
 
 
+def test_generation_release_does_not_charge_an_uncommitted_stale_upload(
+    redis_connection: DeterministicRedis,
+) -> None:
+    resources = coordinator(redis_connection, max_session_bytes=10)
+    stale_asset_id = "1" * 32
+    stale_generation = "2" * 32
+    active_asset_id = "3" * 32
+    active_generation = "4" * 32
+    active = resources.reserve_upload(
+        SESSION_A,
+        5,
+        free_bytes=100,
+        asset_id=active_asset_id,
+        generation_id=active_generation,
+    )
+    active.commit()
+
+    assert (
+        resources.release_committed_asset(
+            SESSION_A,
+            stale_asset_id,
+            stale_generation,
+        )
+        is False
+    )
+    with pytest.raises(ResourceUnavailableError, match="session"):
+        resources.reserve_upload(SESSION_A, 6, free_bytes=100)
+
+
+def test_reused_asset_id_releases_only_the_matching_generation(
+    redis_connection: DeterministicRedis,
+) -> None:
+    resources = coordinator(redis_connection, max_session_bytes=5)
+    asset_id = "1" * 32
+    generation_one = "2" * 32
+    generation_two = "3" * 32
+    first = resources.reserve_upload(
+        SESSION_A,
+        5,
+        free_bytes=100,
+        asset_id=asset_id,
+        generation_id=generation_one,
+    )
+    first.commit()
+    assert resources.release_committed_asset(
+        SESSION_A,
+        asset_id,
+        generation_one,
+    )
+    resources.finalize_asset_release(
+        SESSION_A,
+        asset_id,
+        generation_one,
+    )
+    first_marker = (
+        f"dt:resource:asset-released:{SESSION_A}:{asset_id}:{generation_one}"
+    )
+    assert redis_connection.pttl(first_marker) > 0
+    assert not redis_connection.exists(
+        f"dt:resource:committed-upload:{SESSION_A}:{asset_id}:{generation_one}"
+    )
+
+    second = resources.reserve_upload(
+        SESSION_A,
+        5,
+        free_bytes=100,
+        asset_id=asset_id,
+        generation_id=generation_two,
+    )
+    second.commit()
+
+    assert not resources.release_committed_asset(
+        SESSION_A,
+        asset_id,
+        generation_one,
+    )
+    with pytest.raises(ResourceUnavailableError, match="session"):
+        resources.reserve_upload(SESSION_A, 1, free_bytes=100)
+    assert resources.release_committed_asset(
+        SESSION_A,
+        asset_id,
+        generation_two,
+    )
+    replacement = resources.reserve_upload(
+        SESSION_A,
+        5,
+        free_bytes=100,
+    )
+    replacement.release()
+
+
+def test_mixed_stale_generations_release_only_committed_ledgers(
+    redis_connection: DeterministicRedis,
+) -> None:
+    resources = coordinator(redis_connection, max_session_bytes=20)
+    generations = (
+        ("1" * 32, "2" * 32, 4, True),
+        ("3" * 32, "4" * 32, 5, False),
+        ("5" * 32, "6" * 32, 3, True),
+    )
+    for asset_id, generation_id, size, committed in generations:
+        reservation = resources.reserve_upload(
+            SESSION_A,
+            size,
+            free_bytes=100,
+            asset_id=asset_id,
+            generation_id=generation_id,
+        )
+        if committed:
+            reservation.commit()
+        else:
+            reservation.release()
+
+    for asset_id, generation_id, _size, _committed in generations:
+        resources.release_committed_asset(
+            SESSION_A,
+            asset_id,
+            generation_id,
+        )
+
+    replacement = resources.reserve_upload(
+        SESSION_A,
+        20,
+        free_bytes=100,
+    )
+    replacement.release()
+
+
+def test_generation_commit_acknowledgement_loss_creates_one_ledger() -> None:
+    redis_connection = ExecuteThenRaiseRedis("commit_reservation")
+    resources = coordinator(redis_connection, max_session_bytes=5)
+    asset_id = "1" * 32
+    generation_id = "2" * 32
+    reservation = resources.reserve_upload(
+        SESSION_A,
+        5,
+        free_bytes=100,
+        asset_id=asset_id,
+        generation_id=generation_id,
+    )
+
+    with pytest.raises(RedisConnectionError, match="acknowledgement lost"):
+        reservation.commit()
+    reservation.commit()
+
+    assert resources.release_committed_asset(
+        SESSION_A,
+        asset_id,
+        generation_id,
+    )
+    replacement = resources.reserve_upload(
+        SESSION_A,
+        5,
+        free_bytes=100,
+    )
+    replacement.release()
+
+
 def test_orphan_release_removes_committed_bytes_above_audited_assets(
     redis_connection: DeterministicRedis,
 ) -> None:
@@ -1517,7 +1926,7 @@ def test_concurrent_asset_release_decrements_committed_usage_once(
 
 def test_asset_release_acknowledgement_loss_can_be_retried_without_double_release(
 ) -> None:
-    redis_connection = ExecuteThenRaiseRedis("release_committed_asset")
+    redis_connection = ExecuteThenRaiseRedis("release_legacy_committed_asset")
     resources = coordinator(redis_connection, max_session_bytes=10)
     first = resources.reserve_upload(SESSION_A, 5, free_bytes=100)
     second = resources.reserve_upload(SESSION_A, 3, free_bytes=100)
@@ -1671,6 +2080,118 @@ def test_generation_cleanup_migrates_expiring_marker_without_releasing_again(
     assert redis_connection.pttl(generation_key) == -1
     assert int(redis_connection.hget("dt:resource:state", committed_field)) == 3
     resources.release_cleanup_claim(SESSION_A, claim)
+
+
+def test_generation_cleanup_removes_generation_ledgers_and_pending_markers(
+    redis_connection: DeterministicRedis,
+) -> None:
+    resources = coordinator(redis_connection, max_session_bytes=10)
+    committed_asset = "1" * 32
+    committed_generation = "2" * 32
+    released_asset = "3" * 32
+    released_generation = "4" * 32
+    committed = resources.reserve_upload(
+        SESSION_A,
+        4,
+        free_bytes=100,
+        asset_id=committed_asset,
+        generation_id=committed_generation,
+    )
+    released = resources.reserve_upload(
+        SESSION_A,
+        3,
+        free_bytes=100,
+        asset_id=released_asset,
+        generation_id=released_generation,
+    )
+    committed.commit()
+    released.commit()
+    resources.release_committed_asset(
+        SESSION_A,
+        released_asset,
+        released_generation,
+    )
+    claim = resources.claim_session_cleanup(SESSION_A)
+    assert claim is not None
+
+    generation = resources.capture_session_usage(SESSION_A, claim)
+    resources.clear_session_usage_generation(SESSION_A, claim, generation)
+
+    assert generation.released_upload_generations == (
+        (released_asset, released_generation),
+    )
+    assert not list(
+        redis_connection.scan_iter(
+            match=f"dt:resource:committed-upload:{SESSION_A}:*"
+        )
+    )
+    assert not redis_connection.exists(
+        f"dt:resource:asset-release-pending:{SESSION_A}:{released_asset}"
+    )
+    assert not resources.is_committed_asset_released(
+        SESSION_A,
+        released_asset,
+        released_generation,
+    )
+    replacement = resources.reserve_upload(
+        SESSION_A,
+        10,
+        free_bytes=100,
+    )
+    replacement.release()
+    resources.release_cleanup_claim(SESSION_A, claim)
+
+
+def test_delayed_generation_cleanup_preserves_recreated_upload_ledger(
+    redis_connection: DeterministicRedis,
+) -> None:
+    resources = coordinator(redis_connection, max_session_bytes=10)
+    old_asset_id = "1" * 32
+    old_generation_id = "2" * 32
+    old_upload = resources.reserve_upload(
+        SESSION_A,
+        4,
+        free_bytes=100,
+        asset_id=old_asset_id,
+        generation_id=old_generation_id,
+    )
+    old_upload.commit()
+    old_claim = resources.claim_session_cleanup(SESSION_A)
+    assert old_claim is not None
+    old_usage = resources.capture_session_usage(SESSION_A, old_claim)
+    resources.release_cleanup_claim(SESSION_A, old_claim)
+
+    new_asset_id = "3" * 32
+    new_generation_id = "4" * 32
+    new_upload = resources.reserve_upload(
+        SESSION_A,
+        3,
+        free_bytes=100,
+        asset_id=new_asset_id,
+        generation_id=new_generation_id,
+    )
+    new_upload.commit()
+    recovery_claim = resources.claim_session_cleanup(SESSION_A)
+    assert recovery_claim is not None
+
+    resources.clear_session_usage_generation(
+        SESSION_A,
+        recovery_claim,
+        old_usage,
+    )
+
+    assert resources.release_committed_asset(
+        SESSION_A,
+        new_asset_id,
+        new_generation_id,
+    )
+    replacement = resources.reserve_upload(
+        SESSION_A,
+        10,
+        free_bytes=100,
+    )
+    replacement.release()
+    resources.release_cleanup_claim(SESSION_A, recovery_claim)
 
 
 @pytest.mark.parametrize(

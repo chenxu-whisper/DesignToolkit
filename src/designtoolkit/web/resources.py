@@ -24,7 +24,9 @@ _RESERVATION_INDEX_KEY = "dt:resource:reservations"
 _RESERVATION_PREFIX = "dt:resource:reservation:"
 _RESERVATION_RECEIPT_PREFIX = "dt:resource:reservation-receipt:"
 _COMMITTED_PREFIX = "dt:resource:committed:"
+_COMMITTED_UPLOAD_PREFIX = "dt:resource:committed-upload:"
 _RELEASED_ASSET_PREFIX = "dt:resource:asset-released:"
+_PENDING_ASSET_RELEASE_PREFIX = "dt:resource:asset-release-pending:"
 _LEASE_PREFIX = "dt:resource:lease:"
 _CLEANUP_PREFIX = "dt:resource:cleanup:"
 _CLEANUP_GENERATION_PREFIX = "dt:resource:cleanup-generation:"
@@ -59,6 +61,9 @@ if redis.call("EXISTS", KEYS[2]) == 1 then
     end
     redis.call("DEL", KEYS[2])
     redis.call("SREM", KEYS[3], KEYS[2])
+end
+if redis.call("EXISTS", KEYS[4]) == 1 then
+    return 3
 end
 redis.call(
     "HMSET",
@@ -123,6 +128,8 @@ local function metadata_matches(key)
         and redis.call("HGET", key, "bytes") == ARGV[3]
         and redis.call("HGET", key, "free_bytes") == ARGV[4]
         and redis.call("HGET", key, "min_free_bytes") == ARGV[7]
+        and redis.call("HGET", key, "asset_id") == ARGV[10]
+        and redis.call("HGET", key, "generation_id") == ARGV[11]
 end
 
 if redis.call("EXISTS", receipt_key) == 1 then
@@ -155,7 +162,11 @@ if redis.call("EXISTS", receipt_key) == 1 then
         "free_bytes",
         free_bytes,
         "min_free_bytes",
-        min_free_bytes
+        min_free_bytes,
+        "asset_id",
+        ARGV[10],
+        "generation_id",
+        ARGV[11]
     )
     redis.call("PEXPIRE", token_key, ttl_ms)
     redis.call("PEXPIRE", receipt_key, receipt_ttl_ms)
@@ -213,7 +224,11 @@ redis.call(
     "free_bytes",
     free_bytes,
     "min_free_bytes",
-    min_free_bytes
+    min_free_bytes,
+    "asset_id",
+    ARGV[10],
+    "generation_id",
+    ARGV[11]
 )
 redis.call("PEXPIRE", token_key, ttl_ms)
 redis.call(
@@ -232,7 +247,11 @@ redis.call(
     "free_bytes",
     free_bytes,
     "min_free_bytes",
-    min_free_bytes
+    min_free_bytes,
+    "asset_id",
+    ARGV[10],
+    "generation_id",
+    ARGV[11]
 )
 redis.call("PEXPIRE", receipt_key, receipt_ttl_ms)
 redis.call(
@@ -434,6 +453,13 @@ local function metadata_matches(key)
         and redis.call("HGET", key, "bytes") == ARGV[6]
         and redis.call("HGET", key, "free_bytes") == ARGV[7]
         and redis.call("HGET", key, "min_free_bytes") == ARGV[8]
+        and (
+            ARGV[9] == ""
+            or (
+                redis.call("HGET", key, "asset_id") == ARGV[9]
+                and redis.call("HGET", key, "generation_id") == ARGV[10]
+            )
+        )
 end
 
 if redis.call("EXISTS", receipt_key) == 0 then
@@ -496,7 +522,16 @@ if redis.call("HGET", index_key, ARGV[1]) ~= index_metadata then
 end
 if redis.call("EXISTS", token_key) == 1 then
     for _, field in ipairs(
-        {"kind", "owner_id", "session_id", "bytes", "free_bytes", "min_free_bytes"}
+        {
+            "kind",
+            "owner_id",
+            "session_id",
+            "bytes",
+            "free_bytes",
+            "min_free_bytes",
+            "asset_id",
+            "generation_id"
+        }
     ) do
         if redis.call("HGET", token_key, field)
             ~= redis.call("HGET", metadata_key, field) then
@@ -574,6 +609,8 @@ local index_key = KEYS[2]
 local token_key = KEYS[3]
 local committed_key = KEYS[4]
 local receipt_key = KEYS[5]
+local committed_upload_key = KEYS[6]
+local committed_upload_index_key = KEYS[7]
 if redis.call("HGET", committed_key, "state") == "committed" then
     return 2
 end
@@ -588,6 +625,13 @@ end
 local kind = redis.call("HGET", token_key, "kind")
 local session_id = redis.call("HGET", token_key, "session_id")
 local reserved_bytes = tonumber(redis.call("HGET", token_key, "bytes") or "0")
+local asset_id = redis.call("HGET", token_key, "asset_id")
+local generation_id = redis.call("HGET", token_key, "generation_id")
+if kind == "upload" and asset_id and generation_id
+    and asset_id ~= "" and generation_id ~= ""
+    and redis.call("EXISTS", committed_upload_key) == 1 then
+    return 3
+end
 if redis.call("EXISTS", receipt_key) == 1 then
     for _, field in ipairs(
         {"kind", "owner_id", "session_id", "bytes", "free_bytes", "min_free_bytes"}
@@ -661,6 +705,22 @@ if kind == "upload" then
         "session:" .. session_id .. ":committed_bytes",
         reserved_bytes
     )
+    if asset_id and generation_id
+        and asset_id ~= "" and generation_id ~= "" then
+        redis.call(
+            "HMSET",
+            committed_upload_key,
+            "session_id",
+            session_id,
+            "asset_id",
+            asset_id,
+            "generation_id",
+            generation_id,
+            "bytes",
+            reserved_bytes
+        )
+        redis.call("SADD", committed_upload_index_key, committed_upload_key)
+    end
 end
 redis.call(
     "HMSET",
@@ -674,6 +734,17 @@ redis.call(
     "bytes",
     reserved_bytes
 )
+if asset_id and generation_id
+    and asset_id ~= "" and generation_id ~= "" then
+    redis.call(
+        "HMSET",
+        committed_key,
+        "asset_id",
+        asset_id,
+        "generation_id",
+        generation_id
+    )
+end
 redis.call("PEXPIRE", committed_key, tonumber(ARGV[2]))
 recompute_capacity()
 return 1
@@ -700,6 +771,12 @@ if kind == "upload" then
         redis.call("HSET", state_key, committed_field, remaining)
     else
         redis.call("HDEL", state_key, committed_field)
+    end
+    local asset_id = redis.call("HGET", committed_key, "asset_id")
+    local generation_id = redis.call("HGET", committed_key, "generation_id")
+    if asset_id and asset_id ~= "" and generation_id and generation_id ~= "" then
+        redis.call("DEL", KEYS[3])
+        redis.call("SREM", KEYS[4], KEYS[3])
     end
 end
 redis.call("HSET", committed_key, "state", "rolled_back")
@@ -807,9 +884,22 @@ return removed
 _CLEAR_SESSION_USAGE_SCRIPT = """-- clear_session_usage
 local marker_keys = redis.call("SMEMBERS", KEYS[2])
 for _, marker_key in ipairs(marker_keys) do
+    local marker_asset = redis.call("HGET", marker_key, "asset_id")
+    local marker_generation = redis.call("HGET", marker_key, "generation_id")
+    if marker_asset and marker_generation then
+        local pending_key = ARGV[2] .. ARGV[1] .. ":" .. marker_asset
+        if redis.call("GET", pending_key) == marker_generation then
+            redis.call("DEL", pending_key)
+        end
+    end
     redis.call("DEL", marker_key)
 end
 redis.call("DEL", KEYS[2])
+local ledger_keys = redis.call("SMEMBERS", KEYS[3])
+for _, ledger_key in ipairs(ledger_keys) do
+    redis.call("DEL", ledger_key)
+end
+redis.call("DEL", KEYS[3])
 redis.call(
     "HDEL",
     KEYS[1],
@@ -835,8 +925,13 @@ local result = {
             KEYS[1],
             "session:" .. ARGV[1] .. ":committed_bytes"
         ) or "0"
-    )
+    ),
+    redis.call("SCARD", KEYS[5])
 }
+local ledger_keys = redis.call("SMEMBERS", KEYS[5])
+for _, ledger_key in ipairs(ledger_keys) do
+    table.insert(result, ledger_key)
+end
 local marker_keys = redis.call("SMEMBERS", KEYS[3])
 for _, marker_key in ipairs(marker_keys) do
     table.insert(result, marker_key)
@@ -884,21 +979,61 @@ local generation_bytes = tonumber(ARGV[4])
 if generation_bytes > current then
     return 2
 end
+local legacy_marker_count = tonumber(ARGV[8])
+local generation_marker_count = tonumber(ARGV[9])
+local ledger_count = tonumber(ARGV[10])
+local ledger_start = 11 + legacy_marker_count + (2 * generation_marker_count)
+local ledger_keys = {}
+for index = 0, ledger_count - 1 do
+    local asset_id = ARGV[ledger_start + (2 * index)]
+    local generation_id = ARGV[ledger_start + (2 * index) + 1]
+    local ledger_key = ARGV[7] .. ARGV[1] .. ":" .. asset_id ..
+        ":" .. generation_id
+    if redis.call("HGET", ledger_key, "session_id") ~= ARGV[1]
+        or redis.call("HGET", ledger_key, "asset_id") ~= asset_id
+        or redis.call("HGET", ledger_key, "generation_id") ~= generation_id then
+        return 5
+    end
+    table.insert(ledger_keys, ledger_key)
+end
 local remaining = current - generation_bytes
 if remaining > 0 then
     redis.call("HSET", KEYS[1], committed_field, remaining)
 else
     redis.call("HDEL", KEYS[1], committed_field)
 end
+for _, ledger_key in ipairs(ledger_keys) do
+    redis.call("DEL", ledger_key)
+    redis.call("SREM", KEYS[6], ledger_key)
+end
 
-for index = 6, #ARGV do
-    local asset_id = ARGV[index]
+for index = 1, legacy_marker_count do
+    local asset_id = ARGV[10 + index]
     local marker_key = ARGV[5] .. ARGV[1] .. ":" .. asset_id
     local marker_session = redis.call("HGET", marker_key, "session_id")
     local marker_asset = redis.call("HGET", marker_key, "asset_id")
     if marker_session == ARGV[1] and marker_asset == asset_id then
         redis.call("DEL", marker_key)
         redis.call("SREM", KEYS[4], marker_key)
+    end
+end
+local generation_start = 11 + legacy_marker_count
+for index = 0, generation_marker_count - 1 do
+    local asset_id = ARGV[generation_start + (2 * index)]
+    local generation_id = ARGV[generation_start + (2 * index) + 1]
+    local marker_key = ARGV[5] .. ARGV[1] .. ":" .. asset_id ..
+        ":" .. generation_id
+    local marker_session = redis.call("HGET", marker_key, "session_id")
+    local marker_asset = redis.call("HGET", marker_key, "asset_id")
+    local marker_generation = redis.call("HGET", marker_key, "generation_id")
+    if marker_session == ARGV[1] and marker_asset == asset_id
+        and marker_generation == generation_id then
+        redis.call("DEL", marker_key)
+        redis.call("SREM", KEYS[4], marker_key)
+        local pending_key = ARGV[6] .. ARGV[1] .. ":" .. asset_id
+        if redis.call("GET", pending_key) == generation_id then
+            redis.call("DEL", pending_key)
+        end
     end
 end
 redis.call(
@@ -989,7 +1124,7 @@ redis.call("PEXPIRE", KEYS[1], tonumber(ARGV[1]))
 return 1
 """
 
-_RELEASE_COMMITTED_ASSET_SCRIPT = """-- release_committed_asset
+_RELEASE_LEGACY_COMMITTED_ASSET_SCRIPT = """-- release_legacy_committed_asset
 local session_id = ARGV[1]
 local asset_id = ARGV[2]
 local released_bytes = tonumber(ARGV[3])
@@ -1052,6 +1187,66 @@ redis.call("SADD", KEYS[3], KEYS[2])
 return 1
 """
 
+_RELEASE_COMMITTED_UPLOAD_GENERATION_SCRIPT = (
+    """-- release_committed_upload_generation
+local session_id = ARGV[1]
+local asset_id = ARGV[2]
+local generation_id = ARGV[3]
+if redis.call("EXISTS", KEYS[4]) == 1 then
+    if redis.call("HGET", KEYS[4], "session_id") ~= session_id
+        or redis.call("HGET", KEYS[4], "asset_id") ~= asset_id
+        or redis.call("HGET", KEYS[4], "generation_id") ~= generation_id then
+        return 2
+    end
+    if redis.call("HGET", KEYS[4], "finalized") ~= "1" then
+        redis.call("SADD", KEYS[5], KEYS[4])
+        redis.call("SET", KEYS[6], generation_id)
+    end
+    return 0
+end
+if redis.call("EXISTS", KEYS[2]) == 0 then
+    return 0
+end
+if redis.call("HGET", KEYS[2], "session_id") ~= session_id
+    or redis.call("HGET", KEYS[2], "asset_id") ~= asset_id
+    or redis.call("HGET", KEYS[2], "generation_id") ~= generation_id then
+    return 2
+end
+local committed_bytes = tonumber(redis.call("HGET", KEYS[2], "bytes") or "0")
+if committed_bytes <= 0 then
+    return 3
+end
+local field = "session:" .. session_id .. ":committed_bytes"
+local current = tonumber(redis.call("HGET", KEYS[1], field) or "0")
+if committed_bytes > current then
+    return 3
+end
+local remaining = current - committed_bytes
+if remaining > 0 then
+    redis.call("HSET", KEYS[1], field, remaining)
+else
+    redis.call("HDEL", KEYS[1], field)
+end
+redis.call("DEL", KEYS[2])
+redis.call("SREM", KEYS[3], KEYS[2])
+redis.call(
+    "HMSET",
+    KEYS[4],
+    "session_id",
+    session_id,
+    "asset_id",
+    asset_id,
+    "generation_id",
+    generation_id,
+    "bytes",
+    committed_bytes
+)
+redis.call("SADD", KEYS[5], KEYS[4])
+redis.call("SET", KEYS[6], generation_id)
+return 1
+"""
+)
+
 _IS_COMMITTED_ASSET_RELEASED_SCRIPT = """-- is_committed_asset_released
 if redis.call("EXISTS", KEYS[1]) == 0 then
     return 0
@@ -1063,6 +1258,20 @@ if marker_session ~= ARGV[1] or marker_asset ~= ARGV[2] then
 end
 return 1
 """
+
+_IS_COMMITTED_UPLOAD_GENERATION_RELEASED_SCRIPT = (
+    """-- is_committed_upload_generation_released
+if redis.call("EXISTS", KEYS[1]) == 0 then
+    return 0
+end
+if redis.call("HGET", KEYS[1], "session_id") ~= ARGV[1]
+    or redis.call("HGET", KEYS[1], "asset_id") ~= ARGV[2]
+    or redis.call("HGET", KEYS[1], "generation_id") ~= ARGV[3] then
+    return 0
+end
+return 1
+"""
+)
 
 _FINALIZE_ASSET_RELEASE_SCRIPT = """-- finalize_asset_release
 if redis.call("EXISTS", KEYS[1]) == 0 then
@@ -1081,6 +1290,29 @@ redis.call("HSET", KEYS[1], "finalized", "1")
 redis.call("PEXPIRE", KEYS[1], tonumber(ARGV[3]))
 return 1
 """
+
+_FINALIZE_UPLOAD_GENERATION_RELEASE_SCRIPT = (
+    """-- finalize_upload_generation_release
+if redis.call("EXISTS", KEYS[1]) == 0 then
+    return 0
+end
+if redis.call("HGET", KEYS[1], "session_id") ~= ARGV[1]
+    or redis.call("HGET", KEYS[1], "asset_id") ~= ARGV[2]
+    or redis.call("HGET", KEYS[1], "generation_id") ~= ARGV[3] then
+    return 2
+end
+redis.call("SREM", KEYS[2], KEYS[1])
+if redis.call("GET", KEYS[3]) == ARGV[3] then
+    redis.call("DEL", KEYS[3])
+end
+if redis.call("HGET", KEYS[1], "finalized") == "1" then
+    return 0
+end
+redis.call("HSET", KEYS[1], "finalized", "1")
+redis.call("PEXPIRE", KEYS[1], tonumber(ARGV[4]))
+return 1
+"""
+)
 
 _ACQUIRE_SESSION_SCRIPT = """-- acquire_session
 local state_key = KEYS[1]
@@ -1297,6 +1529,8 @@ class SessionUsageGeneration:
     generation_id: str
     committed_bytes: int
     released_asset_ids: tuple[str, ...]
+    released_upload_generations: tuple[tuple[str, str], ...] = ()
+    committed_upload_generations: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1313,6 +1547,8 @@ class RedisReservation:
     token: str
     owner_id: str
     reserved_bytes: int
+    asset_id: str | None = None
+    generation_id: str | None = None
 
     def refresh(self) -> None:
         self.coordinator._refresh_reservation(self)
@@ -1507,14 +1743,29 @@ class RedisResourceCoordinator:
         self._finalize_legacy_session_usage_script = self._redis.register_script(
             _FINALIZE_LEGACY_SESSION_USAGE_SCRIPT
         )
-        self._release_committed_asset_script = self._redis.register_script(
-            _RELEASE_COMMITTED_ASSET_SCRIPT
+        self._release_legacy_committed_asset_script = self._redis.register_script(
+            _RELEASE_LEGACY_COMMITTED_ASSET_SCRIPT
+        )
+        self._release_committed_upload_generation_script = (
+            self._redis.register_script(
+                _RELEASE_COMMITTED_UPLOAD_GENERATION_SCRIPT
+            )
         )
         self._is_committed_asset_released_script = self._redis.register_script(
             _IS_COMMITTED_ASSET_RELEASED_SCRIPT
         )
+        self._is_committed_upload_generation_released_script = (
+            self._redis.register_script(
+                _IS_COMMITTED_UPLOAD_GENERATION_RELEASED_SCRIPT
+            )
+        )
         self._finalize_asset_release_script = self._redis.register_script(
             _FINALIZE_ASSET_RELEASE_SCRIPT
+        )
+        self._finalize_upload_generation_release_script = (
+            self._redis.register_script(
+                _FINALIZE_UPLOAD_GENERATION_RELEASE_SCRIPT
+            )
         )
         self._acquire_session_script = self._redis.register_script(
             _ACQUIRE_SESSION_SCRIPT
@@ -1571,6 +1822,8 @@ class RedisResourceCoordinator:
                         expected_metadata["bytes"],
                         expected_metadata["free_bytes"],
                         expected_metadata["min_free_bytes"],
+                        expected_metadata.get("asset_id", ""),
+                        expected_metadata.get("generation_id", ""),
                     ],
                 )
             )
@@ -1588,10 +1841,19 @@ class RedisResourceCoordinator:
         requested_bytes: int,
         *,
         free_bytes: int,
+        asset_id: str | None = None,
+        generation_id: str | None = None,
     ) -> RedisReservation:
         _validate_session_id(session_id)
         requested_bytes = _positive_int(requested_bytes, "requested_bytes")
         free_bytes = _nonnegative_int(free_bytes, "free_bytes")
+        if (asset_id is None) != (generation_id is None):
+            raise ValueError(
+                "asset_id and generation_id must be provided together"
+            )
+        if asset_id is not None:
+            _validate_asset_id(asset_id)
+            _validate_token(generation_id)
         token = uuid4().hex
         reservation = RedisReservation(
             coordinator=self,
@@ -1599,6 +1861,8 @@ class RedisResourceCoordinator:
             token=token,
             owner_id=session_id,
             reserved_bytes=requested_bytes,
+            asset_id=asset_id,
+            generation_id=generation_id,
         )
         keys = [
             _STATE_KEY,
@@ -1616,6 +1880,8 @@ class RedisResourceCoordinator:
             self.min_free_bytes,
             self._reservation_ttl_ms,
             self._reservation_receipt_ttl_ms,
+            asset_id or "",
+            generation_id or "",
         ]
         result = self._execute_reservation_script(
             self._reserve_upload_script,
@@ -1629,6 +1895,8 @@ class RedisResourceCoordinator:
                 "bytes": str(requested_bytes),
                 "free_bytes": str(free_bytes),
                 "min_free_bytes": str(self.min_free_bytes),
+                "asset_id": asset_id or "",
+                "generation_id": generation_id or "",
             },
             index_metadata=(
                 f"upload|{session_id}|{requested_bytes}|{free_bytes}|"
@@ -1674,6 +1942,7 @@ class RedisResourceCoordinator:
                             _upload_inflight_key(session_id, upload_id),
                             _released_asset_key(session_id, upload_id),
                             _session_released_assets_key(session_id),
+                            _pending_asset_release_key(session_id, upload_id),
                         ],
                         args=[
                             token,
@@ -1918,8 +2187,12 @@ class RedisResourceCoordinator:
             keys=[
                 _STATE_KEY,
                 _session_released_assets_key(session_id),
+                _session_committed_uploads_key(session_id),
             ],
-            args=[session_id],
+            args=[
+                session_id,
+                _PENDING_ASSET_RELEASE_PREFIX,
+            ],
         )
 
     def capture_session_usage(
@@ -1935,14 +2208,40 @@ class RedisResourceCoordinator:
                 _session_state_key(session_id),
                 _session_released_assets_key(session_id),
                 _cleanup_key(claim_token),
+                _session_committed_uploads_key(session_id),
             ],
             args=[session_id, claim_token],
         )
         if int(result[0]) != 1:
             raise ResourceUnavailableError("Cleanup claim expired")
+        ledger_prefix = f"{_COMMITTED_UPLOAD_PREFIX}{session_id}:"
+        ledger_count = int(result[2])
+        committed_upload_generations: list[tuple[str, str]] = []
+        for raw_ledger_key in result[3 : 3 + ledger_count]:
+            ledger_key = (
+                raw_ledger_key.decode()
+                if isinstance(raw_ledger_key, bytes)
+                else raw_ledger_key
+            )
+            if not ledger_key.startswith(ledger_prefix):
+                raise ResourceUnavailableError(
+                    "Session committed upload ledger is invalid"
+                )
+            ledger_parts = ledger_key.removeprefix(ledger_prefix).split(":")
+            if len(ledger_parts) != 2:
+                raise ResourceUnavailableError(
+                    "Session committed upload ledger is invalid"
+                )
+            committed_upload_generations.append(
+                (
+                    _validate_asset_id(ledger_parts[0]),
+                    _validate_token(ledger_parts[1]),
+                )
+            )
         marker_prefix = f"{_RELEASED_ASSET_PREFIX}{session_id}:"
         released_asset_ids: list[str] = []
-        for raw_marker_key in result[2:]:
+        released_upload_generations: list[tuple[str, str]] = []
+        for raw_marker_key in result[3 + ledger_count :]:
             marker_key = (
                 raw_marker_key.decode()
                 if isinstance(raw_marker_key, bytes)
@@ -1952,13 +2251,33 @@ class RedisResourceCoordinator:
                 raise ResourceUnavailableError(
                     "Session release marker state is invalid"
                 )
-            released_asset_ids.append(
-                _validate_asset_id(marker_key.removeprefix(marker_prefix))
-            )
+            marker_suffix = marker_key.removeprefix(marker_prefix)
+            marker_parts = marker_suffix.split(":")
+            if len(marker_parts) == 1:
+                released_asset_ids.append(
+                    _validate_asset_id(marker_parts[0])
+                )
+            elif len(marker_parts) == 2:
+                released_upload_generations.append(
+                    (
+                        _validate_asset_id(marker_parts[0]),
+                        _validate_token(marker_parts[1]),
+                    )
+                )
+            else:
+                raise ResourceUnavailableError(
+                    "Session release marker state is invalid"
+                )
         return SessionUsageGeneration(
             generation_id=claim_token,
             committed_bytes=int(result[1]),
             released_asset_ids=tuple(sorted(released_asset_ids)),
+            released_upload_generations=tuple(
+                sorted(released_upload_generations)
+            ),
+            committed_upload_generations=tuple(
+                sorted(committed_upload_generations)
+            ),
         )
 
     def clear_session_usage_generation(
@@ -1978,6 +2297,24 @@ class RedisResourceCoordinator:
             _validate_asset_id(asset_id)
             for asset_id in generation.released_asset_ids
         )
+        upload_generations = tuple(
+            (
+                _validate_asset_id(asset_id),
+                _validate_token(generation_id),
+            )
+            for asset_id, generation_id in (
+                generation.released_upload_generations
+            )
+        )
+        committed_upload_generations = tuple(
+            (
+                _validate_asset_id(asset_id),
+                _validate_token(generation_id),
+            )
+            for asset_id, generation_id in (
+                generation.committed_upload_generations
+            )
+        )
         result = int(
             self._clear_session_usage_generation_script(
                 keys=[
@@ -1986,6 +2323,7 @@ class RedisResourceCoordinator:
                     _cleanup_key(claim_token),
                     _session_released_assets_key(session_id),
                     _cleanup_generation_key(generation.generation_id),
+                    _session_committed_uploads_key(session_id),
                 ],
                 args=[
                     session_id,
@@ -1993,7 +2331,24 @@ class RedisResourceCoordinator:
                     generation.generation_id,
                     committed_bytes,
                     _RELEASED_ASSET_PREFIX,
+                    _PENDING_ASSET_RELEASE_PREFIX,
+                    _COMMITTED_UPLOAD_PREFIX,
+                    len(asset_ids),
+                    len(upload_generations),
+                    len(committed_upload_generations),
                     *asset_ids,
+                    *(
+                        value
+                        for upload_generation in upload_generations
+                        for value in upload_generation
+                    ),
+                    *(
+                        value
+                        for committed_upload_generation in (
+                            committed_upload_generations
+                        )
+                        for value in committed_upload_generation
+                    ),
                 ],
             )
         )
@@ -2006,6 +2361,10 @@ class RedisResourceCoordinator:
         if result == 4:
             raise ResourceUnavailableError(
                 "Session usage generation marker is invalid"
+            )
+        if result == 5:
+            raise ResourceUnavailableError(
+                "Session committed upload ledger is invalid"
             )
 
     def finalize_session_usage_generation(self, generation_id: str) -> None:
@@ -2113,6 +2472,63 @@ class RedisResourceCoordinator:
         self,
         session_id: str,
         asset_id: str,
+        generation_id: str | int,
+        *,
+        expected_remaining_bytes: int | None = None,
+    ) -> bool:
+        if not isinstance(generation_id, str):
+            return self.release_legacy_committed_asset(
+                session_id,
+                asset_id,
+                generation_id,
+                expected_remaining_bytes=expected_remaining_bytes,
+            )
+        if expected_remaining_bytes is not None:
+            raise ValueError(
+                "expected_remaining_bytes is only valid for legacy assets"
+            )
+        _validate_session_id(session_id)
+        _validate_asset_id(asset_id)
+        generation_id = _validate_token(generation_id)
+        result = int(
+            self._release_committed_upload_generation_script(
+                keys=[
+                    _STATE_KEY,
+                    _committed_upload_key(
+                        session_id,
+                        asset_id,
+                        generation_id,
+                    ),
+                    _session_committed_uploads_key(session_id),
+                    _released_upload_generation_key(
+                        session_id,
+                        asset_id,
+                        generation_id,
+                    ),
+                    _session_released_assets_key(session_id),
+                    _pending_asset_release_key(session_id, asset_id),
+                ],
+                args=[
+                    session_id,
+                    asset_id,
+                    generation_id,
+                ],
+            )
+        )
+        if result == 2:
+            raise AssetReleaseMismatchError(
+                "Asset release generation does not match"
+            )
+        if result == 3:
+            raise ResourceUnavailableError(
+                "Asset generation ledger is invalid"
+            )
+        return result == 1
+
+    def release_legacy_committed_asset(
+        self,
+        session_id: str,
+        asset_id: str,
         released_bytes: int,
         *,
         expected_remaining_bytes: int | None = None,
@@ -2126,7 +2542,7 @@ class RedisResourceCoordinator:
                 "expected_remaining_bytes",
             )
         result = int(
-            self._release_committed_asset_script(
+            self._release_legacy_committed_asset_script(
                 keys=[
                     _STATE_KEY,
                     _released_asset_key(session_id, asset_id),
@@ -2162,9 +2578,28 @@ class RedisResourceCoordinator:
         self,
         session_id: str,
         asset_id: str,
+        generation_id: str | None = None,
     ) -> bool:
         _validate_session_id(session_id)
         _validate_asset_id(asset_id)
+        if generation_id is not None:
+            _validate_token(generation_id)
+            return bool(
+                self._is_committed_upload_generation_released_script(
+                    keys=[
+                        _released_upload_generation_key(
+                            session_id,
+                            asset_id,
+                            generation_id,
+                        )
+                    ],
+                    args=[
+                        session_id,
+                        asset_id,
+                        generation_id,
+                    ],
+                )
+            )
         return bool(
             self._is_committed_asset_released_script(
                 keys=[_released_asset_key(session_id, asset_id)],
@@ -2175,9 +2610,60 @@ class RedisResourceCoordinator:
             )
         )
 
-    def finalize_asset_release(self, session_id: str, asset_id: str) -> bool:
+    def pending_asset_release_generation(
+        self,
+        session_id: str,
+        asset_id: str,
+    ) -> str | None:
         _validate_session_id(session_id)
         _validate_asset_id(asset_id)
+        value = self._redis.get(
+            _pending_asset_release_key(session_id, asset_id)
+        )
+        if value is None:
+            return None
+        generation_id = value.decode() if isinstance(value, bytes) else value
+        try:
+            return _validate_token(generation_id)
+        except (TypeError, ValueError) as exc:
+            raise ResourceUnavailableError(
+                "Asset release generation marker is invalid"
+            ) from exc
+
+    def finalize_asset_release(
+        self,
+        session_id: str,
+        asset_id: str,
+        generation_id: str | None = None,
+    ) -> bool:
+        _validate_session_id(session_id)
+        _validate_asset_id(asset_id)
+        if generation_id is not None:
+            _validate_token(generation_id)
+            result = int(
+                self._finalize_upload_generation_release_script(
+                    keys=[
+                        _released_upload_generation_key(
+                            session_id,
+                            asset_id,
+                            generation_id,
+                        ),
+                        _session_released_assets_key(session_id),
+                        _pending_asset_release_key(session_id, asset_id),
+                    ],
+                    args=[
+                        session_id,
+                        asset_id,
+                        generation_id,
+                        self._release_marker_ttl_ms,
+                    ],
+                )
+            )
+            if result == 2:
+                raise AssetReleaseMismatchError(
+                    "Asset release generation does not match"
+                )
+            return result == 1
         result = int(
             self._finalize_asset_release_script(
                 keys=[
@@ -2302,6 +2788,22 @@ class RedisResourceCoordinator:
             )
 
     def _commit_reservation(self, reservation: RedisReservation) -> None:
+        committed_upload_key = (
+            _committed_upload_key(
+                reservation.owner_id,
+                reservation.asset_id,
+                reservation.generation_id,
+            )
+            if reservation.kind == "upload"
+            and reservation.asset_id is not None
+            and reservation.generation_id is not None
+            else _committed_key(reservation.token)
+        )
+        committed_upload_index_key = (
+            _session_committed_uploads_key(reservation.owner_id)
+            if reservation.kind == "upload"
+            else _committed_key(reservation.token)
+        )
         committed = int(
             self._commit_reservation_script(
                 keys=[
@@ -2310,6 +2812,8 @@ class RedisResourceCoordinator:
                     _reservation_key(reservation.token),
                     _committed_key(reservation.token),
                     _reservation_receipt_key(reservation.token),
+                    committed_upload_key,
+                    committed_upload_index_key,
                 ],
                 args=[
                     reservation.token,
@@ -2322,13 +2826,30 @@ class RedisResourceCoordinator:
             raise ResourceUnavailableError(
                 f"{reservation.kind.capitalize()} reservation expired"
             )
+        if committed == 3:
+            raise ResourceUnavailableError(
+                "Upload generation ledger already exists"
+            )
 
     def _rollback_commit(self, reservation: RedisReservation) -> bool:
+        committed_upload_key = (
+            _committed_upload_key(
+                reservation.owner_id,
+                reservation.asset_id,
+                reservation.generation_id,
+            )
+            if reservation.kind == "upload"
+            and reservation.asset_id is not None
+            and reservation.generation_id is not None
+            else _committed_key(reservation.token)
+        )
         return bool(
             self._rollback_commit_script(
                 keys=[
                     _STATE_KEY,
                     _committed_key(reservation.token),
+                    committed_upload_key,
+                    _session_committed_uploads_key(reservation.owner_id),
                 ],
                 args=[self._reservation_ttl_ms],
             )
@@ -2414,6 +2935,16 @@ def _committed_key(token: str) -> str:
     return f"{_COMMITTED_PREFIX}{token}"
 
 
+def _committed_upload_key(
+    session_id: str,
+    asset_id: str,
+    generation_id: str,
+) -> str:
+    return (
+        f"{_COMMITTED_UPLOAD_PREFIX}{session_id}:{asset_id}:{generation_id}"
+    )
+
+
 def _lease_key(token: str) -> str:
     return f"{_LEASE_PREFIX}{token}"
 
@@ -2474,6 +3005,24 @@ def _session_released_assets_key(session_id: str) -> str:
 
 def _released_asset_key(session_id: str, asset_id: str) -> str:
     return f"{_RELEASED_ASSET_PREFIX}{session_id}:{asset_id}"
+
+
+def _released_upload_generation_key(
+    session_id: str,
+    asset_id: str,
+    generation_id: str,
+) -> str:
+    return (
+        f"{_RELEASED_ASSET_PREFIX}{session_id}:{asset_id}:{generation_id}"
+    )
+
+
+def _pending_asset_release_key(session_id: str, asset_id: str) -> str:
+    return f"{_PENDING_ASSET_RELEASE_PREFIX}{session_id}:{asset_id}"
+
+
+def _session_committed_uploads_key(session_id: str) -> str:
+    return f"dt:resource:session:{session_id}:committed-uploads"
 
 
 def _validate_session_id(value: str) -> str:

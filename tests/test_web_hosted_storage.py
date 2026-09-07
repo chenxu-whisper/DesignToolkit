@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shutil
 import subprocess
@@ -851,6 +852,72 @@ async def test_delete_asset_preserves_retryable_state_until_finalized(
 
     assert list(tmp_path.rglob("screen.png")) == []
     assert storage.delete_asset(owner, asset.reference) is None
+
+
+def test_stale_partial_deletion_carries_upload_generation(
+    tmp_path: Path,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    session_id = "a" * 32
+    asset_id = "1" * 32
+    generation_id = "2" * 32
+    asset_dir = tmp_path / "sessions" / session_id / "assets" / asset_id
+    asset_dir.mkdir(parents=True)
+    (asset_dir / ".uploading").write_bytes(b"data")
+    (asset_dir / ".asset.json").write_text(
+        json.dumps(
+            {
+                "asset_id": asset_id,
+                "bytes": 4,
+                "generation_id": generation_id,
+            }
+        ),
+        encoding="utf-8",
+    )
+    generation = (
+        tmp_path / "sessions" / session_id / ".upload-generations" / asset_id
+    )
+    generation.parent.mkdir()
+    generation.write_text(generation_id, encoding="ascii")
+    os.utime(generation, (1.0, 1.0))
+
+    deletion = storage.delete_asset(
+        session_id,
+        f"asset:{asset_id}",
+        orphan_stale_after_seconds=1,
+    )
+
+    assert deletion is not None
+    assert deletion.generation_id == generation_id
+
+
+@pytest.mark.anyio
+async def test_published_asset_deletion_carries_manifest_generation(
+    tmp_path: Path,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    session_id = "a" * 32
+    asset_id = "1" * 32
+    registration = RecordingUploadRegistration()
+    storage.claim_upload_generation(
+        session_id,
+        asset_id,
+        token=registration.token,
+    )
+
+    await storage.store_stream(
+        session_id,
+        asset_id=asset_id,
+        filename="screen.png",
+        content_length=4,
+        chunks=_chunks(b"data"),
+        reservation=RecordingReservation(),
+        registration=registration,
+    )
+    deletion = storage.delete_asset(session_id, f"asset:{asset_id}")
+
+    assert deletion is not None
+    assert deletion.generation_id == registration.token
 
 
 @pytest.mark.parametrize(

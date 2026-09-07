@@ -50,6 +50,7 @@ _DEFAULT_TASK_TIMEOUT_SECONDS = 2 * 60 * 60
 _UPLOAD_CHUNK_BYTES = 1024 * 1024
 _RESOURCE_RECOVERY_ATTEMPTS = 3
 _DELETION_METADATA_NAME = ".deletion.json"
+_ASSET_MANIFEST_NAME = ".asset.json"
 _UPLOAD_CANCELLATIONS_NAME = ".upload-cancellations"
 _UPLOAD_GENERATIONS_NAME = ".upload-generations"
 _CLEANUP_GENERATION_NAME = ".cleanup-generation.json"
@@ -503,6 +504,7 @@ class AssetDeletion:
     size: int
     pending: bool = False
     expected_remaining_bytes: int | None = None
+    generation_id: str | None = None
 
 
 class HostedStorage:
@@ -567,6 +569,11 @@ class HostedStorage:
         size = 0
         committed = False
         owns_asset_dir = False
+        generation_id = (
+            registration.token
+            if registration is not None
+            else getattr(reservation, "generation_id", None)
+        )
         try:
             def refresh_generation() -> None:
                 if registration is None:
@@ -595,6 +602,13 @@ class HostedStorage:
                         raise UploadConflictError("Upload ID already exists") from exc
                     owns_asset_dir = True
                 with temporary_path.open("xb") as destination:
+                    if generation_id is not None:
+                        _write_asset_manifest(
+                            asset_dir,
+                            asset_id=asset_id,
+                            generation_id=generation_id,
+                            size=content_length,
+                        )
                     async for chunk in chunks:
                         heartbeat.raise_if_failed()
                         self._raise_if_upload_cancelled(
@@ -758,6 +772,10 @@ class HostedStorage:
                     reference=f"asset:{asset_id}",
                     size=0,
                     pending=True,
+                    generation_id=_asset_manifest_generation(
+                        asset_dir,
+                        asset_id,
+                    ),
                 )
 
             if (
@@ -770,13 +788,24 @@ class HostedStorage:
                 )
             ):
                 orphan_size = _unpublished_upload_size(asset_dir)
-                expected_remaining_bytes = _auditable_session_upload_bytes(
-                    session_dir,
-                    excluded_asset_id=asset_id,
+                generation_id = _asset_manifest_generation(
+                    asset_dir,
+                    asset_id,
+                )
+                expected_remaining_bytes = (
+                    None
+                    if generation_id is not None
+                    else _auditable_session_upload_bytes(
+                        session_dir,
+                        excluded_asset_id=asset_id,
+                    )
                 )
                 if (
                     orphan_size is not None
-                    and expected_remaining_bytes is not None
+                    and (
+                        generation_id is not None
+                        or expected_remaining_bytes is not None
+                    )
                 ):
                     tombstone.parent.mkdir(parents=True, exist_ok=True)
                     deletion = AssetDeletion(
@@ -784,6 +813,7 @@ class HostedStorage:
                         reference=f"asset:{asset_id}",
                         size=orphan_size,
                         expected_remaining_bytes=expected_remaining_bytes,
+                        generation_id=generation_id,
                     )
                     try:
                         _write_asset_deletion(asset_dir, deletion)
@@ -803,13 +833,23 @@ class HostedStorage:
                     reference=f"asset:{asset_id}",
                     size=0,
                     pending=True,
+                    generation_id=_asset_manifest_generation(
+                        asset_dir,
+                        asset_id,
+                    ),
                 )
 
             tombstone.parent.mkdir(parents=True, exist_ok=True)
+            manifest = _read_asset_manifest(asset_dir, asset_id)
             deletion = AssetDeletion(
                 asset_id=asset_id,
                 reference=f"asset:{asset_id}",
                 size=_asset_payload_size(asset_dir),
+                generation_id=(
+                    manifest["generation_id"]
+                    if manifest is not None
+                    else None
+                ),
             )
             try:
                 _write_asset_deletion(asset_dir, deletion)
@@ -1252,6 +1292,18 @@ def _write_session_usage_generation(
         "generation_id": generation.generation_id,
         "committed_bytes": generation.committed_bytes,
         "released_asset_ids": list(generation.released_asset_ids),
+        "released_upload_generations": [
+            [asset_id, generation_id]
+            for asset_id, generation_id in (
+                getattr(generation, "released_upload_generations", ())
+            )
+        ],
+        "committed_upload_generations": [
+            [asset_id, generation_id]
+            for asset_id, generation_id in (
+                getattr(generation, "committed_upload_generations", ())
+            )
+        ],
     }
     (session_dir / _CLEANUP_GENERATION_NAME).write_text(
         json.dumps(payload, separators=(",", ":"), sort_keys=True),
@@ -1271,6 +1323,14 @@ def _read_session_usage_generation(
         generation_id = payload["generation_id"]
         committed_bytes = payload["committed_bytes"]
         released_asset_ids = payload["released_asset_ids"]
+        released_upload_generations = payload.get(
+            "released_upload_generations",
+            [],
+        )
+        committed_upload_generations = payload.get(
+            "committed_upload_generations",
+            [],
+        )
         if (
             generation_id != expected_generation_id
             or not _SESSION_PATTERN.fullmatch(generation_id)
@@ -1283,6 +1343,28 @@ def _read_session_usage_generation(
                 or not _SESSION_PATTERN.fullmatch(asset_id)
                 for asset_id in released_asset_ids
             )
+            or not isinstance(released_upload_generations, list)
+            or any(
+                not isinstance(entry, list)
+                or len(entry) != 2
+                or any(
+                    not isinstance(value, str)
+                    or not _SESSION_PATTERN.fullmatch(value)
+                    for value in entry
+                )
+                for entry in released_upload_generations
+            )
+            or not isinstance(committed_upload_generations, list)
+            or any(
+                not isinstance(entry, list)
+                or len(entry) != 2
+                or any(
+                    not isinstance(value, str)
+                    or not _SESSION_PATTERN.fullmatch(value)
+                    for value in entry
+                )
+                for entry in committed_upload_generations
+            )
         ):
             return None
     except (OSError, KeyError, TypeError, ValueError):
@@ -1291,6 +1373,22 @@ def _read_session_usage_generation(
         generation_id=generation_id,
         committed_bytes=committed_bytes,
         released_asset_ids=tuple(sorted(set(released_asset_ids))),
+        released_upload_generations=tuple(
+            sorted(
+                {
+                    (entry[0], entry[1])
+                    for entry in released_upload_generations
+                }
+            )
+        ),
+        committed_upload_generations=tuple(
+            sorted(
+                {
+                    (entry[0], entry[1])
+                    for entry in committed_upload_generations
+                }
+            )
+        ),
     )
 
 
@@ -1540,13 +1638,22 @@ def _auditable_session_upload_bytes(
         if not visible_files:
             entries = list(asset_dir.iterdir())
             if (
-                len(entries) == 1
-                and entries[0].name == ".uploading"
-                and S_ISREG(entries[0].lstat().st_mode)
+                {entry.name for entry in entries}
+                in (
+                    {".uploading"},
+                    {".uploading", _ASSET_MANIFEST_NAME},
+                )
+                and all(S_ISREG(entry.lstat().st_mode) for entry in entries)
             ):
                 continue
             return None
-        if len(files) != 1 or len(visible_files) != 1:
+        metadata_files = [
+            path
+            for path in files
+            if path.name == _ASSET_MANIFEST_NAME
+            and path.parent == asset_dir
+        ]
+        if len(files) != 1 + len(metadata_files) or len(visible_files) != 1:
             return None
         total += visible_files[0].stat().st_size
     return total
@@ -1573,6 +1680,8 @@ def _write_asset_deletion(asset_dir: Path, deletion: AssetDeletion) -> None:
     }
     if deletion.expected_remaining_bytes is not None:
         payload["expected_remaining_bytes"] = deletion.expected_remaining_bytes
+    if deletion.generation_id is not None:
+        payload["generation_id"] = deletion.generation_id
     try:
         with temporary_path.open("x", encoding="utf-8") as metadata:
             json.dump(payload, metadata, separators=(",", ":"), sort_keys=True)
@@ -1591,6 +1700,7 @@ def _read_asset_deletion(tombstone: Path, asset_id: str) -> AssetDeletion:
         reference = payload["reference"]
         size = payload["bytes"]
         expected_remaining_bytes = payload.get("expected_remaining_bytes")
+        generation_id = payload.get("generation_id")
         if (
             payload["asset_id"] != asset_id
             or reference != f"asset:{asset_id}"
@@ -1605,6 +1715,13 @@ def _read_asset_deletion(tombstone: Path, asset_id: str) -> AssetDeletion:
                     or expected_remaining_bytes < 0
                 )
             )
+            or (
+                generation_id is not None
+                and (
+                    not isinstance(generation_id, str)
+                    or not _SESSION_PATTERN.fullmatch(generation_id)
+                )
+            )
         ):
             raise ValueError
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -1614,7 +1731,74 @@ def _read_asset_deletion(tombstone: Path, asset_id: str) -> AssetDeletion:
         reference=reference,
         size=size,
         expected_remaining_bytes=expected_remaining_bytes,
+        generation_id=generation_id,
     )
+
+
+def _write_asset_manifest(
+    asset_dir: Path,
+    *,
+    asset_id: str,
+    generation_id: str,
+    size: int,
+) -> None:
+    payload = {
+        "asset_id": asset_id,
+        "bytes": size,
+        "generation_id": generation_id,
+    }
+    manifest_path = asset_dir / _ASSET_MANIFEST_NAME
+    temporary_path = asset_dir / f"{_ASSET_MANIFEST_NAME}.{uuid4().hex}.tmp"
+    try:
+        with temporary_path.open("x", encoding="utf-8") as manifest:
+            json.dump(payload, manifest, separators=(",", ":"), sort_keys=True)
+            manifest.flush()
+            os.fsync(manifest.fileno())
+        os.replace(temporary_path, manifest_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def _read_asset_manifest(
+    asset_dir: Path,
+    asset_id: str,
+) -> dict[str, str | int] | None:
+    manifest_path = asset_dir / _ASSET_MANIFEST_NAME
+    if not manifest_path.exists():
+        return None
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        generation_id = payload["generation_id"]
+        size = payload["bytes"]
+        if (
+            payload["asset_id"] != asset_id
+            or not isinstance(generation_id, str)
+            or not _SESSION_PATTERN.fullmatch(generation_id)
+            or isinstance(size, bool)
+            or not isinstance(size, int)
+            or size <= 0
+        ):
+            raise ValueError
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise AssetDeletionStateError(asset_id) from exc
+    return {
+        "asset_id": asset_id,
+        "bytes": size,
+        "generation_id": generation_id,
+    }
+
+
+def _asset_manifest_generation(
+    asset_dir: Path,
+    asset_id: str,
+) -> str | None:
+    manifest = _read_asset_manifest(asset_dir, asset_id)
+    if manifest is None:
+        return None
+    generation_id = manifest["generation_id"]
+    if not isinstance(generation_id, str):
+        raise AssetDeletionStateError(asset_id)
+    return generation_id
 
 
 def _safe_filename(value: str | None) -> str:
