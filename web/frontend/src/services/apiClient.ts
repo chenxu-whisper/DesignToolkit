@@ -227,20 +227,35 @@ export function createVideoFramesTask(payload: VideoFramesPayload): Promise<Task
 export async function uploadFiles(
   files: readonly File[],
   onProgress: (percentage: number) => void,
+  signal?: AbortSignal,
 ): Promise<readonly string[]> {
   const uploaded: UploadResponse[] = []
   try {
     for (let index = 0; index < files.length; index += 1) {
+      throwIfUploadAborted(signal)
       const file = files[index]
       const response = await uploadFile(file, (fileProgress) => {
         onProgress(Math.round(((index + fileProgress) / files.length) * 100))
-      })
+      }, signal)
       uploaded.push(response)
+      throwIfUploadAborted(signal)
     }
   } catch (error) {
-    await Promise.allSettled(
+    const cleanupResults = await Promise.allSettled(
       uploaded.map(({ reference }) => deleteUploadedAsset(reference)),
     )
+    const cleanupErrors = cleanupResults.flatMap((result) =>
+      result.status === 'rejected' ? [result.reason] : [],
+    )
+    if (cleanupErrors.length > 0) {
+      const uploadMessage =
+        error instanceof Error && error.message ? error.message : '文件上传失败'
+      throw new AggregateError(
+        cleanupErrors,
+        `${uploadMessage}；${cleanupErrors.length} 个已上传文件清理失败`,
+        { cause: error },
+      )
+    }
     throw error
   }
   return uploaded.map(({ reference }) => reference)
@@ -251,19 +266,60 @@ async function deleteUploadedAsset(reference: string): Promise<void> {
   if (!assetId) {
     return
   }
-  await fetch(`/api/uploads/${assetId}`, { method: 'DELETE' })
+  const maximumAttempts = 3
+  for (let attempt = 1; attempt <= maximumAttempts; attempt += 1) {
+    let response: Response
+    try {
+      response = await fetch(`/api/uploads/${assetId}`, { method: 'DELETE' })
+    } catch (error) {
+      if (attempt === maximumAttempts) {
+        throw new Error(
+          `Failed to delete uploaded asset ${assetId}: network error`,
+          { cause: error },
+        )
+      }
+      continue
+    }
+    if (response.ok || response.status === 404) {
+      return
+    }
+    const failure = new Error(
+      `Failed to delete uploaded asset ${assetId}: ${response.status}`,
+    )
+    if (response.status < 500 || attempt === maximumAttempts) {
+      throw failure
+    }
+  }
 }
 
 function uploadFile(
   file: File,
   onProgress: (fraction: number) => void,
+  signal?: AbortSignal,
 ): Promise<UploadResponse> {
   return new Promise((resolve, reject) => {
     const request = new XMLHttpRequest()
+    let settled = false
+    const settle = (callback: () => void) => {
+      if (settled) {
+        return
+      }
+      settled = true
+      signal?.removeEventListener('abort', abortRequest)
+      callback()
+    }
+    const abortRequest = () => request.abort()
+
+    if (signal?.aborted) {
+      reject(uploadAbortError(signal))
+      return
+    }
+
     request.open('POST', '/api/uploads')
     request.responseType = 'json'
     request.setRequestHeader('Content-Type', file.type || 'application/octet-stream')
     request.setRequestHeader('X-Upload-Filename', encodeURIComponent(file.name))
+    signal?.addEventListener('abort', abortRequest, { once: true })
     request.upload.addEventListener('progress', (event) => {
       if (event.lengthComputable && event.total > 0) {
         onProgress(event.loaded / event.total)
@@ -276,15 +332,32 @@ function uploadFile(
           body && typeof body === 'object' && 'error' in body
             ? body.error?.message
             : undefined
-        reject(new Error(message ?? `Request failed: ${request.status}`))
+        settle(() => reject(new Error(message ?? `Request failed: ${request.status}`)))
         return
       }
       onProgress(1)
-      resolve(body as UploadResponse)
+      settle(() => resolve(body as UploadResponse))
     })
-    request.addEventListener('error', () => reject(new Error('文件上传失败')))
+    request.addEventListener('error', () => {
+      settle(() => reject(new Error('文件上传失败')))
+    })
+    request.addEventListener('abort', () => {
+      settle(() => reject(uploadAbortError(signal)))
+    })
     request.send(file)
   })
+}
+
+function throwIfUploadAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) {
+    throw uploadAbortError(signal)
+  }
+}
+
+function uploadAbortError(signal?: AbortSignal): Error {
+  return signal?.reason instanceof Error
+    ? signal.reason
+    : new DOMException('文件上传已取消', 'AbortError')
 }
 
 export function createMediaResizeTask(payload: MediaResizePayload): Promise<TaskCreateResponse> {

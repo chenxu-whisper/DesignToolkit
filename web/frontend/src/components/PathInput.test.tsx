@@ -78,6 +78,7 @@ function ControlledUploadPathInput({
   uploadFiles: (
     files: readonly File[],
     onProgress: (percentage: number) => void,
+    signal?: AbortSignal,
   ) => Promise<readonly string[]>
 }) {
   const [value, setValue] = useState('')
@@ -981,5 +982,92 @@ describe('PathInput', () => {
       expect(screen.getByLabelText('输入媒体路径')).toHaveValue('screen.png'),
     )
     expect(uploadFiles).toHaveBeenCalledOnce()
+  })
+
+  it('aborts an in-flight browser upload when unmounted', async () => {
+    let uploadSignal: AbortSignal | undefined
+    const uploadRequest = deferred<readonly string[]>()
+    const uploadFiles = vi.fn(
+      (
+        _files: readonly File[],
+        _onProgress: (percentage: number) => void,
+        signal?: AbortSignal,
+      ) => {
+        uploadSignal = signal
+        return uploadRequest.promise
+      },
+    )
+    const { container, unmount } = render(
+      <ControlledUploadPathInput uploadFiles={uploadFiles} />,
+    )
+    const fileInput = container.querySelector<HTMLInputElement>(
+      'input[type="file"]',
+    )
+    if (!fileInput) {
+      throw new Error('upload input missing')
+    }
+
+    fireEvent.change(fileInput, {
+      target: { files: [new File(['image'], 'screen.png', { type: 'image/png' })] },
+    })
+    expect(uploadSignal?.aborted).toBe(false)
+
+    unmount()
+
+    expect(uploadSignal?.aborted).toBe(true)
+    await act(async () => {
+      uploadRequest.resolve([])
+      await uploadRequest.promise
+    })
+  })
+
+  it('ignores stale upload progress after its intent is invalidated', async () => {
+    let reportProgress: ((percentage: number) => void) | undefined
+    let uploadSignal: AbortSignal | undefined
+    const uploadRequest = deferred<readonly string[]>()
+    const uploadFiles = vi.fn(
+      (
+        _files: readonly File[],
+        onProgress: (percentage: number) => void,
+        signal?: AbortSignal,
+      ) => {
+        reportProgress = onProgress
+        uploadSignal = signal
+        return uploadRequest.promise
+      },
+    )
+    const renderInput = (disabled: boolean) => (
+      <PathInput
+        disabled={disabled}
+        label="输入媒体路径"
+        onChange={() => undefined}
+        uploadFiles={uploadFiles}
+        value=""
+      />
+    )
+    const { container, rerender } = render(renderInput(false))
+    const fileInput = container.querySelector<HTMLInputElement>(
+      'input[type="file"]',
+    )
+    if (!fileInput) {
+      throw new Error('upload input missing')
+    }
+
+    fireEvent.change(fileInput, {
+      target: { files: [new File(['image'], 'screen.png', { type: 'image/png' })] },
+    })
+    expect(screen.getByLabelText('上传进度')).toHaveValue(0)
+
+    rerender(renderInput(true))
+    rerender(renderInput(false))
+    act(() => reportProgress?.(75))
+
+    expect(uploadSignal?.aborted).toBe(true)
+    expect(screen.queryByLabelText('上传进度')).not.toBeInTheDocument()
+    await act(async () => {
+      uploadRequest.resolve([])
+      await uploadRequest.promise
+    })
+    expect(screen.queryByLabelText('上传进度')).not.toBeInTheDocument()
   })
 })

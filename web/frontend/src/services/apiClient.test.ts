@@ -122,7 +122,102 @@ describe('apiClient', () => {
     expect(progress).toEqual([20, 50, 100])
   })
 
-  it('deletes earlier uploads without masking a later upload error', async () => {
+  it('aborts an in-flight upload when its signal is cancelled', async () => {
+    const requests: MockUploadRequest[] = []
+
+    class MockUploadRequest {
+      response: unknown = null
+      status = 0
+      listeners = new Map<string, () => void>()
+      upload = {
+        addEventListener: () => undefined,
+      }
+      abort = vi.fn(() => this.listeners.get('abort')?.())
+
+      constructor() {
+        requests.push(this)
+      }
+
+      open() {}
+
+      setRequestHeader() {}
+
+      addEventListener(type: string, listener: () => void) {
+        this.listeners.set(type, listener)
+      }
+
+      send() {}
+    }
+
+    vi.stubGlobal('XMLHttpRequest', MockUploadRequest)
+    const controller = new AbortController()
+    const pending = uploadFiles(
+      [new File(['image'], 'image.png')],
+      () => undefined,
+      controller.signal,
+    )
+
+    controller.abort()
+
+    await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
+    expect(requests[0].abort).toHaveBeenCalledOnce()
+  })
+
+  it('deletes a committed upload when cancellation wins the response race', async () => {
+    const requests: MockUploadRequest[] = []
+
+    class MockUploadRequest {
+      response: unknown = null
+      status = 201
+      listeners = new Map<string, () => void>()
+      upload = {
+        addEventListener: () => undefined,
+      }
+      abort = vi.fn()
+
+      constructor() {
+        requests.push(this)
+      }
+
+      open() {}
+
+      setRequestHeader() {}
+
+      addEventListener(type: string, listener: () => void) {
+        this.listeners.set(type, listener)
+      }
+
+      send() {}
+    }
+
+    vi.stubGlobal('XMLHttpRequest', MockUploadRequest)
+    const cleanup = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(new Response(null, { status: 204 }))
+    const controller = new AbortController()
+    const pending = uploadFiles(
+      [new File(['image'], 'image.png')],
+      () => undefined,
+      controller.signal,
+    )
+    const assetId = '1'.repeat(32)
+
+    requests[0].response = {
+      filename: 'image.png',
+      reference: `asset:${assetId}:image.png`,
+      size: 5,
+    }
+    requests[0].listeners.get('load')?.()
+    controller.abort()
+
+    await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
+    expect(cleanup).toHaveBeenCalledOnce()
+    expect(cleanup).toHaveBeenCalledWith(`/api/uploads/${assetId}`, {
+      method: 'DELETE',
+    })
+  })
+
+  it('retries network and transient server cleanup failures without masking the upload error', async () => {
     const requests: MockUploadRequest[] = []
 
     class MockUploadRequest {
@@ -151,7 +246,65 @@ describe('apiClient', () => {
     vi.stubGlobal('XMLHttpRequest', MockUploadRequest)
     const cleanup = vi
       .spyOn(globalThis, 'fetch')
-      .mockRejectedValue(new Error('cleanup unavailable'))
+      .mockRejectedValueOnce(new Error('network unavailable'))
+      .mockResolvedValueOnce(new Response(null, { status: 503 }))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+    const pending = uploadFiles(
+      [new File(['first'], 'first.png'), new File(['second'], 'second.png')],
+      () => undefined,
+    )
+    const firstId = '1'.repeat(32)
+
+    requests[0].response = {
+      filename: 'first.png',
+      reference: `asset:${firstId}:first.png`,
+      size: 5,
+    }
+    requests[0].listeners.get('load')?.()
+    await Promise.resolve()
+    requests[1].status = 413
+    requests[1].response = {
+      error: { code: 'upload_too_large', message: 'Second upload rejected' },
+    }
+    requests[1].listeners.get('load')?.()
+
+    await expect(pending).rejects.toThrow('Second upload rejected')
+    expect(cleanup).toHaveBeenCalledTimes(3)
+    expect(cleanup).toHaveBeenCalledWith(`/api/uploads/${firstId}`, {
+      method: 'DELETE',
+    })
+  })
+
+  it('reports a persistent cleanup failure while preserving the upload error as cause', async () => {
+    const requests: MockUploadRequest[] = []
+
+    class MockUploadRequest {
+      status = 201
+      response: unknown = null
+      listeners = new Map<string, () => void>()
+      upload = {
+        addEventListener: () => undefined,
+      }
+
+      constructor() {
+        requests.push(this)
+      }
+
+      open() {}
+
+      setRequestHeader() {}
+
+      addEventListener(type: string, listener: () => void) {
+        this.listeners.set(type, listener)
+      }
+
+      send() {}
+    }
+
+    vi.stubGlobal('XMLHttpRequest', MockUploadRequest)
+    const cleanup = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(new Response(null, { status: 503 }))
     const pending = uploadFiles(
       [
         new File(['first'], 'first.png'),
@@ -183,14 +336,78 @@ describe('apiClient', () => {
     }
     requests[2].listeners.get('load')?.()
 
-    await expect(pending).rejects.toThrow('Third upload rejected')
-    expect(cleanup).toHaveBeenCalledTimes(2)
-    expect(cleanup).toHaveBeenCalledWith(`/api/uploads/${firstId}`, {
-      method: 'DELETE',
+    const error = await pending.catch((reason: unknown) => reason)
+
+    expect(error).toBeInstanceOf(AggregateError)
+    expect(error).toMatchObject({
+      message: expect.stringContaining('Third upload rejected'),
+      cause: expect.objectContaining({ message: 'Third upload rejected' }),
+      errors: [
+        expect.objectContaining({
+          message: expect.stringContaining(`Failed to delete uploaded asset ${firstId}: 503`),
+        }),
+        expect.objectContaining({
+          message: expect.stringContaining(`Failed to delete uploaded asset ${secondId}: 503`),
+        }),
+      ],
     })
-    expect(cleanup).toHaveBeenCalledWith(`/api/uploads/${secondId}`, {
-      method: 'DELETE',
-    })
+    expect(cleanup).toHaveBeenCalledTimes(6)
+  })
+
+  it('treats a missing uploaded asset as an idempotent cleanup success', async () => {
+    const requests: MockUploadRequest[] = []
+
+    class MockUploadRequest {
+      status = 201
+      response: unknown = null
+      listeners = new Map<string, () => void>()
+      upload = {
+        addEventListener: () => undefined,
+      }
+
+      constructor() {
+        requests.push(this)
+      }
+
+      open() {}
+
+      setRequestHeader() {}
+
+      addEventListener(type: string, listener: () => void) {
+        this.listeners.set(type, listener)
+      }
+
+      send() {}
+    }
+
+    vi.stubGlobal('XMLHttpRequest', MockUploadRequest)
+    const cleanup = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(new Response(null, { status: 404 }))
+    const pending = uploadFiles(
+      [new File(['first'], 'first.png'), new File(['second'], 'second.png')],
+      () => undefined,
+    )
+
+    requests[0].response = {
+      filename: 'first.png',
+      reference: `asset:${'1'.repeat(32)}:first.png`,
+      size: 5,
+    }
+    requests[0].listeners.get('load')?.()
+    await Promise.resolve()
+    requests[1].status = 413
+    requests[1].response = {
+      error: { code: 'upload_too_large', message: 'Second upload rejected' },
+    }
+    requests[1].listeners.get('load')?.()
+
+    const error = await pending.catch((reason: unknown) => reason)
+
+    expect(error).toBeInstanceOf(Error)
+    expect(error).not.toBeInstanceOf(AggregateError)
+    expect(error).toMatchObject({ message: 'Second upload rejected' })
+    expect(cleanup).toHaveBeenCalledOnce()
   })
 
   it('models chroma payloads with exactly one RGB sample', () => {

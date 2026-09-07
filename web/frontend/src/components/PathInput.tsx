@@ -22,6 +22,7 @@ type PathInputProps = {
   uploadFiles?: (
     files: readonly File[],
     onProgress: (percentage: number) => void,
+    signal?: AbortSignal,
   ) => Promise<readonly string[]>
   value: string
 }
@@ -61,6 +62,7 @@ export function PathInput({
   const pickerPointerSequenceRef = useRef(0)
   const suppressPickerBlurRef = useRef(false)
   const skipNextBlurRef = useRef(false)
+  const uploadControllerRef = useRef<AbortController | null>(null)
   const uploadInputRef = useRef<HTMLInputElement>(null)
   currentValueRef.current = value
 
@@ -73,8 +75,20 @@ export function PathInput({
   useEffect(() => {
     if (disabled) {
       latestIntentRef.current += 1
+      uploadControllerRef.current?.abort()
+      uploadControllerRef.current = null
+      setIsPicking(false)
+      setUploadProgress(null)
     }
   }, [disabled])
+
+  useEffect(() => {
+    return () => {
+      latestIntentRef.current += 1
+      uploadControllerRef.current?.abort()
+      uploadControllerRef.current = null
+    }
+  }, [])
 
   const openEditor = () => {
     if (!isEditorOpen) {
@@ -173,12 +187,23 @@ export function PathInput({
       return
     }
     const intent = beginIntent()
+    const controller = new AbortController()
+    uploadControllerRef.current?.abort()
+    uploadControllerRef.current = controller
     setPickerError(null)
     setDropError(null)
     setIsPicking(true)
     setUploadProgress(0)
     try {
-      const references = await uploadFiles(files, setUploadProgress)
+      const references = await uploadFiles(
+        files,
+        (percentage) => {
+          if (isLatestIntent(intent) && !controller.signal.aborted) {
+            setUploadProgress(percentage)
+          }
+        },
+        controller.signal,
+      )
       if (isLatestIntent(intent) && references.length > 0) {
         commitValue(
           valueWithDroppedPaths(currentValueRef.current, references, multiline),
@@ -193,10 +218,15 @@ export function PathInput({
         )
       }
     } finally {
-      setIsPicking(false)
-      setUploadProgress(null)
-      if (uploadInputRef.current) {
-        uploadInputRef.current.value = ''
+      if (uploadControllerRef.current === controller) {
+        uploadControllerRef.current = null
+      }
+      if (isLatestIntent(intent)) {
+        setIsPicking(false)
+        setUploadProgress(null)
+        if (uploadInputRef.current) {
+          uploadInputRef.current.value = ''
+        }
       }
     }
   }
