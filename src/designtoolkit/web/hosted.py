@@ -12,6 +12,7 @@ from pathlib import Path
 from stat import S_ISDIR, S_ISLNK, S_ISREG
 from threading import Event, RLock, Thread
 from time import time
+from typing import BinaryIO
 from unicodedata import category
 from urllib.parse import quote
 from uuid import UUID, uuid4
@@ -25,6 +26,7 @@ from designtoolkit.web.heartbeat import (
     stop_heartbeat_thread,
 )
 from designtoolkit.web.media_limits import HostedMediaLimits
+from designtoolkit.web.output_limits import OutputLimitExceeded
 from designtoolkit.web.resources import (
     CleanupMarker,
     RedisReservation,
@@ -1026,33 +1028,45 @@ def prepare_download_artifact(
         child.lstat().st_size for files in output_files.values() for child in files
     )
     if output_size > max_output_bytes:
-        for path in paths:
-            if path.is_dir():
-                shutil.rmtree(path, ignore_errors=True)
-            else:
-                path.unlink(missing_ok=True)
+        _remove_output_paths(paths)
         raise UploadRejectedError("Task output exceeds the configured limit")
     if len(paths) == 1 and paths[0].is_file():
         return paths[0]
 
     archive_path = paths[0].parent / f"{task_id}.zip"
     try:
-        with ZipFile(archive_path, "w", compression=ZIP_DEFLATED) as archive:
-            for path in paths:
-                files = output_files[path]
-                if S_ISREG(path.lstat().st_mode):
-                    archive.write(path, arcname=path.name)
-                    path.unlink()
-                    continue
-                for child in files:
-                    archive.write(
-                        child,
-                        arcname=str(Path(path.name) / child.relative_to(path)),
-                    )
-                    child.unlink()
-                shutil.rmtree(path, ignore_errors=True)
+        with archive_path.open("w+b") as archive_file:
+            budgeted_archive = _BudgetedArchiveFile(
+                archive_file,
+                source_bytes=output_size,
+                max_bytes=max_output_bytes,
+            )
+            with ZipFile(
+                budgeted_archive,
+                "w",
+                compression=ZIP_DEFLATED,
+            ) as archive:
+                for path in paths:
+                    files = output_files[path]
+                    if S_ISREG(path.lstat().st_mode):
+                        _archive_file(
+                            archive,
+                            path,
+                            path.name,
+                            budgeted_archive,
+                        )
+                        continue
+                    for child in files:
+                        _archive_file(
+                            archive,
+                            child,
+                            str(Path(path.name) / child.relative_to(path)),
+                            budgeted_archive,
+                        )
+                    shutil.rmtree(path)
     except Exception:
         archive_path.unlink(missing_ok=True)
+        _remove_output_paths(paths)
         raise
     return archive_path
 
@@ -1061,6 +1075,67 @@ def decode_output_paths(output_value: Sequence[Path] | str) -> list[Path]:
     if isinstance(output_value, str):
         return [Path(value) for value in output_value.split("; ") if value]
     return list(output_value)
+
+
+class _BudgetedArchiveFile:
+    def __init__(
+        self,
+        file: BinaryIO,
+        *,
+        source_bytes: int,
+        max_bytes: int,
+    ) -> None:
+        self._file = file
+        self._source_bytes = source_bytes
+        self._archive_bytes = 0
+        self._max_bytes = max_bytes
+
+    def write(self, data: bytes) -> int:
+        projected_size = max(
+            self._archive_bytes,
+            self._file.tell() + len(data),
+        )
+        if self._source_bytes + projected_size > self._max_bytes:
+            raise OutputLimitExceeded(
+                "Task output exceeds the configured "
+                f"{self._max_bytes}-byte limit"
+            )
+        written = self._file.write(data)
+        self._archive_bytes = max(self._archive_bytes, self._file.tell())
+        return written
+
+    def release_source(self, size: int) -> None:
+        self._source_bytes -= size
+
+    def tell(self) -> int:
+        return self._file.tell()
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        return self._file.seek(offset, whence)
+
+    def flush(self) -> None:
+        self._file.flush()
+
+
+def _archive_file(
+    archive: ZipFile,
+    source: Path,
+    archive_name: str,
+    budgeted_archive: _BudgetedArchiveFile,
+) -> None:
+    source_size = source.lstat().st_size
+    with source.open("rb") as input_file, archive.open(archive_name, "w") as output:
+        shutil.copyfileobj(input_file, output, length=_UPLOAD_CHUNK_BYTES)
+    source.unlink()
+    budgeted_archive.release_source(source_size)
+
+
+def _remove_output_paths(paths: Sequence[Path]) -> None:
+    for path in paths:
+        if path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+        else:
+            path.unlink(missing_ok=True)
 
 
 def _collect_download_files(path: Path) -> tuple[Path, ...]:

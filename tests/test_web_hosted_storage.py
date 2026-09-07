@@ -7,6 +7,7 @@ import subprocess
 from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from random import Random
 from threading import Event
 from time import sleep
 from types import SimpleNamespace
@@ -22,6 +23,7 @@ from designtoolkit.web.hosted import (
     _CleanupClaimHeartbeat,
     prepare_download_artifact,
 )
+from designtoolkit.web.output_limits import OutputLimitExceeded
 from designtoolkit.web.resources import ReservationState, ResourceUnavailableError
 
 
@@ -1836,6 +1838,17 @@ def test_directory_result_is_packaged_as_a_zip(tmp_path: Path) -> None:
     assert not output_dir.exists()
 
 
+def test_single_file_result_is_not_packaged(tmp_path: Path) -> None:
+    output = tmp_path / "result.png"
+    output.write_bytes(b"png")
+
+    artifact = prepare_download_artifact("task-1", [output])
+
+    assert artifact == output
+    assert output.read_bytes() == b"png"
+    assert not (tmp_path / "task-1.zip").exists()
+
+
 def test_structured_multiple_output_paths_are_packaged_as_a_zip(
     tmp_path: Path,
 ) -> None:
@@ -1843,11 +1856,41 @@ def test_structured_multiple_output_paths_are_packaged_as_a_zip(
     for output in outputs:
         output.write_bytes(output.stem.encode())
 
-    artifact = prepare_download_artifact("task-1", outputs)
+    artifact = prepare_download_artifact(
+        "task-1",
+        outputs,
+        max_output_bytes=512,
+    )
 
     with ZipFile(artifact) as archive:
         assert archive.namelist() == ["one.png", "two.png"]
+        assert archive.read("one.png") == b"one"
+        assert archive.read("two.png") == b"two"
     assert all(not output.exists() for output in outputs)
+
+
+def test_archive_stops_when_source_plus_zip_exceeds_physical_budget(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "frames"
+    output_dir.mkdir()
+    source_bytes = 64 * 1024
+    random = Random(0)
+    for index in range(2):
+        (output_dir / f"frame_{index}.bin").write_bytes(
+            random.randbytes(source_bytes)
+        )
+    archive_path = tmp_path / "task-1.zip"
+
+    with pytest.raises(OutputLimitExceeded, match="configured 132096-byte limit"):
+        prepare_download_artifact(
+            "task-1",
+            [output_dir],
+            max_output_bytes=2 * source_bytes + 1024,
+        )
+
+    assert not archive_path.exists()
+    assert not output_dir.exists()
 
 
 def test_legacy_delimited_output_record_is_still_supported(tmp_path: Path) -> None:
@@ -1909,17 +1952,31 @@ def test_partial_zip_is_removed_after_packaging_failure(
     archive_path = tmp_path / "task-1.zip"
 
     class FailingZipFile:
-        def __init__(self, path: Path, *_args, **_kwargs) -> None:
-            self.path = path
+        def __init__(self, archive_file, *_args, **_kwargs) -> None:
+            self.archive_file = archive_file
 
         def __enter__(self):
-            self.path.write_bytes(b"partial zip")
+            self.archive_file.write(b"partial zip")
             return self
 
         def write(self, _path: Path, *, arcname: str) -> None:
             del arcname
             if failure_mode == "write":
                 raise OSError("zip write failed")
+
+        def open(self, _name: str, _mode: str):
+            class FailingArchiveMember:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, _exc_type, _exc, _traceback) -> None:
+                    pass
+
+                def write(self, _data: bytes) -> None:
+                    if failure_mode == "write":
+                        raise OSError("zip write failed")
+
+            return FailingArchiveMember()
 
         def __exit__(self, _exc_type, _exc, _traceback) -> None:
             if failure_mode == "close":
@@ -1931,7 +1988,7 @@ def test_partial_zip_is_removed_after_packaging_failure(
         prepare_download_artifact("task-1", str(output_dir))
 
     assert not archive_path.exists()
-    assert source.exists() is (failure_mode == "write")
+    assert not output_dir.exists()
 
 
 def test_oversized_task_result_is_removed(tmp_path: Path) -> None:
