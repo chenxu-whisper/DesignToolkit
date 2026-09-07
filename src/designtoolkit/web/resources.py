@@ -718,7 +718,9 @@ if kind == "upload" then
             "generation_id",
             generation_id,
             "bytes",
-            reserved_bytes
+            reserved_bytes,
+            "reservation_token",
+            ARGV[1]
         )
         redis.call("SADD", committed_upload_index_key, committed_upload_key)
     end
@@ -754,31 +756,149 @@ return 1
 _ROLLBACK_COMMIT_SCRIPT = """-- rollback_commit
 local state_key = KEYS[1]
 local committed_key = KEYS[2]
-if redis.call("EXISTS", committed_key) == 0 then
-    return 0
-end
-if redis.call("HGET", committed_key, "state") == "rolled_back" then
+local ledger_key = KEYS[3]
+local ledger_index_key = KEYS[4]
+local receipt_key = KEYS[5]
+local release_marker_key = KEYS[6]
+local marker_ttl_ms = tonumber(ARGV[3])
+local expected_kind = ARGV[4]
+local expected_session = ARGV[5]
+local expected_bytes = ARGV[6]
+local expected_asset = ARGV[7]
+local expected_generation = ARGV[8]
+local receipt_state = redis.call("HGET", receipt_key, "state")
+if redis.call("HGET", committed_key, "state") == "rolled_back"
+    or receipt_state == "rolled_back" then
     return 2
 end
-
-local kind = redis.call("HGET", committed_key, "kind")
-local session_id = redis.call("HGET", committed_key, "session_id")
-local committed_bytes = tonumber(redis.call("HGET", committed_key, "bytes") or "0")
-if kind == "upload" then
-    local committed_field = "session:" .. session_id .. ":committed_bytes"
+local generation_upload = expected_kind == "upload"
+    and expected_asset ~= "" and expected_generation ~= ""
+if not generation_upload and redis.call("EXISTS", committed_key) == 0 then
+    return 0
+end
+local function metadata_matches(key)
+    if redis.call("HGET", key, "kind") ~= expected_kind
+        or redis.call("HGET", key, "bytes") ~= expected_bytes
+        or (
+            expected_session ~= ""
+            and redis.call("HGET", key, "session_id") ~= expected_session
+        ) then
+        return false
+    end
+    if generation_upload and (
+        redis.call("HGET", key, "asset_id") ~= expected_asset
+        or redis.call("HGET", key, "generation_id") ~= expected_generation
+    ) then
+        return false
+    end
+    return true
+end
+if redis.call("EXISTS", committed_key) == 1
+    and not metadata_matches(committed_key) then
+    return 3
+end
+if redis.call("EXISTS", receipt_key) == 1 then
+    if redis.call("HGET", receipt_key, "kind") ~= expected_kind
+        or redis.call("HGET", receipt_key, "bytes") ~= expected_bytes
+        or (
+            expected_session ~= ""
+            and redis.call("HGET", receipt_key, "session_id")
+                ~= expected_session
+        ) then
+        return 3
+    end
+    if generation_upload and (
+        redis.call("HGET", receipt_key, "asset_id") ~= expected_asset
+        or redis.call("HGET", receipt_key, "generation_id")
+            ~= expected_generation
+    ) then
+        return 3
+    end
+end
+if generation_upload then
+    if redis.call("EXISTS", release_marker_key) == 1 then
+        if redis.call("HGET", release_marker_key, "session_id")
+                ~= expected_session
+            or redis.call("HGET", release_marker_key, "asset_id")
+                ~= expected_asset
+            or redis.call("HGET", release_marker_key, "generation_id")
+                ~= expected_generation then
+            return 3
+        end
+        local marker_state = redis.call("HGET", release_marker_key, "state")
+        if redis.call("EXISTS", receipt_key) == 1 then
+            if marker_state == "rolled_back" then
+                redis.call("HSET", receipt_key, "state", "rolled_back")
+            else
+                redis.call("HSET", receipt_key, "state", "released")
+            end
+            redis.call("PEXPIRE", receipt_key, tonumber(ARGV[2]))
+        end
+        redis.call("HSET", committed_key, "state", "rolled_back")
+        redis.call("PEXPIRE", committed_key, tonumber(ARGV[1]))
+        return 2
+    end
+    if redis.call("EXISTS", ledger_key) == 0 then
+        if receipt_state ~= "committed" and receipt_state ~= "released" then
+            return 0
+        end
+        redis.call("HSET", receipt_key, "state", "released")
+        redis.call("PEXPIRE", receipt_key, tonumber(ARGV[2]))
+        redis.call("HSET", committed_key, "state", "rolled_back")
+        redis.call("PEXPIRE", committed_key, tonumber(ARGV[1]))
+        return 2
+    end
+    if redis.call("HGET", ledger_key, "session_id") ~= expected_session
+        or redis.call("HGET", ledger_key, "asset_id") ~= expected_asset
+        or redis.call("HGET", ledger_key, "generation_id")
+            ~= expected_generation
+        or redis.call("HGET", ledger_key, "bytes") ~= expected_bytes then
+        return 3
+    end
+end
+local committed_bytes = tonumber(
+    redis.call("HGET", ledger_key, "bytes") or "0"
+)
+if committed_bytes <= 0 then
+    return 4
+end
+if expected_kind == "upload" then
+    local committed_field = "session:" .. expected_session .. ":committed_bytes"
     local current = tonumber(redis.call("HGET", state_key, committed_field) or "0")
+    if committed_bytes > current then
+        return 4
+    end
     local remaining = current - committed_bytes
     if remaining > 0 then
         redis.call("HSET", state_key, committed_field, remaining)
     else
         redis.call("HDEL", state_key, committed_field)
     end
-    local asset_id = redis.call("HGET", committed_key, "asset_id")
-    local generation_id = redis.call("HGET", committed_key, "generation_id")
-    if asset_id and asset_id ~= "" and generation_id and generation_id ~= "" then
-        redis.call("DEL", KEYS[3])
-        redis.call("SREM", KEYS[4], KEYS[3])
-    end
+end
+if generation_upload then
+    redis.call("DEL", ledger_key)
+    redis.call("SREM", ledger_index_key, ledger_key)
+    redis.call(
+        "HMSET",
+        release_marker_key,
+        "session_id",
+        expected_session,
+        "asset_id",
+        expected_asset,
+        "generation_id",
+        expected_generation,
+        "bytes",
+        committed_bytes,
+        "state",
+        "rolled_back",
+        "finalized",
+        "1"
+    )
+    redis.call("PEXPIRE", release_marker_key, marker_ttl_ms)
+end
+if redis.call("EXISTS", receipt_key) == 1 then
+    redis.call("HSET", receipt_key, "state", "rolled_back")
+    redis.call("PEXPIRE", receipt_key, tonumber(ARGV[2]))
 end
 redis.call("HSET", committed_key, "state", "rolled_back")
 redis.call("PEXPIRE", committed_key, tonumber(ARGV[1]))
@@ -794,6 +914,14 @@ if redis.call("EXISTS", KEYS[1]) == 1 then
     return 1
 end
 if redis.call("HGET", KEYS[2], "state") == "committed" then
+    return 2
+end
+if ARGV[1] == "1"
+    and redis.call("HGET", KEYS[3], "state") == "committed"
+    and (
+        redis.call("EXISTS", KEYS[4]) == 1
+        or redis.call("EXISTS", KEYS[5]) == 1
+    ) then
     return 2
 end
 return 0
@@ -1215,6 +1343,25 @@ local session_id = ARGV[1]
 local asset_id = ARGV[2]
 local generation_id = ARGV[3]
 local marker_ttl_ms = tonumber(ARGV[4])
+local receipt_prefix = ARGV[5]
+local receipt_ttl_ms = tonumber(ARGV[6])
+local function sync_receipt(reservation_token, state)
+    if not reservation_token or reservation_token == "" then
+        return
+    end
+    local receipt_key = receipt_prefix .. reservation_token
+    if redis.call("EXISTS", receipt_key) == 0 then
+        return
+    end
+    if redis.call("HGET", receipt_key, "kind") ~= "upload"
+        or redis.call("HGET", receipt_key, "session_id") ~= session_id
+        or redis.call("HGET", receipt_key, "asset_id") ~= asset_id
+        or redis.call("HGET", receipt_key, "generation_id") ~= generation_id then
+        return
+    end
+    redis.call("HSET", receipt_key, "state", state)
+    redis.call("PEXPIRE", receipt_key, receipt_ttl_ms)
+end
 local function retain_recovery_state()
     local marker_ttl = redis.call("PTTL", KEYS[4])
     if marker_ttl < 0 then
@@ -1240,6 +1387,13 @@ if redis.call("EXISTS", KEYS[4]) == 1 then
     if redis.call("HGET", KEYS[4], "finalized") ~= "1" then
         retain_recovery_state()
     end
+    local marker_state = redis.call("HGET", KEYS[4], "state")
+    if marker_state ~= "rolled_back" then
+        sync_receipt(
+            redis.call("HGET", KEYS[4], "reservation_token"),
+            "released"
+        )
+    end
     return 0
 end
 if redis.call("EXISTS", KEYS[2]) == 0 then
@@ -1254,6 +1408,11 @@ local committed_bytes = tonumber(redis.call("HGET", KEYS[2], "bytes") or "0")
 if committed_bytes <= 0 then
     return 3
 end
+local reservation_token = redis.call(
+    "HGET",
+    KEYS[2],
+    "reservation_token"
+)
 local field = "session:" .. session_id .. ":committed_bytes"
 local current = tonumber(redis.call("HGET", KEYS[1], field) or "0")
 if committed_bytes > current then
@@ -1277,10 +1436,15 @@ redis.call(
     "generation_id",
     generation_id,
     "bytes",
-    committed_bytes
+    committed_bytes,
+    "state",
+    "released",
+    "reservation_token",
+    reservation_token or ""
 )
 redis.call("PEXPIRE", KEYS[4], marker_ttl_ms)
 retain_recovery_state()
+sync_receipt(reservation_token, "released")
 return 1
 """
 )
@@ -1733,6 +1897,7 @@ class RedisResourceCoordinator:
         )
         self._reservation_receipt_ttl_ms = max(
             self._reservation_ttl_ms,
+            self._release_marker_ttl_ms,
             _ttl_milliseconds(
                 _RESERVATION_RECOVERY_ATTEMPTS
                 * self.heartbeat_stop_timeout_seconds,
@@ -2655,6 +2820,8 @@ class RedisResourceCoordinator:
                     asset_id,
                     generation_id,
                     self._release_marker_ttl_ms,
+                    _RESERVATION_RECEIPT_PREFIX,
+                    self._reservation_receipt_ttl_ms,
                 ],
             )
         )
@@ -2977,28 +3144,60 @@ class RedisResourceCoordinator:
             )
 
     def _rollback_commit(self, reservation: RedisReservation) -> bool:
+        generation_upload = (
+            reservation.kind == "upload"
+            and reservation.asset_id is not None
+            and reservation.generation_id is not None
+        )
         committed_upload_key = (
             _committed_upload_key(
                 reservation.owner_id,
                 reservation.asset_id,
                 reservation.generation_id,
             )
-            if reservation.kind == "upload"
-            and reservation.asset_id is not None
-            and reservation.generation_id is not None
+            if generation_upload
             else _committed_key(reservation.token)
         )
-        return bool(
+        release_marker_key = (
+            _released_upload_generation_key(
+                reservation.owner_id,
+                reservation.asset_id,
+                reservation.generation_id,
+            )
+            if generation_upload
+            else _committed_key(reservation.token)
+        )
+        result = int(
             self._rollback_commit_script(
                 keys=[
                     _STATE_KEY,
                     _committed_key(reservation.token),
                     committed_upload_key,
                     _session_committed_uploads_key(reservation.owner_id),
+                    _reservation_receipt_key(reservation.token),
+                    release_marker_key,
                 ],
-                args=[self._reservation_ttl_ms],
+                args=[
+                    self._reservation_ttl_ms,
+                    self._reservation_receipt_ttl_ms,
+                    self._release_marker_ttl_ms,
+                    reservation.kind,
+                    reservation.owner_id if reservation.kind == "upload" else "",
+                    reservation.reserved_bytes,
+                    reservation.asset_id or "",
+                    reservation.generation_id or "",
+                ],
             )
         )
+        if result == 3:
+            raise ResourceUnavailableError(
+                f"{reservation.kind.capitalize()} rollback metadata conflict"
+            )
+        if result == 4:
+            raise ResourceUnavailableError(
+                f"{reservation.kind.capitalize()} generation ledger is invalid"
+            )
+        return bool(result)
 
     def _finalize_commit(self, reservation: RedisReservation) -> None:
         self._finalize_commit_script(
@@ -3010,13 +3209,37 @@ class RedisResourceCoordinator:
         self,
         reservation: RedisReservation,
     ) -> ReservationState:
+        generation_upload = (
+            reservation.kind == "upload"
+            and reservation.asset_id is not None
+            and reservation.generation_id is not None
+        )
         state = int(
             self._reservation_state_script(
                 keys=[
                     _reservation_key(reservation.token),
                     _committed_key(reservation.token),
+                    _reservation_receipt_key(reservation.token),
+                    (
+                        _committed_upload_key(
+                            reservation.owner_id,
+                            reservation.asset_id,
+                            reservation.generation_id,
+                        )
+                        if generation_upload
+                        else _committed_key(reservation.token)
+                    ),
+                    (
+                        _released_upload_generation_key(
+                            reservation.owner_id,
+                            reservation.asset_id,
+                            reservation.generation_id,
+                        )
+                        if generation_upload
+                        else _committed_key(reservation.token)
+                    ),
                 ],
-                args=[],
+                args=["1" if generation_upload else "0"],
             )
         )
         if state == 1:

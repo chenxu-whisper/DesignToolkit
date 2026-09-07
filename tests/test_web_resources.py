@@ -17,6 +17,7 @@ from redis.exceptions import RedisError
 from designtoolkit.web.hosted import HostedStorage
 from designtoolkit.web.resources import (
     CleanupMarker,
+    RedisReservation,
     RedisResourceCoordinator,
     ReservationState,
     ResourceUnavailableError,
@@ -517,6 +518,7 @@ class DeterministicRedis(fakeredis.FakeRedis):
                         "asset_id": asset_id,
                         "generation_id": generation_id,
                         "bytes": reserved_bytes,
+                        "reservation_token": args[0],
                     },
                 )
                 self.sadd(
@@ -547,42 +549,165 @@ class DeterministicRedis(fakeredis.FakeRedis):
             committed_key,
             committed_upload_key,
             committed_upload_index_key,
+            receipt_key,
+            release_marker_key,
         ) = keys
-        if not self.exists(committed_key):
-            return 0
-        if self.hget(committed_key, "state") == b"rolled_back":
+        (
+            committed_ttl_ms,
+            receipt_ttl_ms,
+            marker_ttl_ms,
+            expected_kind,
+            expected_session,
+            expected_bytes,
+            expected_asset,
+            expected_generation,
+        ) = args
+        expected_kind = str(expected_kind)
+        expected_session = str(expected_session)
+        expected_bytes = str(expected_bytes)
+        expected_asset = str(expected_asset)
+        expected_generation = str(expected_generation)
+        receipt_state = self.hget(receipt_key, "state")
+        if (
+            self.hget(committed_key, "state") == b"rolled_back"
+            or receipt_state == b"rolled_back"
+        ):
             return 2
-        kind = self._text(self.hget(committed_key, "kind"))
-        session_id = self._text(self.hget(committed_key, "session_id"))
-        committed_bytes = int(self.hget(committed_key, "bytes"))
-        if kind == "upload":
+        generation_upload = (
+            expected_kind == "upload"
+            and expected_asset != ""
+            and expected_generation != ""
+        )
+        if not generation_upload and not self.exists(committed_key):
+            return 0
+
+        def metadata_matches(key: str) -> bool:
+            return (
+                self._text(self.hget(key, "kind")) == expected_kind
+                and self._text(self.hget(key, "bytes")) == expected_bytes
+                and (
+                    not expected_session
+                    or self._text(self.hget(key, "session_id"))
+                    == expected_session
+                )
+                and (
+                    not generation_upload
+                    or (
+                        self._text(self.hget(key, "asset_id"))
+                        == expected_asset
+                        and self._text(self.hget(key, "generation_id"))
+                        == expected_generation
+                    )
+                )
+            )
+
+        if self.exists(committed_key) and not metadata_matches(committed_key):
+            return 3
+        if self.exists(receipt_key) and not metadata_matches(receipt_key):
+            return 3
+        if generation_upload:
+            if self.exists(release_marker_key):
+                if (
+                    self._text(self.hget(release_marker_key, "session_id"))
+                    != expected_session
+                    or self._text(self.hget(release_marker_key, "asset_id"))
+                    != expected_asset
+                    or self._text(
+                        self.hget(release_marker_key, "generation_id")
+                    )
+                    != expected_generation
+                ):
+                    return 3
+                if self.exists(receipt_key):
+                    marker_state = self.hget(release_marker_key, "state")
+                    self.hset(
+                        receipt_key,
+                        "state",
+                        (
+                            "rolled_back"
+                            if marker_state == b"rolled_back"
+                            else "released"
+                        ),
+                    )
+                    self.pexpire(receipt_key, int(receipt_ttl_ms))
+                self.hset(committed_key, "state", "rolled_back")
+                self.pexpire(committed_key, int(committed_ttl_ms))
+                return 2
+            if not self.exists(committed_upload_key):
+                if receipt_state not in {b"committed", b"released"}:
+                    return 0
+                self.hset(receipt_key, "state", "released")
+                self.pexpire(receipt_key, int(receipt_ttl_ms))
+                self.hset(committed_key, "state", "rolled_back")
+                self.pexpire(committed_key, int(committed_ttl_ms))
+                return 2
+            if (
+                self._text(self.hget(committed_upload_key, "session_id"))
+                != expected_session
+                or self._text(self.hget(committed_upload_key, "asset_id"))
+                != expected_asset
+                or self._text(
+                    self.hget(committed_upload_key, "generation_id")
+                )
+                != expected_generation
+                or self._text(self.hget(committed_upload_key, "bytes"))
+                != expected_bytes
+            ):
+                return 3
+        committed_bytes = int(self.hget(committed_upload_key, "bytes") or 0)
+        if committed_bytes <= 0:
+            return 4
+        if expected_kind == "upload":
+            current = self._number(
+                state_key,
+                f"session:{expected_session}:committed_bytes",
+            )
+            if committed_bytes > current:
+                return 4
             self._decrement(
                 state_key,
-                f"session:{session_id}:committed_bytes",
+                f"session:{expected_session}:committed_bytes",
                 committed_bytes,
             )
-            asset_id = self._text(self.hget(committed_key, "asset_id"))
-            generation_id = self._text(
-                self.hget(committed_key, "generation_id")
+        if generation_upload:
+            self.delete(committed_upload_key)
+            self.srem(
+                committed_upload_index_key,
+                committed_upload_key,
             )
-            if asset_id and generation_id:
-                self.delete(committed_upload_key)
-                self.srem(
-                    committed_upload_index_key,
-                    committed_upload_key,
-                )
+            self.hset(
+                release_marker_key,
+                mapping={
+                    "session_id": expected_session,
+                    "asset_id": expected_asset,
+                    "generation_id": expected_generation,
+                    "bytes": committed_bytes,
+                    "state": "rolled_back",
+                    "finalized": "1",
+                },
+            )
+            self.pexpire(release_marker_key, int(marker_ttl_ms))
+        if self.exists(receipt_key):
+            self.hset(receipt_key, "state", "rolled_back")
+            self.pexpire(receipt_key, int(receipt_ttl_ms))
         self.hset(committed_key, "state", "rolled_back")
-        self.pexpire(committed_key, int(args[0]))
+        self.pexpire(committed_key, int(committed_ttl_ms))
         return 1
 
     def _eval_finalize_commit(self, keys, _args):  # noqa: ANN001, ANN202
         return self.delete(keys[0])
 
-    def _eval_reservation_state(self, keys, _args):  # noqa: ANN001, ANN202
-        token_key, committed_key = keys
+    def _eval_reservation_state(self, keys, args):  # noqa: ANN001, ANN202
+        token_key, committed_key, receipt_key, ledger_key, marker_key = keys
         if self.exists(token_key):
             return 1
         if self.hget(committed_key, "state") == b"committed":
+            return 2
+        if (
+            str(args[0]) == "1"
+            and self.hget(receipt_key, "state") == b"committed"
+            and (self.exists(ledger_key) or self.exists(marker_key))
+        ):
             return 2
         return 0
 
@@ -976,10 +1101,34 @@ class DeterministicRedis(fakeredis.FakeRedis):
             pending_release_key,
             pending_release_index_key,
         ) = keys
-        session_id, asset_id, generation_id, marker_ttl_ms = (
+        (
+            session_id,
+            asset_id,
+            generation_id,
+            marker_ttl_ms,
+            receipt_prefix,
+            receipt_ttl_ms,
+        ) = (
             str(value) for value in args
         )
         marker_ttl_ms = int(marker_ttl_ms)
+        receipt_ttl_ms = int(receipt_ttl_ms)
+
+        def sync_receipt(reservation_token: str | None, state: str) -> None:
+            if not reservation_token:
+                return
+            receipt_key = f"{receipt_prefix}{reservation_token}"
+            if (
+                self._text(self.hget(receipt_key, "kind")) != "upload"
+                or self._text(self.hget(receipt_key, "session_id"))
+                != session_id
+                or self._text(self.hget(receipt_key, "asset_id")) != asset_id
+                or self._text(self.hget(receipt_key, "generation_id"))
+                != generation_id
+            ):
+                return
+            self.hset(receipt_key, "state", state)
+            self.pexpire(receipt_key, receipt_ttl_ms)
 
         def retain_recovery_state() -> None:
             marker_ttl = self.pttl(marker_key)
@@ -1008,6 +1157,11 @@ class DeterministicRedis(fakeredis.FakeRedis):
                 return 2
             if self.hget(marker_key, "finalized") != b"1":
                 retain_recovery_state()
+            if self.hget(marker_key, "state") != b"rolled_back":
+                sync_receipt(
+                    self._text(self.hget(marker_key, "reservation_token")),
+                    "released",
+                )
             return 0
         if not self.exists(ledger_key):
             return 0
@@ -1019,6 +1173,9 @@ class DeterministicRedis(fakeredis.FakeRedis):
         ):
             return 2
         committed_bytes = int(self.hget(ledger_key, "bytes") or 0)
+        reservation_token = self._text(
+            self.hget(ledger_key, "reservation_token")
+        )
         field = f"session:{session_id}:committed_bytes"
         if committed_bytes <= 0 or committed_bytes > self._number(
             state_key,
@@ -1035,10 +1192,13 @@ class DeterministicRedis(fakeredis.FakeRedis):
                 "asset_id": asset_id,
                 "generation_id": generation_id,
                 "bytes": committed_bytes,
+                "state": "released",
+                "reservation_token": reservation_token or "",
             },
         )
         self.pexpire(marker_key, marker_ttl_ms)
         retain_recovery_state()
+        sync_receipt(reservation_token, "released")
         return 1
 
     def _eval_is_committed_asset_released(  # noqa: ANN001, ANN202
@@ -2040,6 +2200,225 @@ def test_real_redis_generation_release_ack_loss_is_idempotent(
         generation_id,
     )
     resources.reserve_upload(SESSION_A, 5, free_bytes=100).release()
+
+
+def _committed_generation_pair(
+    redis_connection: Redis,
+) -> tuple[
+    RedisResourceCoordinator,
+    RedisReservation,
+    tuple[str, str],
+]:
+    resources = coordinator(redis_connection, max_session_bytes=9)
+    target_asset = "1" * 32
+    target_generation = "2" * 32
+    target = resources.reserve_upload(
+        SESSION_A,
+        5,
+        free_bytes=100,
+        asset_id=target_asset,
+        generation_id=target_generation,
+    )
+    target.commit()
+    other = resources.reserve_upload(
+        SESSION_A,
+        4,
+        free_bytes=100,
+        asset_id="3" * 32,
+        generation_id="4" * 32,
+    )
+    other.commit()
+    return resources, target, (target_asset, target_generation)
+
+
+def _assert_only_other_generation_remains(
+    redis_connection: Redis,
+    resources: RedisResourceCoordinator,
+) -> None:
+    assert redis_connection.hget(
+        "dt:resource:state",
+        f"session:{SESSION_A}:committed_bytes",
+    ) == b"4"
+    replacement = resources.reserve_upload(
+        SESSION_A,
+        5,
+        free_bytes=100,
+    )
+    with pytest.raises(ResourceUnavailableError, match="session"):
+        resources.reserve_upload(SESSION_A, 6, free_bytes=100)
+    replacement.release()
+
+
+def test_real_redis_generation_release_then_rollback_deducts_once(
+    real_redis_connection: Redis,
+) -> None:
+    resources, target, generation = _committed_generation_pair(
+        real_redis_connection
+    )
+
+    assert resources.release_committed_asset(SESSION_A, *generation)
+    assert target.rollback() is True
+
+    assert real_redis_connection.hget(
+        f"dt:resource:reservation-receipt:{target.token}",
+        "state",
+    ) == b"released"
+    assert real_redis_connection.hget(
+        f"dt:resource:asset-released:{SESSION_A}:{generation[0]}:{generation[1]}",
+        "state",
+    ) == b"released"
+    _assert_only_other_generation_remains(real_redis_connection, resources)
+
+
+def test_real_redis_generation_released_receipt_survives_marker_expiry(
+    real_redis_connection: Redis,
+) -> None:
+    resources, target, generation = _committed_generation_pair(
+        real_redis_connection
+    )
+    marker_key = (
+        f"dt:resource:asset-released:{SESSION_A}:{generation[0]}:{generation[1]}"
+    )
+
+    assert resources.release_committed_asset(SESSION_A, *generation)
+    real_redis_connection.delete(marker_key)
+    assert target.rollback() is True
+
+    assert real_redis_connection.hget(
+        f"dt:resource:reservation-receipt:{target.token}",
+        "state",
+    ) == b"released"
+    _assert_only_other_generation_remains(real_redis_connection, resources)
+
+
+def test_real_redis_generation_rollback_then_release_deducts_once(
+    real_redis_connection: Redis,
+) -> None:
+    resources, target, generation = _committed_generation_pair(
+        real_redis_connection
+    )
+
+    assert target.rollback() is True
+    assert not resources.release_committed_asset(SESSION_A, *generation)
+
+    assert real_redis_connection.hget(
+        f"dt:resource:reservation-receipt:{target.token}",
+        "state",
+    ) == b"rolled_back"
+    marker_key = (
+        f"dt:resource:asset-released:{SESSION_A}:{generation[0]}:{generation[1]}"
+    )
+    assert real_redis_connection.hmget(
+        marker_key,
+        "state",
+        "finalized",
+    ) == [b"rolled_back", b"1"]
+    _assert_only_other_generation_remains(real_redis_connection, resources)
+
+
+def test_real_redis_generation_release_and_rollback_race_deducts_once(
+    real_redis_connection: Redis,
+) -> None:
+    resources, target, generation = _committed_generation_pair(
+        real_redis_connection
+    )
+    start = Barrier(2)
+
+    def release() -> bool:
+        start.wait()
+        return resources.release_committed_asset(SESSION_A, *generation)
+
+    def rollback() -> bool:
+        start.wait()
+        sleep(0.01)
+        return target.rollback()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        release_result = executor.submit(release)
+        rollback_result = executor.submit(rollback)
+        release_result.result()
+        assert rollback_result.result() is True
+
+    assert real_redis_connection.hget(
+        f"dt:resource:reservation-receipt:{target.token}",
+        "state",
+    ) == b"released"
+    _assert_only_other_generation_remains(real_redis_connection, resources)
+
+
+def test_real_redis_generation_rollback_recovers_continuous_commit_ack_loss(
+    real_redis_connection: Redis,
+) -> None:
+    stable_resources = coordinator(real_redis_connection, max_session_bytes=9)
+    other = stable_resources.reserve_upload(
+        SESSION_A,
+        4,
+        free_bytes=100,
+        asset_id="3" * 32,
+        generation_id="4" * 32,
+    )
+    other.commit()
+    failing_redis = ExecuteThenRaiseRedis(
+        "commit_reservation",
+        real_redis_connection,
+        raise_once=False,
+    )
+    resources = coordinator(
+        failing_redis,
+        max_session_bytes=9,
+        reservation_ttl=0.02,
+        reservation_heartbeat_interval=0.005,
+    )
+    asset_id = "1" * 32
+    generation_id = "2" * 32
+    reservation = resources.reserve_upload(
+        SESSION_A,
+        5,
+        free_bytes=100,
+        asset_id=asset_id,
+        generation_id=generation_id,
+    )
+
+    for _attempt in range(3):
+        with pytest.raises(RedisConnectionError, match="acknowledgement lost"):
+            reservation.commit()
+    committed_key = f"dt:resource:committed:{reservation.token}"
+    deadline = monotonic() + 1
+    while real_redis_connection.exists(committed_key) and monotonic() < deadline:
+        sleep(0.005)
+    assert not real_redis_connection.exists(committed_key)
+
+    assert reservation.state() is ReservationState.COMMITTED
+    assert reservation.rollback() is True
+
+    assert real_redis_connection.hget(
+        f"dt:resource:reservation-receipt:{reservation.token}",
+        "state",
+    ) == b"rolled_back"
+    _assert_only_other_generation_remains(real_redis_connection, resources)
+
+
+def test_real_redis_legacy_rollback_without_token_marker_preserves_usage(
+    real_redis_connection: Redis,
+) -> None:
+    resources = coordinator(real_redis_connection, max_session_bytes=9)
+    legacy = resources.reserve_upload(SESSION_A, 5, free_bytes=100)
+    legacy.commit()
+    other = resources.reserve_upload(
+        SESSION_A,
+        4,
+        free_bytes=100,
+        asset_id="3" * 32,
+        generation_id="4" * 32,
+    )
+    other.commit()
+    real_redis_connection.delete(f"dt:resource:committed:{legacy.token}")
+
+    assert not legacy.rollback()
+    assert real_redis_connection.hget(
+        "dt:resource:state",
+        f"session:{SESSION_A}:committed_bytes",
+    ) == b"9"
 
 
 def test_orphan_release_removes_committed_bytes_above_audited_assets(
