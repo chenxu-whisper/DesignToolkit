@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import subprocess
 from collections.abc import Callable, Sequence
-from functools import partial
 from importlib import resources
 from os import name as os_name
 from pathlib import Path
+from shutil import which
 
 import imageio_ffmpeg
 
@@ -27,20 +27,16 @@ def _is_relative_to(path: Path, directory: Path) -> bool:
     return True
 
 
-def _set_file_size_limit(max_bytes: int) -> None:
-    import resource
-
-    resource.setrlimit(resource.RLIMIT_FSIZE, (max_bytes, max_bytes))
-
-
-def _file_size_limit_preexec(
+def _file_size_limited_command(
+    command: Sequence[str],
     max_bytes: int | None,
-    *,
-    os_name: str = os_name,
-) -> Callable[[], None] | None:
+) -> list[str]:
     if os_name != "posix" or max_bytes is None:
-        return None
-    return partial(_set_file_size_limit, max_bytes)
+        return list(command)
+    prlimit = which("prlimit")
+    if prlimit is None:
+        return list(command)
+    return [prlimit, f"--fsize={max_bytes}", "--", *command]
 
 
 class FfmpegBackend:
@@ -115,11 +111,8 @@ class FfmpegBackend:
             "encoding": "utf-8",
             "errors": "replace",
         }
-        preexec_fn = _file_size_limit_preexec(self._max_file_bytes)
-        if preexec_fn is not None:
-            popen_kwargs["preexec_fn"] = preexec_fn
         process = self._popen(
-            list(command),
+            _file_size_limited_command(command, self._max_file_bytes),
             **popen_kwargs,
         )
         while True:

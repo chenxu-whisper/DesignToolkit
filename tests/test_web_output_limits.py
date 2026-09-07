@@ -9,10 +9,8 @@ from typing import Any
 
 import pytest
 
-from designtoolkit.video_frames.ffmpeg_backend import (
-    FfmpegBackend,
-    _file_size_limit_preexec,
-)
+from designtoolkit.video_frames import ffmpeg_backend
+from designtoolkit.video_frames.ffmpeg_backend import FfmpegBackend
 from designtoolkit.web.output_limits import (
     OutputBudgetGuard,
     OutputLimitExceeded,
@@ -516,9 +514,89 @@ def test_ffmpeg_backend_preserves_limit_error_during_exit_race(
         backend.run(["ffmpeg", "out.mp4"])
 
 
-def test_file_size_limit_preexec_is_disabled_on_windows() -> None:
-    assert _file_size_limit_preexec(10, os_name="nt") is None
+def test_ffmpeg_backend_wraps_posix_command_without_preexec(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = FakePopen([("", "encode failed")], returncode=23)
+    calls: list[tuple[list[str], dict[str, Any]]] = []
+    monkeypatch.setattr(ffmpeg_backend, "os_name", "posix")
+    monkeypatch.setattr(
+        ffmpeg_backend,
+        "which",
+        lambda executable: "/usr/bin/prlimit" if executable == "prlimit" else None,
+    )
+    backend = FfmpegBackend(
+        popen=_popen_factory(process, calls),
+        max_file_bytes=123_456,
+    )
+
+    result = backend.run(["ffmpeg", "-i", "input.mp4", "out.mp4"])
+
+    assert calls[0][0] == [
+        "/usr/bin/prlimit",
+        "--fsize=123456",
+        "--",
+        "ffmpeg",
+        "-i",
+        "input.mp4",
+        "out.mp4",
+    ]
+    assert "preexec_fn" not in calls[0][1]
+    assert result.returncode == 23
+    assert result.stderr == "encode failed"
 
 
-def test_file_size_limit_preexec_is_created_for_posix() -> None:
-    assert callable(_file_size_limit_preexec(10, os_name="posix"))
+def test_ffmpeg_backend_falls_back_to_monitor_when_prlimit_is_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "out.mp4"
+
+    class GrowingOutputPopen(FakePopen):
+        def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+            del timeout
+            target.write_bytes(b"x" * 80)
+            raise subprocess.TimeoutExpired("ffmpeg", 0.01)
+
+    process = GrowingOutputPopen([])
+    calls: list[tuple[list[str], dict[str, Any]]] = []
+    monkeypatch.setattr(ffmpeg_backend, "os_name", "posix")
+    monkeypatch.setattr(ffmpeg_backend, "which", lambda _executable: None)
+    backend = FfmpegBackend(
+        output_guard=OutputBudgetGuard(tmp_path, max_bytes=80, safety_bytes=1),
+        poll_interval=0.01,
+        popen=_popen_factory(process, calls),
+        max_file_bytes=79,
+    )
+
+    with pytest.raises(OutputLimitExceeded, match="80-byte limit"):
+        backend.run(["ffmpeg", str(target)])
+
+    assert calls[0][0] == ["ffmpeg", str(target)]
+    assert "preexec_fn" not in calls[0][1]
+    assert process.terminate_called
+
+
+def test_ffmpeg_backend_keeps_windows_command_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = FakePopen([("", "")])
+    calls: list[tuple[list[str], dict[str, Any]]] = []
+    monkeypatch.setattr(ffmpeg_backend, "os_name", "nt")
+    monkeypatch.setattr(
+        ffmpeg_backend,
+        "which",
+        lambda _executable: (_ for _ in ()).throw(
+            AssertionError("Windows must not search for prlimit")
+        ),
+    )
+    backend = FfmpegBackend(
+        popen=_popen_factory(process, calls),
+        max_file_bytes=123_456,
+    )
+
+    result = backend.run(["ffmpeg", "out.mp4"])
+
+    assert calls[0][0] == ["ffmpeg", "out.mp4"]
+    assert "preexec_fn" not in calls[0][1]
+    assert result.returncode == 0
