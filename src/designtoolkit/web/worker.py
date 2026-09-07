@@ -17,6 +17,7 @@ from designtoolkit.web.heartbeat import (
 from designtoolkit.web.hosted import (
     HostedSettings,
     HostedStorage,
+    decode_output_paths,
     prepare_download_artifact,
     redis_connection_options,
 )
@@ -147,20 +148,21 @@ class RedisTaskExecutor(TaskManager):
     def _mark_succeeded(
         self,
         task_id: str,
-        output_path: str,
+        output_paths: list[Path] | str,
         *,
         elapsed_seconds: float | None = None,
         frame_count: int | None = None,
     ) -> None:
         artifact: Path | None = None
+        paths = decode_output_paths(output_paths)
         archive_candidate = (
-            Path(output_path.split("; ", 1)[0]).parent / f"{task_id}.zip"
+            paths[0].parent / f"{task_id}.zip" if paths else None
         )
         try:
             self._check_output_tree()
             artifact = prepare_download_artifact(
                 task_id,
-                output_path,
+                paths,
                 max_output_bytes=self._max_output_bytes,
             )
             self._validate_artifact(artifact)
@@ -191,7 +193,8 @@ class RedisTaskExecutor(TaskManager):
         except Exception as exc:
             if artifact is not None:
                 artifact.unlink(missing_ok=True)
-            archive_candidate.unlink(missing_ok=True)
+            if archive_candidate is not None:
+                archive_candidate.unlink(missing_ok=True)
             self._discard_partial_output()
             output_limit_error = _find_output_limit_error(exc)
             self._mark_failed(
@@ -217,7 +220,8 @@ class RedisTaskExecutor(TaskManager):
                     artifact.unlink(missing_ok=True)
                 return
             artifact.unlink(missing_ok=True)
-            archive_candidate.unlink(missing_ok=True)
+            if archive_candidate is not None:
+                archive_candidate.unlink(missing_ok=True)
             self._discard_partial_output()
             self._mark_failed(task_id, str(exc))
             return

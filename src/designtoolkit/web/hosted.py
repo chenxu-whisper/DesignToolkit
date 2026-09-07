@@ -5,7 +5,7 @@ import logging
 import os
 import re
 import shutil
-from collections.abc import AsyncIterable, Callable, Mapping
+from collections.abc import AsyncIterable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from math import isfinite
 from pathlib import Path
@@ -1014,11 +1014,11 @@ def new_session_id() -> str:
 
 def prepare_download_artifact(
     task_id: str,
-    output_value: str,
+    output_value: Sequence[Path] | str,
     *,
     max_output_bytes: int = _DEFAULT_MAX_OUTPUT_BYTES,
 ) -> Path:
-    paths = [Path(value) for value in output_value.split("; ") if value]
+    paths = decode_output_paths(output_value)
     if not paths or any(not path.exists() for path in paths):
         raise FileNotFoundError("Task output is not available")
     output_files = {path: _collect_download_files(path) for path in paths}
@@ -1055,6 +1055,12 @@ def prepare_download_artifact(
         archive_path.unlink(missing_ok=True)
         raise
     return archive_path
+
+
+def decode_output_paths(output_value: Sequence[Path] | str) -> list[Path]:
+    if isinstance(output_value, str):
+        return [Path(value) for value in output_value.split("; ") if value]
+    return list(output_value)
 
 
 def _collect_download_files(path: Path) -> tuple[Path, ...]:

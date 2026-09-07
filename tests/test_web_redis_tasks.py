@@ -2517,6 +2517,50 @@ def test_worker_executor_runs_reserved_task_and_persists_success(
     assert Path(completed.result_path).is_file()
 
 
+def test_worker_publishes_single_output_with_semicolon_in_filename(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    state = _manager(redis_connection, tmp_path)
+    input_path = tmp_path / "assets" / "photo.png"
+    input_path.parent.mkdir()
+    input_path.write_bytes(b"input")
+    output_path = tmp_path / "task-output" / "a; b.png"
+    output_path.parent.mkdir()
+    request = ChromaKeyerTaskRequest(
+        input_path=str(input_path),
+        samples=[[0, 255, 0]],
+        params={},
+        output_path=str(output_path),
+    )
+    task = state.create_chroma_keyer_task(request, owner_id="a" * 32)
+    executor = RedisTaskExecutor(state)
+    received_outputs: list[object] = []
+    original_prepare = worker_module.prepare_download_artifact
+
+    def prepare(task_id, output_paths, **kwargs):
+        received_outputs.append(output_paths)
+        return original_prepare(task_id, output_paths, **kwargs)
+
+    def key_image(options, _model, _params) -> KeyImageResult:
+        assert options.output_path is not None
+        options.output_path.write_bytes(b"png")
+        return KeyImageResult(output_path=options.output_path)
+
+    monkeypatch.setattr(worker_module, "prepare_download_artifact", prepare)
+    executor._keyer = key_image
+
+    executor.execute_reserved_task(task, request)
+
+    completed = state.get_task(task.task_id, owner_id="a" * 32)
+    assert completed is not None
+    assert completed.status is TaskStatus.SUCCEEDED
+    assert received_outputs == [[output_path]]
+    assert completed.result_path == str(output_path)
+    assert output_path.read_bytes() == b"png"
+
+
 def test_worker_preserves_success_artifact_when_terminal_ack_is_lost(
     tmp_path: Path,
 ) -> None:

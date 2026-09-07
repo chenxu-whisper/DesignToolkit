@@ -10,6 +10,7 @@ from pathlib import Path
 from threading import Event
 from time import sleep
 from types import SimpleNamespace
+from zipfile import ZipFile
 
 import pytest
 from redis.exceptions import ConnectionError as RedisConnectionError
@@ -1833,6 +1834,35 @@ def test_directory_result_is_packaged_as_a_zip(tmp_path: Path) -> None:
     assert artifact == tmp_path / "task-1.zip"
     assert artifact.is_file()
     assert not output_dir.exists()
+
+
+def test_structured_multiple_output_paths_are_packaged_as_a_zip(
+    tmp_path: Path,
+) -> None:
+    outputs = [tmp_path / "one.png", tmp_path / "two.png"]
+    for output in outputs:
+        output.write_bytes(output.stem.encode())
+
+    artifact = prepare_download_artifact("task-1", outputs)
+
+    with ZipFile(artifact) as archive:
+        assert archive.namelist() == ["one.png", "two.png"]
+    assert all(not output.exists() for output in outputs)
+
+
+def test_legacy_delimited_output_record_is_still_supported(tmp_path: Path) -> None:
+    outputs = [tmp_path / "one.png", tmp_path / "two.png"]
+    for output in outputs:
+        output.write_bytes(output.stem.encode())
+
+    artifact = prepare_download_artifact(
+        "task-1",
+        "; ".join(str(output) for output in outputs),
+    )
+
+    with ZipFile(artifact) as archive:
+        assert archive.namelist() == ["one.png", "two.png"]
+    assert all(not output.exists() for output in outputs)
 
 
 def test_download_artifact_rejects_linked_directory_child(

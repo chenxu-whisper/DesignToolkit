@@ -383,7 +383,7 @@ class TaskManager:
             return
         self._mark_succeeded(
             task.task_id,
-            "; ".join(str(result.output_dir) for result in results),
+            [result.output_dir for result in results],
             elapsed_seconds=self._elapsed_seconds(task_started_at),
         )
 
@@ -443,7 +443,7 @@ class TaskManager:
             return
         self._mark_succeeded(
             task.task_id,
-            "; ".join(str(result.output_path) for result in results),
+            [result.output_path for result in results],
             elapsed_seconds=self._elapsed_seconds(task_started_at),
         )
 
@@ -478,7 +478,7 @@ class TaskManager:
             return
         self._mark_succeeded(
             task.task_id,
-            str(result.output_path),
+            [result.output_path],
             elapsed_seconds=self._elapsed_seconds(task_started_at),
         )
 
@@ -593,7 +593,7 @@ class TaskManager:
             return
         self._mark_succeeded(
             task.task_id,
-            str(result.output_dir),
+            [result.output_dir],
             elapsed_seconds=self._elapsed_seconds(task_started_at),
             frame_count=result.frame_count,
         )
@@ -613,11 +613,12 @@ class TaskManager:
     def _mark_succeeded(
         self,
         task_id: str,
-        output_path: str,
+        output_paths: list[Path],
         *,
         elapsed_seconds: float | None = None,
         frame_count: int | None = None,
     ) -> None:
+        output_path = "; ".join(str(path) for path in output_paths)
         details: dict[str, object] = {"output_path": output_path}
         if elapsed_seconds is not None:
             details["elapsed_seconds"] = elapsed_seconds
