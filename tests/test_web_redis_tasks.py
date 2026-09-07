@@ -320,6 +320,90 @@ def test_enqueue_failure_discards_staged_rq_transaction(
     assert list(redis_connection.scan_iter(match="dt:enqueue-owner:*")) == []
 
 
+def test_enqueue_failure_releases_asset_reference(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = _manager(redis_connection, tmp_path)
+    asset_id = "1" * 32
+
+    def fail_create_job(*_args, **_kwargs):
+        raise RuntimeError("job creation failed")
+
+    monkeypatch.setattr(manager.queue, "create_job", fail_create_job)
+
+    with pytest.raises(RuntimeError, match="job creation failed"):
+        manager.create_video_frames_task(
+            VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+            owner_id="a" * 32,
+            asset_ids=(asset_id,),
+        )
+
+    claim = manager.claim_asset_deletion("a" * 32, asset_id)
+    manager.release_asset_deletion("a" * 32, asset_id, claim)
+    assert list(
+        redis_connection.scan_iter(match="dt:resource:asset-tasks:*")
+    ) == []
+
+
+def test_real_redis_asset_deletion_claim_blocks_enqueue(
+    real_redis_connection: Redis,
+    tmp_path: Path,
+) -> None:
+    manager = _manager(real_redis_connection, tmp_path)
+    session_id = "a" * 32
+    asset_id = "1" * 32
+    claim = manager.claim_asset_deletion(session_id, asset_id)
+
+    with pytest.raises(TaskConflictError, match="deletion is already in progress"):
+        manager.create_video_frames_task(
+            VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+            owner_id=session_id,
+            asset_ids=(asset_id,),
+        )
+
+    assert manager.queue.count == 0
+    assert real_redis_connection.llen("dt:queue:reservations") == 0
+    manager.release_asset_deletion(session_id, asset_id, claim)
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+        owner_id=session_id,
+        asset_ids=(asset_id,),
+    )
+    assert task.status is TaskStatus.QUEUED
+
+
+def test_real_redis_reconcile_releases_terminal_asset_pin_after_ack_loss(
+    real_redis_connection: Redis,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(real_redis_connection, tmp_path)
+    session_id = "a" * 32
+    asset_id = "1" * 32
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+        owner_id=session_id,
+        asset_ids=(asset_id,),
+    )
+    release_task_pin = manager.release_task_pin
+
+    def lose_release_acknowledgement(_task_id: str) -> bool:
+        raise RedisConnectionError("task pin release acknowledgement lost")
+
+    monkeypatch.setattr(manager, "release_task_pin", lose_release_acknowledgement)
+
+    with pytest.raises(RedisConnectionError, match="acknowledgement lost"):
+        manager.mark_finished(task.task_id, status=TaskStatus.SUCCEEDED)
+
+    assert manager.get_task(task.task_id).status is TaskStatus.SUCCEEDED
+    monkeypatch.setattr(manager, "release_task_pin", release_task_pin)
+    assert manager.reconcile_tasks(grace_seconds=60) == 1
+    claim = manager.claim_asset_deletion(session_id, asset_id)
+    manager.release_asset_deletion(session_id, asset_id, claim)
+
+
 def test_redis_manager_rejects_when_waiting_queue_is_full(tmp_path: Path) -> None:
     redis_connection = fakeredis.FakeRedis(decode_responses=False)
     manager = _manager(redis_connection, tmp_path, max_queued_tasks=1)
@@ -2258,6 +2342,7 @@ def test_real_redis_reconcile_fails_uncommitted_ambiguous_enqueue(
     )
     original_confirmation = manager._enqueue_has_authoritative_evidence
     confirmation_calls = 0
+    asset_id = "1" * 32
 
     def enqueue_without_commit(*_args, **_kwargs):
         raise RedisConnectionError("enqueue disconnected before commit")
@@ -2279,9 +2364,12 @@ def test_real_redis_reconcile_fails_uncommitted_ambiguous_enqueue(
     task = manager.create_video_frames_task(
         VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
         owner_id="a" * 32,
+        asset_ids=(asset_id,),
     )
 
     assert task.status is TaskStatus.QUEUED
+    with pytest.raises(TaskConflictError, match="referenced by an active task"):
+        manager.claim_asset_deletion("a" * 32, asset_id)
     intent = real_redis_connection.hgetall(
         f"dt:enqueue-intent:{task.task_id}"
     )
@@ -2312,6 +2400,11 @@ def test_real_redis_reconcile_fails_uncommitted_ambiguous_enqueue(
     claim = resources.claim_session_cleanup("a" * 32)
     assert claim is not None
     resources.release_cleanup_claim("a" * 32, claim)
+    asset_claim = manager.claim_asset_deletion("a" * 32, asset_id)
+    manager.release_asset_deletion("a" * 32, asset_id, asset_claim)
+    assert list(
+        real_redis_connection.scan_iter(match="dt:resource:asset-tasks:*")
+    ) == []
 
 
 def test_cleanup_once_reclaims_orphaned_real_redis_queue_slot(

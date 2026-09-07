@@ -30,6 +30,7 @@ _CLEANUP_GENERATION_PREFIX = "dt:resource:cleanup-generation:"
 _LEGACY_CLEANUP_PREFIX = "dt:resource:legacy-cleanup:"
 _TASK_RESOURCE_PREFIX = "dt:resource:task:"
 _TASK_PIN_PREFIX = "dt:resource:task-pin:"
+_ASSET_TASK_PREFIX = "dt:resource:asset-tasks:"
 _SESSION_PATTERN = re.compile(r"^[a-f0-9]{32}$")
 _ASSET_PATTERN = re.compile(r"^[a-f0-9]{32}$")
 _TOKEN_PATTERN = re.compile(r"^[a-f0-9]{32}$")
@@ -857,6 +858,17 @@ if redis.call("HGET", KEYS[1], "session_id") ~= ARGV[1] then
 end
 if redis.call("HGET", KEYS[1], "task_id") ~= ARGV[2] then
     return 2
+end
+local asset_ids_json = redis.call("HGET", KEYS[1], "asset_ids")
+if asset_ids_json then
+    local asset_ids = cjson.decode(asset_ids_json)
+    for _, asset_id in ipairs(asset_ids) do
+        local asset_tasks_key = ARGV[3] .. ARGV[1] .. ":" .. asset_id
+        redis.call("SREM", asset_tasks_key, ARGV[2])
+        if redis.call("SCARD", asset_tasks_key) == 0 then
+            redis.call("DEL", asset_tasks_key)
+        end
+    end
 end
 redis.call("DEL", KEYS[1])
 redis.call("SREM", KEYS[2], ARGV[2])
@@ -1719,6 +1731,7 @@ class RedisResourceCoordinator:
                 args=[
                     session_id,
                     task_id,
+                    _ASSET_TASK_PREFIX,
                 ],
             )
         )
@@ -1898,6 +1911,10 @@ def _task_resource_key(task_id: str) -> str:
 
 def _task_pin_key(task_id: str) -> str:
     return f"{_TASK_PIN_PREFIX}{task_id}"
+
+
+def _asset_tasks_key(session_id: str, asset_id: str) -> str:
+    return f"{_ASSET_TASK_PREFIX}{session_id}:{asset_id}"
 
 
 def _decoded_hash_value(

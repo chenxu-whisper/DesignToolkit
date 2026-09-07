@@ -10,6 +10,7 @@ from numbers import Integral, Real
 from os import stat_result
 from pathlib import Path
 from threading import Lock
+from typing import Literal
 
 from PIL import Image
 
@@ -41,8 +42,8 @@ _DEFAULT_CACHE_SIZE = 128
 
 
 @dataclass(frozen=True)
-class _ValidatedMedia:
-    media_type: str
+class ValidatedMedia:
+    media_type: Literal["image", "video"]
     width: int
     height: int
     video_metadata: VideoMetadata | None = None
@@ -50,7 +51,7 @@ class _ValidatedMedia:
 
 _StatIdentity = tuple[int | None, int | None, int, int | None, int | None]
 _CacheKey = tuple[Path, _StatIdentity]
-_CacheEntry = _ValidatedMedia | MediaLimitError
+_CacheEntry = ValidatedMedia | MediaLimitError
 
 
 class HostedMediaValidator:
@@ -67,10 +68,10 @@ class HostedMediaValidator:
         self._video_probe = video_probe or ImageioVideoDecoder().probe
         self._cache_size = cache_size
         self._cache: OrderedDict[_CacheKey, _CacheEntry] = OrderedDict()
-        self._inflight: dict[_CacheKey, Future[_ValidatedMedia]] = {}
+        self._inflight: dict[_CacheKey, Future[ValidatedMedia]] = {}
         self._cache_lock = Lock()
 
-    def validate(self, path: Path) -> VideoMetadata | None:
+    def validate_media(self, path: Path) -> ValidatedMedia:
         resolved_path = path.resolve()
         suffix = resolved_path.suffix.lower()
         if suffix not in _IMAGE_SUFFIXES | _VIDEO_SUFFIXES:
@@ -91,7 +92,7 @@ class HostedMediaValidator:
                 self._cache[cache_key] = cached
                 if isinstance(cached, MediaLimitError):
                     raise cached
-                return cached.video_metadata
+                return cached
 
             future = self._inflight.get(cache_key)
             if future is None:
@@ -102,7 +103,7 @@ class HostedMediaValidator:
                 owns_probe = False
 
         if not owns_probe:
-            return future.result().video_metadata
+            return future.result()
 
         try:
             validated = self._validate_uncached(resolved_path, suffix)
@@ -126,7 +127,10 @@ class HostedMediaValidator:
                 self._trim_cache()
                 self._inflight.pop(cache_key, None)
             future.set_result(validated)
-            return validated.video_metadata
+            return validated
+
+    def validate(self, path: Path) -> VideoMetadata | None:
+        return self.validate_media(path).video_metadata
 
     def _trim_cache(self) -> None:
         while len(self._cache) > self._cache_size:
@@ -135,17 +139,17 @@ class HostedMediaValidator:
     def validate_video(self, path: Path) -> VideoMetadata:
         if path.suffix.lower() not in _VIDEO_SUFFIXES:
             raise MediaLimitError("invalid_media", "Media type is not a video")
-        metadata = self.validate(path)
+        metadata = self.validate_media(path).video_metadata
         if metadata is None:
             raise MediaLimitError("invalid_media", "Video metadata could not be read")
         return metadata
 
-    def _validate_uncached(self, path: Path, suffix: str) -> _ValidatedMedia:
+    def _validate_uncached(self, path: Path, suffix: str) -> ValidatedMedia:
         if suffix in _IMAGE_SUFFIXES:
             width, height = self._validate_image(path)
-            return _ValidatedMedia("image", width, height)
+            return ValidatedMedia("image", width, height)
         metadata = self._validate_video(path)
-        return _ValidatedMedia(
+        return ValidatedMedia(
             "video",
             metadata.width,
             metadata.height,
@@ -156,11 +160,20 @@ class HostedMediaValidator:
         self,
         paths: Iterable[Path],
     ) -> list[VideoMetadata | None]:
+        return [
+            media.video_metadata
+            for media in self.validate_media_many(paths)
+        ]
+
+    def validate_media_many(
+        self,
+        paths: Iterable[Path],
+    ) -> list[ValidatedMedia]:
         resolved_paths = [path.resolve() for path in paths]
-        validated: dict[Path, VideoMetadata | None] = {}
+        validated: dict[Path, ValidatedMedia] = {}
         for path in resolved_paths:
             if path not in validated:
-                validated[path] = self.validate(path)
+                validated[path] = self.validate_media(path)
         return [validated[path] for path in resolved_paths]
 
     def _validate_image(self, path: Path) -> tuple[int, int]:

@@ -1288,6 +1288,104 @@ def test_hosted_task_uses_uploaded_asset_and_is_session_isolated(
     assert stranger_status.status_code == 404
 
 
+@pytest.mark.parametrize("status", [TaskStatus.QUEUED, TaskStatus.RUNNING])
+def test_delete_upload_rejects_asset_referenced_by_active_task(
+    tmp_path: Path,
+    status: TaskStatus,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = RedisTaskManager(
+        redis_connection=redis_connection,
+        queue=Queue("designtoolkit", connection=redis_connection),
+        data_dir=tmp_path,
+        max_queued_tasks=20,
+        retention_seconds=7200,
+    )
+    with _client(tmp_path, task_manager=manager) as client:
+        reference = _upload(client, "clip.mp4", b"video").json()["reference"]
+        asset_id = reference.split(":", 2)[1]
+        session_id = client.cookies["dt_session"]
+        asset_path = HostedStorage(tmp_path, max_upload_bytes=1024).resolve(
+            session_id,
+            reference,
+        )
+        created = client.post(
+            "/api/tasks/video-frames",
+            json={"input_path": reference, "image_format": "png"},
+        )
+        task_id = created.json()["task_id"]
+        if status is TaskStatus.RUNNING:
+            manager.mark_running(task_id)
+
+        deleted = client.delete(f"/api/uploads/{asset_id}")
+
+    assert created.status_code == 202
+    assert deleted.status_code == 409
+    assert deleted.json()["error"]["code"] == "asset_in_use"
+    assert asset_path.read_bytes() == b"video"
+
+
+def test_delete_upload_accepts_asset_after_task_becomes_terminal(
+    tmp_path: Path,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = RedisTaskManager(
+        redis_connection=redis_connection,
+        queue=Queue("designtoolkit", connection=redis_connection),
+        data_dir=tmp_path,
+        max_queued_tasks=20,
+        retention_seconds=7200,
+    )
+    with _client(tmp_path, task_manager=manager) as client:
+        reference = _upload(client, "clip.mp4", b"video").json()["reference"]
+        asset_id = reference.split(":", 2)[1]
+        created = client.post(
+            "/api/tasks/video-frames",
+            json={"input_path": reference, "image_format": "png"},
+        )
+        manager.mark_finished(
+            created.json()["task_id"],
+            status=TaskStatus.SUCCEEDED,
+        )
+
+        deleted = client.delete(f"/api/uploads/{asset_id}")
+
+    assert created.status_code == 202
+    assert deleted.status_code == 204
+    assert list(tmp_path.glob(f"sessions/*/assets/{asset_id}")) == []
+
+
+def test_delete_upload_waits_for_all_tasks_sharing_asset_to_finish(
+    tmp_path: Path,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = RedisTaskManager(
+        redis_connection=redis_connection,
+        queue=Queue("designtoolkit", connection=redis_connection),
+        data_dir=tmp_path,
+        max_queued_tasks=20,
+        retention_seconds=7200,
+    )
+    with _client(tmp_path, task_manager=manager) as client:
+        reference = _upload(client, "clip.mp4", b"video").json()["reference"]
+        asset_id = reference.split(":", 2)[1]
+        task_ids = [
+            client.post(
+                "/api/tasks/video-frames",
+                json={"input_path": reference, "image_format": "png"},
+            ).json()["task_id"]
+            for _index in range(2)
+        ]
+        manager.mark_finished(task_ids[0], status=TaskStatus.SUCCEEDED)
+
+        still_referenced = client.delete(f"/api/uploads/{asset_id}")
+        manager.mark_finished(task_ids[1], status=TaskStatus.FAILED, error="failed")
+        deleted = client.delete(f"/api/uploads/{asset_id}")
+
+    assert still_referenced.status_code == 409
+    assert deleted.status_code == 204
+
+
 def test_hosted_task_holds_session_lease_through_queue_creation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2097,6 +2195,93 @@ def test_hosted_batch_resize_uses_unique_managed_output_directory(
     payload = job.args[2]
     assert payload["output_dir"].startswith(str(tmp_path))
     assert payload["output_path"] is None
+
+
+@pytest.mark.parametrize(
+    ("filename", "content", "route", "payload"),
+    [
+        (
+            "screen.png",
+            _png_bytes(),
+            "/api/tasks/video-frames",
+            {"image_format": "png"},
+        ),
+        (
+            "clip.mp4",
+            b"video",
+            "/api/tasks/chroma-keyer",
+            {"samples": [[0, 255, 0]], "params": {}},
+        ),
+    ],
+)
+def test_hosted_task_rejects_wrong_input_media_type_before_enqueue(
+    tmp_path: Path,
+    filename: str,
+    content: bytes,
+    route: str,
+    payload: dict[str, object],
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = RedisTaskManager(
+        redis_connection=redis_connection,
+        queue=Queue("designtoolkit", connection=redis_connection),
+        data_dir=tmp_path,
+        max_queued_tasks=20,
+        retention_seconds=7200,
+    )
+    with _client(tmp_path, task_manager=manager) as client:
+        reference = _upload(client, filename, content).json()["reference"]
+        response = client.post(route, json={"input_path": reference, **payload})
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_request"
+    assert manager.queue.count == 0
+    assert redis_connection.llen("dt:queue:reservations") == 0
+    assert list(redis_connection.scan_iter(match="dt:task:*")) == []
+    assert list(tmp_path.glob("sessions/*/tasks/*")) == []
+
+
+@pytest.mark.parametrize(
+    ("filename", "content", "route", "payload"),
+    [
+        (
+            "clip.mp4",
+            b"video",
+            "/api/tasks/video-frames",
+            {"image_format": "png"},
+        ),
+        (
+            "screen.png",
+            _png_bytes(),
+            "/api/tasks/chroma-keyer",
+            {"samples": [[0, 255, 0]], "params": {}},
+        ),
+        (
+            "screen.png",
+            _png_bytes(),
+            "/api/tasks/media-resize",
+            {"size": "100x100"},
+        ),
+        (
+            "clip.mp4",
+            b"video",
+            "/api/tasks/media-resize",
+            {"size": "100x100"},
+        ),
+    ],
+)
+def test_hosted_task_accepts_matching_input_media_type(
+    tmp_path: Path,
+    filename: str,
+    content: bytes,
+    route: str,
+    payload: dict[str, object],
+) -> None:
+    with _client(tmp_path) as client:
+        reference = _upload(client, filename, content).json()["reference"]
+        response = client.post(route, json={"input_path": reference, **payload})
+
+    assert response.status_code == 202
 
 
 def test_hosted_queue_rejection_removes_empty_task_directory(

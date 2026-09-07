@@ -57,6 +57,7 @@ from designtoolkit.web.hosted import (
     HostedSettings,
     HostedStorage,
     UploadRejectedError,
+    _asset_id,
     _safe_filename,
 )
 from designtoolkit.web.local_paths import resolve_dropped_file_paths
@@ -837,13 +838,33 @@ def create_router(
     def validate_hosted_paths(
         http_request: Request,
         paths: list[Path],
+        *,
+        allowed_media_types: frozenset[str] | None = None,
     ) -> None:
+        del http_request
         if media_validator is None:
             return
         try:
-            media_validator.validate_many(paths)
+            validated = media_validator.validate_media_many(paths)
         except MediaLimitError as exc:
             raise _media_limit_error_response(exc) from exc
+        if allowed_media_types is None:
+            return
+        invalid = next(
+            (
+                media.media_type
+                for media in validated
+                if media.media_type not in allowed_media_types
+            ),
+            None,
+        )
+        if invalid is not None:
+            expected = " or ".join(sorted(allowed_media_types))
+            raise ApiError(
+                "invalid_request",
+                f"Task input must be {expected}, not {invalid}",
+                422,
+            )
 
     def resolve_input_path(http_request: Request, reference: str) -> Path:
         path = resolve_hosted_asset(http_request, reference)
@@ -927,6 +948,8 @@ def create_router(
         http_request: Request,
         create_task: Callable[..., TaskRecord],
         payload: object,
+        *,
+        asset_ids: tuple[str, ...] = (),
     ) -> TaskRecord:
         operation = http_request.state.hosted_session_operation
         owner_id = getattr(http_request.state, "session_id", None)
@@ -935,6 +958,7 @@ def create_router(
                 payload,
                 owner_id=owner_id,
                 commit=operation.commit,
+                asset_ids=asset_ids,
             )
             operation.mark_committed()
             return task
@@ -942,15 +966,34 @@ def create_router(
             lambda: create_task(payload, owner_id=owner_id)
         )
 
+    def hosted_task_asset_ids(payload: object) -> tuple[str, ...]:
+        if storage is None:
+            return ()
+        input_path = getattr(payload, "input_path", None)
+        input_paths = getattr(payload, "input_paths", None)
+        references = [input_path] if input_path is not None else list(input_paths or [])
+        try:
+            return tuple(
+                dict.fromkeys(_asset_id(reference) for reference in references)
+            )
+        except UploadRejectedError as exc:
+            raise ApiError("asset_not_found", str(exc), 404) from exc
+
     def resolve_input_references(
         http_request: Request,
         references: list[str],
+        *,
+        allowed_media_types: frozenset[str] | None = None,
     ) -> list[str]:
         paths = [
             resolve_hosted_asset(http_request, reference)
             for reference in references
         ]
-        validate_hosted_paths(http_request, paths)
+        validate_hosted_paths(
+            http_request,
+            paths,
+            allowed_media_types=allowed_media_types,
+        )
         return [str(path) for path in paths]
 
     def hosted_video_frames_request(
@@ -964,7 +1007,11 @@ def create_router(
             if payload.input_path is not None
             else list(payload.input_paths or [])
         )
-        paths = resolve_input_references(http_request, references)
+        paths = resolve_input_references(
+            http_request,
+            references,
+            allowed_media_types=frozenset({"video"}),
+        )
         output_dir = storage.create_task_dir(http_request.state.session_id) / "frames"
         return payload.model_copy(
             update={
@@ -1011,7 +1058,12 @@ def create_router(
     ) -> ChromaKeyerTaskRequest:
         if storage is None:
             return payload
-        input_path = resolve_input_path(http_request, payload.input_path)
+        input_path = resolve_hosted_asset(http_request, payload.input_path)
+        validate_hosted_paths(
+            http_request,
+            [input_path],
+            allowed_media_types=frozenset({"image"}),
+        )
         task_dir = storage.create_task_dir(http_request.state.session_id)
         return payload.model_copy(
             update={
@@ -1026,7 +1078,12 @@ def create_router(
     ) -> ChromaVideoKeyerTaskRequest:
         if storage is None:
             return payload
-        input_path = resolve_input_path(http_request, payload.input_path)
+        input_path = resolve_hosted_asset(http_request, payload.input_path)
+        validate_hosted_paths(
+            http_request,
+            [input_path],
+            allowed_media_types=frozenset({"video"}),
+        )
         task_dir = storage.create_task_dir(http_request.state.session_id)
         return payload.model_copy(
             update={
@@ -1139,7 +1196,15 @@ def create_router(
             raise ApiError("hosted_mode_disabled", "Uploads are unavailable", 404)
         operation = http_request.state.hosted_session_operation
         session_id = http_request.state.session_id
+        deletion_claim: str | None = None
         try:
+            if isinstance(task_manager, RedisTaskManager):
+                deletion_claim = operation.commit(
+                    lambda: task_manager.claim_asset_deletion(
+                        session_id,
+                        asset_id,
+                    )
+                )
             try:
                 deletion = operation.commit(
                     lambda: storage.delete_asset(
@@ -1197,6 +1262,8 @@ def create_router(
                 "Uploaded asset is not available",
                 404,
             ) from exc
+        except TaskConflictError as exc:
+            raise ApiError("asset_in_use", str(exc), 409) from exc
         except (RedisError, ResourceUnavailableError) as exc:
             raise ApiError("storage_unavailable", str(exc), 503) from exc
         except OSError as exc:
@@ -1205,6 +1272,22 @@ def create_router(
                 "Server storage is temporarily unavailable",
                 503,
             ) from exc
+        finally:
+            if deletion_claim is not None and isinstance(
+                task_manager,
+                RedisTaskManager,
+            ):
+                try:
+                    task_manager.release_asset_deletion(
+                        session_id,
+                        asset_id,
+                        deletion_claim,
+                    )
+                except RedisError:
+                    _LOGGER.warning(
+                        "Failed to release asset deletion claim; TTL will expire it",
+                        exc_info=True,
+                    )
         return Response(status_code=204)
 
     @router.post(
@@ -1299,12 +1382,14 @@ def create_router(
         payload: VideoFramesTaskRequest,
         http_request: Request,
     ) -> TaskCreateResponse:
+        asset_ids = hosted_task_asset_ids(payload)
         hosted_payload = hosted_video_frames_request(http_request, payload)
         try:
             task = create_task_with_session_commit(
                 http_request,
                 task_manager.create_video_frames_task,
                 hosted_payload,
+                asset_ids=asset_ids,
             )
         except Exception as exc:
             discard_failed_hosted_task_dir(http_request, hosted_payload)
@@ -1327,12 +1412,14 @@ def create_router(
         payload: MediaResizeTaskRequest,
         http_request: Request,
     ) -> TaskCreateResponse:
+        asset_ids = hosted_task_asset_ids(payload)
         hosted_payload = hosted_media_resize_request(http_request, payload)
         try:
             task = create_task_with_session_commit(
                 http_request,
                 task_manager.create_media_resize_task,
                 hosted_payload,
+                asset_ids=asset_ids,
             )
         except Exception as exc:
             discard_failed_hosted_task_dir(http_request, hosted_payload)
@@ -1355,12 +1442,14 @@ def create_router(
         payload: ChromaKeyerTaskRequest,
         http_request: Request,
     ) -> TaskCreateResponse:
+        asset_ids = hosted_task_asset_ids(payload)
         hosted_payload = hosted_chroma_keyer_request(http_request, payload)
         try:
             task = create_task_with_session_commit(
                 http_request,
                 task_manager.create_chroma_keyer_task,
                 hosted_payload,
+                asset_ids=asset_ids,
             )
         except Exception as exc:
             discard_failed_hosted_task_dir(http_request, hosted_payload)
@@ -1383,12 +1472,14 @@ def create_router(
         payload: ChromaVideoKeyerTaskRequest,
         http_request: Request,
     ) -> TaskCreateResponse:
+        asset_ids = hosted_task_asset_ids(payload)
         hosted_payload = hosted_chroma_video_request(http_request, payload)
         try:
             task = create_task_with_session_commit(
                 http_request,
                 task_manager.create_chroma_video_keyer_task,
                 hosted_payload,
+                asset_ids=asset_ids,
             )
         except Exception as exc:
             discard_failed_hosted_task_dir(http_request, hosted_payload)

@@ -101,7 +101,12 @@ def test_accepts_image_at_exact_pixel_limit(tmp_path: Path) -> None:
         HostedMediaLimits(max_image_pixels=100),
     )
 
-    assert validator.validate(image_path) is None
+    validated = validator.validate_media(image_path)
+
+    assert validated.media_type == "image"
+    assert validated.width == 10
+    assert validated.height == 10
+    assert validated.video_metadata is None
 
 
 def test_accepts_static_jpeg_without_frame_count(tmp_path: Path) -> None:
@@ -200,7 +205,12 @@ def test_accepts_video_at_exact_limits(tmp_path: Path) -> None:
     probe = StubVideoProbe(_metadata())
     validator = HostedMediaValidator(video_probe=probe)
 
-    assert validator.validate(video_path) is probe.metadata
+    validated = validator.validate_media(video_path)
+
+    assert validated.media_type == "video"
+    assert validated.width == 3840
+    assert validated.height == 2160
+    assert validated.video_metadata is probe.metadata
     assert probe.paths == [video_path]
 
 
@@ -227,6 +237,7 @@ def test_validate_video_reuses_cached_metadata_until_stat_changes(
     probe = StubVideoProbe(_metadata())
     validator = HostedMediaValidator(video_probe=probe)
 
+    assert validator.validate_media(video_path).video_metadata is probe.metadata
     assert validator.validate_video(video_path) is probe.metadata
     assert validator.validate_video(video_path) is probe.metadata
     video_path.write_bytes(b"changed-video")

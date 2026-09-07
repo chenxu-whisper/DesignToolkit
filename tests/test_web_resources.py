@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier, RLock
@@ -615,13 +616,20 @@ class DeterministicRedis(fakeredis.FakeRedis):
 
     def _eval_release_task_pin(self, keys, args):  # noqa: ANN001, ANN202
         pin_key, task_pins_key = keys
-        session_id, task_id = args
+        session_id, task_id, asset_task_prefix = args
         if not self.exists(pin_key):
             return 0
         if self._text(self.hget(pin_key, "session_id")) != session_id:
             return 2
         if self._text(self.hget(pin_key, "task_id")) != task_id:
             return 2
+        raw_asset_ids = self.hget(pin_key, "asset_ids")
+        asset_ids = json.loads(self._text(raw_asset_ids)) if raw_asset_ids else []
+        for asset_id in asset_ids:
+            asset_tasks_key = f"{asset_task_prefix}{session_id}:{asset_id}"
+            self.srem(asset_tasks_key, task_id)
+            if not self.scard(asset_tasks_key):
+                self.delete(asset_tasks_key)
         self.delete(pin_key)
         self.srem(task_pins_key, task_id)
         if not self.scard(task_pins_key):

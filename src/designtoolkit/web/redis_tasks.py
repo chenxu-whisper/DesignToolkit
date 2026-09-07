@@ -35,11 +35,16 @@ from designtoolkit.web.heartbeat import (
     stop_heartbeat_thread,
 )
 from designtoolkit.web.resources import (
+    _ASSET_TASK_PREFIX,
     _CLEANUP_PREFIX,
+    _RELEASE_TASK_PIN_SCRIPT,
     SessionDeletingError,
+    _asset_tasks_key,
     _session_state_key,
     _session_task_pins_key,
     _task_pin_key,
+    _validate_asset_id,
+    _validate_session_id,
 )
 from designtoolkit.web.schemas import (
     ChromaKeyerTaskRequest,
@@ -62,6 +67,8 @@ _TERMINAL_TTL_SECONDS = 2 * 60 * 60
 _UNCERTAIN_ENQUEUE_ERROR = "Task enqueue could not be confirmed"
 _ENQUEUE_INTENT_TTL_SECONDS = 60.0
 _ENQUEUE_INTENT_HEARTBEAT_SECONDS = 10.0
+_ASSET_DELETE_PREFIX = "dt:resource:asset-delete:"
+_ASSET_DELETE_TTL_MS = 60_000
 _RESERVE_ENQUEUE_SCRIPT = """-- reserve_enqueue_intent
 local queue_key = KEYS[1]
 local intent_key = KEYS[2]
@@ -77,6 +84,9 @@ local created_at = ARGV[5]
 local cleanup_prefix = ARGV[6]
 local owner_token = ARGV[7]
 local owner_ttl_ms = tonumber(ARGV[8])
+local asset_ids = cjson.decode(ARGV[9])
+local asset_task_prefix = ARGV[10]
+local asset_delete_prefix = ARGV[11]
 
 if owner_id ~= "" then
     local deleting = redis.call("HGET", session_state_key, "deleting")
@@ -89,6 +99,15 @@ if owner_id ~= "" then
 end
 if redis.call("LLEN", queue_key) >= max_queued_tasks then
     return 1
+end
+for _, asset_id in ipairs(asset_ids) do
+    local delete_key = asset_delete_prefix .. owner_id .. ":" .. asset_id
+    local redis_time = redis.call("TIME")
+    local now_ms = redis_time[1] * 1000 + math.floor(redis_time[2] / 1000)
+    redis.call("ZREMRANGEBYSCORE", delete_key, "-inf", now_ms)
+    if redis.call("ZCARD", delete_key) ~= 0 then
+        return 3
+    end
 end
 
 redis.call("RPUSH", queue_key, task_id)
@@ -119,9 +138,18 @@ if owner_id ~= "" then
         "task_id",
         task_id,
         "session_id",
-        owner_id
+        owner_id,
+        "asset_ids",
+        ARGV[9]
     )
     redis.call("SADD", session_task_pins_key, task_id)
+    for _, asset_id in ipairs(asset_ids) do
+        redis.call(
+            "SADD",
+            asset_task_prefix .. owner_id .. ":" .. asset_id,
+            task_id
+        )
+    end
 end
 return 0
 """
@@ -138,6 +166,17 @@ if owner_id ~= "" then
     local pin_session = redis.call("HGET", KEYS[6], "session_id")
     local pin_task = redis.call("HGET", KEYS[6], "task_id")
     if pin_session == owner_id and pin_task == task_id then
+        local asset_ids_json = redis.call("HGET", KEYS[6], "asset_ids")
+        if asset_ids_json then
+            local asset_ids = cjson.decode(asset_ids_json)
+            for _, asset_id in ipairs(asset_ids) do
+                local asset_tasks_key = ARGV[4] .. owner_id .. ":" .. asset_id
+                redis.call("SREM", asset_tasks_key, task_id)
+                if redis.call("SCARD", asset_tasks_key) == 0 then
+                    redis.call("DEL", asset_tasks_key)
+                end
+            end
+        end
         redis.call("DEL", KEYS[6])
         redis.call("SREM", KEYS[7], task_id)
         if redis.call("SCARD", KEYS[7]) == 0 then
@@ -146,6 +185,24 @@ if owner_id ~= "" then
     end
 end
 return 1
+"""
+_CLAIM_ASSET_DELETION_SCRIPT = """-- claim_asset_deletion
+if redis.call("SCARD", KEYS[1]) ~= 0 then
+    return 1
+end
+local redis_time = redis.call("TIME")
+local now_ms = redis_time[1] * 1000 + math.floor(redis_time[2] / 1000)
+redis.call("ZREMRANGEBYSCORE", KEYS[2], "-inf", now_ms)
+redis.call("ZADD", KEYS[2], now_ms + tonumber(ARGV[2]), ARGV[1])
+redis.call("PEXPIRE", KEYS[2], ARGV[2])
+return 0
+"""
+_RELEASE_ASSET_DELETION_SCRIPT = """-- release_asset_deletion
+local removed = redis.call("ZREM", KEYS[1], ARGV[1])
+if redis.call("ZCARD", KEYS[1]) == 0 then
+    redis.call("DEL", KEYS[1])
+end
+return removed
 """
 _REFRESH_ENQUEUE_OWNER_SCRIPT = """-- refresh_enqueue_owner
 local owner_token = ARGV[1]
@@ -459,6 +516,15 @@ class RedisTaskManager:
         self._terminal_transition_script = self._redis.register_script(
             _TERMINAL_TRANSITION_SCRIPT
         )
+        self._release_task_pin_script = self._redis.register_script(
+            _RELEASE_TASK_PIN_SCRIPT
+        )
+        self._claim_asset_deletion_script = self._redis.register_script(
+            _CLAIM_ASSET_DELETION_SCRIPT
+        )
+        self._release_asset_deletion_script = self._redis.register_script(
+            _RELEASE_ASSET_DELETION_SCRIPT
+        )
         self.log_store = RedisLogStore(
             redis_connection,
             retention_seconds=retention_seconds,
@@ -470,6 +536,7 @@ class RedisTaskManager:
         *,
         owner_id: str | None = None,
         commit: Callable[[Callable[[], Job]], Job] | None = None,
+        asset_ids: tuple[str, ...] = (),
     ) -> TaskRecord:
         options = video_frame_options_list_from_request(request)
         return self._enqueue(
@@ -479,6 +546,7 @@ class RedisTaskManager:
             owner_id=owner_id,
             input_path=_joined_input_names(options),
             commit=commit,
+            asset_ids=asset_ids,
         )
 
     def create_media_resize_task(
@@ -487,6 +555,7 @@ class RedisTaskManager:
         *,
         owner_id: str | None = None,
         commit: Callable[[Callable[[], Job]], Job] | None = None,
+        asset_ids: tuple[str, ...] = (),
     ) -> TaskRecord:
         options = media_resize_options_list_from_request(request)
         return self._enqueue(
@@ -496,6 +565,7 @@ class RedisTaskManager:
             owner_id=owner_id,
             input_path="\n".join(option.input_path.name for option in options),
             commit=commit,
+            asset_ids=asset_ids,
         )
 
     def create_chroma_keyer_task(
@@ -504,6 +574,7 @@ class RedisTaskManager:
         *,
         owner_id: str | None = None,
         commit: Callable[[Callable[[], Job]], Job] | None = None,
+        asset_ids: tuple[str, ...] = (),
     ) -> TaskRecord:
         options, _model, _params = chroma_keyer_options_from_request(request)
         output_path = options.output_path or default_output_path(options.input_path)
@@ -515,6 +586,7 @@ class RedisTaskManager:
             owner_id=owner_id,
             input_path=options.input_path.name,
             commit=commit,
+            asset_ids=asset_ids,
         )
 
     def create_chroma_video_keyer_task(
@@ -523,6 +595,7 @@ class RedisTaskManager:
         *,
         owner_id: str | None = None,
         commit: Callable[[Callable[[], Job]], Job] | None = None,
+        asset_ids: tuple[str, ...] = (),
     ) -> TaskRecord:
         options, _model, _params = chroma_video_keyer_options_from_request(request)
         output_root = options.output_root or options.input_path.parent
@@ -538,6 +611,7 @@ class RedisTaskManager:
             owner_id=owner_id,
             input_path=options.input_path.name,
             commit=commit,
+            asset_ids=asset_ids,
         )
 
     def get_task(
@@ -753,6 +827,81 @@ class RedisTaskManager:
             self._redis.expire(key, window + 1)
         return count <= limit
 
+    def claim_asset_deletion(self, session_id: str, asset_id: str) -> str:
+        session_id = _validate_session_id(session_id)
+        asset_id = _validate_asset_id(asset_id)
+        token = uuid4().hex
+        asset_tasks_key = _asset_tasks_key(session_id, asset_id)
+        claim_key = _asset_delete_key(session_id, asset_id)
+        try:
+            result = int(
+                self._claim_asset_deletion_script(
+                    keys=[asset_tasks_key, claim_key],
+                    args=[token, _ASSET_DELETE_TTL_MS],
+                )
+            )
+        except ResponseError as error_response:
+            if "unknown command" not in str(error_response).lower():
+                raise
+            while True:
+                with self._redis.pipeline() as pipeline:
+                    try:
+                        pipeline.watch(asset_tasks_key, claim_key)
+                        if pipeline.scard(asset_tasks_key):
+                            pipeline.unwatch()
+                            result = 1
+                            break
+                        now_ms = round(time() * 1000)
+                        pipeline.multi()
+                        pipeline.zremrangebyscore(claim_key, "-inf", now_ms)
+                        pipeline.zadd(
+                            claim_key,
+                            {token: now_ms + _ASSET_DELETE_TTL_MS},
+                        )
+                        pipeline.pexpire(claim_key, _ASSET_DELETE_TTL_MS)
+                        pipeline.execute()
+                        result = 0
+                        break
+                    except WatchError:
+                        continue
+        if result == 1:
+            raise TaskConflictError("Asset is referenced by an active task")
+        return token
+
+    def release_asset_deletion(
+        self,
+        session_id: str,
+        asset_id: str,
+        token: str,
+    ) -> bool:
+        session_id = _validate_session_id(session_id)
+        asset_id = _validate_asset_id(asset_id)
+        claim_key = _asset_delete_key(session_id, asset_id)
+        try:
+            return bool(
+                self._release_asset_deletion_script(
+                    keys=[claim_key],
+                    args=[token],
+                )
+            )
+        except ResponseError as error_response:
+            if "unknown command" not in str(error_response).lower():
+                raise
+        while True:
+            with self._redis.pipeline() as pipeline:
+                try:
+                    pipeline.watch(claim_key)
+                    claimed = pipeline.zscore(claim_key, token) is not None
+                    claim_count = pipeline.zcard(claim_key)
+                    pipeline.multi()
+                    pipeline.zrem(claim_key, token)
+                    if claimed and claim_count == 1:
+                        pipeline.delete(claim_key)
+                    results = pipeline.execute()
+                    return bool(results[0])
+                except WatchError:
+                    continue
+
     def _enqueue(
         self,
         kind: TaskKind,
@@ -762,7 +911,13 @@ class RedisTaskManager:
         owner_id: str | None,
         input_path: str,
         commit: Callable[[Callable[[], Job]], Job] | None,
+        asset_ids: tuple[str, ...],
     ) -> TaskRecord:
+        asset_ids = tuple(dict.fromkeys(asset_ids))
+        if asset_ids and owner_id is None:
+            raise ValueError("Hosted asset references require a task owner")
+        for asset_id in asset_ids:
+            _validate_asset_id(asset_id)
         task_id = str(uuid4())
         task = TaskRecord(
             task_id=task_id,
@@ -777,7 +932,7 @@ class RedisTaskManager:
             owner_id=owner_id,
         )
         owner_token = uuid4().hex
-        self._reserve_enqueue_intent(task, owner_token)
+        self._reserve_enqueue_intent(task, owner_token, asset_ids)
         heartbeat = _EnqueueIntentHeartbeat(
             lambda: self._refresh_enqueue_intent(task.task_id, owner_token),
             self.enqueue_intent_heartbeat_interval,
@@ -890,6 +1045,7 @@ class RedisTaskManager:
         self,
         task: TaskRecord,
         owner_token: str,
+        asset_ids: tuple[str, ...],
     ) -> None:
         owner_id = task.owner_id or ""
         session_state_key = (
@@ -922,6 +1078,9 @@ class RedisTaskManager:
                         _CLEANUP_PREFIX,
                         owner_token,
                         self._enqueue_intent_ttl_ms,
+                        json.dumps(asset_ids, separators=(",", ":")),
+                        _ASSET_TASK_PREFIX,
+                        _ASSET_DELETE_PREFIX,
                     ],
                 )
             )
@@ -931,16 +1090,20 @@ class RedisTaskManager:
             result = self._reserve_enqueue_intent_without_lua(
                 task,
                 owner_token,
+                asset_ids,
             )
         if result == 1:
             raise TaskConflictError("The task queue is full")
         if result == 2:
             raise SessionDeletingError("Session is being deleted")
+        if result == 3:
+            raise TaskConflictError("Asset deletion is already in progress")
 
     def _reserve_enqueue_intent_without_lua(
         self,
         task: TaskRecord,
         owner_token: str,
+        asset_ids: tuple[str, ...],
     ) -> int:
         owner_id = task.owner_id or ""
         state_key = (
@@ -948,10 +1111,17 @@ class RedisTaskManager:
             if owner_id
             else _enqueue_intent_key(task.task_id)
         )
+        asset_claim_keys = [
+            _asset_delete_key(owner_id, asset_id) for asset_id in asset_ids
+        ]
         while True:
             with self._redis.pipeline() as pipeline:
                 try:
-                    pipeline.watch(_queue_reservations_key(), state_key)
+                    pipeline.watch(
+                        _queue_reservations_key(),
+                        state_key,
+                        *asset_claim_keys,
+                    )
                     deleting = pipeline.hget(state_key, "deleting")
                     if owner_id and deleting is not None:
                         deleting_text = _redis_text(deleting)
@@ -964,7 +1134,16 @@ class RedisTaskManager:
                     ):
                         pipeline.unwatch()
                         return 1
+                    now_ms = round(time() * 1000)
+                    if any(
+                        pipeline.zcount(key, now_ms, "+inf")
+                        for key in asset_claim_keys
+                    ):
+                        pipeline.unwatch()
+                        return 3
                     pipeline.multi()
+                    for key in asset_claim_keys:
+                        pipeline.zremrangebyscore(key, "-inf", now_ms)
                     if owner_id and deleting is not None:
                         pipeline.hdel(state_key, "deleting")
                     pipeline.rpush(_queue_reservations_key(), task.task_id)
@@ -990,12 +1169,21 @@ class RedisTaskManager:
                             mapping={
                                 "task_id": task.task_id,
                                 "session_id": owner_id,
+                                "asset_ids": json.dumps(
+                                    asset_ids,
+                                    separators=(",", ":"),
+                                ),
                             },
                         )
                         pipeline.sadd(
                             _session_task_pins_key(owner_id),
                             task.task_id,
                         )
+                        for asset_id in asset_ids:
+                            pipeline.sadd(
+                                _asset_tasks_key(owner_id, asset_id),
+                                task.task_id,
+                            )
                     pipeline.execute()
                     return 0
                 except WatchError:
@@ -1042,7 +1230,7 @@ class RedisTaskManager:
                         session_task_pins_key,
                         _enqueue_owner_key(task_id),
                     ],
-                    args=[task_id, owner, owner_token],
+                    args=[task_id, owner, owner_token, _ASSET_TASK_PREFIX],
                 )
             )
         except ResponseError as error_response:
@@ -1059,6 +1247,14 @@ class RedisTaskManager:
                     if _redis_text(token) != owner_token:
                         pipeline.unwatch()
                         return False
+                    pin_metadata = pipeline.hgetall(_task_pin_key(task_id))
+                    asset_ids = _asset_ids_from_pin_metadata(pin_metadata)
+                    asset_task_keys = [
+                        _asset_tasks_key(owner, asset_id)
+                        for asset_id in asset_ids
+                    ]
+                    if asset_task_keys:
+                        pipeline.watch(*asset_task_keys)
                     pipeline.multi()
                     pipeline.lrem(_queue_reservations_key(), 0, task_id)
                     pipeline.delete(
@@ -1069,6 +1265,8 @@ class RedisTaskManager:
                         _enqueue_owner_key(task_id),
                     )
                     if owner:
+                        for asset_task_key in asset_task_keys:
+                            pipeline.srem(asset_task_key, task_id)
                         pipeline.delete(_task_pin_key(task_id))
                         pipeline.srem(_session_task_pins_key(owner), task_id)
                     pipeline.execute()
@@ -1405,30 +1603,20 @@ class RedisTaskManager:
                         pipeline.multi()
                         pipeline.lrem(_queue_reservations_key(), 0, task_id)
                         pipeline.delete(intent_key, owner_key)
-                        if owner_id:
-                            pipeline.delete(_task_pin_key(task_id))
-                            pipeline.srem(
-                                _session_task_pins_key(owner_id),
-                                task_id,
-                            )
                         pipeline.execute()
+                        self.release_task_pin(task_id)
                         return True
                     task = _decode_task(value)
                     if task.status is not TaskStatus.QUEUED:
                         pipeline.multi()
                         pipeline.lrem(_queue_reservations_key(), 0, task_id)
                         pipeline.delete(intent_key, owner_key)
-                        if (
-                            owner_id
-                            and task.status
-                            in {TaskStatus.SUCCEEDED, TaskStatus.FAILED}
-                        ):
-                            pipeline.delete(_task_pin_key(task_id))
-                            pipeline.srem(
-                                _session_task_pins_key(owner_id),
-                                task_id,
-                            )
                         pipeline.execute()
+                        if task.status in {
+                            TaskStatus.SUCCEEDED,
+                            TaskStatus.FAILED,
+                        }:
+                            self.release_task_pin(task_id)
                         if (
                             task.status is TaskStatus.FAILED
                             and self._cleanup_failed_task(task_id)
@@ -1455,13 +1643,8 @@ class RedisTaskManager:
                     )
                     pipeline.lrem(_queue_reservations_key(), 0, task_id)
                     pipeline.delete(intent_key, owner_key)
-                    if owner_id:
-                        pipeline.delete(_task_pin_key(task_id))
-                        pipeline.srem(
-                            _session_task_pins_key(owner_id),
-                            task_id,
-                        )
                     pipeline.execute()
+                    self.release_task_pin(task_id)
                     transitioned = True
                     break
                 except WatchError:
@@ -1471,8 +1654,6 @@ class RedisTaskManager:
 
     def _reconcile_stale_task_pins(self, started_ids: set[str]) -> int:
         coordinator = self.resource_coordinator
-        if coordinator is None or not hasattr(coordinator, "release_task_pin"):
-            return 0
         reconciled = 0
         for key in self._redis.scan_iter(match="dt:resource:task-pin:*"):
             key_text = key.decode() if isinstance(key, bytes) else key
@@ -1485,16 +1666,78 @@ class RedisTaskManager:
                 TaskStatus.RUNNING,
             }:
                 continue
-            job = self.queue.fetch_job(task_id)
-            status = job.get_status(refresh=True) if job is not None else None
-            if status in {JobStatus.QUEUED, JobStatus.STARTED}:
-                continue
-            if task_id in started_ids:
-                continue
-            coordinator.release_task_resources(task_id)
+            if task is None:
+                job = self.queue.fetch_job(task_id)
+                status = job.get_status(refresh=True) if job is not None else None
+                if status in {JobStatus.QUEUED, JobStatus.STARTED}:
+                    continue
+                if task_id in started_ids:
+                    continue
+            if coordinator is not None:
+                coordinator.release_task_resources(task_id)
+            self.release_task_pin(task_id)
             if not self._redis.exists(key):
                 reconciled += 1
         return reconciled
+
+    def release_task_pin(self, task_id: str) -> bool:
+        pin_key = _task_pin_key(task_id)
+        metadata = self._redis.hgetall(pin_key)
+        session_id = _redis_hash_text(metadata, "session_id")
+        if session_id is None:
+            return False
+        session_task_pins_key = _session_task_pins_key(session_id)
+        try:
+            result = int(
+                self._release_task_pin_script(
+                    keys=[
+                        pin_key,
+                        session_task_pins_key,
+                    ],
+                    args=[
+                        session_id,
+                        task_id,
+                        _ASSET_TASK_PREFIX,
+                    ],
+                )
+            )
+        except ResponseError as error_response:
+            if "unknown command" not in str(error_response).lower():
+                raise
+            while True:
+                with self._redis.pipeline() as pipeline:
+                    try:
+                        pipeline.watch(pin_key, session_task_pins_key)
+                        metadata = pipeline.hgetall(pin_key)
+                        if not metadata:
+                            pipeline.unwatch()
+                            return False
+                        if (
+                            _redis_hash_text(metadata, "session_id") != session_id
+                            or _redis_hash_text(metadata, "task_id") != task_id
+                        ):
+                            pipeline.unwatch()
+                            result = 2
+                            break
+                        asset_task_keys = [
+                            _asset_tasks_key(session_id, asset_id)
+                            for asset_id in _asset_ids_from_pin_metadata(metadata)
+                        ]
+                        if asset_task_keys:
+                            pipeline.watch(*asset_task_keys)
+                        pipeline.multi()
+                        for asset_task_key in asset_task_keys:
+                            pipeline.srem(asset_task_key, task_id)
+                        pipeline.delete(pin_key)
+                        pipeline.srem(session_task_pins_key, task_id)
+                        pipeline.execute()
+                        result = 1
+                        break
+                    except WatchError:
+                        continue
+        if result == 2:
+            raise TaskConflictError("Task pin ownership is invalid")
+        return result == 1
 
     def _release_queue_slot(self, task_id: str) -> None:
         self._redis.lrem(_queue_reservations_key(), 0, task_id)
@@ -1596,6 +1839,7 @@ class RedisTaskManager:
             if code == 1
             else TerminalTransitionResult.ALREADY_TERMINAL
         )
+        self.release_task_pin(task_id)
         return task, transition
 
     def _transition_finished_without_lua(
@@ -1620,6 +1864,7 @@ class RedisTaskManager:
                     task = _decode_task(value)
                     if task.status in {TaskStatus.SUCCEEDED, TaskStatus.FAILED}:
                         pipeline.unwatch()
+                        self.release_task_pin(task_id)
                         return task, TerminalTransitionResult.ALREADY_TERMINAL
                     task.status = status
                     if output_path is not None:
@@ -1648,6 +1893,7 @@ class RedisTaskManager:
                             _TERMINAL_TTL_SECONDS,
                         )
                     pipeline.execute()
+                    self.release_task_pin(task_id)
                     return task, TerminalTransitionResult.APPLIED
                 except WatchError:
                     continue
@@ -1799,6 +2045,31 @@ def _task_resources_key(task_id: str) -> str:
 
 def _task_work_key(task_id: str) -> str:
     return f"dt:task-work:{task_id}"
+
+
+def _asset_delete_key(session_id: str, asset_id: str) -> str:
+    return f"{_ASSET_DELETE_PREFIX}{session_id}:{asset_id}"
+
+
+def _asset_ids_from_pin_metadata(
+    metadata: dict[bytes | str, bytes | str],
+) -> tuple[str, ...]:
+    value = _redis_hash_text(metadata, "asset_ids")
+    if value is None:
+        return ()
+    decoded = json.loads(value)
+    if not isinstance(decoded, list) or not all(
+        isinstance(asset_id, str) for asset_id in decoded
+    ):
+        raise TaskConflictError("Task pin asset metadata is invalid")
+    return tuple(decoded)
+
+
+def _redis_hash_text(
+    metadata: dict[bytes | str, bytes | str],
+    field: str,
+) -> str | None:
+    return _redis_text(metadata.get(field) or metadata.get(field.encode()))
 
 
 def _failure_cleanup_key(task_id: str) -> str:
