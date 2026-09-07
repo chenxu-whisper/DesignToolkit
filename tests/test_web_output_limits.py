@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
+import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Event
@@ -325,6 +327,57 @@ def _popen_factory(
     return create
 
 
+class FakeProcessTreeOwner:
+    def __init__(self) -> None:
+        self.close_calls = 0
+        self.closed = False
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        self.close_calls += 1
+
+
+def test_windows_job_assignment_failure_closes_handle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ctypes
+
+    class FakeFunction:
+        def __init__(self, result: int) -> None:
+            self.result = result
+            self.calls: list[tuple[object, ...]] = []
+
+        def __call__(self, *args: object) -> int:
+            self.calls.append(args)
+            return self.result
+
+    class FakeKernel32:
+        CreateJobObjectW = FakeFunction(123)
+        SetInformationJobObject = FakeFunction(1)
+        AssignProcessToJobObject = FakeFunction(0)
+        CloseHandle = FakeFunction(1)
+
+    process = FakePopen([])
+    process._handle = 456  # type: ignore[attr-defined]
+    kernel32 = FakeKernel32()
+    monkeypatch.setattr(ffmpeg_backend, "os_name", "nt")
+    monkeypatch.setattr(ctypes, "WinDLL", lambda *_args, **_kwargs: kernel32)
+    monkeypatch.setattr(ctypes, "get_last_error", lambda: 5)
+    monkeypatch.setattr(
+        ctypes,
+        "WinError",
+        lambda _error: PermissionError("access denied"),
+    )
+
+    owner = ffmpeg_backend._create_windows_job(process)  # type: ignore[arg-type]
+
+    assert owner is None
+    assert kernel32.AssignProcessToJobObject.calls == [(123, 456)]
+    assert kernel32.CloseHandle.calls == [(123,)]
+
+
 def test_ffmpeg_backend_stops_when_active_sequence_tail_grows(
     tmp_path: Path,
 ) -> None:
@@ -378,6 +431,52 @@ def test_ffmpeg_backend_preserves_captured_stderr_on_success() -> None:
     assert calls[0][1]["encoding"] == "utf-8"
     assert not process.terminate_called
     assert not process.kill_called
+
+
+def test_ffmpeg_backend_closes_windows_job_after_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = FakePopen([("", "")])
+    owner = FakeProcessTreeOwner()
+    monkeypatch.setattr(ffmpeg_backend, "os_name", "nt")
+    monkeypatch.setattr(
+        ffmpeg_backend,
+        "_create_windows_job",
+        lambda _process: owner,
+        raising=False,
+    )
+    backend = FfmpegBackend(popen=_popen_factory(process, []))
+
+    result = backend.run(["ffmpeg", "out.mp4"])
+
+    assert result.returncode == 0
+    assert owner.close_calls == 1
+
+
+def test_ffmpeg_backend_closes_windows_job_when_root_waits_immediately(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timeout = JobTimeoutException("worker timed out")
+    process = FakePopen([timeout])
+    owner = FakeProcessTreeOwner()
+    monkeypatch.setattr(ffmpeg_backend, "os_name", "nt")
+    monkeypatch.setattr(
+        ffmpeg_backend,
+        "_create_windows_job",
+        lambda _process: owner,
+        raising=False,
+    )
+    backend = FfmpegBackend(popen=_popen_factory(process, []))
+
+    with pytest.raises(JobTimeoutException) as exc_info:
+        backend.run(["ffmpeg", "out.mp4"])
+
+    assert exc_info.value is timeout
+    assert process.wait_calls == [
+        ffmpeg_backend._PROCESS_CLEANUP_TIMEOUT_SECONDS,
+        ffmpeg_backend._PROCESS_CLEANUP_TIMEOUT_SECONDS,
+    ]
+    assert owner.close_calls == 1
 
 
 def test_ffmpeg_backend_stops_process_and_preserves_rq_timeout() -> None:
@@ -637,6 +736,88 @@ def test_ffmpeg_backend_signals_posix_process_group_on_timeout(
     assert not process.kill_called
 
 
+def test_ffmpeg_backend_kills_posix_group_when_root_waits_immediately(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timeout = JobTimeoutException("worker timed out")
+
+    class GroupedPopen(FakePopen):
+        pid = 4321
+
+    process = GroupedPopen([timeout])
+    signals: list[tuple[int, int]] = []
+    monkeypatch.setattr(ffmpeg_backend, "os_name", "posix")
+    monkeypatch.setattr(
+        os,
+        "killpg",
+        lambda process_group, sent_signal: signals.append(
+            (process_group, sent_signal)
+        ),
+        raising=False,
+    )
+    backend = FfmpegBackend(popen=_popen_factory(process, []))
+
+    with pytest.raises(JobTimeoutException) as exc_info:
+        backend.run(["ffmpeg", "out.mp4"])
+
+    assert exc_info.value is timeout
+    assert signals == [
+        (process.pid, signal.SIGTERM),
+        (process.pid, 9),
+    ]
+    assert process.wait_calls == [
+        ffmpeg_backend._PROCESS_CLEANUP_TIMEOUT_SECONDS,
+        ffmpeg_backend._PROCESS_CLEANUP_TIMEOUT_SECONDS,
+    ]
+
+
+def test_ffmpeg_backend_uses_taskkill_when_job_assignment_fails_and_root_exits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timeout = JobTimeoutException("worker timed out")
+
+    class GroupedPopen(FakePopen):
+        pid = 4321
+
+        def __init__(self) -> None:
+            super().__init__([timeout])
+            self.signals: list[int] = []
+
+        def send_signal(self, sent_signal: int) -> None:
+            self.signals.append(sent_signal)
+
+    process = GroupedPopen()
+    taskkill_calls: list[list[str]] = []
+    ctrl_break = 1
+    monkeypatch.setattr(ffmpeg_backend, "os_name", "nt")
+    monkeypatch.setattr(signal, "CTRL_BREAK_EVENT", ctrl_break, raising=False)
+    monkeypatch.setattr(
+        ffmpeg_backend,
+        "_create_windows_job",
+        lambda _process: None,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda command, **_kwargs: taskkill_calls.append(command),
+    )
+    backend = FfmpegBackend(popen=_popen_factory(process, []))
+
+    with pytest.raises(JobTimeoutException) as exc_info:
+        backend.run(["ffmpeg", "out.mp4"])
+
+    assert exc_info.value is timeout
+    assert process.signals == [ctrl_break]
+    assert taskkill_calls == [
+        ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+    ]
+    assert process.wait_calls == [
+        ffmpeg_backend._PROCESS_CLEANUP_TIMEOUT_SECONDS,
+        ffmpeg_backend._PROCESS_CLEANUP_TIMEOUT_SECONDS,
+    ]
+
+
 def test_ffmpeg_backend_falls_back_when_windows_taskkill_times_out(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -685,6 +866,80 @@ def test_ffmpeg_backend_falls_back_when_windows_taskkill_times_out(
     assert taskkill_calls[0][1]["check"] is False
     assert process.kill_called
     assert process.wait_calls == [cleanup_timeout, cleanup_timeout]
+
+
+def _windows_process_is_active(pid: int) -> bool:
+    import ctypes
+    from ctypes import wintypes
+
+    process_query_limited_information = 0x1000
+    still_active = 259
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    open_process = kernel32.OpenProcess
+    open_process.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    open_process.restype = wintypes.HANDLE
+    get_exit_code = kernel32.GetExitCodeProcess
+    get_exit_code.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    get_exit_code.restype = wintypes.BOOL
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+
+    handle = open_process(process_query_limited_information, False, pid)
+    if not handle:
+        return False
+    try:
+        exit_code = wintypes.DWORD()
+        return bool(get_exit_code(handle, ctypes.byref(exit_code))) and (
+            exit_code.value == still_active
+        )
+    finally:
+        close_handle(handle)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows Job Objects")
+def test_ffmpeg_backend_job_kills_descendant_that_ignores_break(
+    tmp_path: Path,
+) -> None:
+    child_pid_path = tmp_path / "child.pid"
+    child_script = (
+        "import os, signal, sys, time; "
+        "signal.signal(signal.SIGBREAK, signal.SIG_IGN); "
+        "open(sys.argv[1], 'w', encoding='ascii').write(str(os.getpid())); "
+        "time.sleep(60)"
+    )
+    parent_script = (
+        "import os, signal, subprocess, sys, time; "
+        "signal.signal(signal.SIGBREAK, lambda *_args: os._exit(0)); "
+        f"subprocess.Popen([sys.executable, '-c', {child_script!r}, sys.argv[1]]); "
+        "time.sleep(1)"
+    )
+
+    def reject_when_child_is_ready() -> None:
+        if child_pid_path.exists():
+            raise OutputLimitExceeded("stop the process tree")
+
+    backend = FfmpegBackend(
+        output_guard=reject_when_child_is_ready,
+        poll_interval=0.05,
+    )
+    child_pid: int | None = None
+    try:
+        with pytest.raises(OutputLimitExceeded, match="stop the process tree"):
+            backend.run([sys.executable, "-c", parent_script, str(child_pid_path)])
+        child_pid = int(child_pid_path.read_text(encoding="ascii"))
+        deadline = time.monotonic() + 2
+        while _windows_process_is_active(child_pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not _windows_process_is_active(child_pid)
+    finally:
+        if child_pid is not None and _windows_process_is_active(child_pid):
+            subprocess.run(
+                ["taskkill", "/PID", str(child_pid), "/T", "/F"],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
 
 
 def test_ffmpeg_backend_falls_back_to_monitor_when_prlimit_is_missing(
