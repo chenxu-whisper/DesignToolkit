@@ -46,6 +46,46 @@ class DeterministicRedis(fakeredis.FakeRedis):
 
         return execute
 
+    def _eval_register_upload(self, keys, args):  # noqa: ANN001, ANN202
+        key = keys[0]
+        token, ttl_ms = args
+        if self.exists(key):
+            if self.hget(key, "token") != str(token).encode():
+                return 1
+            self.pexpire(key, int(ttl_ms))
+            return 2
+        self.hset(
+            key,
+            mapping={
+                "token": token,
+                "state": "inflight",
+            },
+        )
+        self.pexpire(key, int(ttl_ms))
+        return 0
+
+    def _eval_refresh_upload(self, keys, args):  # noqa: ANN001, ANN202
+        key = keys[0]
+        token, ttl_ms = args
+        if self.hget(key, "token") != str(token).encode():
+            return 0
+        self.pexpire(key, int(ttl_ms))
+        return 2 if self.hget(key, "state") == b"cancelled" else 1
+
+    def _eval_cancel_upload(self, keys, args):  # noqa: ANN001, ANN202
+        key = keys[0]
+        if not self.exists(key):
+            return 0
+        self.hset(key, "state", "cancelled")
+        self.pexpire(key, int(args[0]))
+        return 1
+
+    def _eval_finish_upload(self, keys, args):  # noqa: ANN001, ANN202
+        key = keys[0]
+        if self.hget(key, "token") != str(args[0]).encode():
+            return 0
+        return self.delete(key)
+
     def _eval_reserve_upload(self, keys, args):  # noqa: ANN001, ANN202
         state_key, index_key, token_key, receipt_key = keys
         (
@@ -1068,6 +1108,96 @@ def test_upload_reservations_enforce_global_concurrency_atomically(
     assert len(accepted) == 2
     for reservation in accepted:
         reservation.release()
+
+
+def test_upload_registration_is_session_scoped_and_cancellable(
+    redis_connection: DeterministicRedis,
+) -> None:
+    resources = coordinator(redis_connection)
+    upload_id = "1" * 32
+
+    registration = resources.register_upload(SESSION_A, upload_id)
+
+    assert resources.cancel_upload(SESSION_B, upload_id) is False
+    assert registration.refresh() is False
+    assert resources.cancel_upload(SESSION_A, upload_id) is True
+    assert registration.refresh() is True
+
+    registration.finish()
+
+    assert resources.cancel_upload(SESSION_A, upload_id) is False
+    assert list(
+        redis_connection.scan_iter(match="dt:resource:upload-inflight:*")
+    ) == []
+
+
+def test_upload_registration_acknowledgement_loss_reuses_one_token() -> None:
+    redis_connection = ExecuteThenRaiseRedis("register_upload")
+    resources = coordinator(redis_connection)
+
+    registration = resources.register_upload(SESSION_A, "1" * 32)
+
+    assert len(redis_connection.attempt_tokens) == 2
+    assert len(set(redis_connection.attempt_tokens)) == 1
+    registration.finish()
+
+
+def test_upload_registration_finish_recovers_acknowledgement_loss() -> None:
+    redis_connection = ExecuteThenRaiseRedis("finish_upload")
+    resources = coordinator(redis_connection)
+    registration = resources.register_upload(SESSION_A, "1" * 32)
+
+    registration.finish()
+
+    assert list(
+        redis_connection.scan_iter(match="dt:resource:upload-inflight:*")
+    ) == []
+
+
+def test_upload_registration_finish_recovers_when_key_has_new_owner() -> None:
+    redis_connection = DeterministicRedis()
+    resources = coordinator(redis_connection)
+    upload_id = "1" * 32
+    registration = resources.register_upload(SESSION_A, upload_id)
+    registration_key = (
+        f"dt:resource:upload-inflight:{SESSION_A}:{upload_id}"
+    )
+    replacement_token = "2" * 32
+    execute_finish = resources._finish_upload_script
+
+    def finish_then_replace_and_lose_ack(*, keys, args):
+        execute_finish(keys=keys, args=args)
+        redis_connection.hset(
+            registration_key,
+            mapping={
+                "token": replacement_token,
+                "state": "inflight",
+            },
+        )
+        raise RedisConnectionError("finish_upload acknowledgement lost")
+
+    resources._finish_upload_script = finish_then_replace_and_lose_ack
+
+    registration.finish()
+
+    assert redis_connection.hget(registration_key, "token") == (
+        replacement_token.encode()
+    )
+
+
+def test_duplicate_upload_registration_is_rejected_until_finish(
+    redis_connection: DeterministicRedis,
+) -> None:
+    resources = coordinator(redis_connection)
+    upload_id = "1" * 32
+    registration = resources.register_upload(SESSION_A, upload_id)
+
+    with pytest.raises(ResourceUnavailableError, match="already in progress"):
+        resources.register_upload(SESSION_A, upload_id)
+
+    registration.finish()
+    replacement = resources.register_upload(SESSION_A, upload_id)
+    replacement.finish()
 
 
 def test_upload_reservations_enforce_per_session_bytes(
@@ -2308,6 +2438,30 @@ def test_real_redis_ttl_expiry_is_reconciled(
     committed.rollback()
     with pytest.raises(ResourceUnavailableError, match="session"):
         resources.reserve_upload(SESSION_A, 1, free_bytes=100)
+
+
+def test_real_redis_upload_registration_expiry_allows_retry_without_reconcile(
+    real_redis_connection: Redis,
+) -> None:
+    resources = coordinator(
+        real_redis_connection,
+        reservation_ttl=0.02,
+        reservation_heartbeat_interval=0.005,
+    )
+    upload_id = "1" * 32
+    registration = resources.register_upload(SESSION_A, upload_id)
+    registration_key = (
+        f"dt:resource:upload-inflight:{SESSION_A}:{upload_id}"
+    )
+
+    deadline = monotonic() + 1
+    while real_redis_connection.exists(registration_key) and monotonic() < deadline:
+        sleep(0.005)
+
+    assert not real_redis_connection.exists(registration_key)
+    replacement = resources.register_upload(SESSION_A, upload_id)
+    replacement.finish()
+    registration.finish()
 
 
 def test_context_managers_release_reservation_and_session_lease(

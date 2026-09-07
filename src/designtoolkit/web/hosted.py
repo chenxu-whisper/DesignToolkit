@@ -32,6 +32,7 @@ from designtoolkit.web.resources import (
     RedisReservation,
     RedisResourceCoordinator,
     RedisSessionLease,
+    RedisUploadRegistration,
     ReservationState,
     ResourceUnavailableError,
     SessionUsageGeneration,
@@ -208,9 +209,11 @@ class _UploadResourceHeartbeat:
         self,
         reservation: RedisReservation,
         lease: RedisSessionLease | None,
+        registration: RedisUploadRegistration | None,
     ) -> None:
         self._reservation = reservation
         self._lease = lease
+        self._registration = registration
         intervals = [
             getattr(
                 getattr(reservation, "coordinator", None),
@@ -229,6 +232,7 @@ class _UploadResourceHeartbeat:
         coordinators = [
             getattr(reservation, "coordinator", None),
             getattr(lease, "coordinator", None),
+            getattr(registration, "coordinator", None),
         ]
         self._stop_timeout = max(
             (
@@ -280,6 +284,11 @@ class _UploadResourceHeartbeat:
         self._reservation.refresh()
         if self._lease is not None:
             self._lease.refresh()
+        if (
+            self._registration is not None
+            and self._registration.refresh()
+        ):
+            raise UploadConflictError("Upload was cancelled")
 
     def _run(self) -> None:
         while not self._stopped.wait(self._interval):
@@ -516,6 +525,7 @@ class HostedStorage:
         chunks: AsyncIterable[bytes],
         reservation: RedisReservation,
         lease: RedisSessionLease | None = None,
+        registration: RedisUploadRegistration | None = None,
     ) -> UploadedAsset:
         """Store an upload with conservative Redis/filesystem recovery.
 
@@ -553,9 +563,17 @@ class HostedStorage:
         committed = False
         owns_asset_dir = False
         try:
-            with _UploadResourceHeartbeat(reservation, lease) as heartbeat:
+            with _UploadResourceHeartbeat(
+                reservation,
+                lease,
+                registration,
+            ) as heartbeat:
                 with self._deletion_lock:
-                    self._raise_if_upload_cancelled(session_id, asset_id)
+                    self._raise_if_upload_cancelled(
+                        session_id,
+                        asset_id,
+                        registration,
+                    )
                     try:
                         asset_dir.mkdir(parents=True, exist_ok=False)
                     except FileExistsError as exc:
@@ -564,7 +582,11 @@ class HostedStorage:
                 with temporary_path.open("xb") as destination:
                     async for chunk in chunks:
                         heartbeat.raise_if_failed()
-                        self._raise_if_upload_cancelled(session_id, asset_id)
+                        self._raise_if_upload_cancelled(
+                            session_id,
+                            asset_id,
+                            registration,
+                        )
                         if not chunk:
                             continue
                         size += len(chunk)
@@ -582,15 +604,32 @@ class HostedStorage:
                     raise UploadRejectedError(
                         "Upload size does not match declared Content-Length"
                     )
-                self._raise_if_upload_cancelled(session_id, asset_id)
+                self._raise_if_upload_cancelled(
+                    session_id,
+                    asset_id,
+                    registration,
+                )
                 os.utime(self._session_dir(session_id), None)
                 heartbeat.seal()
+                self._raise_if_upload_cancelled(
+                    session_id,
+                    asset_id,
+                    registration,
+                )
                 _commit_with_recovery(reservation)
                 committed = True
                 with self._deletion_lock:
-                    self._raise_if_upload_cancelled(session_id, asset_id)
+                    self._raise_if_upload_cancelled(
+                        session_id,
+                        asset_id,
+                        registration,
+                    )
                     temporary_path.replace(final_path)
-                    self._raise_if_upload_cancelled(session_id, asset_id)
+                    self._raise_if_upload_cancelled(
+                        session_id,
+                        asset_id,
+                        registration,
+                    )
         except HeartbeatStopTimeoutError:
             if owns_asset_dir:
                 self._discard_asset(session_id, asset_dir)
@@ -652,25 +691,34 @@ class HostedStorage:
         self,
         session_id: str,
         reference: str,
-    ) -> AssetDeletion:
+        *,
+        cancel_inflight: bool = False,
+    ) -> AssetDeletion | None:
         session_id = _validate_session_id(session_id)
         asset_id = _asset_id(reference)
         session_dir = self._session_dir(session_id)
         assets_dir = session_dir / "assets"
         asset_dir = assets_dir / asset_id
         tombstone = session_dir / ".trash" / asset_id
+        generation = session_dir / _UPLOAD_GENERATIONS_NAME / asset_id
+        cancellation = session_dir / _UPLOAD_CANCELLATIONS_NAME / asset_id
         with self._deletion_lock:
             if tombstone.is_dir():
                 self._mark_upload_cancelled(session_id, asset_id)
                 return _read_asset_deletion(tombstone, asset_id)
             if not asset_dir.is_dir():
-                if self._asset_belongs_to_other_session(session_id, asset_id):
-                    raise UploadRejectedError("Uploaded asset is not available")
+                if not (
+                    cancel_inflight
+                    or generation.is_file()
+                    or cancellation.is_file()
+                ):
+                    return None
                 self._mark_upload_cancelled(session_id, asset_id)
                 return AssetDeletion(
                     asset_id=asset_id,
                     reference=f"asset:{asset_id}",
                     size=0,
+                    pending=True,
                 )
 
             self._mark_upload_cancelled(session_id, asset_id)
@@ -699,14 +747,37 @@ class HostedStorage:
         os.utime(session_dir, None)
         return deletion
 
+    def has_upload_state(self, session_id: str, asset_id: str) -> bool:
+        session_id = _validate_session_id(session_id)
+        asset_id = _asset_id(f"asset:{asset_id}")
+        session_dir = self._session_dir(session_id)
+        with self._deletion_lock:
+            return any(
+                (
+                    (session_dir / "assets" / asset_id).is_dir(),
+                    (session_dir / ".trash" / asset_id).is_dir(),
+                    (
+                        session_dir / _UPLOAD_CANCELLATIONS_NAME / asset_id
+                    ).is_file(),
+                    (session_dir / _UPLOAD_GENERATIONS_NAME / asset_id).is_file(),
+                )
+            )
+
     def finalize_asset_deletion(self, session_id: str, asset_id: str) -> None:
         session_id = _validate_session_id(session_id)
         asset_id = _asset_id(f"asset:{asset_id}")
-        tombstone = self._session_dir(session_id) / ".trash" / asset_id
+        session_dir = self._session_dir(session_id)
+        tombstone = session_dir / ".trash" / asset_id
         with self._deletion_lock:
             shutil.rmtree(tombstone, ignore_errors=True)
             if tombstone.exists():
                 raise OSError("Asset tombstone removal failed")
+            (
+                session_dir / _UPLOAD_CANCELLATIONS_NAME / asset_id
+            ).unlink(missing_ok=True)
+            (
+                session_dir / _UPLOAD_GENERATIONS_NAME / asset_id
+            ).unlink(missing_ok=True)
             self._remove_empty_session(session_id)
 
     def create_task_dir(self, session_id: str) -> Path:
@@ -1012,26 +1083,6 @@ class HostedStorage:
         shutil.rmtree(asset_dir, ignore_errors=True)
         self._remove_empty_session(session_id)
 
-    def _asset_belongs_to_other_session(
-        self,
-        session_id: str,
-        asset_id: str,
-    ) -> bool:
-        sessions_dir = self.root / "sessions"
-        if not sessions_dir.is_dir():
-            return False
-        return any(
-            candidate.name != session_id
-            and (
-                (candidate / "assets" / asset_id).is_dir()
-                or (candidate / ".trash" / asset_id).is_dir()
-                or (candidate / _UPLOAD_CANCELLATIONS_NAME / asset_id).is_file()
-                or (candidate / _UPLOAD_GENERATIONS_NAME / asset_id).is_file()
-            )
-            for candidate in sessions_dir.iterdir()
-            if candidate.is_dir()
-        )
-
     def _mark_upload_cancelled(self, session_id: str, asset_id: str) -> None:
         marker = self._session_dir(session_id) / _UPLOAD_CANCELLATIONS_NAME / asset_id
         marker.parent.mkdir(parents=True, exist_ok=True)
@@ -1041,9 +1092,12 @@ class HostedStorage:
         self,
         session_id: str,
         asset_id: str,
+        registration: RedisUploadRegistration | None = None,
     ) -> None:
         marker = self._session_dir(session_id) / _UPLOAD_CANCELLATIONS_NAME / asset_id
-        if marker.is_file():
+        if marker.is_file() or (
+            registration is not None and registration.refresh()
+        ):
             raise UploadConflictError("Upload was cancelled")
 
 

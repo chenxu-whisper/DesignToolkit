@@ -140,6 +140,19 @@ class RecordingLease:
         self.refresh_count += 1
 
 
+class RecordingUploadRegistration:
+    def __init__(self) -> None:
+        self.coordinator = SimpleNamespace(
+            heartbeat_stop_timeout_seconds=1.0,
+        )
+        self.cancelled = False
+        self.refresh_count = 0
+
+    def refresh(self) -> bool:
+        self.refresh_count += 1
+        return self.cancelled
+
+
 class RecordingCleanupCoordinator:
     def __init__(
         self,
@@ -509,7 +522,9 @@ async def test_upload_is_streamed_to_an_opaque_session_asset(
 
 
 @pytest.mark.anyio
-async def test_delete_before_upload_prevents_later_publication(tmp_path: Path) -> None:
+async def test_random_delete_does_not_create_cancellation_state(
+    tmp_path: Path,
+) -> None:
     storage = HostedStorage(tmp_path, max_upload_bytes=16)
     session_id = "a" * 32
     upload_id = "1" * 32
@@ -517,23 +532,21 @@ async def test_delete_before_upload_prevents_later_publication(tmp_path: Path) -
 
     deletion = storage.delete_asset(session_id, f"asset:{upload_id}")
 
-    with pytest.raises(UploadRejectedError, match="cancelled"):
-        await storage.store_stream(
-            session_id,
-            asset_id=upload_id,
-            filename="screen.png",
-            content_length=4,
-            chunks=_chunks(b"data"),
-            reservation=reservation,
-        )
+    asset = await storage.store_stream(
+        session_id,
+        asset_id=upload_id,
+        filename="screen.png",
+        content_length=4,
+        chunks=_chunks(b"data"),
+        reservation=reservation,
+    )
 
-    assert deletion.size == 0
-    assert reservation.committed is False
-    assert reservation.released is True
-    assert list(tmp_path.rglob("screen.png")) == []
-    assert (
+    assert deletion is None
+    assert reservation.committed is True
+    assert storage.resolve(session_id, asset.reference).read_bytes() == b"data"
+    assert not (
         tmp_path / "sessions" / session_id / ".upload-cancellations" / upload_id
-    ).is_file()
+    ).exists()
 
 
 @pytest.mark.anyio
@@ -666,6 +679,37 @@ async def test_upload_heartbeats_resources_while_waiting_for_next_chunk(
 
 
 @pytest.mark.anyio
+async def test_upload_registration_heartbeat_aborts_cancelled_upload(
+    tmp_path: Path,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    reservation = RecordingReservation()
+    registration = RecordingUploadRegistration()
+
+    async def cancelled_chunks() -> AsyncIterator[bytes]:
+        yield b"im"
+        registration.cancelled = True
+        await asyncio.sleep(0.03)
+        yield b"ag"
+
+    with pytest.raises(UploadRejectedError, match="cancelled"):
+        await storage.store_stream(
+            "a" * 32,
+            asset_id="1" * 32,
+            filename="screen.png",
+            content_length=4,
+            chunks=cancelled_chunks(),
+            reservation=reservation,
+            registration=registration,
+        )
+
+    assert registration.refresh_count >= 2
+    assert reservation.committed is False
+    assert reservation.released is True
+    assert list(tmp_path.rglob("screen.png")) == []
+
+
+@pytest.mark.anyio
 async def test_upload_aborts_before_commit_after_background_heartbeat_failure(
     tmp_path: Path,
 ) -> None:
@@ -749,8 +793,9 @@ async def test_delete_asset_preserves_retryable_state_until_finalized(
         reservation=RecordingReservation(),
     )
 
-    with pytest.raises(UploadRejectedError, match="not available"):
-        storage.delete_asset(stranger, asset.reference)
+    foreign = storage.delete_asset(stranger, asset.reference)
+    assert foreign is None
+    assert not (tmp_path / "sessions" / stranger).exists()
 
     deletion = storage.delete_asset(owner, asset.reference)
     retry = storage.delete_asset(owner, asset.reference)
@@ -766,7 +811,7 @@ async def test_delete_asset_preserves_retryable_state_until_finalized(
     storage.finalize_asset_deletion(owner, deletion.asset_id)
 
     assert list(tmp_path.rglob("screen.png")) == []
-    assert storage.delete_asset(owner, asset.reference).size == 0
+    assert storage.delete_asset(owner, asset.reference) is None
 
 
 @pytest.mark.parametrize(

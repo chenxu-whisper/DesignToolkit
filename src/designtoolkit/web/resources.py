@@ -32,12 +32,60 @@ _LEGACY_CLEANUP_PREFIX = "dt:resource:legacy-cleanup:"
 _TASK_RESOURCE_PREFIX = "dt:resource:task:"
 _TASK_PIN_PREFIX = "dt:resource:task-pin:"
 _ASSET_TASK_PREFIX = "dt:resource:asset-tasks:"
+_UPLOAD_INFLIGHT_PREFIX = "dt:resource:upload-inflight:"
 _SESSION_PATTERN = re.compile(r"^[a-f0-9]{32}$")
 _ASSET_PATTERN = re.compile(r"^[a-f0-9]{32}$")
 _TOKEN_PATTERN = re.compile(r"^[a-f0-9]{32}$")
 _DEFAULT_HEARTBEAT_INTERVAL = 5.0
 _RESERVATION_RECOVERY_ATTEMPTS = 3
 _REDIS_TRANSPORT_ERRORS = (RedisConnectionError, RedisTimeoutError)
+
+_REGISTER_UPLOAD_SCRIPT = """-- register_upload
+if redis.call("EXISTS", KEYS[1]) == 1 then
+    if redis.call("HGET", KEYS[1], "token") ~= ARGV[1] then
+        return 1
+    end
+    redis.call("PEXPIRE", KEYS[1], tonumber(ARGV[2]))
+    return 2
+end
+redis.call(
+    "HMSET",
+    KEYS[1],
+    "token",
+    ARGV[1],
+    "state",
+    "inflight"
+)
+redis.call("PEXPIRE", KEYS[1], tonumber(ARGV[2]))
+return 0
+"""
+
+_REFRESH_UPLOAD_SCRIPT = """-- refresh_upload
+if redis.call("HGET", KEYS[1], "token") ~= ARGV[1] then
+    return 0
+end
+redis.call("PEXPIRE", KEYS[1], tonumber(ARGV[2]))
+if redis.call("HGET", KEYS[1], "state") == "cancelled" then
+    return 2
+end
+return 1
+"""
+
+_CANCEL_UPLOAD_SCRIPT = """-- cancel_upload
+if redis.call("EXISTS", KEYS[1]) == 0 then
+    return 0
+end
+redis.call("HSET", KEYS[1], "state", "cancelled")
+redis.call("PEXPIRE", KEYS[1], tonumber(ARGV[1]))
+return 1
+"""
+
+_FINISH_UPLOAD_SCRIPT = """-- finish_upload
+if redis.call("HGET", KEYS[1], "token") ~= ARGV[1] then
+    return 0
+end
+return redis.call("DEL", KEYS[1])
+"""
 
 _RESERVE_UPLOAD_SCRIPT = """-- reserve_upload
 local state_key = KEYS[1]
@@ -1288,6 +1336,20 @@ class RedisSessionLease:
         self.release()
 
 
+@dataclass
+class RedisUploadRegistration:
+    coordinator: RedisResourceCoordinator
+    session_id: str
+    upload_id: str
+    token: str
+
+    def refresh(self) -> bool:
+        return self.coordinator._upload_registration_state(self)
+
+    def finish(self) -> None:
+        self.coordinator._finish_upload(self)
+
+
 class RedisResourceCoordinator:
     def __init__(
         self,
@@ -1356,6 +1418,18 @@ class RedisResourceCoordinator:
             ),
         )
         self.reservation_heartbeat_interval = reservation_heartbeat_interval
+        self._register_upload_script = self._redis.register_script(
+            _REGISTER_UPLOAD_SCRIPT
+        )
+        self._refresh_upload_script = self._redis.register_script(
+            _REFRESH_UPLOAD_SCRIPT
+        )
+        self._cancel_upload_script = self._redis.register_script(
+            _CANCEL_UPLOAD_SCRIPT
+        )
+        self._finish_upload_script = self._redis.register_script(
+            _FINISH_UPLOAD_SCRIPT
+        )
         self._reserve_upload_script = self._redis.register_script(
             _RESERVE_UPLOAD_SCRIPT
         )
@@ -1548,6 +1622,103 @@ class RedisResourceCoordinator:
         if result == 6:
             raise ResourceUnavailableError("Upload reservation expired")
         return reservation
+
+    def register_upload(
+        self,
+        session_id: str,
+        upload_id: str,
+    ) -> RedisUploadRegistration:
+        _validate_session_id(session_id)
+        _validate_asset_id(upload_id)
+        token = uuid4().hex
+        registration = RedisUploadRegistration(
+            coordinator=self,
+            session_id=session_id,
+            upload_id=upload_id,
+            token=token,
+        )
+        last_transport_error: RedisConnectionError | RedisTimeoutError | None = None
+        for _attempt in range(_RESERVATION_RECOVERY_ATTEMPTS):
+            try:
+                result = int(
+                    self._register_upload_script(
+                        keys=[_upload_inflight_key(session_id, upload_id)],
+                        args=[
+                            token,
+                            self._reservation_ttl_ms,
+                        ],
+                    )
+                )
+            except _REDIS_TRANSPORT_ERRORS as exc:
+                last_transport_error = exc
+                continue
+            if result == 1:
+                raise ResourceUnavailableError("Upload is already in progress")
+            return registration
+        if last_transport_error is None:
+            raise RuntimeError("Upload registration recovery lost its error")
+        raise last_transport_error
+
+    def cancel_upload(self, session_id: str, upload_id: str) -> bool:
+        _validate_session_id(session_id)
+        _validate_asset_id(upload_id)
+        return bool(
+            self._cancel_upload_script(
+                keys=[_upload_inflight_key(session_id, upload_id)],
+                args=[self._reservation_ttl_ms],
+            )
+        )
+
+    def _upload_registration_state(
+        self,
+        registration: RedisUploadRegistration,
+    ) -> bool:
+        result = int(
+            self._refresh_upload_script(
+                keys=[
+                    _upload_inflight_key(
+                        registration.session_id,
+                        registration.upload_id,
+                    )
+                ],
+                args=[
+                    registration.token,
+                    self._reservation_ttl_ms,
+                ],
+            )
+        )
+        if result == 0:
+            raise ResourceUnavailableError("Upload registration expired")
+        return result == 2
+
+    def _finish_upload(self, registration: RedisUploadRegistration) -> None:
+        registration_key = _upload_inflight_key(
+            registration.session_id,
+            registration.upload_id,
+        )
+        last_transport_error: RedisConnectionError | RedisTimeoutError | None = None
+        for _attempt in range(_RESERVATION_RECOVERY_ATTEMPTS):
+            try:
+                self._finish_upload_script(
+                    keys=[registration_key],
+                    args=[registration.token],
+                )
+            except _REDIS_TRANSPORT_ERRORS as exc:
+                last_transport_error = exc
+                try:
+                    owner = self._redis.hget(registration_key, "token")
+                except _REDIS_TRANSPORT_ERRORS:
+                    continue
+                owner_text = (
+                    owner.decode() if isinstance(owner, bytes) else owner
+                )
+                if owner_text != registration.token:
+                    return
+                continue
+            return
+        if last_transport_error is None:
+            raise RuntimeError("Upload registration cleanup lost its error")
+        raise last_transport_error
 
     def reserve_output(
         self,
@@ -2227,6 +2398,10 @@ def _task_pin_key(task_id: str) -> str:
 
 def _asset_tasks_key(session_id: str, asset_id: str) -> str:
     return f"{_ASSET_TASK_PREFIX}{session_id}:{asset_id}"
+
+
+def _upload_inflight_key(session_id: str, upload_id: str) -> str:
+    return f"{_UPLOAD_INFLIGHT_PREFIX}{session_id}:{upload_id}"
 
 
 def _decoded_hash_value(

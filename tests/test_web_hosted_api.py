@@ -47,6 +47,7 @@ from designtoolkit.web.media_limits import HostedMediaValidator, MediaLimitError
 from designtoolkit.web.redis_tasks import RedisTaskManager
 from designtoolkit.web.resources import (
     AssetReleaseMismatchError,
+    RedisResourceCoordinator,
     ResourceUnavailableError,
 )
 from designtoolkit.web.schemas import LogLevel, LogPhase, TaskKind, TaskStatus
@@ -122,6 +123,26 @@ class StubLease:
             self.coordinator.active_leases -= 1
 
 
+class StubUploadRegistration:
+    def __init__(
+        self,
+        coordinator: StubCoordinator,
+        session_id: str,
+        upload_id: str,
+    ) -> None:
+        self.coordinator = coordinator
+        self.session_id = session_id
+        self.upload_id = upload_id
+
+    def refresh(self) -> bool:
+        if (self.session_id, self.upload_id) not in self.coordinator.inflight:
+            raise ResourceUnavailableError("Upload registration expired")
+        return self.coordinator.inflight[(self.session_id, self.upload_id)]
+
+    def finish(self) -> None:
+        self.coordinator.inflight.pop((self.session_id, self.upload_id), None)
+
+
 class StubCoordinator:
     def __init__(
         self,
@@ -148,6 +169,25 @@ class StubCoordinator:
         self.fail_lease_refresh = False
         self.session_lease_heartbeat_interval = 5.0
         self.reservation_heartbeat_interval = 5.0
+        self.inflight: dict[tuple[str, str], bool] = {}
+
+    def register_upload(
+        self,
+        session_id: str,
+        upload_id: str,
+    ) -> StubUploadRegistration:
+        key = (session_id, upload_id)
+        if key in self.inflight:
+            raise ResourceUnavailableError("Upload is already in progress")
+        self.inflight[key] = False
+        return StubUploadRegistration(self, session_id, upload_id)
+
+    def cancel_upload(self, session_id: str, upload_id: str) -> bool:
+        key = (session_id, upload_id)
+        if key not in self.inflight:
+            return False
+        self.inflight[key] = True
+        return True
 
     def reserve_upload(
         self,
@@ -720,7 +760,7 @@ def test_known_upload_id_recovers_committed_upload_after_response_loss(
     assert list(tmp_path.rglob("screen.png")) == []
 
 
-def test_delete_before_upload_returns_404_and_prevents_later_publication(
+def test_random_delete_returns_404_without_blocking_later_upload(
     tmp_path: Path,
 ) -> None:
     upload_id = "1" * 32
@@ -737,9 +777,83 @@ def test_delete_before_upload_returns_404_and_prevents_later_publication(
         coordinator = client.app.state.resource_coordinator
 
     assert deleted.status_code == 404
-    assert rejected.status_code == 409
-    assert coordinator.committed.get(session_id, 0) == 0
-    assert list(tmp_path.rglob("screen.png")) == []
+    assert rejected.status_code == 201
+    assert coordinator.committed[session_id] == 5
+    assert len(list(tmp_path.rglob("screen.png"))) == 1
+    assert not (
+        tmp_path / "sessions" / session_id / ".upload-cancellations" / upload_id
+    ).exists()
+
+
+def test_random_delete_does_not_scan_other_session_namespaces(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    for index in range(10_000):
+        (sessions_dir / f"{index:032x}").mkdir()
+    original_iterdir = Path.iterdir
+
+    def reject_global_session_scan(path: Path):
+        if path == sessions_dir:
+            raise AssertionError("DELETE scanned all session namespaces")
+        return original_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", reject_global_session_scan)
+    with _client(tmp_path) as client:
+        client.get("/api/config")
+        session_id = client.cookies["dt_session"]
+        response = client.delete(f"/api/uploads/{'f' * 32}")
+
+    assert response.status_code == 404
+    assert not (sessions_dir / session_id).exists()
+
+
+def test_delete_redis_queries_use_session_operation_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coordinator = StubCoordinator(
+        max_upload_concurrency=4,
+        max_session_bytes=2 * 1024 * 1024 * 1024,
+        min_free_bytes=0,
+    )
+    inside_commit = False
+    original_commit = routes_module._HostedSessionOperation.commit
+    original_query = coordinator.is_committed_asset_released
+
+    def track_commit(operation, action):  # noqa: ANN001, ANN202
+        def tracked_action():
+            nonlocal inside_commit
+            inside_commit = True
+            try:
+                return action()
+            finally:
+                inside_commit = False
+
+        return original_commit(operation, tracked_action)
+
+    def guarded_query(session_id: str, asset_id: str) -> bool:
+        assert inside_commit
+        return original_query(session_id, asset_id)
+
+    monkeypatch.setattr(
+        routes_module._HostedSessionOperation,
+        "commit",
+        track_commit,
+    )
+    monkeypatch.setattr(
+        coordinator,
+        "is_committed_asset_released",
+        guarded_query,
+    )
+
+    with _client(tmp_path, resource_coordinator=coordinator) as client:
+        client.get("/api/config")
+        response = client.delete(f"/api/uploads/{'f' * 32}")
+
+    assert response.status_code == 404
 
 
 @pytest.mark.parametrize(
@@ -784,6 +898,50 @@ def test_delete_in_progress_upload_returns_409_with_cancellation_marker(
     assert deleted.status_code == 409
     assert (asset_dir.parent.parent / ".upload-cancellations" / upload_id).is_file()
     assert (asset_dir / ".uploading").read_bytes() == b"partial"
+
+
+def test_delete_inflight_upload_prevents_publish_and_releases_quota(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=5)
+    started = Event()
+    resume = Event()
+    original_store = storage.store_stream
+
+    async def paused_store(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        started.set()
+        while not resume.is_set():
+            await asyncio.sleep(0.005)
+        return await original_store(*args, **kwargs)
+
+    monkeypatch.setattr(storage, "store_stream", paused_store)
+    with _client(
+        tmp_path,
+        max_session_bytes=5,
+        hosted_storage=storage,
+    ) as client:
+        client.get("/api/config")
+        coordinator = client.app.state.resource_coordinator
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            upload_future = executor.submit(
+                _upload,
+                client,
+                "screen.png",
+                b"image",
+                upload_id="1" * 32,
+            )
+            assert started.wait(timeout=2)
+            deleted = client.delete(f"/api/uploads/{'1' * 32}")
+            resume.set()
+            uploaded = upload_future.result(timeout=2)
+
+    assert deleted.status_code == 409
+    assert uploaded.status_code == 409
+    assert coordinator.active_uploads == 0
+    assert coordinator.committed == {}
+    assert coordinator.inflight == {}
+    assert list(tmp_path.rglob("screen.png")) == []
 
 
 def test_delete_upload_is_owner_scoped_idempotent_and_reclaims_quota(
@@ -1382,6 +1540,69 @@ def test_real_redis_hosted_get_endpoint_is_rate_limited(tmp_path: Path) -> None:
         rate_keys = list(redis_connection.scan_iter(match="dt:rate:*"))
         if rate_keys:
             redis_connection.delete(*rate_keys)
+        redis_connection.close()
+
+
+def test_real_redis_random_delete_does_not_grow_upload_state(
+    tmp_path: Path,
+) -> None:
+    url = os.environ.get(
+        "DESIGNTOOLKIT_TEST_REDIS_URL",
+        "redis://localhost:6379/15",
+    )
+    redis_connection = Redis.from_url(
+        url,
+        decode_responses=False,
+        socket_connect_timeout=0.2,
+        socket_timeout=0.2,
+    )
+    try:
+        redis_connection.ping()
+    except RedisError as error:
+        redis_connection.close()
+        pytest.skip(f"real Redis unavailable at {url}: {error}")
+    resource_keys = list(redis_connection.scan_iter(match="dt:resource:*"))
+    if resource_keys:
+        redis_connection.delete(*resource_keys)
+    manager = RedisTaskManager(
+        redis_connection=redis_connection,
+        queue=Queue("designtoolkit", connection=redis_connection),
+        data_dir=tmp_path,
+        max_queued_tasks=20,
+        retention_seconds=7200,
+    )
+    resources = RedisResourceCoordinator(
+        redis_connection=redis_connection,
+        max_upload_concurrency=4,
+        max_session_bytes=2 * 1024 * 1024 * 1024,
+        min_free_bytes=0,
+        reservation_ttl=30,
+        lease_ttl=30,
+    )
+    try:
+        with _client(
+            tmp_path,
+            task_manager=manager,
+            resource_coordinator=resources,
+        ) as client:
+            client.get("/api/config")
+            for index in range(100):
+                response = client.delete(f"/api/uploads/{index:032x}")
+                assert response.status_code == 404
+
+        assert list(
+            redis_connection.scan_iter(
+                match="dt:resource:upload-inflight:*"
+            )
+        ) == []
+        assert list(
+            redis_connection.scan_iter(match="dt:resource:session:*")
+        ) == []
+        assert list(tmp_path.rglob(".upload-cancellations")) == []
+    finally:
+        resource_keys = list(redis_connection.scan_iter(match="dt:resource:*"))
+        if resource_keys:
+            redis_connection.delete(*resource_keys)
         redis_connection.close()
 
 

@@ -1302,8 +1302,18 @@ def create_router(
 
         reservation = None
         lease = None
+        registration = None
         release_resources = True
         try:
+            try:
+                registration = resources.register_upload(
+                    http_request.state.session_id,
+                    upload_id,
+                )
+            except ResourceUnavailableError as exc:
+                if str(exc) == "Upload is already in progress":
+                    raise ApiError("upload_conflict", str(exc), 409) from exc
+                raise
             storage.claim_upload_generation(
                 http_request.state.session_id,
                 upload_id,
@@ -1322,6 +1332,7 @@ def create_router(
                 chunks=http_request.stream(),
                 reservation=reservation,
                 lease=lease,
+                registration=registration,
             )
         except UploadConflictError as exc:
             raise ApiError("upload_conflict", str(exc), 409) from exc
@@ -1356,6 +1367,11 @@ def create_router(
                     reservation.release,
                     "upload reservation",
                 )
+            if registration is not None:
+                _release_redis_resource_best_effort(
+                    registration.finish,
+                    "upload registration",
+                )
         return UploadResponse(
             reference=asset.reference,
             filename=asset.filename,
@@ -1375,6 +1391,40 @@ def create_router(
         session_id = http_request.state.session_id
         deletion_claim: str | None = None
         try:
+            inflight = operation.commit(
+                lambda: resources.cancel_upload(session_id, asset_id)
+            )
+            has_local_state = storage.has_upload_state(
+                session_id,
+                asset_id,
+            )
+            if not inflight and not has_local_state:
+                already_released = operation.commit(
+                    lambda: resources.is_committed_asset_released(
+                        session_id,
+                        asset_id,
+                    )
+                )
+                if already_released:
+                    operation.commit(
+                        lambda: storage.finalize_asset_deletion(
+                            session_id,
+                            asset_id,
+                        )
+                    )
+                    try:
+                        operation.commit(
+                            lambda: resources.finalize_asset_release(
+                                session_id,
+                                asset_id,
+                            )
+                        )
+                    except RedisError:
+                        _LOGGER.warning(
+                            "Failed to finalize release marker for absent asset",
+                            exc_info=True,
+                        )
+                return Response(status_code=404)
             if isinstance(task_manager, RedisTaskManager):
                 deletion_claim = operation.commit(
                     lambda: task_manager.claim_asset_deletion(
@@ -1382,20 +1432,28 @@ def create_router(
                         asset_id,
                     )
                 )
+            recovered_deletion = False
             try:
                 deletion = operation.commit(
                     lambda: storage.delete_asset(
                         session_id,
                         f"asset:{asset_id}",
+                        cancel_inflight=inflight,
                     )
                 )
             except AssetDeletionStateError as exc:
-                if not resources.is_committed_asset_released(
-                    session_id,
-                    exc.asset_id,
+                invalid_asset_id = exc.asset_id
+                if not operation.commit(
+                    lambda: resources.is_committed_asset_released(
+                        session_id,
+                        invalid_asset_id,
+                    )
                 ):
                     raise
                 deletion = None
+                recovered_deletion = True
+            if deletion is None and not recovered_deletion:
+                return Response(status_code=404)
             if deletion is not None and deletion.pending:
                 raise ApiError(
                     "upload_in_progress",
@@ -1410,34 +1468,18 @@ def create_router(
                         deletion.size,
                     )
                 )
-            asset_was_absent = deletion is not None and deletion.size == 0
             operation.commit(
                 lambda: storage.finalize_asset_deletion(
                     session_id,
                     asset_id,
                 )
             )
-            if asset_was_absent:
-                try:
-                    operation.commit(
-                        lambda: resources.finalize_asset_release(
-                            session_id,
-                            asset_id,
-                        )
-                    )
-                except RedisError:
-                    _LOGGER.warning(
-                        "Failed to finalize release marker for absent asset",
-                        exc_info=True,
-                    )
-                return Response(status_code=404)
-            else:
-                operation.commit(
-                    lambda: resources.finalize_asset_release(
-                        session_id,
-                        asset_id,
-                    )
+            operation.commit(
+                lambda: resources.finalize_asset_release(
+                    session_id,
+                    asset_id,
                 )
+            )
         except UploadRejectedError as exc:
             raise ApiError("asset_not_found", str(exc), 404) from exc
         except AssetReleaseMismatchError as exc:
