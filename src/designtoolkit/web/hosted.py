@@ -324,7 +324,7 @@ class HostedSettings:
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> HostedSettings:
         values = os.environ if env is None else env
-        return cls(
+        settings = cls(
             enabled=_read_bool(values, "DESIGNTOOLKIT_HOSTED", False),
             data_dir=Path(values.get("DESIGNTOOLKIT_DATA_DIR", "/data")),
             redis_url=values.get("REDIS_URL", "redis://redis:6379/0"),
@@ -444,6 +444,21 @@ class HostedSettings:
                 True,
             ),
         )
+        if (
+            settings.reservation_ttl_seconds
+            <= settings.reservation_heartbeat_seconds
+        ):
+            raise ValueError(
+                "Reservation TTL must be greater than the reservation heartbeat"
+            )
+        if (
+            settings.reservation_ttl_seconds
+            <= settings.redis_socket_timeout_seconds
+        ):
+            raise ValueError(
+                "Reservation TTL must be greater than the Redis socket timeout"
+            )
+        return settings
 
     @property
     def heartbeat_stop_timeout_seconds(self) -> float:

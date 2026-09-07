@@ -47,7 +47,7 @@ class DeterministicRedis(fakeredis.FakeRedis):
         return execute
 
     def _eval_reserve_upload(self, keys, args):  # noqa: ANN001, ANN202
-        state_key, index_key, token_key = keys
+        state_key, index_key, token_key, receipt_key = keys
         (
             token,
             session_id,
@@ -57,20 +57,39 @@ class DeterministicRedis(fakeredis.FakeRedis):
             max_session_bytes,
             min_free_bytes,
             ttl_ms,
+            receipt_ttl_ms,
         ) = args
         requested = int(requested)
         free_bytes = int(free_bytes)
         min_free_bytes = int(min_free_bytes)
-        if self.exists(token_key):
-            expected = {
-                b"kind": b"upload",
-                b"owner_id": str(session_id).encode(),
-                b"session_id": str(session_id).encode(),
-                b"bytes": str(requested).encode(),
-                b"free_bytes": str(free_bytes).encode(),
-                b"min_free_bytes": str(min_free_bytes).encode(),
-            }
-            return 4 if self.hgetall(token_key) == expected else 5
+        expected = {
+            b"kind": b"upload",
+            b"owner_id": str(session_id).encode(),
+            b"session_id": str(session_id).encode(),
+            b"bytes": str(requested).encode(),
+            b"free_bytes": str(free_bytes).encode(),
+            b"min_free_bytes": str(min_free_bytes).encode(),
+        }
+        index_metadata = (
+            f"upload|{session_id}|{requested}|{free_bytes}|{min_free_bytes}"
+        )
+        if self.exists(receipt_key):
+            receipt = self.hgetall(receipt_key)
+            receipt_state = receipt.pop(b"state", None)
+            if receipt != expected:
+                return 5
+            if receipt_state != b"reserved":
+                return 6
+            if self.hget(index_key, token) != index_metadata.encode():
+                return 5
+            if self.exists(token_key):
+                return 4 if self.hgetall(token_key) == expected else 5
+            self.hset(token_key, mapping=expected)
+            self.pexpire(token_key, int(ttl_ms))
+            self.pexpire(receipt_key, int(receipt_ttl_ms))
+            return 4
+        if self.exists(token_key) or self.hexists(index_key, token):
+            return 5
         if self._number(state_key, "upload_count") >= int(max_uploads):
             return 1
         if self._number(
@@ -111,9 +130,20 @@ class DeterministicRedis(fakeredis.FakeRedis):
         )
         self.pexpire(token_key, int(ttl_ms))
         self.hset(
+            receipt_key,
+            mapping={
+                "state": "reserved",
+                **{
+                    self._text(field): self._text(value)
+                    for field, value in expected.items()
+                },
+            },
+        )
+        self.pexpire(receipt_key, int(receipt_ttl_ms))
+        self.hset(
             index_key,
             token,
-            f"upload|{session_id}|{requested}|{free_bytes}|{min_free_bytes}",
+            index_metadata,
         )
         self.hincrby(state_key, "reserved_bytes", requested)
         self.hincrby(state_key, "upload_count", 1)
@@ -127,7 +157,7 @@ class DeterministicRedis(fakeredis.FakeRedis):
         return 0
 
     def _eval_reserve_output(self, keys, args):  # noqa: ANN001, ANN202
-        state_key, index_key, token_key, task_key = keys
+        state_key, index_key, token_key, task_key, receipt_key = keys
         (
             token,
             task_id,
@@ -137,10 +167,48 @@ class DeterministicRedis(fakeredis.FakeRedis):
             min_free_bytes,
             ttl_ms,
             heartbeat_at,
+            receipt_ttl_ms,
         ) = args
         requested = int(requested)
         free_bytes = int(free_bytes)
         min_free_bytes = int(min_free_bytes)
+        expected = {
+            b"kind": b"output",
+            b"owner_id": str(task_id).encode(),
+            b"session_id": str(session_id).encode(),
+            b"bytes": str(requested).encode(),
+            b"free_bytes": str(free_bytes).encode(),
+            b"min_free_bytes": str(min_free_bytes).encode(),
+        }
+        index_metadata = (
+            f"output|{session_id}|{requested}|{free_bytes}|{min_free_bytes}"
+        )
+        if self.exists(receipt_key):
+            receipt = self.hgetall(receipt_key)
+            receipt_state = receipt.pop(b"state", None)
+            if receipt != expected:
+                return 3
+            if receipt_state != b"reserved":
+                return 4
+            if self.hget(index_key, token) != index_metadata.encode():
+                return 3
+            if self.exists(token_key):
+                return 2 if self.hgetall(token_key) == expected else 3
+            self.hset(token_key, mapping=expected)
+            self.pexpire(token_key, int(ttl_ms))
+            self.pexpire(receipt_key, int(receipt_ttl_ms))
+            self.hset(
+                task_key,
+                mapping={
+                    "session_id": session_id,
+                    "output_token": token,
+                    "heartbeat_at": heartbeat_at,
+                },
+            )
+            self.pexpire(task_key, int(ttl_ms))
+            return 2
+        if self.exists(token_key) or self.hexists(index_key, token):
+            return 3
         observed_free = self._optional_number(
             state_key,
             "observed_free_bytes",
@@ -171,9 +239,20 @@ class DeterministicRedis(fakeredis.FakeRedis):
         )
         self.pexpire(token_key, int(ttl_ms))
         self.hset(
+            receipt_key,
+            mapping={
+                "state": "reserved",
+                **{
+                    self._text(field): self._text(value)
+                    for field, value in expected.items()
+                },
+            },
+        )
+        self.pexpire(receipt_key, int(receipt_ttl_ms))
+        self.hset(
             index_key,
             token,
-            f"output|{session_id}|{requested}|{free_bytes}|{min_free_bytes}",
+            index_metadata,
         )
         self.hincrby(state_key, "reserved_bytes", requested)
         self.hincrby(state_key, "output_reserved_bytes", requested)
@@ -196,20 +275,103 @@ class DeterministicRedis(fakeredis.FakeRedis):
         self.pexpire(keys[0], int(args[0]))
         return 1
 
-    def _eval_release_reservation(self, keys, _args):  # noqa: ANN001, ANN202
-        state_key, index_key, token_key, task_key = keys
+    def _eval_refresh_reservation(self, keys, args):  # noqa: ANN001, ANN202
+        token_key, receipt_key = keys
+        if (
+            not self.exists(token_key)
+            or self.hget(receipt_key, "state") != b"reserved"
+        ):
+            return 0
+        self.pexpire(token_key, int(args[0]))
+        self.pexpire(receipt_key, int(args[1]))
+        return 1
+
+    def _eval_reservation_recovery_state(  # noqa: ANN001, ANN202
+        self,
+        keys,
+        args,
+    ):
+        token_key, index_key, receipt_key = keys
+        (
+            token,
+            index_metadata,
+            kind,
+            owner_id,
+            session_id,
+            byte_count,
+            free_bytes,
+            min_free_bytes,
+        ) = (str(value) for value in args)
+        expected = {
+            b"kind": kind.encode(),
+            b"owner_id": owner_id.encode(),
+            b"session_id": session_id.encode(),
+            b"bytes": byte_count.encode(),
+            b"free_bytes": free_bytes.encode(),
+            b"min_free_bytes": min_free_bytes.encode(),
+        }
+        if not self.exists(receipt_key):
+            return 0
+        receipt = self.hgetall(receipt_key)
+        receipt_state = receipt.pop(b"state", None)
+        if receipt != expected:
+            return 2
+        if receipt_state != b"reserved":
+            return 0
+        if self.hget(index_key, token) != index_metadata.encode():
+            return 2
+        if not self.exists(token_key):
+            return 0
+        return 1 if self.hgetall(token_key) == expected else 2
+
+    def _eval_release_reservation(self, keys, args):  # noqa: ANN001, ANN202
+        state_key, index_key, token_key, task_key, receipt_key = keys
         token = token_key.rsplit(":", 1)[-1]
+        receipt_ttl_ms = int(args[1])
         if self.hget(task_key, "output_token") == token.encode():
             self.hdel(task_key, "output_token")
             if not self.hexists(task_key, "lease_token"):
                 self.delete(task_key)
-        if not self.exists(token_key):
+        metadata_key = token_key
+        if self.exists(receipt_key):
+            if self.hget(receipt_key, "state") != b"reserved":
+                return 0
+            metadata_key = receipt_key
+        elif not self.exists(token_key):
             return 0
-        kind = self._text(self.hget(token_key, "kind"))
-        session_id = self._text(self.hget(token_key, "session_id"))
-        reserved_bytes = int(self.hget(token_key, "bytes"))
+        kind = self._text(self.hget(metadata_key, "kind"))
+        session_id = self._text(self.hget(metadata_key, "session_id"))
+        reserved_bytes = int(self.hget(metadata_key, "bytes"))
+        index_metadata = "|".join(
+            (
+                kind,
+                session_id,
+                str(reserved_bytes),
+                self._text(self.hget(metadata_key, "free_bytes")),
+                self._text(self.hget(metadata_key, "min_free_bytes")),
+            )
+        )
+        if self.hget(index_key, token) != index_metadata.encode():
+            return 2
+        if self.exists(token_key):
+            fields = (
+                "kind",
+                "owner_id",
+                "session_id",
+                "bytes",
+                "free_bytes",
+                "min_free_bytes",
+            )
+            if any(
+                self.hget(token_key, field) != self.hget(metadata_key, field)
+                for field in fields
+            ):
+                return 2
         self.delete(token_key)
         self.hdel(index_key, token_key.rsplit(":", 1)[-1])
+        if self.exists(receipt_key):
+            self.hset(receipt_key, "state", "released")
+            self.pexpire(receipt_key, receipt_ttl_ms)
         self._decrement(state_key, "reserved_bytes", reserved_bytes)
         if kind == "upload":
             self._decrement(state_key, "upload_count", 1)
@@ -228,16 +390,24 @@ class DeterministicRedis(fakeredis.FakeRedis):
         return 1
 
     def _eval_commit_reservation(self, keys, args):  # noqa: ANN001, ANN202
-        state_key, index_key, token_key, committed_key = keys
+        state_key, index_key, token_key, committed_key, receipt_key = keys
         if self.hget(committed_key, "state") == b"committed":
             return 2
         if not self.exists(token_key):
+            return 0
+        if (
+            self.exists(receipt_key)
+            and self.hget(receipt_key, "state") != b"reserved"
+        ):
             return 0
         kind = self._text(self.hget(token_key, "kind"))
         session_id = self._text(self.hget(token_key, "session_id"))
         reserved_bytes = int(self.hget(token_key, "bytes"))
         self.delete(token_key)
         self.hdel(index_key, token_key.rsplit(":", 1)[-1])
+        if self.exists(receipt_key):
+            self.hset(receipt_key, "state", "committed")
+            self.pexpire(receipt_key, int(args[2]))
         self._decrement(state_key, "reserved_bytes", reserved_bytes)
         if kind == "upload":
             self._decrement(state_key, "upload_count", 1)
@@ -297,6 +467,8 @@ class DeterministicRedis(fakeredis.FakeRedis):
     def _eval_reconcile_reservations(self, keys, args):  # noqa: ANN001, ANN202
         state_key, index_key = keys
         token_prefix = str(args[0])
+        receipt_prefix = str(args[1])
+        receipt_ttl_ms = int(args[2])
         removed = 0
         for raw_token, raw_metadata in self.hgetall(index_key).items():
             token = self._text(raw_token)
@@ -321,6 +493,10 @@ class DeterministicRedis(fakeredis.FakeRedis):
                     "output_reserved_bytes",
                     reserved_bytes,
                 )
+            receipt_key = f"{receipt_prefix}{token}"
+            if self.hget(receipt_key, "state") == b"reserved":
+                self.hset(receipt_key, "state", "expired")
+                self.pexpire(receipt_key, receipt_ttl_ms)
             removed += 1
         self._recompute_capacity(state_key, index_key)
         return removed
@@ -775,6 +951,36 @@ class ExecuteThenRaiseRedis:
             raise RedisConnectionError(f"{operation} acknowledgement lost")
 
         return execute_then_raise
+
+    def __getattr__(self, name: str):
+        return getattr(self._redis, name)
+
+
+class ExecuteThenExpireAndRaiseRedis:
+    def __init__(
+        self,
+        operation: str,
+        redis_connection: Redis,
+        after_execute,
+    ) -> None:
+        self._redis = redis_connection
+        self.operation = operation
+        self.after_execute = after_execute
+        self.raised = False
+
+    def register_script(self, script):  # noqa: ANN001, ANN201
+        execute = self._redis.register_script(script)
+        operation = script.splitlines()[0].removeprefix("-- ")
+
+        def execute_then_expire_and_raise(*, keys, args):
+            if operation != self.operation or self.raised:
+                return execute(keys=keys, args=args)
+            execute(keys=keys, args=args)
+            self.raised = True
+            self.after_execute(keys, args)
+            raise RedisConnectionError(f"{operation} acknowledgement lost")
+
+        return execute_then_expire_and_raise
 
     def __getattr__(self, name: str):
         return getattr(self._redis, name)
@@ -1565,6 +1771,50 @@ def test_upload_reserve_recovers_lost_ack_without_double_reserving(
     assert reservation.state() is ReservationState.COMMITTED
 
 
+def test_real_redis_upload_reserve_recovers_after_token_expires_between_retries(
+    real_redis_connection: Redis,
+) -> None:
+    def await_token_expiry(keys, _args) -> None:  # noqa: ANN001
+        deadline = monotonic() + 1
+        while real_redis_connection.exists(keys[2]) and monotonic() < deadline:
+            sleep(0.005)
+        assert not real_redis_connection.exists(keys[2])
+
+    redis_connection = ExecuteThenExpireAndRaiseRedis(
+        "reserve_upload",
+        real_redis_connection,
+        await_token_expiry,
+    )
+    resources = coordinator(
+        redis_connection,
+        max_uploads=2,
+        max_session_bytes=10,
+        reservation_ttl=0.02,
+        reservation_heartbeat_interval=0.005,
+    )
+
+    reservation = resources.reserve_upload(SESSION_A, 4, free_bytes=100)
+    receipt_key = f"dt:resource:reservation-receipt:{reservation.token}"
+
+    assert real_redis_connection.hget("dt:resource:state", "reserved_bytes") == b"4"
+    assert real_redis_connection.hget("dt:resource:state", "upload_count") == b"1"
+    assert real_redis_connection.hget(receipt_key, "state") == b"reserved"
+    assert (
+        0
+        < real_redis_connection.pttl(receipt_key)
+        <= resources._reservation_receipt_ttl_ms
+    )
+    reservation.release()
+    assert real_redis_connection.hget("dt:resource:state", "reserved_bytes") is None
+    assert real_redis_connection.hget("dt:resource:state", "upload_count") is None
+    assert real_redis_connection.hget(receipt_key, "state") == b"released"
+    assert (
+        0
+        < real_redis_connection.pttl(receipt_key)
+        <= resources._reservation_receipt_ttl_ms
+    )
+
+
 def test_upload_reserve_rejects_conflicting_existing_token_metadata(
     real_redis_connection: Redis,
     monkeypatch: pytest.MonkeyPatch,
@@ -1626,6 +1876,126 @@ def test_output_reserve_recovers_lost_ack_without_double_reserving(
         )
         is None
     )
+
+
+def test_output_reserve_recovers_after_token_expires_between_retries(
+    redis_connection: DeterministicRedis,
+) -> None:
+    def expire_token(keys, _args) -> None:  # noqa: ANN001
+        redis_connection.delete(keys[2], keys[3])
+
+    failing_redis = ExecuteThenExpireAndRaiseRedis(
+        "reserve_output",
+        redis_connection,
+        expire_token,
+    )
+    resources = coordinator(failing_redis)
+
+    reservation = resources.reserve_output(
+        "task-1",
+        SESSION_A,
+        4,
+        free_bytes=100,
+    )
+
+    assert redis_connection.hget("dt:resource:state", "reserved_bytes") == b"4"
+    assert redis_connection.hget(
+        "dt:resource:state",
+        "output_reserved_bytes",
+    ) == b"4"
+    assert redis_connection.hget(
+        "dt:resource:task:task-1",
+        "output_token",
+    ) == reservation.token.encode()
+    reservation.release()
+    assert redis_connection.hget("dt:resource:state", "reserved_bytes") is None
+    assert redis_connection.hget(
+        "dt:resource:state",
+        "output_reserved_bytes",
+    ) is None
+
+
+def test_reconcile_fences_late_reservation_retry_without_reviving_accounting(
+    redis_connection: DeterministicRedis,
+) -> None:
+    resources_ref: dict[str, RedisResourceCoordinator] = {}
+    token_ref: dict[str, str] = {}
+
+    def expire_and_reconcile(keys, args) -> None:  # noqa: ANN001
+        token_ref["token"] = str(args[0])
+        redis_connection.delete(keys[2])
+        assert resources_ref["resources"].reconcile_reservations() == 1
+
+    failing_redis = ExecuteThenExpireAndRaiseRedis(
+        "reserve_upload",
+        redis_connection,
+        expire_and_reconcile,
+    )
+    resources = coordinator(failing_redis)
+    resources_ref["resources"] = resources
+
+    with pytest.raises(ResourceUnavailableError, match="expired"):
+        resources.reserve_upload(SESSION_A, 4, free_bytes=100)
+
+    receipt_key = f"dt:resource:reservation-receipt:{token_ref['token']}"
+    assert redis_connection.hget(receipt_key, "state") == b"expired"
+    assert redis_connection.hget("dt:resource:state", "reserved_bytes") is None
+    assert redis_connection.hlen("dt:resource:reservations") == 0
+
+
+def test_reservation_receipt_records_release_with_bounded_ttl(
+    redis_connection: DeterministicRedis,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token = "4" * 32
+    monkeypatch.setattr(
+        "designtoolkit.web.resources.uuid4",
+        lambda: SimpleNamespace(hex=token),
+    )
+    resources = coordinator(redis_connection)
+    reservation = resources.reserve_upload(SESSION_A, 4, free_bytes=100)
+    receipt_key = f"dt:resource:reservation-receipt:{reservation.token}"
+
+    assert redis_connection.hget(receipt_key, "state") == b"reserved"
+    assert (
+        0
+        < redis_connection.pttl(receipt_key)
+        <= resources._reservation_receipt_ttl_ms
+    )
+
+    reservation.release()
+
+    assert redis_connection.hget(receipt_key, "state") == b"released"
+    assert (
+        0
+        < redis_connection.pttl(receipt_key)
+        <= resources._reservation_receipt_ttl_ms
+    )
+    with pytest.raises(ResourceUnavailableError, match="expired"):
+        resources.reserve_upload(SESSION_A, 4, free_bytes=100)
+    assert redis_connection.hget("dt:resource:state", "reserved_bytes") is None
+
+
+def test_reservation_retry_rejects_conflicting_receipt_metadata(
+    redis_connection: DeterministicRedis,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token = "3" * 32
+    monkeypatch.setattr(
+        "designtoolkit.web.resources.uuid4",
+        lambda: SimpleNamespace(hex=token),
+    )
+    resources = coordinator(redis_connection)
+    reservation = resources.reserve_upload(SESSION_A, 4, free_bytes=100)
+    receipt_key = f"dt:resource:reservation-receipt:{token}"
+    redis_connection.hset(receipt_key, "owner_id", SESSION_B)
+
+    with pytest.raises(ResourceUnavailableError, match="metadata conflict"):
+        resources.reserve_upload(SESSION_A, 4, free_bytes=100)
+
+    assert redis_connection.hget("dt:resource:state", "reserved_bytes") == b"4"
+    redis_connection.hset(receipt_key, "owner_id", SESSION_A)
+    reservation.release()
 
 
 def test_output_reserve_rejects_conflicting_existing_token_metadata(

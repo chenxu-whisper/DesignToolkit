@@ -22,6 +22,7 @@ from redis.exceptions import TimeoutError as RedisTimeoutError
 _STATE_KEY = "dt:resource:state"
 _RESERVATION_INDEX_KEY = "dt:resource:reservations"
 _RESERVATION_PREFIX = "dt:resource:reservation:"
+_RESERVATION_RECEIPT_PREFIX = "dt:resource:reservation-receipt:"
 _COMMITTED_PREFIX = "dt:resource:committed:"
 _RELEASED_ASSET_PREFIX = "dt:resource:asset-released:"
 _LEASE_PREFIX = "dt:resource:lease:"
@@ -42,6 +43,7 @@ _RESERVE_UPLOAD_SCRIPT = """-- reserve_upload
 local state_key = KEYS[1]
 local index_key = KEYS[2]
 local token_key = KEYS[3]
+local receipt_key = KEYS[4]
 local token = ARGV[1]
 local session_id = ARGV[2]
 local requested = tonumber(ARGV[3])
@@ -50,16 +52,58 @@ local max_uploads = tonumber(ARGV[5])
 local max_session_bytes = tonumber(ARGV[6])
 local min_free_bytes = tonumber(ARGV[7])
 local ttl_ms = tonumber(ARGV[8])
+local receipt_ttl_ms = tonumber(ARGV[9])
+local index_metadata = "upload|" .. session_id .. "|" .. requested ..
+    "|" .. free_bytes .. "|" .. min_free_bytes
 
-if redis.call("EXISTS", token_key) == 1 then
-    if redis.call("HGET", token_key, "kind") == "upload"
-        and redis.call("HGET", token_key, "owner_id") == session_id
-        and redis.call("HGET", token_key, "session_id") == session_id
-        and redis.call("HGET", token_key, "bytes") == ARGV[3]
-        and redis.call("HGET", token_key, "free_bytes") == ARGV[4]
-        and redis.call("HGET", token_key, "min_free_bytes") == ARGV[7] then
-        return 4
+local function metadata_matches(key)
+    return redis.call("HGET", key, "kind") == "upload"
+        and redis.call("HGET", key, "owner_id") == session_id
+        and redis.call("HGET", key, "session_id") == session_id
+        and redis.call("HGET", key, "bytes") == ARGV[3]
+        and redis.call("HGET", key, "free_bytes") == ARGV[4]
+        and redis.call("HGET", key, "min_free_bytes") == ARGV[7]
+end
+
+if redis.call("EXISTS", receipt_key) == 1 then
+    if not metadata_matches(receipt_key) then
+        return 5
     end
+    if redis.call("HGET", receipt_key, "state") ~= "reserved" then
+        return 6
+    end
+    if redis.call("HGET", index_key, token) ~= index_metadata then
+        return 5
+    end
+    if redis.call("EXISTS", token_key) == 1 then
+        if metadata_matches(token_key) then
+            return 4
+        end
+        return 5
+    end
+    redis.call(
+        "HMSET",
+        token_key,
+        "kind",
+        "upload",
+        "owner_id",
+        session_id,
+        "session_id",
+        session_id,
+        "bytes",
+        requested,
+        "free_bytes",
+        free_bytes,
+        "min_free_bytes",
+        min_free_bytes
+    )
+    redis.call("PEXPIRE", token_key, ttl_ms)
+    redis.call("PEXPIRE", receipt_key, receipt_ttl_ms)
+    return 4
+end
+
+if redis.call("EXISTS", token_key) == 1
+    or redis.call("HEXISTS", index_key, token) == 1 then
     return 5
 end
 
@@ -113,11 +157,29 @@ redis.call(
 )
 redis.call("PEXPIRE", token_key, ttl_ms)
 redis.call(
+    "HMSET",
+    receipt_key,
+    "state",
+    "reserved",
+    "kind",
+    "upload",
+    "owner_id",
+    session_id,
+    "session_id",
+    session_id,
+    "bytes",
+    requested,
+    "free_bytes",
+    free_bytes,
+    "min_free_bytes",
+    min_free_bytes
+)
+redis.call("PEXPIRE", receipt_key, receipt_ttl_ms)
+redis.call(
     "HSET",
     index_key,
     token,
-    "upload|" .. session_id .. "|" .. requested ..
-        "|" .. free_bytes .. "|" .. min_free_bytes
+    index_metadata
 )
 redis.call("HINCRBY", state_key, "reserved_bytes", requested)
 redis.call("HINCRBY", state_key, "upload_count", 1)
@@ -131,6 +193,7 @@ _RESERVE_OUTPUT_SCRIPT = """-- reserve_output
 local state_key = KEYS[1]
 local index_key = KEYS[2]
 local token_key = KEYS[3]
+local receipt_key = KEYS[5]
 local token = ARGV[1]
 local task_id = ARGV[2]
 local session_id = ARGV[3]
@@ -139,16 +202,69 @@ local free_bytes = tonumber(ARGV[5])
 local min_free_bytes = tonumber(ARGV[6])
 local ttl_ms = tonumber(ARGV[7])
 local heartbeat_at = ARGV[8]
+local receipt_ttl_ms = tonumber(ARGV[9])
+local index_metadata = "output|" .. session_id .. "|" .. requested ..
+    "|" .. free_bytes .. "|" .. min_free_bytes
 
-if redis.call("EXISTS", token_key) == 1 then
-    if redis.call("HGET", token_key, "kind") == "output"
-        and redis.call("HGET", token_key, "owner_id") == task_id
-        and redis.call("HGET", token_key, "session_id") == session_id
-        and redis.call("HGET", token_key, "bytes") == ARGV[4]
-        and redis.call("HGET", token_key, "free_bytes") == ARGV[5]
-        and redis.call("HGET", token_key, "min_free_bytes") == ARGV[6] then
-        return 2
+local function metadata_matches(key)
+    return redis.call("HGET", key, "kind") == "output"
+        and redis.call("HGET", key, "owner_id") == task_id
+        and redis.call("HGET", key, "session_id") == session_id
+        and redis.call("HGET", key, "bytes") == ARGV[4]
+        and redis.call("HGET", key, "free_bytes") == ARGV[5]
+        and redis.call("HGET", key, "min_free_bytes") == ARGV[6]
+end
+
+if redis.call("EXISTS", receipt_key) == 1 then
+    if not metadata_matches(receipt_key) then
+        return 3
     end
+    if redis.call("HGET", receipt_key, "state") ~= "reserved" then
+        return 4
+    end
+    if redis.call("HGET", index_key, token) ~= index_metadata then
+        return 3
+    end
+    if redis.call("EXISTS", token_key) == 1 then
+        if metadata_matches(token_key) then
+            return 2
+        end
+        return 3
+    end
+    redis.call(
+        "HMSET",
+        token_key,
+        "kind",
+        "output",
+        "owner_id",
+        task_id,
+        "session_id",
+        session_id,
+        "bytes",
+        requested,
+        "free_bytes",
+        free_bytes,
+        "min_free_bytes",
+        min_free_bytes
+    )
+    redis.call("PEXPIRE", token_key, ttl_ms)
+    redis.call("PEXPIRE", receipt_key, receipt_ttl_ms)
+    redis.call(
+        "HMSET",
+        KEYS[4],
+        "session_id",
+        session_id,
+        "output_token",
+        token,
+        "heartbeat_at",
+        heartbeat_at
+    )
+    redis.call("PEXPIRE", KEYS[4], ttl_ms)
+    return 2
+end
+
+if redis.call("EXISTS", token_key) == 1
+    or redis.call("HEXISTS", index_key, token) == 1 then
     return 3
 end
 
@@ -185,11 +301,29 @@ redis.call(
 )
 redis.call("PEXPIRE", token_key, ttl_ms)
 redis.call(
+    "HMSET",
+    receipt_key,
+    "state",
+    "reserved",
+    "kind",
+    "output",
+    "owner_id",
+    task_id,
+    "session_id",
+    session_id,
+    "bytes",
+    requested,
+    "free_bytes",
+    free_bytes,
+    "min_free_bytes",
+    min_free_bytes
+)
+redis.call("PEXPIRE", receipt_key, receipt_ttl_ms)
+redis.call(
     "HSET",
     index_key,
     token,
-    "output|" .. session_id .. "|" .. requested ..
-        "|" .. free_bytes .. "|" .. min_free_bytes
+    index_metadata
 )
 redis.call("HINCRBY", state_key, "reserved_bytes", requested)
 redis.call("HINCRBY", state_key, "output_reserved_bytes", requested)
@@ -217,24 +351,99 @@ redis.call("PEXPIRE", KEYS[1], tonumber(ARGV[1]))
 return 1
 """
 
+_REFRESH_RESERVATION_SCRIPT = """-- refresh_reservation
+if redis.call("EXISTS", KEYS[1]) == 0
+    or redis.call("HGET", KEYS[2], "state") ~= "reserved" then
+    return 0
+end
+redis.call("PEXPIRE", KEYS[1], tonumber(ARGV[1]))
+redis.call("PEXPIRE", KEYS[2], tonumber(ARGV[2]))
+return 1
+"""
+
+_RESERVATION_RECOVERY_STATE_SCRIPT = """-- reservation_recovery_state
+local token_key = KEYS[1]
+local index_key = KEYS[2]
+local receipt_key = KEYS[3]
+local token = ARGV[1]
+
+local function metadata_matches(key)
+    return redis.call("HGET", key, "kind") == ARGV[3]
+        and redis.call("HGET", key, "owner_id") == ARGV[4]
+        and redis.call("HGET", key, "session_id") == ARGV[5]
+        and redis.call("HGET", key, "bytes") == ARGV[6]
+        and redis.call("HGET", key, "free_bytes") == ARGV[7]
+        and redis.call("HGET", key, "min_free_bytes") == ARGV[8]
+end
+
+if redis.call("EXISTS", receipt_key) == 0 then
+    return 0
+end
+if not metadata_matches(receipt_key) then
+    return 2
+end
+if redis.call("HGET", receipt_key, "state") ~= "reserved" then
+    return 0
+end
+if redis.call("HGET", index_key, token) ~= ARGV[2] then
+    return 2
+end
+if redis.call("EXISTS", token_key) == 0 then
+    return 0
+end
+if not metadata_matches(token_key) then
+    return 2
+end
+return 1
+"""
+
 _RELEASE_RESERVATION_SCRIPT = """-- release_reservation
 local state_key = KEYS[1]
 local index_key = KEYS[2]
 local token_key = KEYS[3]
 local task_key = KEYS[4]
+local receipt_key = KEYS[5]
+local receipt_ttl_ms = tonumber(ARGV[2])
 if redis.call("HGET", task_key, "output_token") == ARGV[1] then
     redis.call("HDEL", task_key, "output_token")
     if redis.call("HEXISTS", task_key, "lease_token") == 0 then
         redis.call("DEL", task_key)
     end
 end
-if redis.call("EXISTS", token_key) == 0 then
+
+local metadata_key = token_key
+if redis.call("EXISTS", receipt_key) == 1 then
+    local receipt_state = redis.call("HGET", receipt_key, "state")
+    if receipt_state ~= "reserved" then
+        return 0
+    end
+    metadata_key = receipt_key
+elseif redis.call("EXISTS", token_key) == 0 then
     return 0
 end
 
-local kind = redis.call("HGET", token_key, "kind")
-local session_id = redis.call("HGET", token_key, "session_id")
-local reserved_bytes = tonumber(redis.call("HGET", token_key, "bytes") or "0")
+local kind = redis.call("HGET", metadata_key, "kind")
+local session_id = redis.call("HGET", metadata_key, "session_id")
+local reserved_bytes = tonumber(
+    redis.call("HGET", metadata_key, "bytes") or "0"
+)
+local free_bytes = redis.call("HGET", metadata_key, "free_bytes")
+local min_free_bytes = redis.call("HGET", metadata_key, "min_free_bytes")
+local index_metadata = kind .. "|" .. session_id .. "|" .. reserved_bytes ..
+    "|" .. free_bytes .. "|" .. min_free_bytes
+if redis.call("HGET", index_key, ARGV[1]) ~= index_metadata then
+    return 2
+end
+if redis.call("EXISTS", token_key) == 1 then
+    for _, field in ipairs(
+        {"kind", "owner_id", "session_id", "bytes", "free_bytes", "min_free_bytes"}
+    ) do
+        if redis.call("HGET", token_key, field)
+            ~= redis.call("HGET", metadata_key, field) then
+            return 2
+        end
+    end
+end
 
 local function decrement(field, amount)
     local current = tonumber(redis.call("HGET", state_key, field) or "0")
@@ -281,6 +490,10 @@ end
 
 redis.call("DEL", token_key)
 redis.call("HDEL", index_key, ARGV[1])
+if redis.call("EXISTS", receipt_key) == 1 then
+    redis.call("HSET", receipt_key, "state", "released")
+    redis.call("PEXPIRE", receipt_key, receipt_ttl_ms)
+end
 decrement("reserved_bytes", reserved_bytes)
 if kind == "upload" then
     decrement("upload_count", 1)
@@ -300,16 +513,31 @@ local state_key = KEYS[1]
 local index_key = KEYS[2]
 local token_key = KEYS[3]
 local committed_key = KEYS[4]
+local receipt_key = KEYS[5]
 if redis.call("HGET", committed_key, "state") == "committed" then
     return 2
 end
 if redis.call("EXISTS", token_key) == 0 then
     return 0
 end
+if redis.call("EXISTS", receipt_key) == 1
+    and redis.call("HGET", receipt_key, "state") ~= "reserved" then
+    return 0
+end
 
 local kind = redis.call("HGET", token_key, "kind")
 local session_id = redis.call("HGET", token_key, "session_id")
 local reserved_bytes = tonumber(redis.call("HGET", token_key, "bytes") or "0")
+if redis.call("EXISTS", receipt_key) == 1 then
+    for _, field in ipairs(
+        {"kind", "owner_id", "session_id", "bytes", "free_bytes", "min_free_bytes"}
+    ) do
+        if redis.call("HGET", token_key, field)
+            ~= redis.call("HGET", receipt_key, field) then
+            return 0
+        end
+    end
+end
 
 local function decrement(field, amount)
     local current = tonumber(redis.call("HGET", state_key, field) or "0")
@@ -356,6 +584,10 @@ end
 
 redis.call("DEL", token_key)
 redis.call("HDEL", index_key, ARGV[1])
+if redis.call("EXISTS", receipt_key) == 1 then
+    redis.call("HSET", receipt_key, "state", "committed")
+    redis.call("PEXPIRE", receipt_key, tonumber(ARGV[3]))
+end
 decrement("reserved_bytes", reserved_bytes)
 if kind == "upload" then
     decrement("upload_count", 1)
@@ -433,6 +665,8 @@ _RECONCILE_RESERVATIONS_SCRIPT = """-- reconcile_reservations
 local state_key = KEYS[1]
 local index_key = KEYS[2]
 local token_prefix = ARGV[1]
+local receipt_prefix = ARGV[2]
+local receipt_ttl_ms = tonumber(ARGV[3])
 local entries = redis.call("HGETALL", index_key)
 local removed = 0
 
@@ -465,6 +699,11 @@ for index = 1, #entries, 2 do
                 )
             elseif kind == "output" then
                 decrement("output_reserved_bytes", reserved_bytes)
+            end
+            local receipt_key = receipt_prefix .. token
+            if redis.call("HGET", receipt_key, "state") == "reserved" then
+                redis.call("HSET", receipt_key, "state", "expired")
+                redis.call("PEXPIRE", receipt_key, receipt_ttl_ms)
             end
         end
         redis.call("HDEL", index_key, token)
@@ -1108,6 +1347,14 @@ class RedisResourceCoordinator:
             self._reservation_ttl_ms,
             self._lease_ttl_ms,
         )
+        self._reservation_receipt_ttl_ms = max(
+            self._reservation_ttl_ms,
+            _ttl_milliseconds(
+                _RESERVATION_RECOVERY_ATTEMPTS
+                * self.heartbeat_stop_timeout_seconds,
+                "reservation recovery window",
+            ),
+        )
         self.reservation_heartbeat_interval = reservation_heartbeat_interval
         self._reserve_upload_script = self._redis.register_script(
             _RESERVE_UPLOAD_SCRIPT
@@ -1116,6 +1363,12 @@ class RedisResourceCoordinator:
             _RESERVE_OUTPUT_SCRIPT
         )
         self._refresh_token_script = self._redis.register_script(_REFRESH_TOKEN_SCRIPT)
+        self._refresh_reservation_script = self._redis.register_script(
+            _REFRESH_RESERVATION_SCRIPT
+        )
+        self._reservation_recovery_state_script = self._redis.register_script(
+            _RESERVATION_RECOVERY_STATE_SCRIPT
+        )
         self._release_reservation_script = self._redis.register_script(
             _RELEASE_RESERVATION_SCRIPT
         )
@@ -1186,6 +1439,7 @@ class RedisResourceCoordinator:
         args: list[object],
         token: str,
         expected_metadata: dict[str, str],
+        index_metadata: str,
         reserved_result: int,
         conflict_result: int,
     ) -> int:
@@ -1199,14 +1453,32 @@ class RedisResourceCoordinator:
         if last_transport_error is None:
             raise RuntimeError("Reservation recovery lost its transport error")
         try:
-            metadata = self._redis.hgetall(_reservation_key(token))
+            recovery_state = int(
+                self._reservation_recovery_state_script(
+                    keys=[
+                        _reservation_key(token),
+                        _RESERVATION_INDEX_KEY,
+                        _reservation_receipt_key(token),
+                    ],
+                    args=[
+                        token,
+                        index_metadata,
+                        expected_metadata["kind"],
+                        expected_metadata["owner_id"],
+                        expected_metadata["session_id"],
+                        expected_metadata["bytes"],
+                        expected_metadata["free_bytes"],
+                        expected_metadata["min_free_bytes"],
+                    ],
+                )
+            )
         except _REDIS_TRANSPORT_ERRORS as query_error:
             raise last_transport_error from query_error
-        if not metadata:
-            raise last_transport_error
-        if _reservation_metadata_matches(metadata, expected_metadata):
+        if recovery_state == 1:
             return reserved_result
-        return conflict_result
+        if recovery_state == 2:
+            return conflict_result
+        raise last_transport_error
 
     def reserve_upload(
         self,
@@ -1230,6 +1502,7 @@ class RedisResourceCoordinator:
             _STATE_KEY,
             _RESERVATION_INDEX_KEY,
             _reservation_key(token),
+            _reservation_receipt_key(token),
         ]
         args = [
             token,
@@ -1240,6 +1513,7 @@ class RedisResourceCoordinator:
             self.max_session_bytes,
             self.min_free_bytes,
             self._reservation_ttl_ms,
+            self._reservation_receipt_ttl_ms,
         ]
         result = self._execute_reservation_script(
             self._reserve_upload_script,
@@ -1254,6 +1528,10 @@ class RedisResourceCoordinator:
                 "free_bytes": str(free_bytes),
                 "min_free_bytes": str(self.min_free_bytes),
             },
+            index_metadata=(
+                f"upload|{session_id}|{requested_bytes}|{free_bytes}|"
+                f"{self.min_free_bytes}"
+            ),
             reserved_result=4,
             conflict_result=5,
         )
@@ -1267,6 +1545,8 @@ class RedisResourceCoordinator:
             raise ResourceUnavailableError(
                 "Upload reservation token metadata conflict"
             )
+        if result == 6:
+            raise ResourceUnavailableError("Upload reservation expired")
         return reservation
 
     def reserve_output(
@@ -1300,6 +1580,7 @@ class RedisResourceCoordinator:
                 _RESERVATION_INDEX_KEY,
                 _reservation_key(token),
                 _task_resource_key(task_id),
+                _reservation_receipt_key(token),
             ],
             args=[
                 token,
@@ -1310,6 +1591,7 @@ class RedisResourceCoordinator:
                 min_free_bytes,
                 self._reservation_ttl_ms,
                 time(),
+                self._reservation_receipt_ttl_ms,
             ],
             token=token,
             expected_metadata={
@@ -1320,6 +1602,10 @@ class RedisResourceCoordinator:
                 "free_bytes": str(free_bytes),
                 "min_free_bytes": str(min_free_bytes),
             },
+            index_metadata=(
+                f"output|{session_id}|{requested_bytes}|{free_bytes}|"
+                f"{min_free_bytes}"
+            ),
             reserved_result=2,
             conflict_result=3,
         )
@@ -1329,6 +1615,8 @@ class RedisResourceCoordinator:
             raise ResourceUnavailableError(
                 "Output reservation token metadata conflict"
             )
+        if result == 4:
+            raise ResourceUnavailableError("Output reservation expired")
         return reservation
 
     def acquire_session(
@@ -1693,6 +1981,8 @@ class RedisResourceCoordinator:
                 ],
                 args=[
                     _RESERVATION_PREFIX,
+                    _RESERVATION_RECEIPT_PREFIX,
+                    self._reservation_receipt_ttl_ms,
                 ],
             )
         )
@@ -1748,9 +2038,15 @@ class RedisResourceCoordinator:
         return float(value) if value is not None else None
 
     def _refresh_reservation(self, reservation: RedisReservation) -> None:
-        refreshed = self._refresh_token_script(
-            keys=[_reservation_key(reservation.token)],
-            args=[self._reservation_ttl_ms],
+        refreshed = self._refresh_reservation_script(
+            keys=[
+                _reservation_key(reservation.token),
+                _reservation_receipt_key(reservation.token),
+            ],
+            args=[
+                self._reservation_ttl_ms,
+                self._reservation_receipt_ttl_ms,
+            ],
         )
         if not refreshed:
             raise ResourceUnavailableError(
@@ -1760,15 +2056,25 @@ class RedisResourceCoordinator:
             self._touch_task_resources(reservation.owner_id)
 
     def _release_reservation(self, reservation: RedisReservation) -> None:
-        self._release_reservation_script(
-            keys=[
-                _STATE_KEY,
-                _RESERVATION_INDEX_KEY,
-                _reservation_key(reservation.token),
-                _task_resource_key(reservation.owner_id),
-            ],
-            args=[reservation.token],
+        result = int(
+            self._release_reservation_script(
+                keys=[
+                    _STATE_KEY,
+                    _RESERVATION_INDEX_KEY,
+                    _reservation_key(reservation.token),
+                    _task_resource_key(reservation.owner_id),
+                    _reservation_receipt_key(reservation.token),
+                ],
+                args=[
+                    reservation.token,
+                    self._reservation_receipt_ttl_ms,
+                ],
+            )
         )
+        if result == 2:
+            raise ResourceUnavailableError(
+                f"{reservation.kind.capitalize()} reservation metadata conflict"
+            )
 
     def _commit_reservation(self, reservation: RedisReservation) -> None:
         committed = int(
@@ -1778,10 +2084,12 @@ class RedisResourceCoordinator:
                     _RESERVATION_INDEX_KEY,
                     _reservation_key(reservation.token),
                     _committed_key(reservation.token),
+                    _reservation_receipt_key(reservation.token),
                 ],
                 args=[
                     reservation.token,
                     self._reservation_ttl_ms,
+                    self._reservation_receipt_ttl_ms,
                 ],
             )
         )
@@ -1885,6 +2193,10 @@ def _reservation_key(token: str) -> str:
     return f"{_RESERVATION_PREFIX}{token}"
 
 
+def _reservation_receipt_key(token: str) -> str:
+    return f"{_RESERVATION_RECEIPT_PREFIX}{token}"
+
+
 def _committed_key(token: str) -> str:
     return f"{_COMMITTED_PREFIX}{token}"
 
@@ -1925,16 +2237,6 @@ def _decoded_hash_value(
     if value is None:
         return None
     return value.decode() if isinstance(value, bytes) else value
-
-
-def _reservation_metadata_matches(
-    metadata: dict[bytes | str, bytes | str],
-    expected: dict[str, str],
-) -> bool:
-    return all(
-        _decoded_hash_value(metadata, field) == value
-        for field, value in expected.items()
-    )
 
 
 def _session_state_key(session_id: str) -> str:

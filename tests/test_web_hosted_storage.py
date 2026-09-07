@@ -434,6 +434,27 @@ def test_hosted_settings_read_redis_socket_timeouts(tmp_path: Path) -> None:
     assert settings.redis_socket_timeout_seconds == 2.5
 
 
+@pytest.mark.parametrize(
+    "env",
+    [
+        {
+            "DESIGNTOOLKIT_RESERVATION_TTL_SECONDS": "5",
+            "DESIGNTOOLKIT_RESERVATION_HEARTBEAT_SECONDS": "5",
+        },
+        {
+            "DESIGNTOOLKIT_RESERVATION_TTL_SECONDS": "5",
+            "DESIGNTOOLKIT_RESERVATION_HEARTBEAT_SECONDS": "1",
+            "DESIGNTOOLKIT_REDIS_SOCKET_TIMEOUT_SECONDS": "5",
+        },
+    ],
+)
+def test_hosted_settings_reject_unsafe_reservation_timing(
+    env: dict[str, str],
+) -> None:
+    with pytest.raises(ValueError, match="Reservation TTL"):
+        HostedSettings.from_env(env)
+
+
 def test_hosted_settings_read_stream_concurrency(tmp_path: Path) -> None:
     settings = HostedSettings.from_env(
         {
