@@ -63,7 +63,6 @@ if TYPE_CHECKING:
     from designtoolkit.web.resources import RedisResourceCoordinator
 
 _QUEUE_NAME = "designtoolkit"
-_TERMINAL_TTL_SECONDS = 2 * 60 * 60
 _UNCERTAIN_ENQUEUE_ERROR = "Task enqueue could not be confirmed"
 _ENQUEUE_INTENT_TTL_SECONDS = 60.0
 _ENQUEUE_INTENT_HEARTBEAT_SECONDS = 10.0
@@ -305,8 +304,8 @@ if redis.call("EXISTS", KEYS[2]) == 1 then
 end
 if ARGV[10] == "1" then
     redis.call("RPUSH", KEYS[3], ARGV[11])
-    redis.call("EXPIRE", KEYS[3], ARGV[9])
 end
+redis.call("EXPIRE", KEYS[3], ARGV[9])
 return {1, encoded}
 """
 
@@ -1630,16 +1629,16 @@ class RedisTaskManager:
                     pipeline.set(
                         task_key,
                         _encode_task(task),
-                        ex=_TERMINAL_TTL_SECONDS,
+                        ex=self.retention_seconds,
                     )
                     pipeline.expire(
                         _task_work_key(task_id),
-                        _TERMINAL_TTL_SECONDS,
+                        self.retention_seconds,
                     )
                     pipeline.rpush(_event_key(task_id), event.model_dump_json())
                     pipeline.expire(
                         _event_key(task_id),
-                        _TERMINAL_TTL_SECONDS,
+                        self.retention_seconds,
                     )
                     pipeline.lrem(_queue_reservations_key(), 0, task_id)
                     pipeline.delete(intent_key, owner_key)
@@ -1813,7 +1812,7 @@ class RedisTaskManager:
                     "1" if result_path is not None else "0",
                     result_path or "",
                     finished_at.isoformat(),
-                    _TERMINAL_TTL_SECONDS,
+                    self.retention_seconds,
                     "1" if terminal_event is not None else "0",
                     event_json,
                 ],
@@ -1877,21 +1876,21 @@ class RedisTaskManager:
                     pipeline.set(
                         key,
                         _encode_task(task),
-                        ex=_TERMINAL_TTL_SECONDS,
+                        ex=self.retention_seconds,
                     )
                     pipeline.expire(
                         _task_work_key(task_id),
-                        _TERMINAL_TTL_SECONDS,
+                        self.retention_seconds,
                     )
                     if terminal_event is not None:
                         pipeline.rpush(
                             _event_key(task_id),
                             terminal_event.model_dump_json(),
                         )
-                        pipeline.expire(
-                            _event_key(task_id),
-                            _TERMINAL_TTL_SECONDS,
-                        )
+                    pipeline.expire(
+                        _event_key(task_id),
+                        self.retention_seconds,
+                    )
                     pipeline.execute()
                     self.release_task_pin(task_id)
                     return task, TerminalTransitionResult.APPLIED
@@ -1933,7 +1932,7 @@ class RedisTaskManager:
         finally:
             if self.resource_coordinator is not None:
                 self.resource_coordinator.release_task_resources(task_id)
-        self._redis.set(cleanup_key, "1", ex=_TERMINAL_TTL_SECONDS)
+        self._redis.set(cleanup_key, "1", ex=self.retention_seconds)
         return True
 
     def _tasks_requiring_failure_cleanup(self) -> list[TaskRecord]:
@@ -2132,7 +2131,7 @@ def _callback_manager(connection: Redis) -> RedisTaskManager:
         queue=Queue(_QUEUE_NAME, connection=connection),
         data_dir=settings.data_dir,
         max_queued_tasks=settings.max_queued_tasks,
-        retention_seconds=_TERMINAL_TTL_SECONDS,
+        retention_seconds=settings.retention_seconds,
         task_timeout_seconds=settings.task_timeout_seconds,
         resource_coordinator=resources,
         heartbeat_stop_timeout_seconds=settings.heartbeat_stop_timeout_seconds,

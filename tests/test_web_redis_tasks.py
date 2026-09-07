@@ -114,6 +114,7 @@ def _manager(
     tmp_path: Path,
     *,
     max_queued_tasks: int = 20,
+    retention_seconds: int = 7200,
     resource_coordinator=None,
     enqueue_intent_ttl: float = 60,
     enqueue_intent_heartbeat_interval: float = 10,
@@ -123,7 +124,7 @@ def _manager(
         queue=Queue("designtoolkit", connection=redis_connection),
         data_dir=tmp_path,
         max_queued_tasks=max_queued_tasks,
-        retention_seconds=7200,
+        retention_seconds=retention_seconds,
         resource_coordinator=resource_coordinator,
         enqueue_intent_ttl=enqueue_intent_ttl,
         enqueue_intent_heartbeat_interval=enqueue_intent_heartbeat_interval,
@@ -134,6 +135,7 @@ def _hosted_settings(
     tmp_path: Path,
     *,
     task_timeout_seconds: int = 7200,
+    retention_seconds: int = 7200,
 ) -> HostedSettings:
     return HostedSettings(
         enabled=True,
@@ -142,6 +144,7 @@ def _hosted_settings(
         max_output_bytes=10,
         min_free_bytes=5,
         task_timeout_seconds=task_timeout_seconds,
+        retention_seconds=retention_seconds,
     )
 
 
@@ -154,6 +157,14 @@ def _resources(redis_connection: Redis) -> RedisResourceCoordinator:
         reservation_ttl=60,
         lease_ttl=60,
     )
+
+
+def _assert_ttl_matches(
+    redis_connection: Redis,
+    key: str,
+    retention_seconds: int,
+) -> None:
+    assert retention_seconds - 2 <= redis_connection.ttl(key) <= retention_seconds
 
 
 def _race_mark_running(
@@ -251,12 +262,115 @@ def test_callback_manager_uses_configured_task_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     redis_connection = fakeredis.FakeRedis(decode_responses=False)
-    settings = _hosted_settings(tmp_path, task_timeout_seconds=9000)
+    settings = _hosted_settings(
+        tmp_path,
+        task_timeout_seconds=9000,
+        retention_seconds=300,
+    )
     monkeypatch.setattr(HostedSettings, "from_env", lambda: settings)
 
     manager = redis_tasks_module._callback_manager(redis_connection)
 
     assert manager.task_timeout_seconds == 9000
+    assert manager.retention_seconds == 300
+
+
+@pytest.mark.parametrize("retention_seconds", [300, 10_800])
+def test_real_redis_terminal_keys_use_configured_retention(
+    real_redis_connection: Redis,
+    tmp_path: Path,
+    retention_seconds: int,
+) -> None:
+    manager = _manager(
+        real_redis_connection,
+        tmp_path,
+        retention_seconds=retention_seconds,
+        resource_coordinator=_resources(real_redis_connection),
+    )
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+        owner_id="a" * 32,
+        asset_ids=("1" * 32,),
+    )
+
+    assert manager._finalize_external_failure(task.task_id, "worker failed")
+
+    for key in (
+        f"dt:task:{task.task_id}",
+        f"dt:task-work:{task.task_id}",
+        f"dt:task:{task.task_id}:events",
+        f"dt:failure-cleanup:{task.task_id}",
+    ):
+        _assert_ttl_matches(real_redis_connection, key, retention_seconds)
+    assert not real_redis_connection.exists(
+        f"dt:resource:task-pin:{task.task_id}"
+    )
+    assert not real_redis_connection.exists(
+        f"dt:resource:asset-tasks:{'a' * 32}:{'1' * 32}"
+    )
+
+
+def test_real_redis_callback_uses_configured_retention(
+    real_redis_connection: Redis,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    retention_seconds = 300
+    settings = _hosted_settings(
+        tmp_path,
+        retention_seconds=retention_seconds,
+    )
+    manager = _manager(
+        real_redis_connection,
+        tmp_path,
+        retention_seconds=retention_seconds,
+    )
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+        owner_id="a" * 32,
+    )
+    job = manager.queue.fetch_job(task.task_id)
+    assert job is not None
+    monkeypatch.setattr(HostedSettings, "from_env", lambda: settings)
+
+    handle_job_failure(
+        job,
+        real_redis_connection,
+        RuntimeError,
+        RuntimeError("worker failed"),
+        None,
+    )
+
+    for key in (
+        f"dt:task:{task.task_id}",
+        f"dt:task-work:{task.task_id}",
+        f"dt:task:{task.task_id}:events",
+        f"dt:failure-cleanup:{task.task_id}",
+    ):
+        _assert_ttl_matches(real_redis_connection, key, retention_seconds)
+
+
+def test_real_redis_terminal_transition_refreshes_existing_event_retention(
+    real_redis_connection: Redis,
+    tmp_path: Path,
+) -> None:
+    retention_seconds = 300
+    manager = _manager(
+        real_redis_connection,
+        tmp_path,
+        retention_seconds=retention_seconds,
+    )
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+        owner_id="a" * 32,
+    )
+    event_key = f"dt:task:{task.task_id}:events"
+    real_redis_connection.expire(event_key, 30)
+
+    manager.mark_finished(task.task_id, status=TaskStatus.SUCCEEDED)
+
+    assert real_redis_connection.llen(event_key) == 1
+    _assert_ttl_matches(real_redis_connection, event_key, retention_seconds)
 
 
 def test_enqueue_registers_importable_rq_failure_and_stopped_callbacks(
@@ -402,6 +516,49 @@ def test_real_redis_reconcile_releases_terminal_asset_pin_after_ack_loss(
     assert manager.reconcile_tasks(grace_seconds=60) == 1
     claim = manager.claim_asset_deletion(session_id, asset_id)
     manager.release_asset_deletion(session_id, asset_id, claim)
+
+
+def test_real_redis_repeated_terminal_does_not_shorten_ttl_or_resurrect(
+    real_redis_connection: Redis,
+    tmp_path: Path,
+) -> None:
+    retention_seconds = 300
+    manager = _manager(
+        real_redis_connection,
+        tmp_path,
+        retention_seconds=retention_seconds,
+    )
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+        owner_id="a" * 32,
+    )
+    assert manager._finalize_external_failure(task.task_id, "worker failed")
+    keys = (
+        f"dt:task:{task.task_id}",
+        f"dt:task-work:{task.task_id}",
+        f"dt:task:{task.task_id}:events",
+        f"dt:failure-cleanup:{task.task_id}",
+    )
+    for key in keys:
+        real_redis_connection.expire(key, retention_seconds + 120)
+    ttl_before_retry = {
+        key: real_redis_connection.pttl(key) for key in keys
+    }
+
+    assert not manager._finalize_external_failure(
+        task.task_id,
+        "repeated worker failure",
+    )
+
+    for key in keys:
+        ttl_after_retry = real_redis_connection.pttl(key)
+        assert ttl_before_retry[key] - 2_000 <= ttl_after_retry
+        assert ttl_after_retry <= ttl_before_retry[key]
+
+    real_redis_connection.delete(f"dt:task:{task.task_id}")
+    with pytest.raises(KeyError):
+        manager.mark_finished(task.task_id, status=TaskStatus.FAILED)
+    assert not real_redis_connection.exists(f"dt:task:{task.task_id}")
 
 
 def test_redis_manager_rejects_when_waiting_queue_is_full(tmp_path: Path) -> None:
@@ -1009,7 +1166,11 @@ def test_run_task_reserves_refreshes_and_releases_worker_resources(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     redis_connection = fakeredis.FakeRedis(decode_responses=False)
-    settings = _hosted_settings(tmp_path, task_timeout_seconds=9000)
+    settings = _hosted_settings(
+        tmp_path,
+        task_timeout_seconds=9000,
+        retention_seconds=300,
+    )
     manager = _manager(redis_connection, tmp_path)
     task = manager.create_video_frames_task(
         VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
@@ -1074,6 +1235,7 @@ def test_run_task_reserves_refreshes_and_releases_worker_resources(
     assert resources.events.count("refresh:lease") >= 3
     assert resources.events[-2:] == ["release:output", "release:lease"]
     assert manager_options["task_timeout_seconds"] == 9000
+    assert manager_options["retention_seconds"] == 300
     assert manager.get_task(task.task_id).status is TaskStatus.SUCCEEDED
 
 
@@ -2080,6 +2242,37 @@ def test_reconcile_fails_old_queued_task_when_rq_job_is_missing(
     assert not output_root.exists()
 
 
+def test_real_redis_reconcile_uses_configured_retention(
+    real_redis_connection: Redis,
+    tmp_path: Path,
+) -> None:
+    retention_seconds = 10_800
+    manager = _manager(
+        real_redis_connection,
+        tmp_path,
+        retention_seconds=retention_seconds,
+    )
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+        owner_id="a" * 32,
+    )
+    task.created_at = datetime.now(UTC) - timedelta(minutes=5)
+    manager._save_task(task)
+    job = manager.queue.fetch_job(task.task_id)
+    assert job is not None
+    real_redis_connection.delete(job.key)
+
+    assert manager.reconcile_tasks(grace_seconds=60) == 1
+
+    for key in (
+        f"dt:task:{task.task_id}",
+        f"dt:task-work:{task.task_id}",
+        f"dt:task:{task.task_id}:events",
+        f"dt:failure-cleanup:{task.task_id}",
+    ):
+        _assert_ttl_matches(real_redis_connection, key, retention_seconds)
+
+
 def test_reconcile_preserves_running_task_with_recent_heartbeat(
     tmp_path: Path,
 ) -> None:
@@ -2334,10 +2527,12 @@ def test_real_redis_reconcile_fails_uncommitted_ambiguous_enqueue(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    retention_seconds = 300
     resources = _resources(real_redis_connection)
     manager = _manager(
         real_redis_connection,
         tmp_path,
+        retention_seconds=retention_seconds,
         resource_coordinator=resources,
     )
     original_confirmation = manager._enqueue_has_authoritative_evidence
@@ -2397,6 +2592,13 @@ def test_real_redis_reconcile_fails_uncommitted_ambiguous_enqueue(
     assert real_redis_connection.exists(
         f"dt:enqueue-intent:{task.task_id}"
     ) == 0
+    for key in (
+        f"dt:task:{task.task_id}",
+        f"dt:task-work:{task.task_id}",
+        f"dt:task:{task.task_id}:events",
+        f"dt:failure-cleanup:{task.task_id}",
+    ):
+        _assert_ttl_matches(real_redis_connection, key, retention_seconds)
     claim = resources.claim_session_cleanup("a" * 32)
     assert claim is not None
     resources.release_cleanup_claim("a" * 32, claim)

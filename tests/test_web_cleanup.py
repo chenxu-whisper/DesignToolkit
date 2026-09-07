@@ -34,6 +34,7 @@ def test_cleanup_reconciles_stale_tasks_and_reservations_before_storage(
             assert kwargs["redis_connection"] is redis_connection
             assert kwargs["resource_coordinator"] is coordinator
             assert kwargs["task_timeout_seconds"] == 9000
+            assert kwargs["retention_seconds"] == 60
 
         def reconcile_tasks(self) -> int:
             events.append("tasks")
