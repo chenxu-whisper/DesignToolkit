@@ -280,6 +280,7 @@ def test_hosted_settings_use_public_deployment_defaults(tmp_path: Path) -> None:
     assert settings.data_dir == tmp_path
     assert settings.max_upload_bytes == 500 * 1024 * 1024
     assert settings.max_upload_concurrency == 4
+    assert settings.max_stream_concurrency == 16
     assert settings.reservation_ttl_seconds >= (
         2 * settings.reservation_heartbeat_seconds
     )
@@ -317,6 +318,17 @@ def test_hosted_settings_read_redis_socket_timeouts(tmp_path: Path) -> None:
 
     assert settings.redis_socket_connect_timeout_seconds == 1.5
     assert settings.redis_socket_timeout_seconds == 2.5
+
+
+def test_hosted_settings_read_stream_concurrency(tmp_path: Path) -> None:
+    settings = HostedSettings.from_env(
+        {
+            "DESIGNTOOLKIT_DATA_DIR": str(tmp_path),
+            "DESIGNTOOLKIT_MAX_STREAM_CONCURRENCY": "7",
+        }
+    )
+
+    assert settings.max_stream_concurrency == 7
 
 
 @pytest.mark.anyio

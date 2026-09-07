@@ -13,6 +13,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 README_TEXT = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
 CADDYFILE_TEXT = (PROJECT_ROOT / "Caddyfile").read_text(encoding="utf-8")
 ENV_EXAMPLE_TEXT = (PROJECT_ROOT / ".env.example").read_text(encoding="utf-8")
+COMPOSE_TEXT = (PROJECT_ROOT / "compose.yaml").read_text(encoding="utf-8")
 MINIMUM_COMPOSE_VERSION = (2, 6, 0)
 RESOURCE_VARIABLES = (
     "APP_CPUS",
@@ -39,6 +40,9 @@ HOSTED_TIMEOUT_DEFAULTS = {
     "DESIGNTOOLKIT_LEASE_TTL_SECONDS": "60.0",
     "DESIGNTOOLKIT_LEASE_HEARTBEAT_SECONDS": "5.0",
     "DESIGNTOOLKIT_TASK_TIMEOUT_SECONDS": "7200",
+}
+HOSTED_CONCURRENCY_DEFAULTS = {
+    "DESIGNTOOLKIT_MAX_STREAM_CONCURRENCY": "16",
 }
 HOSTED_SERVICES = ("app", "worker-1", "worker-2", "cleanup")
 
@@ -73,6 +77,12 @@ def test_hosted_timeout_defaults_are_documented() -> None:
     for name, value in HOSTED_TIMEOUT_DEFAULTS.items():
         assert f"{name}={value}" in ENV_EXAMPLE_TEXT
         assert name in README_TEXT
+
+
+def test_hosted_stream_concurrency_default_is_deployable() -> None:
+    for name, value in HOSTED_CONCURRENCY_DEFAULTS.items():
+        assert f"{name}={value}" in ENV_EXAMPLE_TEXT
+        assert f"{name}: \"${{{name}:-{value}}}\"" in COMPOSE_TEXT
 
 
 def test_resolved_compose_skips_unsupported_compose_version(

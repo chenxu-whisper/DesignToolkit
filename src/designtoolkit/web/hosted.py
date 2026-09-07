@@ -302,6 +302,7 @@ class HostedSettings:
     )
     max_preview_concurrency: int = 2
     max_upload_concurrency: int = 4
+    max_stream_concurrency: int = 16
     reservation_ttl_seconds: float = 60.0
     reservation_heartbeat_seconds: float = 5.0
     lease_ttl_seconds: float = 60.0
@@ -383,6 +384,11 @@ class HostedSettings:
                 values,
                 "DESIGNTOOLKIT_MAX_UPLOAD_CONCURRENCY",
                 4,
+            ),
+            max_stream_concurrency=_read_positive_int(
+                values,
+                "DESIGNTOOLKIT_MAX_STREAM_CONCURRENCY",
+                16,
             ),
             reservation_ttl_seconds=_read_positive_float(
                 values,

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 from pathlib import Path
+from threading import BoundedSemaphore
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from redis import Redis
+from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import TimeoutError as RedisTimeoutError
 from rq import Queue
 
 from designtoolkit.chroma_keyer.video_io import ImageioVideoDecoder
@@ -96,6 +99,7 @@ def create_app(
     log_store = manager.log_store
     decoder = video_decoder if video_decoder is not None else ImageioVideoDecoder()
     app = FastAPI(title="DesignToolkit Web GUI")
+    stream_capacity = BoundedSemaphore(settings.max_stream_concurrency)
 
     if settings.enabled:
 
@@ -111,27 +115,48 @@ def create_app(
                 forwarded_for.split(",", 1)[0].strip()
                 or (request.client.host if request.client is not None else "unknown")
             )
-            rate_limit = _rate_limit_for_request(request, settings)
-            if (
-                rate_limit is not None
-                and isinstance(manager, RedisTaskManager)
-                and not manager.allow_request(
-                    f"{client_host}:{rate_limit[0]}",
-                    limit=rate_limit[1],
-                    window=rate_limit[2],
+            rate_limits = _rate_limits_for_request(request, settings)
+            try:
+                rate_limited = isinstance(
+                    manager, RedisTaskManager
+                ) and _is_rate_limited(
+                    manager,
+                    client_host=client_host,
+                    session_id=session_id,
+                    rate_limits=rate_limits,
                 )
-            ):
-                response = JSONResponse(
-                    status_code=429,
-                    content={
-                        "error": {
-                            "code": "rate_limited",
-                            "message": "Too many requests; retry later",
-                        }
-                    },
+            except (RedisConnectionError, RedisTimeoutError):
+                response = _middleware_error_response(
+                    "storage_unavailable",
+                    "Rate limit storage is temporarily unavailable",
+                    503,
                 )
             else:
-                response = await call_next(request)
+                if rate_limited:
+                    response = _middleware_error_response(
+                        "rate_limited",
+                        "Too many requests; retry later",
+                        429,
+                    )
+                elif _uses_stream_capacity(request):
+                    if not stream_capacity.acquire(blocking=False):
+                        response = _middleware_error_response(
+                            "stream_concurrency",
+                            "Download and event stream capacity is busy; retry shortly",
+                            429,
+                        )
+                    else:
+                        try:
+                            response = await call_next(request)
+                        except BaseException:
+                            stream_capacity.release()
+                            raise
+                        _release_stream_capacity_after_response(
+                            response,
+                            stream_capacity,
+                        )
+                else:
+                    response = await call_next(request)
             response.set_cookie(
                 "dt_session",
                 session_id,
@@ -172,19 +197,78 @@ def create_app(
     app.state.log_store = log_store
     app.state.video_decoder = decoder
     app.state.resource_coordinator = resource_coordinator
+    app.state.stream_capacity = stream_capacity
     return app
 
 
-def _rate_limit_for_request(
+def _rate_limits_for_request(
     request: Request,
     settings: HostedSettings,
-) -> tuple[str, int, int] | None:
-    if request.method != "POST":
-        return None
-    if request.url.path == "/api/uploads":
-        return ("upload", settings.upload_requests_per_hour, 60 * 60)
-    if request.url.path.startswith("/api/chroma-keyer/"):
-        return ("preview", settings.api_requests_per_minute, 60)
-    if request.url.path.startswith("/api/tasks/"):
-        return ("task", settings.api_requests_per_minute, 60)
-    return None
+) -> tuple[tuple[str, int, int], ...]:
+    if not request.url.path.startswith("/api/"):
+        return ()
+    if request.url.path == "/api/health":
+        return ()
+
+    rate_limits = [
+        ("api", settings.api_requests_per_minute, 60),
+    ]
+    if request.method == "POST" and request.url.path == "/api/uploads":
+        rate_limits.append(("upload", settings.upload_requests_per_hour, 60 * 60))
+    return tuple(rate_limits)
+
+
+def _is_rate_limited(
+    manager: RedisTaskManager,
+    *,
+    client_host: str,
+    session_id: str,
+    rate_limits: tuple[tuple[str, int, int], ...],
+) -> bool:
+    for bucket, limit, window in rate_limits:
+        for identity in (f"ip:{client_host}", f"session:{session_id}"):
+            if not manager.allow_request(
+                f"{identity}:{bucket}",
+                limit=limit,
+                window=window,
+            ):
+                return True
+    return False
+
+
+def _middleware_error_response(
+    code: str,
+    message: str,
+    status_code: int,
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content={"error": {"code": code, "message": message}},
+    )
+
+
+def _uses_stream_capacity(request: Request) -> bool:
+    if request.method != "GET":
+        return False
+    path_parts = request.url.path.split("/")
+    return (
+        len(path_parts) == 5
+        and path_parts[1:3] == ["api", "tasks"]
+        and path_parts[4] in {"download", "events"}
+    )
+
+
+def _release_stream_capacity_after_response(
+    response: Response,
+    capacity: BoundedSemaphore,
+) -> None:
+    body_iterator = response.body_iterator
+
+    async def body_with_release():
+        try:
+            async for chunk in body_iterator:
+                yield chunk
+        finally:
+            capacity.release()
+
+    response.body_iterator = body_with_release()

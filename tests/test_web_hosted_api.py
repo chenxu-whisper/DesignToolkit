@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import os
 import shutil
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from pathlib import Path
-from threading import Event
+from threading import BoundedSemaphore, Event
 from time import monotonic, sleep
 from unittest.mock import Mock
 from urllib.parse import quote
@@ -12,10 +13,13 @@ from urllib.parse import quote
 import fakeredis
 import numpy as np
 import pytest
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.testclient import TestClient
 from PIL import Image
+from redis import Redis
 from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import RedisError
+from redis.exceptions import TimeoutError as RedisTimeoutError
 from rq import Queue
 
 from designtoolkit.chroma_keyer.video_models import VideoMetadata
@@ -273,6 +277,8 @@ def _client(
     min_free_bytes: int = 0,
     task_manager: TaskManager | RedisTaskManager | None = None,
     upload_requests_per_hour: int = 30,
+    api_requests_per_minute: int = 120,
+    max_stream_concurrency: int = 16,
     resource_coordinator: StubCoordinator | None = None,
     hosted_storage: HostedStorage | None = None,
     max_image_pixels: int = 100_000_000,
@@ -304,6 +310,8 @@ def _client(
         max_video_duration_seconds=max_video_duration_seconds,
         secure_cookies=False,
         upload_requests_per_hour=upload_requests_per_hour,
+        api_requests_per_minute=api_requests_per_minute,
+        max_stream_concurrency=max_stream_concurrency,
     )
     coordinator = resource_coordinator or StubCoordinator(
         max_upload_concurrency=max_upload_concurrency,
@@ -1067,6 +1075,186 @@ def test_hosted_upload_endpoint_is_rate_limited(tmp_path: Path) -> None:
     assert second.json()["error"]["code"] == "rate_limited"
 
 
+def test_real_redis_hosted_get_endpoint_is_rate_limited(tmp_path: Path) -> None:
+    url = os.environ.get(
+        "DESIGNTOOLKIT_TEST_REDIS_URL",
+        "redis://localhost:6379/15",
+    )
+    redis_connection = Redis.from_url(
+        url,
+        decode_responses=False,
+        socket_connect_timeout=0.2,
+        socket_timeout=0.2,
+    )
+    try:
+        redis_connection.ping()
+    except RedisError as error:
+        redis_connection.close()
+        pytest.skip(f"real Redis unavailable at {url}: {error}")
+    rate_keys = list(redis_connection.scan_iter(match="dt:rate:*"))
+    if rate_keys:
+        redis_connection.delete(*rate_keys)
+    try:
+        manager = RedisTaskManager(
+            redis_connection=redis_connection,
+            queue=Queue("designtoolkit", connection=redis_connection),
+            data_dir=tmp_path,
+            max_queued_tasks=20,
+            retention_seconds=7200,
+        )
+        with _client(
+            tmp_path,
+            task_manager=manager,
+            api_requests_per_minute=1,
+        ) as client:
+            first = client.get("/api/config")
+            second = client.get("/api/config")
+
+        assert first.status_code == 200
+        assert second.status_code == 429
+        assert second.json()["error"]["code"] == "rate_limited"
+    finally:
+        rate_keys = list(redis_connection.scan_iter(match="dt:rate:*"))
+        if rate_keys:
+            redis_connection.delete(*rate_keys)
+        redis_connection.close()
+
+
+def test_hosted_upload_also_consumes_api_rate_limit(tmp_path: Path) -> None:
+    with _client(tmp_path, api_requests_per_minute=1) as client:
+        upload = _upload(client, "screen.png", _png_bytes())
+        session_id = client.cookies["dt_session"]
+        redis_connection = client.app.state.task_manager.queue.connection
+        config = client.get("/api/config")
+
+    assert upload.status_code == 201
+    assert config.status_code == 429
+    assert config.json()["error"]["code"] == "rate_limited"
+    rate_keys = {
+        key.decode() for key in redis_connection.scan_iter(match="dt:rate:*")
+    }
+    expected_prefixes = {
+        "dt:rate:ip:testclient:api:",
+        f"dt:rate:session:{session_id}:api:",
+        "dt:rate:ip:testclient:upload:",
+        f"dt:rate:session:{session_id}:upload:",
+    }
+    assert all(
+        any(key.startswith(prefix) for key in rate_keys)
+        for prefix in expected_prefixes
+    )
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        f"/api/tasks/{'0' * 32}/download",
+        f"/api/tasks/{'0' * 32}/events",
+    ],
+)
+def test_hosted_get_endpoints_are_rate_limited_before_resource_acquisition(
+    tmp_path: Path,
+    path: str,
+) -> None:
+    coordinator = StubCoordinator(
+        max_upload_concurrency=4,
+        max_session_bytes=1024,
+        min_free_bytes=0,
+    )
+    with _client(
+        tmp_path,
+        api_requests_per_minute=1,
+        resource_coordinator=coordinator,
+    ) as client:
+        first = client.get(path)
+        second = client.get(path)
+
+    assert first.status_code == 404
+    assert second.status_code == 429
+    assert second.json()["error"]["code"] == "rate_limited"
+    assert coordinator.lease_acquisitions == 0
+
+
+def test_hosted_delete_is_rate_limited_before_second_lease(
+    tmp_path: Path,
+) -> None:
+    coordinator = StubCoordinator(
+        max_upload_concurrency=4,
+        max_session_bytes=1024,
+        min_free_bytes=0,
+    )
+    with _client(
+        tmp_path,
+        api_requests_per_minute=1,
+        resource_coordinator=coordinator,
+    ) as client:
+        first = client.delete(f"/api/uploads/{'0' * 32}")
+        second = client.delete(f"/api/uploads/{'0' * 32}")
+
+    assert first.status_code == 204
+    assert second.status_code == 429
+    assert second.json()["error"]["code"] == "rate_limited"
+    assert coordinator.lease_acquisitions == 1
+
+
+def test_hosted_static_frontend_and_health_are_not_rate_limited(
+    tmp_path: Path,
+) -> None:
+    with _client(tmp_path, api_requests_per_minute=1) as client:
+        responses = [
+            client.get("/"),
+            client.get("/"),
+            client.get("/api/health"),
+            client.get("/api/health"),
+        ]
+
+    assert [response.status_code for response in responses] == [200, 200, 200, 200]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        RedisConnectionError("rate limit store unavailable"),
+        RedisTimeoutError("rate limit store timed out"),
+    ],
+)
+def test_rate_limit_redis_transport_failure_returns_structured_503(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error: Exception,
+) -> None:
+    with _client(tmp_path) as client:
+        manager = client.app.state.task_manager
+        monkeypatch.setattr(manager, "allow_request", Mock(side_effect=error))
+
+        response = client.get("/api/config")
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "error": {
+            "code": "storage_unavailable",
+            "message": "Rate limit storage is temporarily unavailable",
+        }
+    }
+    assert "dt_session=" in response.headers["set-cookie"]
+
+
+def test_rate_limit_unknown_failure_is_not_suppressed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _client(tmp_path) as client:
+        manager = client.app.state.task_manager
+        monkeypatch.setattr(
+            manager,
+            "allow_request",
+            Mock(side_effect=RuntimeError("unexpected rate limit failure")),
+        )
+
+        with pytest.raises(RuntimeError, match="unexpected rate limit failure"):
+            client.get("/api/config")
+
+
 def test_hosted_task_uses_uploaded_asset_and_is_session_isolated(
     tmp_path: Path,
 ) -> None:
@@ -1681,6 +1869,9 @@ def test_hosted_download_releases_lease_after_response_body(
         coordinator.lease_refresh_calls = 0
         coordinator.lease_release_calls = 0
         response = client.get(f"/api/tasks/{task_id}/download")
+        capacity = client.app.state.stream_capacity
+        assert capacity.acquire(blocking=False)
+        capacity.release()
         refreshes_after_response = coordinator.lease_refresh_calls
         sleep(0.03)
 
@@ -1825,6 +2016,59 @@ def test_hosted_download_releases_lease_when_response_send_fails(
         in caplog.text
     )
     assert "Session lease heartbeat failed" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        f"/api/tasks/{'0' * 32}/download",
+        f"/api/tasks/{'0' * 32}/events",
+    ],
+)
+def test_hosted_stream_concurrency_rejects_before_route_resources(
+    tmp_path: Path,
+    path: str,
+) -> None:
+    coordinator = StubCoordinator(
+        max_upload_concurrency=4,
+        max_session_bytes=1024,
+        min_free_bytes=0,
+    )
+    with _client(
+        tmp_path,
+        resource_coordinator=coordinator,
+        max_stream_concurrency=1,
+    ) as client:
+        capacity = client.app.state.stream_capacity
+        assert capacity.acquire(blocking=False)
+        try:
+            rejected = client.get(path)
+        finally:
+            capacity.release()
+        after_release = client.get(path)
+
+    assert rejected.status_code == 429
+    assert rejected.json()["error"]["code"] == "stream_concurrency"
+    assert after_release.status_code == 404
+    assert coordinator.lease_acquisitions == 0
+
+
+@pytest.mark.anyio
+async def test_stream_capacity_is_released_when_client_disconnects() -> None:
+    capacity = BoundedSemaphore(1)
+    assert capacity.acquire(blocking=False)
+
+    async def stream_body():
+        yield b"event"
+        yield b"later"
+
+    response = StreamingResponse(stream_body())
+    app_module._release_stream_capacity_after_response(response, capacity)
+
+    assert await anext(response.body_iterator) == b"event"
+    await response.body_iterator.aclose()
+    assert capacity.acquire(blocking=False)
+    capacity.release()
 
 
 def test_hosted_batch_resize_uses_unique_managed_output_directory(
