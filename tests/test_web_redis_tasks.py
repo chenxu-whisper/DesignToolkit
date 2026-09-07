@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from queue import Empty
 from threading import Barrier, Event, Lock
+from zipfile import ZipFile
 
 import fakeredis
 import pytest
@@ -28,7 +29,10 @@ from designtoolkit.video_frames import ExportResult
 from designtoolkit.web import cleanup as cleanup_module
 from designtoolkit.web import redis_tasks as redis_tasks_module
 from designtoolkit.web import worker as worker_module
-from designtoolkit.web.adapters import media_resize_options_list_from_request
+from designtoolkit.web.adapters import (
+    media_resize_options_list_from_request,
+    video_frame_options_list_from_request,
+)
 from designtoolkit.web.hosted import HostedSettings, HostedStorage
 from designtoolkit.web.redis_tasks import (
     RedisLogStore,
@@ -3187,6 +3191,89 @@ def test_batch_resize_disambiguates_duplicate_input_names(tmp_path: Path) -> Non
 
     assert options[0].output_path == tmp_path / "001_photo_resized.png"
     assert options[1].output_path == tmp_path / "002_photo_resized.png"
+
+
+def test_batch_video_frames_disambiguates_duplicate_input_names(
+    tmp_path: Path,
+) -> None:
+    asset_ids = ("1" * 32, "2" * 32)
+    input_paths = [
+        str(tmp_path / "assets" / asset_id / "clip.mp4")
+        for asset_id in asset_ids
+    ]
+    request = VideoFramesTaskRequest(
+        input_paths=input_paths,
+        output_dir=str(tmp_path / "output"),
+    )
+
+    first = video_frame_options_list_from_request(request)
+    second = video_frame_options_list_from_request(request)
+    single = video_frame_options_list_from_request(
+        VideoFramesTaskRequest(
+            input_path=input_paths[0],
+            output_dir=str(tmp_path / "single-output"),
+        )
+    )
+
+    expected = [
+        tmp_path / "output" / "001_clip_frames",
+        tmp_path / "output" / "002_clip_frames",
+    ]
+    assert [option.output_dir for option in first] == expected
+    assert [option.output_dir for option in second] == expected
+    assert single[0].output_dir == tmp_path / "single-output"
+    assert all(
+        asset_id not in output_dir.name
+        for output_dir in expected
+        for asset_id in asset_ids
+    )
+
+
+def test_worker_packages_duplicate_video_names_without_overwriting(
+    tmp_path: Path,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    state = _manager(redis_connection, tmp_path)
+    input_paths = [
+        str(tmp_path / "assets" / ("1" * 32) / "clip.mp4"),
+        str(tmp_path / "assets" / ("2" * 32) / "clip.mp4"),
+    ]
+    output_root = tmp_path / "task-output"
+    output_root.mkdir()
+    request = VideoFramesTaskRequest(
+        input_paths=input_paths,
+        output_dir=str(output_root),
+    )
+    task = state.create_video_frames_task(request, owner_id="a" * 32)
+    executor = RedisTaskExecutor(state)
+
+    def export(options, _backend) -> ExportResult:
+        assert options.output_dir is not None
+        options.output_dir.mkdir()
+        frame = options.output_dir / "clip_000001.png"
+        frame.write_text(options.input_path.parent.name, encoding="utf-8")
+        return ExportResult(
+            output_dir=options.output_dir,
+            output_pattern=options.output_dir / "clip_%06d.png",
+            command=("ffmpeg",),
+        )
+
+    executor._exporter = export
+
+    executor.execute_reserved_task(task, request)
+
+    completed = state.get_task(task.task_id, owner_id="a" * 32)
+    assert completed is not None
+    assert completed.status is TaskStatus.SUCCEEDED
+    assert completed.output_path == f"/api/tasks/{task.task_id}/download"
+    assert completed.result_path == str(output_root / f"{task.task_id}.zip")
+    with ZipFile(completed.result_path) as archive:
+        assert archive.namelist() == [
+            "001_clip_frames/clip_000001.png",
+            "002_clip_frames/clip_000001.png",
+        ]
+        assert archive.read("001_clip_frames/clip_000001.png") == b"1" * 32
+        assert archive.read("002_clip_frames/clip_000001.png") == b"2" * 32
 
 
 def test_worker_executor_runs_reserved_task_and_persists_success(

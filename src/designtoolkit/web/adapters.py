@@ -102,13 +102,14 @@ def video_frame_options_list_from_request(
     output_root = Path(request.output_dir) if request.output_dir else None
     is_batch = len(input_paths) > 1
     options: list[VideoFrameOptions] = []
-    for input_path in input_paths:
+    for index, input_path in enumerate(input_paths, start=1):
         input_path_obj = Path(input_path)
         options.append(
             VideoFrameOptions(
                 input_path=input_path_obj,
                 output_dir=(
-                    output_root / default_output_dir(input_path_obj).name
+                    output_root
+                    / f"{index:03d}_{default_output_dir(input_path_obj).name}"
                     if output_root is not None and is_batch
                     else output_root
                 ),
