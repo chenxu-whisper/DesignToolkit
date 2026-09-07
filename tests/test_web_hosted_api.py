@@ -182,6 +182,12 @@ class StubCoordinator:
         key = (session_id, upload_id)
         if key in self.inflight:
             raise ResourceUnavailableError("Upload is already in progress")
+        released = self.released_assets.get(upload_id)
+        if released is not None and released[0] == session_id:
+            if key not in self.finalized_assets:
+                raise ResourceUnavailableError("Upload deletion is still pending")
+            self.released_assets.pop(upload_id)
+            self.finalized_assets.discard(key)
         self.inflight[key] = False
         return StubUploadRegistration(self, session_id, upload_id)
 
@@ -237,8 +243,8 @@ class StubCoordinator:
         if expected_remaining_bytes is not None:
             if current == expected_remaining_bytes:
                 remaining = current
-            elif current == expected_remaining_bytes + released_bytes:
-                remaining = expected_remaining_bytes
+            elif current >= expected_remaining_bytes + released_bytes:
+                remaining = current - released_bytes
             else:
                 raise ResourceUnavailableError(
                     "Asset release does not match audited committed usage"
@@ -775,6 +781,34 @@ def test_known_upload_id_recovers_committed_upload_after_response_loss(
     assert list(tmp_path.rglob("screen.png")) == []
 
 
+def test_reused_upload_id_releases_each_generation_quota(tmp_path: Path) -> None:
+    upload_id = "1" * 32
+    with _client(tmp_path, max_session_bytes=5) as client:
+        first_upload = _upload(
+            client,
+            "first.png",
+            b"first",
+            upload_id=upload_id,
+        )
+        first_delete = client.delete(f"/api/uploads/{upload_id}")
+        second_upload = _upload(
+            client,
+            "second.png",
+            b"other",
+            upload_id=upload_id,
+        )
+        second_delete = client.delete(f"/api/uploads/{upload_id}")
+        session_id = client.cookies["dt_session"]
+        coordinator = client.app.state.resource_coordinator
+
+    assert first_upload.status_code == 201
+    assert first_delete.status_code == 204
+    assert second_upload.status_code == 201
+    assert second_delete.status_code == 204
+    assert coordinator.committed.get(session_id, 0) == 0
+    assert coordinator.release_calls == 2
+
+
 def test_random_delete_returns_404_without_blocking_later_upload(
     tmp_path: Path,
 ) -> None:
@@ -1017,6 +1051,66 @@ def test_delete_reclaims_precommit_partial_without_releasing_published_quota(
         session_id,
         published.json()["reference"],
     ).read_bytes() == b"live"
+
+
+def test_delete_reclaims_multiple_stale_partials_and_reuses_their_ids(
+    tmp_path: Path,
+) -> None:
+    session_id = "a" * 32
+    uploads = {
+        "1" * 32: b"four",
+        "2" * 32: b"other",
+    }
+    coordinator = StubCoordinator(
+        max_upload_concurrency=4,
+        max_session_bytes=9,
+        min_free_bytes=0,
+    )
+    coordinator.committed[session_id] = 9
+    for upload_id, content in uploads.items():
+        asset_dir = tmp_path / "sessions" / session_id / "assets" / upload_id
+        asset_dir.mkdir(parents=True)
+        (asset_dir / ".uploading").write_bytes(content)
+        generation = (
+            tmp_path
+            / "sessions"
+            / session_id
+            / ".upload-generations"
+            / upload_id
+        )
+        generation.parent.mkdir(exist_ok=True)
+        generation.write_text(uuid4().hex, encoding="ascii")
+        os.utime(generation, (1.0, 1.0))
+
+    with _client(
+        tmp_path,
+        max_session_bytes=9,
+        resource_coordinator=coordinator,
+    ) as client:
+        client.cookies.set("dt_session", session_id)
+        deleted = [
+            client.delete(f"/api/uploads/{upload_id}") for upload_id in uploads
+        ]
+        assert coordinator.committed.get(session_id, 0) == 0
+
+        replacements = [
+            _upload(
+                client,
+                f"{index}.png",
+                content,
+                upload_id=upload_id,
+            )
+            for index, (upload_id, content) in enumerate(uploads.items())
+        ]
+        replacement_deletes = [
+            client.delete(f"/api/uploads/{upload_id}") for upload_id in uploads
+        ]
+
+    assert [response.status_code for response in deleted] == [204, 204]
+    assert [response.status_code for response in replacements] == [201, 201]
+    assert [response.status_code for response in replacement_deletes] == [204, 204]
+    assert coordinator.committed.get(session_id, 0) == 0
+    assert list(tmp_path.rglob(".uploading")) == []
 
 
 def test_delete_does_not_reclaim_active_partial_upload(tmp_path: Path) -> None:

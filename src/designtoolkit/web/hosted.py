@@ -1537,6 +1537,15 @@ def _auditable_session_upload_bytes(
                 for part in path.relative_to(asset_dir).parts
             )
         ]
+        if not visible_files:
+            entries = list(asset_dir.iterdir())
+            if (
+                len(entries) == 1
+                and entries[0].name == ".uploading"
+                and S_ISREG(entries[0].lstat().st_mode)
+            ):
+                continue
+            return None
         if len(files) != 1 or len(visible_files) != 1:
             return None
         total += visible_files[0].stat().st_size

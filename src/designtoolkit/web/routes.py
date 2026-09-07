@@ -1311,7 +1311,10 @@ def create_router(
                     upload_id,
                 )
             except ResourceUnavailableError as exc:
-                if str(exc) == "Upload is already in progress":
+                if str(exc) in {
+                    "Upload is already in progress",
+                    "Upload deletion is still pending",
+                }:
                     raise ApiError("upload_conflict", str(exc), 409) from exc
                 raise
             storage.claim_upload_generation(

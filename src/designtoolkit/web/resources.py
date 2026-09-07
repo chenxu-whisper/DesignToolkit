@@ -48,6 +48,18 @@ if redis.call("EXISTS", KEYS[1]) == 1 then
     redis.call("PEXPIRE", KEYS[1], tonumber(ARGV[2]))
     return 2
 end
+if redis.call("EXISTS", KEYS[2]) == 1 then
+    if redis.call("TYPE", KEYS[2])["ok"] ~= "hash"
+        or redis.call("HGET", KEYS[2], "session_id") ~= ARGV[3]
+        or redis.call("HGET", KEYS[2], "asset_id") ~= ARGV[4] then
+        return 4
+    end
+    if redis.call("HGET", KEYS[2], "finalized") ~= "1" then
+        return 3
+    end
+    redis.call("DEL", KEYS[2])
+    redis.call("SREM", KEYS[3], KEYS[2])
+end
 redis.call(
     "HMSET",
     KEYS[1],
@@ -1007,8 +1019,8 @@ local remaining = nil
 if expected_remaining then
     if current == expected_remaining then
         remaining = current
-    elseif current == expected_remaining + released_bytes then
-        remaining = expected_remaining
+    elseif current >= expected_remaining + released_bytes then
+        remaining = current - released_bytes
     else
         return 5
     end
@@ -1658,10 +1670,16 @@ class RedisResourceCoordinator:
             try:
                 result = int(
                     self._register_upload_script(
-                        keys=[_upload_inflight_key(session_id, upload_id)],
+                        keys=[
+                            _upload_inflight_key(session_id, upload_id),
+                            _released_asset_key(session_id, upload_id),
+                            _session_released_assets_key(session_id),
+                        ],
                         args=[
                             token,
                             self._reservation_ttl_ms,
+                            session_id,
+                            upload_id,
                         ],
                     )
                 )
@@ -1670,6 +1688,10 @@ class RedisResourceCoordinator:
                 continue
             if result == 1:
                 raise ResourceUnavailableError("Upload is already in progress")
+            if result == 3:
+                raise ResourceUnavailableError("Upload deletion is still pending")
+            if result == 4:
+                raise ResourceUnavailableError("Upload release marker is invalid")
             return registration
         if last_transport_error is None:
             raise RuntimeError("Upload registration recovery lost its error")
@@ -2344,9 +2366,8 @@ class RedisResourceCoordinator:
         )
         if not refreshed:
             raise ResourceUnavailableError("Session lease expired")
-        task_id = lease.task_id or self._task_id_for_lease(lease.token)
-        if task_id is not None:
-            self._touch_task_resources(task_id)
+        if lease.task_id is not None:
+            self._touch_task_resources(lease.task_id)
 
     def _release_session(
         self,
@@ -2355,7 +2376,7 @@ class RedisResourceCoordinator:
         task_id: str | None = None,
     ) -> None:
         if task_id is None:
-            task_id = lease.task_id or self._task_id_for_lease(lease.token)
+            task_id = lease.task_id
         self._release_session_script(
             keys=[
                 _session_state_key(lease.session_id),
@@ -2379,17 +2400,6 @@ class RedisResourceCoordinator:
             max(self._reservation_ttl_ms, self._lease_ttl_ms),
         )
         pipeline.execute()
-
-    def _task_id_for_lease(self, token: str) -> str | None:
-        for key in self._redis.scan_iter(match=f"{_TASK_RESOURCE_PREFIX}*"):
-            value = self._redis.hget(key, "lease_token")
-            if value is None:
-                continue
-            value_text = value.decode() if isinstance(value, bytes) else value
-            if value_text == token:
-                key_text = key.decode() if isinstance(key, bytes) else key
-                return key_text.removeprefix(_TASK_RESOURCE_PREFIX)
-        return None
 
 
 def _reservation_key(token: str) -> str:

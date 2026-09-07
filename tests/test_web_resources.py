@@ -47,13 +47,25 @@ class DeterministicRedis(fakeredis.FakeRedis):
         return execute
 
     def _eval_register_upload(self, keys, args):  # noqa: ANN001, ANN202
-        key = keys[0]
-        token, ttl_ms = args
+        key, marker_key, marker_index_key = keys
+        token, ttl_ms, session_id, asset_id = args
         if self.exists(key):
             if self.hget(key, "token") != str(token).encode():
                 return 1
             self.pexpire(key, int(ttl_ms))
             return 2
+        if self.exists(marker_key):
+            if (
+                self._text(self.type(marker_key)) != "hash"
+                or self.hget(marker_key, "session_id")
+                != str(session_id).encode()
+                or self.hget(marker_key, "asset_id") != str(asset_id).encode()
+            ):
+                return 4
+            if self.hget(marker_key, "finalized") != b"1":
+                return 3
+            self.delete(marker_key)
+            self.srem(marker_index_key, marker_key)
         self.hset(
             key,
             mapping={
@@ -742,8 +754,8 @@ class DeterministicRedis(fakeredis.FakeRedis):
         if expected_remaining is not None:
             if current == expected_remaining:
                 remaining = current
-            elif current == expected_remaining + released_bytes:
-                remaining = expected_remaining
+            elif current >= expected_remaining + released_bytes:
+                remaining = current - released_bytes
             else:
                 return 5
         else:
@@ -1153,6 +1165,53 @@ def test_upload_registration_acknowledgement_loss_reuses_one_token() -> None:
     registration.finish()
 
 
+def test_upload_registration_clears_only_finalized_release_marker(
+    redis_connection: DeterministicRedis,
+) -> None:
+    resources = coordinator(redis_connection, max_session_bytes=5)
+    upload_id = "1" * 32
+    first = resources.reserve_upload(SESSION_A, 5, free_bytes=100)
+    first.commit()
+    resources.release_committed_asset(SESSION_A, upload_id, 5)
+
+    with pytest.raises(ResourceUnavailableError, match="deletion.*pending"):
+        resources.register_upload(SESSION_A, upload_id)
+
+    resources.finalize_asset_release(SESSION_A, upload_id)
+    registration = resources.register_upload(SESSION_A, upload_id)
+    assert resources.is_committed_asset_released(SESSION_A, upload_id) is False
+
+    second = resources.reserve_upload(SESSION_A, 5, free_bytes=100)
+    second.commit()
+    resources.release_committed_asset(SESSION_A, upload_id, 5)
+
+    assert int(
+        redis_connection.hget(
+            "dt:resource:state",
+            f"session:{SESSION_A}:committed_bytes",
+        )
+        or 0
+    ) == 0
+    registration.finish()
+
+
+def test_upload_registration_marker_reset_survives_acknowledgement_loss() -> None:
+    redis_connection = ExecuteThenRaiseRedis("register_upload")
+    resources = coordinator(redis_connection, max_session_bytes=5)
+    upload_id = "1" * 32
+    first = resources.reserve_upload(SESSION_A, 5, free_bytes=100)
+    first.commit()
+    resources.release_committed_asset(SESSION_A, upload_id, 5)
+    resources.finalize_asset_release(SESSION_A, upload_id)
+
+    registration = resources.register_upload(SESSION_A, upload_id)
+
+    assert len(redis_connection.attempt_tokens) == 2
+    assert len(set(redis_connection.attempt_tokens)) == 1
+    assert resources.is_committed_asset_released(SESSION_A, upload_id) is False
+    registration.finish()
+
+
 def test_upload_registration_finish_recovers_acknowledgement_loss() -> None:
     redis_connection = ExecuteThenRaiseRedis("finish_upload")
     resources = coordinator(redis_connection)
@@ -1299,6 +1358,35 @@ def test_orphan_release_removes_committed_bytes_above_audited_assets(
     replacement = resources.reserve_upload(SESSION_A, 6, free_bytes=100)
     replacement.release()
     assert resources.is_committed_asset_released(SESSION_A, asset_id) is True
+
+
+def test_orphan_release_reclaims_multiple_commits_above_published_floor(
+    redis_connection: DeterministicRedis,
+) -> None:
+    resources = coordinator(redis_connection, max_session_bytes=20)
+    for size in (4, 5, 3):
+        reservation = resources.reserve_upload(SESSION_A, size, free_bytes=100)
+        reservation.commit()
+
+    resources.release_committed_asset(
+        SESSION_A,
+        "1" * 32,
+        5,
+        expected_remaining_bytes=4,
+    )
+    resources.release_committed_asset(
+        SESSION_A,
+        "2" * 32,
+        3,
+        expected_remaining_bytes=4,
+    )
+
+    assert int(
+        redis_connection.hget(
+            "dt:resource:state",
+            f"session:{SESSION_A}:committed_bytes",
+        )
+    ) == 4
 
 
 def test_orphan_release_preserves_audited_assets_when_upload_never_committed(
@@ -2864,6 +2952,26 @@ def test_session_lease_release_is_idempotent_and_token_scoped(
     claim = resources.claim_session_cleanup(SESSION_A)
     assert claim is not None
     resources.release_cleanup_claim(SESSION_A, claim)
+
+
+def test_random_upload_delete_lease_never_scans_task_resources(
+    redis_connection: DeterministicRedis,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resources = coordinator(redis_connection)
+    upload_id = "1" * 32
+    lease = resources.acquire_session(SESSION_A)
+
+    def reject_scan(*_args: object, **_kwargs: object):
+        raise AssertionError("random upload DELETE scanned task resources")
+
+    monkeypatch.setattr(redis_connection, "scan_iter", reject_scan)
+
+    assert resources.cancel_upload(SESSION_A, upload_id) is False
+    lease.refresh()
+    assert resources.is_committed_asset_released(SESSION_A, upload_id) is False
+    lease.refresh()
+    lease.release()
 
 
 def test_expired_session_lease_is_reconciled_before_cleanup_claim(
