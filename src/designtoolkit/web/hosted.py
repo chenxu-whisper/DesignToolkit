@@ -42,6 +42,8 @@ _DEFAULT_MAX_SESSION_BYTES = 2 * 1024 * 1024 * 1024
 _DEFAULT_MAX_OUTPUT_BYTES = 5 * 1024 * 1024 * 1024
 _DEFAULT_MIN_FREE_BYTES = 5 * 1024 * 1024 * 1024
 _DEFAULT_MAX_QUEUED_TASKS = 20
+_DEFAULT_MAX_UPLOAD_CONCURRENCY = 4
+_DEFAULT_MAX_PREVIEW_CONCURRENCY = 2
 _DEFAULT_RETENTION_SECONDS = 2 * 60 * 60
 _DEFAULT_TASK_TIMEOUT_SECONDS = 2 * 60 * 60
 _UPLOAD_CHUNK_BYTES = 1024 * 1024
@@ -300,8 +302,8 @@ class HostedSettings:
     max_video_duration_seconds: float = (
         _DEFAULT_MEDIA_LIMITS.max_video_duration_seconds
     )
-    max_preview_concurrency: int = 2
-    max_upload_concurrency: int = 4
+    max_preview_concurrency: int = _DEFAULT_MAX_PREVIEW_CONCURRENCY
+    max_upload_concurrency: int = _DEFAULT_MAX_UPLOAD_CONCURRENCY
     max_stream_concurrency: int = 16
     reservation_ttl_seconds: float = 60.0
     reservation_heartbeat_seconds: float = 5.0
@@ -330,27 +332,27 @@ class HostedSettings:
                 "DESIGNTOOLKIT_REDIS_SOCKET_TIMEOUT_SECONDS",
                 5.0,
             ),
-            max_upload_bytes=_read_positive_int(
+            max_upload_bytes=_read_clamped_positive_int(
                 values,
                 "DESIGNTOOLKIT_MAX_UPLOAD_BYTES",
                 _DEFAULT_MAX_UPLOAD_BYTES,
             ),
-            max_session_bytes=_read_positive_int(
+            max_session_bytes=_read_clamped_positive_int(
                 values,
                 "DESIGNTOOLKIT_MAX_SESSION_BYTES",
                 _DEFAULT_MAX_SESSION_BYTES,
             ),
-            max_output_bytes=_read_positive_int(
+            max_output_bytes=_read_clamped_positive_int(
                 values,
                 "DESIGNTOOLKIT_MAX_OUTPUT_BYTES",
                 _DEFAULT_MAX_OUTPUT_BYTES,
             ),
-            min_free_bytes=_read_non_negative_int(
+            min_free_bytes=_read_floored_non_negative_int(
                 values,
                 "DESIGNTOOLKIT_MIN_FREE_BYTES",
                 _DEFAULT_MIN_FREE_BYTES,
             ),
-            max_queued_tasks=_read_positive_int(
+            max_queued_tasks=_read_clamped_positive_int(
                 values,
                 "DESIGNTOOLKIT_MAX_QUEUED_TASKS",
                 _DEFAULT_MAX_QUEUED_TASKS,
@@ -375,15 +377,15 @@ class HostedSettings:
                 "DESIGNTOOLKIT_MAX_VIDEO_DURATION_SECONDS",
                 _DEFAULT_MEDIA_LIMITS.max_video_duration_seconds,
             ),
-            max_preview_concurrency=_read_positive_int(
+            max_preview_concurrency=_read_clamped_positive_int(
                 values,
                 "DESIGNTOOLKIT_MAX_PREVIEW_CONCURRENCY",
-                2,
+                _DEFAULT_MAX_PREVIEW_CONCURRENCY,
             ),
-            max_upload_concurrency=_read_positive_int(
+            max_upload_concurrency=_read_clamped_positive_int(
                 values,
                 "DESIGNTOOLKIT_MAX_UPLOAD_CONCURRENCY",
-                4,
+                _DEFAULT_MAX_UPLOAD_CONCURRENCY,
             ),
             max_stream_concurrency=_read_positive_int(
                 values,
@@ -1319,7 +1321,17 @@ def _read_clamped_positive_int(
     key: str,
     ceiling: int,
 ) -> int:
-    return min(_read_positive_int(env, key, ceiling), ceiling)
+    value = _read_positive_int(env, key, ceiling)
+    if value > ceiling:
+        _LOGGER.warning(
+            "%s=%s exceeds hosted safety ceiling %s; clamping to %s",
+            key,
+            value,
+            ceiling,
+            ceiling,
+        )
+        return ceiling
+    return value
 
 
 def _read_non_negative_int(
@@ -1333,6 +1345,24 @@ def _read_non_negative_int(
     value = int(raw)
     if value < 0:
         raise ValueError(f"{key} must not be negative")
+    return value
+
+
+def _read_floored_non_negative_int(
+    env: Mapping[str, str],
+    key: str,
+    floor: int,
+) -> int:
+    value = _read_non_negative_int(env, key, floor)
+    if value < floor:
+        _LOGGER.warning(
+            "%s=%s is below hosted safety floor %s; clamping to %s",
+            key,
+            value,
+            floor,
+            floor,
+        )
+        return floor
     return value
 
 
@@ -1358,7 +1388,16 @@ def _read_clamped_positive_float(
     value = _read_positive_float(env, key, ceiling)
     if not isfinite(value):
         raise ValueError(f"{key} must be positive")
-    return min(value, ceiling)
+    if value > ceiling:
+        _LOGGER.warning(
+            "%s=%s exceeds hosted safety ceiling %s; clamping to %s",
+            key,
+            value,
+            ceiling,
+            ceiling,
+        )
+        return ceiling
+    return value
 
 
 def _directory_modified_at(path: Path) -> float:

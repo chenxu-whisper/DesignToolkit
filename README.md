@@ -172,6 +172,11 @@ docker compose up -d --build
 Worker 各预留最多 5 GiB 输出空间，并始终保留 5 GiB 基础余量，因此两个输出
 任务开始前至少需要 15 GiB 可用磁盘空间。
 
+公网安全硬边界采用默认值作为最大允许值：单次上传 500 MiB、会话 2 GiB、输出
+5 GiB、排队任务 20、上传并发 4、预览并发 2、图片 100M 像素、视频
+3840x2160/1800 秒。对应 `.env` 最大值变量只能收紧；`MIN_FREE_BYTES` 至少为
+5 GiB，只能提高。越界配置会被钳制并记录 warning。
+
 托管超时与租约设置：
 
 - `DESIGNTOOLKIT_TASK_TIMEOUT_SECONDS` 默认 7200 秒，仅控制 RQ 任务执行上限；

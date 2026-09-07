@@ -44,6 +44,19 @@ HOSTED_TIMEOUT_DEFAULTS = {
 HOSTED_CONCURRENCY_DEFAULTS = {
     "DESIGNTOOLKIT_MAX_STREAM_CONCURRENCY": "16",
 }
+HOSTED_SAFETY_DEFAULTS = {
+    "DESIGNTOOLKIT_MAX_UPLOAD_BYTES": "524288000",
+    "DESIGNTOOLKIT_MAX_SESSION_BYTES": "2147483648",
+    "DESIGNTOOLKIT_MAX_OUTPUT_BYTES": "5368709120",
+    "DESIGNTOOLKIT_MIN_FREE_BYTES": "5368709120",
+    "DESIGNTOOLKIT_MAX_QUEUED_TASKS": "20",
+    "DESIGNTOOLKIT_MAX_UPLOAD_CONCURRENCY": "4",
+    "DESIGNTOOLKIT_MAX_PREVIEW_CONCURRENCY": "2",
+    "DESIGNTOOLKIT_MAX_IMAGE_PIXELS": "100000000",
+    "DESIGNTOOLKIT_MAX_VIDEO_WIDTH": "3840",
+    "DESIGNTOOLKIT_MAX_VIDEO_HEIGHT": "2160",
+    "DESIGNTOOLKIT_MAX_VIDEO_DURATION_SECONDS": "1800",
+}
 HOSTED_SERVICES = ("app", "worker-1", "worker-2", "cleanup")
 
 
@@ -83,6 +96,14 @@ def test_hosted_stream_concurrency_default_is_deployable() -> None:
     for name, value in HOSTED_CONCURRENCY_DEFAULTS.items():
         assert f"{name}={value}" in ENV_EXAMPLE_TEXT
         assert f"{name}: \"${{{name}:-{value}}}\"" in COMPOSE_TEXT
+
+
+def test_hosted_safety_limit_direction_is_documented() -> None:
+    assert "Only lower maximums or raise DESIGNTOOLKIT_MIN_FREE_BYTES" in (
+        ENV_EXAMPLE_TEXT
+    )
+    assert "公网安全硬边界" in README_TEXT
+    assert "只能收紧" in README_TEXT
 
 
 def test_resolved_compose_skips_unsupported_compose_version(
@@ -170,6 +191,7 @@ def _resolved_compose(
     environment["DOMAIN"] = "tools.example.com"
     environment.update(dict.fromkeys(RESOURCE_VARIABLES, ""))
     environment.update(dict.fromkeys(HOSTED_TIMEOUT_DEFAULTS, ""))
+    environment.update(dict.fromkeys(HOSTED_SAFETY_DEFAULTS, ""))
     environment.update(overrides or {})
     result = subprocess.run(
         ["docker", "compose", "config", "--format", "json"],
@@ -227,6 +249,38 @@ def test_compose_allows_hosted_timeout_overrides() -> None:
     overrides = {
         name: str(index)
         for index, name in enumerate(HOSTED_TIMEOUT_DEFAULTS, start=11)
+    }
+
+    services = _resolved_compose(overrides)["services"]
+
+    for service_name in HOSTED_SERVICES:
+        environment = services[service_name]["environment"]
+        assert {name: environment.get(name) for name in overrides} == overrides
+
+
+def test_compose_forwards_hosted_safety_defaults() -> None:
+    services = _resolved_compose()["services"]
+
+    for service_name in HOSTED_SERVICES:
+        environment = services[service_name]["environment"]
+        assert {
+            name: environment.get(name) for name in HOSTED_SAFETY_DEFAULTS
+        } == HOSTED_SAFETY_DEFAULTS
+
+
+def test_compose_forwards_hosted_safety_overrides() -> None:
+    overrides = {
+        "DESIGNTOOLKIT_MAX_UPLOAD_BYTES": "262144000",
+        "DESIGNTOOLKIT_MAX_SESSION_BYTES": "1073741824",
+        "DESIGNTOOLKIT_MAX_OUTPUT_BYTES": "2684354560",
+        "DESIGNTOOLKIT_MIN_FREE_BYTES": "6442450944",
+        "DESIGNTOOLKIT_MAX_QUEUED_TASKS": "10",
+        "DESIGNTOOLKIT_MAX_UPLOAD_CONCURRENCY": "2",
+        "DESIGNTOOLKIT_MAX_PREVIEW_CONCURRENCY": "1",
+        "DESIGNTOOLKIT_MAX_IMAGE_PIXELS": "50000000",
+        "DESIGNTOOLKIT_MAX_VIDEO_WIDTH": "1920",
+        "DESIGNTOOLKIT_MAX_VIDEO_HEIGHT": "1080",
+        "DESIGNTOOLKIT_MAX_VIDEO_DURATION_SECONDS": "900",
     }
 
     services = _resolved_compose(overrides)["services"]

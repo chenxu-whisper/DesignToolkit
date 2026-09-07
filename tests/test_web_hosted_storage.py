@@ -292,6 +292,120 @@ def test_hosted_settings_use_public_deployment_defaults(tmp_path: Path) -> None:
     assert settings.redis_socket_timeout_seconds == 5.0
 
 
+@pytest.mark.parametrize(
+    ("env_name", "attribute", "ceiling"),
+    [
+        ("DESIGNTOOLKIT_MAX_UPLOAD_BYTES", "max_upload_bytes", 500 * 1024 * 1024),
+        (
+            "DESIGNTOOLKIT_MAX_SESSION_BYTES",
+            "max_session_bytes",
+            2 * 1024 * 1024 * 1024,
+        ),
+        (
+            "DESIGNTOOLKIT_MAX_OUTPUT_BYTES",
+            "max_output_bytes",
+            5 * 1024 * 1024 * 1024,
+        ),
+        ("DESIGNTOOLKIT_MAX_QUEUED_TASKS", "max_queued_tasks", 20),
+        ("DESIGNTOOLKIT_MAX_UPLOAD_CONCURRENCY", "max_upload_concurrency", 4),
+        ("DESIGNTOOLKIT_MAX_PREVIEW_CONCURRENCY", "max_preview_concurrency", 2),
+        ("DESIGNTOOLKIT_MAX_IMAGE_PIXELS", "max_image_pixels", 100_000_000),
+        ("DESIGNTOOLKIT_MAX_VIDEO_WIDTH", "max_video_width", 3840),
+        ("DESIGNTOOLKIT_MAX_VIDEO_HEIGHT", "max_video_height", 2160),
+        (
+            "DESIGNTOOLKIT_MAX_VIDEO_DURATION_SECONDS",
+            "max_video_duration_seconds",
+            1800.0,
+        ),
+    ],
+)
+def test_hosted_settings_clamp_public_safety_limits_to_hard_ceiling(
+    env_name: str,
+    attribute: str,
+    ceiling: int | float,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level("WARNING", logger="designtoolkit.web.hosted")
+
+    settings = HostedSettings.from_env({env_name: str(ceiling + 1)})
+
+    assert getattr(settings, attribute) == ceiling
+    assert env_name in caplog.text
+    assert str(ceiling) in caplog.text
+
+
+def test_hosted_settings_clamp_minimum_free_space_to_hard_floor(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level("WARNING", logger="designtoolkit.web.hosted")
+
+    settings = HostedSettings.from_env({"DESIGNTOOLKIT_MIN_FREE_BYTES": "1"})
+
+    assert settings.min_free_bytes == 5 * 1024 * 1024 * 1024
+    assert "DESIGNTOOLKIT_MIN_FREE_BYTES" in caplog.text
+    assert str(5 * 1024 * 1024 * 1024) in caplog.text
+
+
+def test_hosted_settings_allow_stricter_public_safety_limits() -> None:
+    settings = HostedSettings.from_env(
+        {
+            "DESIGNTOOLKIT_MAX_UPLOAD_BYTES": str(250 * 1024 * 1024),
+            "DESIGNTOOLKIT_MAX_SESSION_BYTES": str(1024 * 1024 * 1024),
+            "DESIGNTOOLKIT_MAX_OUTPUT_BYTES": str(2 * 1024 * 1024 * 1024),
+            "DESIGNTOOLKIT_MIN_FREE_BYTES": str(6 * 1024 * 1024 * 1024),
+            "DESIGNTOOLKIT_MAX_QUEUED_TASKS": "10",
+            "DESIGNTOOLKIT_MAX_UPLOAD_CONCURRENCY": "2",
+            "DESIGNTOOLKIT_MAX_PREVIEW_CONCURRENCY": "1",
+            "DESIGNTOOLKIT_MAX_IMAGE_PIXELS": "50000000",
+            "DESIGNTOOLKIT_MAX_VIDEO_WIDTH": "1920",
+            "DESIGNTOOLKIT_MAX_VIDEO_HEIGHT": "1080",
+            "DESIGNTOOLKIT_MAX_VIDEO_DURATION_SECONDS": "900",
+        }
+    )
+
+    assert settings.max_upload_bytes == 250 * 1024 * 1024
+    assert settings.max_session_bytes == 1024 * 1024 * 1024
+    assert settings.max_output_bytes == 2 * 1024 * 1024 * 1024
+    assert settings.min_free_bytes == 6 * 1024 * 1024 * 1024
+    assert settings.max_queued_tasks == 10
+    assert settings.max_upload_concurrency == 2
+    assert settings.max_preview_concurrency == 1
+    assert settings.max_image_pixels == 50_000_000
+    assert settings.max_video_width == 1920
+    assert settings.max_video_height == 1080
+    assert settings.max_video_duration_seconds == 900.0
+
+
+def test_hosted_settings_do_not_clamp_operational_tuning() -> None:
+    settings = HostedSettings.from_env(
+        {
+            "DESIGNTOOLKIT_MAX_STREAM_CONCURRENCY": "32",
+            "DESIGNTOOLKIT_UPLOAD_REQUESTS_PER_HOUR": "60",
+            "DESIGNTOOLKIT_API_REQUESTS_PER_MINUTE": "240",
+            "DESIGNTOOLKIT_RETENTION_SECONDS": "14400",
+            "DESIGNTOOLKIT_TASK_TIMEOUT_SECONDS": "14400",
+            "DESIGNTOOLKIT_REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS": "10",
+            "DESIGNTOOLKIT_REDIS_SOCKET_TIMEOUT_SECONDS": "20",
+            "DESIGNTOOLKIT_RESERVATION_TTL_SECONDS": "120",
+            "DESIGNTOOLKIT_RESERVATION_HEARTBEAT_SECONDS": "10",
+            "DESIGNTOOLKIT_LEASE_TTL_SECONDS": "120",
+            "DESIGNTOOLKIT_LEASE_HEARTBEAT_SECONDS": "10",
+        }
+    )
+
+    assert settings.max_stream_concurrency == 32
+    assert settings.upload_requests_per_hour == 60
+    assert settings.api_requests_per_minute == 240
+    assert settings.retention_seconds == 14400
+    assert settings.task_timeout_seconds == 14400
+    assert settings.redis_socket_connect_timeout_seconds == 10.0
+    assert settings.redis_socket_timeout_seconds == 20.0
+    assert settings.reservation_ttl_seconds == 120.0
+    assert settings.reservation_heartbeat_seconds == 10.0
+    assert settings.lease_ttl_seconds == 120.0
+    assert settings.lease_heartbeat_seconds == 10.0
+
+
 def test_hosted_settings_keep_task_timeout_independent_from_retention(
     tmp_path: Path,
 ) -> None:
