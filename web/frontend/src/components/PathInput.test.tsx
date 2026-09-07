@@ -984,6 +984,87 @@ describe('PathInput', () => {
     expect(uploadFiles).toHaveBeenCalledOnce()
   })
 
+  it('keeps the active upload intent when another file is dropped', async () => {
+    const user = userEvent.setup()
+    const uploadRequest = deferred<readonly string[]>()
+    const uploadFiles = vi.fn(() => uploadRequest.promise)
+    const { container } = render(
+      <ControlledUploadPathInput uploadFiles={uploadFiles} />,
+    )
+    const input = screen.getByLabelText('输入媒体路径')
+    const picker = screen.getByRole('button', { name: '上传输入媒体路径' })
+    const fileInput = container.querySelector<HTMLInputElement>(
+      'input[type="file"]',
+    )
+    if (!fileInput) {
+      throw new Error('upload input missing')
+    }
+    const fileInputClick = vi.spyOn(fileInput, 'click')
+
+    fireEvent.change(fileInput, {
+      target: { files: [new File(['first'], 'first.png', { type: 'image/png' })] },
+    })
+    expect(screen.getByLabelText('上传进度')).toHaveValue(0)
+    expect(picker).toHaveAttribute('aria-disabled', 'true')
+
+    fireEvent.drop(input, {
+      dataTransfer: {
+        files: [new File(['second'], 'second.png', { type: 'image/png' })],
+        getData: () => '',
+      },
+    })
+    picker.focus()
+    await user.keyboard('{Enter}')
+
+    expect(uploadFiles).toHaveBeenCalledOnce()
+    expect(fileInputClick).not.toHaveBeenCalled()
+
+    await act(async () => {
+      uploadRequest.resolve([
+        'asset:11111111111111111111111111111111:first.png',
+      ])
+      await uploadRequest.promise
+    })
+
+    expect(input).toHaveValue('first.png')
+    expect(screen.queryByLabelText('上传进度')).not.toBeInTheDocument()
+    expect(picker).toHaveAttribute('aria-disabled', 'false')
+  })
+
+  it('starts only one upload for rapid consecutive file selections', async () => {
+    const uploadRequest = deferred<readonly string[]>()
+    const uploadFiles = vi.fn(() => uploadRequest.promise)
+    const { container } = render(
+      <ControlledUploadPathInput uploadFiles={uploadFiles} />,
+    )
+    const fileInput = container.querySelector<HTMLInputElement>(
+      'input[type="file"]',
+    )
+    if (!fileInput) {
+      throw new Error('upload input missing')
+    }
+
+    fireEvent.change(fileInput, {
+      target: { files: [new File(['first'], 'first.png', { type: 'image/png' })] },
+    })
+    expect(fileInput).toBeDisabled()
+    fireEvent.change(fileInput, {
+      target: { files: [new File(['second'], 'second.png', { type: 'image/png' })] },
+    })
+
+    expect(uploadFiles).toHaveBeenCalledOnce()
+
+    await act(async () => {
+      uploadRequest.resolve([
+        'asset:11111111111111111111111111111111:first.png',
+      ])
+      await uploadRequest.promise
+    })
+
+    expect(screen.getByLabelText('输入媒体路径')).toHaveValue('first.png')
+    expect(screen.queryByLabelText('上传进度')).not.toBeInTheDocument()
+  })
+
   it('aborts an in-flight browser upload when unmounted', async () => {
     let uploadSignal: AbortSignal | undefined
     const uploadRequest = deferred<readonly string[]>()

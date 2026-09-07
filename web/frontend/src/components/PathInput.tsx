@@ -118,12 +118,15 @@ export function PathInput({
   }
 
   const commitManualValue = (nextValue: string) => {
+    if (uploadControllerRef.current) {
+      return
+    }
     beginIntent()
     onCommit?.(nextValue)
   }
 
   const applyDraftPath = () => {
-    if (disabled) {
+    if (disabled || uploadControllerRef.current) {
       return
     }
     beginIntent()
@@ -147,7 +150,7 @@ export function PathInput({
   }
 
   const handlePickerClick = async () => {
-    if (disabled || isPicking) {
+    if (disabled || isPicking || uploadControllerRef.current) {
       return
     }
     if (uploadFiles) {
@@ -183,12 +186,17 @@ export function PathInput({
   }
 
   const handleUploads = async (files: readonly File[]) => {
-    if (disabled || isPicking || !uploadFiles || files.length === 0) {
+    if (
+      disabled
+      || isPicking
+      || uploadControllerRef.current
+      || !uploadFiles
+      || files.length === 0
+    ) {
       return
     }
     const intent = beginIntent()
     const controller = new AbortController()
-    uploadControllerRef.current?.abort()
     uploadControllerRef.current = controller
     setPickerError(null)
     setDropError(null)
@@ -220,8 +228,6 @@ export function PathInput({
     } finally {
       if (uploadControllerRef.current === controller) {
         uploadControllerRef.current = null
-      }
-      if (isLatestIntent(intent)) {
         setIsPicking(false)
         setUploadProgress(null)
         if (uploadInputRef.current) {
@@ -236,6 +242,11 @@ export function PathInput({
       return
     }
     event.preventDefault()
+    if (isPicking || uploadControllerRef.current) {
+      event.dataTransfer.dropEffect = 'none'
+      setIsDragActive(false)
+      return
+    }
     event.dataTransfer.dropEffect = 'copy'
     setIsDragActive(true)
   }
@@ -245,8 +256,11 @@ export function PathInput({
       return
     }
     event.preventDefault()
-    const intent = beginIntent()
     setIsDragActive(false)
+    if (isPicking || uploadControllerRef.current) {
+      return
+    }
+    const intent = beginIntent()
     if (uploadFiles && event.dataTransfer.files.length > 0) {
       await handleUploads(Array.from(event.dataTransfer.files))
       return
@@ -306,6 +320,9 @@ export function PathInput({
             disabled={disabled}
             id={inputId}
             onChange={(event) => {
+              if (uploadControllerRef.current) {
+                return
+              }
               beginIntent()
               updateValue(event.target.value)
             }}
@@ -326,6 +343,9 @@ export function PathInput({
             disabled={disabled}
             id={inputId}
             onBlur={(event) => {
+              if (uploadControllerRef.current) {
+                return
+              }
               if (skipNextBlurRef.current) {
                 skipNextBlurRef.current = false
                 return
@@ -337,6 +357,9 @@ export function PathInput({
               commitManualValue(event.currentTarget.value)
             }}
             onChange={(event) => {
+              if (uploadControllerRef.current) {
+                return
+              }
               beginIntent()
               updateValue(event.target.value)
             }}
@@ -360,7 +383,7 @@ export function PathInput({
         {uploadFiles ? (
           <input
             accept={uploadAccept}
-            disabled={disabled}
+            disabled={isPickerDisabled}
             hidden
             multiple={multiline}
             onChange={(event) => {
