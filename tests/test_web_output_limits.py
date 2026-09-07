@@ -394,7 +394,10 @@ def test_ffmpeg_backend_stops_process_and_preserves_rq_timeout() -> None:
     assert exc_info.value is timeout
     assert process.terminate_called
     assert process.kill_called
-    assert process.wait_calls == [0.01, 0.01]
+    assert process.wait_calls == [
+        ffmpeg_backend._PROCESS_CLEANUP_TIMEOUT_SECONDS,
+        ffmpeg_backend._PROCESS_CLEANUP_TIMEOUT_SECONDS,
+    ]
 
 
 def test_ffmpeg_backend_logs_cleanup_failure_without_masking_timeout(
@@ -632,6 +635,56 @@ def test_ffmpeg_backend_signals_posix_process_group_on_timeout(
     ]
     assert not process.terminate_called
     assert not process.kill_called
+
+
+def test_ffmpeg_backend_falls_back_when_windows_taskkill_times_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timeout = JobTimeoutException("worker timed out")
+
+    class GroupedPopen(FakePopen):
+        pid = 4321
+
+        def __init__(self) -> None:
+            super().__init__([timeout], wait_times_out=True)
+            self.signals: list[int] = []
+
+        def send_signal(self, sent_signal: int) -> None:
+            self.signals.append(sent_signal)
+
+    process = GroupedPopen()
+    taskkill_calls: list[tuple[list[str], dict[str, Any]]] = []
+    ctrl_break = 1
+
+    def taskkill(command: list[str], **kwargs: Any) -> None:
+        taskkill_calls.append((command, kwargs))
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr(ffmpeg_backend, "os_name", "nt")
+    monkeypatch.setattr(signal, "CTRL_BREAK_EVENT", ctrl_break, raising=False)
+    monkeypatch.setattr(subprocess, "run", taskkill)
+    backend = FfmpegBackend(
+        poll_interval=0.01,
+        popen=_popen_factory(process, []),
+    )
+
+    with pytest.raises(JobTimeoutException) as exc_info:
+        backend.run(["ffmpeg", "out.mp4"])
+
+    assert exc_info.value is timeout
+    assert process.signals == [ctrl_break]
+    assert taskkill_calls[0][0] == [
+        "taskkill",
+        "/PID",
+        str(process.pid),
+        "/T",
+        "/F",
+    ]
+    cleanup_timeout = taskkill_calls[0][1]["timeout"]
+    assert cleanup_timeout > backend._poll_interval
+    assert taskkill_calls[0][1]["check"] is False
+    assert process.kill_called
+    assert process.wait_calls == [cleanup_timeout, cleanup_timeout]
 
 
 def test_ffmpeg_backend_falls_back_to_monitor_when_prlimit_is_missing(

@@ -19,6 +19,7 @@ PopenFactory = Callable[..., subprocess.Popen[str]]
 _LOGGER = logging.getLogger(__name__)
 _POSIX_SIGKILL = getattr(signal, "SIGKILL", 9)
 _WINDOWS_NEW_PROCESS_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200)
+_PROCESS_CLEANUP_TIMEOUT_SECONDS = 5.0
 
 
 def _bundled_binary_dir() -> Path:
@@ -190,13 +191,16 @@ class FfmpegBackend:
             os.killpg(pid, _POSIX_SIGKILL)
             return
         if os_name == "nt" and pid is not None:
-            subprocess.run(
-                ["taskkill", "/PID", str(pid), "/T", "/F"],
-                check=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=self._poll_interval,
-            )
+            try:
+                subprocess.run(
+                    ["taskkill", "/PID", str(pid), "/T", "/F"],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=_PROCESS_CLEANUP_TIMEOUT_SECONDS,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                pass
             if not self._process_is_running(process):
                 return
         process.kill()
@@ -209,7 +213,7 @@ class FfmpegBackend:
         except ProcessLookupError:
             return
         try:
-            process.wait(timeout=self._poll_interval)
+            process.wait(timeout=_PROCESS_CLEANUP_TIMEOUT_SECONDS)
         except ProcessLookupError:
             return
         except subprocess.TimeoutExpired:
@@ -220,6 +224,6 @@ class FfmpegBackend:
             except ProcessLookupError:
                 return
             try:
-                process.wait(timeout=self._poll_interval)
+                process.wait(timeout=_PROCESS_CLEANUP_TIMEOUT_SECONDS)
             except ProcessLookupError:
                 return
