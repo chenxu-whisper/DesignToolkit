@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import logging
+import os
+import signal
 import subprocess
 from collections.abc import Callable, Sequence
 from importlib import resources
@@ -13,6 +16,9 @@ from designtoolkit.video_frames.core import BackendResult, BackendUnavailableErr
 from designtoolkit.web.output_limits import OutputBudgetGuard, OutputTargetMonitor
 
 PopenFactory = Callable[..., subprocess.Popen[str]]
+_LOGGER = logging.getLogger(__name__)
+_POSIX_SIGKILL = getattr(signal, "SIGKILL", 9)
+_WINDOWS_NEW_PROCESS_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200)
 
 
 def _bundled_binary_dir() -> Path:
@@ -111,35 +117,95 @@ class FfmpegBackend:
             "encoding": "utf-8",
             "errors": "replace",
         }
+        if os_name == "posix":
+            popen_kwargs["start_new_session"] = True
+        elif os_name == "nt":
+            popen_kwargs["creationflags"] = _WINDOWS_NEW_PROCESS_GROUP
         process = self._popen(
             _file_size_limited_command(command, self._max_file_bytes),
             **popen_kwargs,
         )
-        while True:
-            try:
-                _stdout, stderr = process.communicate(timeout=self._poll_interval)
-            except subprocess.TimeoutExpired:
-                if self._output_guard is None:
-                    continue
+        try:
+            while True:
                 try:
+                    _stdout, stderr = process.communicate(
+                        timeout=self._poll_interval
+                    )
+                except subprocess.TimeoutExpired:
+                    if self._output_guard is None:
+                        continue
                     if monitor is not None:
                         monitor.poll()
                     else:
                         self._output_guard()
-                except Exception:
+                    continue
+                if monitor is not None:
+                    monitor.finish()
+                return BackendResult(
+                    returncode=(
+                        process.returncode if process.returncode is not None else 1
+                    ),
+                    stderr=stderr or "",
+                )
+        except BaseException:
+            try:
+                if self._process_is_running(process):
                     self._stop_process(process)
-                    raise
-                continue
-            if monitor is not None:
-                monitor.finish()
-            return BackendResult(
-                returncode=process.returncode if process.returncode is not None else 1,
-                stderr=stderr or "",
+            except BaseException:
+                try:
+                    _LOGGER.exception(
+                        "Failed to stop FFmpeg after worker interruption"
+                    )
+                except BaseException:
+                    pass
+            raise
+
+    @staticmethod
+    def _process_is_running(process: subprocess.Popen[str]) -> bool:
+        poll = getattr(process, "poll", None)
+        if poll is not None:
+            return poll() is None
+        return process.returncode is None
+
+    @staticmethod
+    def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
+        pid = getattr(process, "pid", None)
+        if os_name == "posix" and pid is not None:
+            os.killpg(pid, signal.SIGTERM)
+            return
+        if os_name == "nt" and pid is not None:
+            send_signal = getattr(process, "send_signal", None)
+            ctrl_break = getattr(signal, "CTRL_BREAK_EVENT", None)
+            if send_signal is not None and ctrl_break is not None:
+                try:
+                    send_signal(ctrl_break)
+                    return
+                except OSError:
+                    pass
+        process.terminate()
+
+    def _kill_process_tree(self, process: subprocess.Popen[str]) -> None:
+        pid = getattr(process, "pid", None)
+        if os_name == "posix" and pid is not None:
+            os.killpg(pid, _POSIX_SIGKILL)
+            return
+        if os_name == "nt" and pid is not None:
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=self._poll_interval,
             )
+            if not self._process_is_running(process):
+                return
+        process.kill()
 
     def _stop_process(self, process: subprocess.Popen[str]) -> None:
+        if not self._process_is_running(process):
+            return
         try:
-            process.terminate()
+            self._terminate_process_tree(process)
         except ProcessLookupError:
             return
         try:
@@ -147,11 +213,13 @@ class FfmpegBackend:
         except ProcessLookupError:
             return
         except subprocess.TimeoutExpired:
+            if not self._process_is_running(process):
+                return
             try:
-                process.kill()
+                self._kill_process_tree(process)
             except ProcessLookupError:
                 return
             try:
-                process.wait()
+                process.wait(timeout=self._poll_interval)
             except ProcessLookupError:
                 return

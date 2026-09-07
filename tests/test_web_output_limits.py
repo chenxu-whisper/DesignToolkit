@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -8,6 +9,7 @@ from threading import Event
 from typing import Any
 
 import pytest
+from rq.timeouts import JobTimeoutException
 
 from designtoolkit.video_frames import ffmpeg_backend
 from designtoolkit.video_frames.ffmpeg_backend import FfmpegBackend
@@ -285,6 +287,7 @@ class FakePopen:
         self.returncode: int | None = None
         self.terminate_called = False
         self.kill_called = False
+        self.wait_calls: list[float | None] = []
 
     def communicate(self, timeout: float | None = None) -> tuple[str, str]:
         del timeout
@@ -304,7 +307,7 @@ class FakePopen:
         self.kill_called = True
 
     def wait(self, timeout: float | None = None) -> int:
-        del timeout
+        self.wait_calls.append(timeout)
         if self._wait_times_out and not self.kill_called:
             raise subprocess.TimeoutExpired("ffmpeg", 0.01)
         self.returncode = self._final_returncode
@@ -373,6 +376,47 @@ def test_ffmpeg_backend_preserves_captured_stderr_on_success() -> None:
     assert calls[0][1]["stdout"] is subprocess.PIPE
     assert calls[0][1]["stderr"] is subprocess.PIPE
     assert calls[0][1]["encoding"] == "utf-8"
+    assert not process.terminate_called
+    assert not process.kill_called
+
+
+def test_ffmpeg_backend_stops_process_and_preserves_rq_timeout() -> None:
+    timeout = JobTimeoutException("worker timed out")
+    process = FakePopen([timeout], wait_times_out=True)
+    backend = FfmpegBackend(
+        poll_interval=0.01,
+        popen=_popen_factory(process, []),
+    )
+
+    with pytest.raises(JobTimeoutException) as exc_info:
+        backend.run(["ffmpeg", "out.mp4"])
+
+    assert exc_info.value is timeout
+    assert process.terminate_called
+    assert process.kill_called
+    assert process.wait_calls == [0.01, 0.01]
+
+
+def test_ffmpeg_backend_logs_cleanup_failure_without_masking_timeout(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    timeout = JobTimeoutException("worker timed out")
+
+    class StopFailurePopen(FakePopen):
+        def terminate(self) -> None:
+            super().terminate()
+            raise RuntimeError("terminate failed")
+
+    process = StopFailurePopen([timeout])
+    backend = FfmpegBackend(popen=_popen_factory(process, []))
+    caplog.set_level("ERROR", logger="designtoolkit.video_frames.ffmpeg_backend")
+
+    with pytest.raises(JobTimeoutException) as exc_info:
+        backend.run(["ffmpeg", "out.mp4"])
+
+    assert exc_info.value is timeout
+    assert process.terminate_called
+    assert "Failed to stop FFmpeg after worker interruption" in caplog.text
 
 
 def test_ffmpeg_backend_polls_guard_between_timeouts() -> None:
@@ -542,8 +586,52 @@ def test_ffmpeg_backend_wraps_posix_command_without_preexec(
         "out.mp4",
     ]
     assert "preexec_fn" not in calls[0][1]
+    assert calls[0][1]["start_new_session"] is True
     assert result.returncode == 23
     assert result.stderr == "encode failed"
+
+
+def test_ffmpeg_backend_signals_posix_process_group_on_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timeout = JobTimeoutException("worker timed out")
+
+    class GroupedPopen(FakePopen):
+        pid = 4321
+
+        def wait(self, timeout: float | None = None) -> int:
+            self.wait_calls.append(timeout)
+            if len(self.wait_calls) == 1:
+                raise subprocess.TimeoutExpired("ffmpeg", timeout)
+            self.returncode = 0
+            return 0
+
+    process = GroupedPopen([timeout])
+    signals: list[tuple[int, int]] = []
+    monkeypatch.setattr(ffmpeg_backend, "os_name", "posix")
+    monkeypatch.setattr(
+        os,
+        "killpg",
+        lambda process_group, sent_signal: signals.append(
+            (process_group, sent_signal)
+        ),
+        raising=False,
+    )
+    backend = FfmpegBackend(
+        poll_interval=0.01,
+        popen=_popen_factory(process, []),
+    )
+
+    with pytest.raises(JobTimeoutException) as exc_info:
+        backend.run(["ffmpeg", "out.mp4"])
+
+    assert exc_info.value is timeout
+    assert signals == [
+        (process.pid, signal.SIGTERM),
+        (process.pid, 9),
+    ]
+    assert not process.terminate_called
+    assert not process.kill_called
 
 
 def test_ffmpeg_backend_falls_back_to_monitor_when_prlimit_is_missing(
@@ -599,4 +687,5 @@ def test_ffmpeg_backend_keeps_windows_command_unchanged(
 
     assert calls[0][0] == ["ffmpeg", "out.mp4"]
     assert "preexec_fn" not in calls[0][1]
+    assert calls[0][1]["creationflags"] == subprocess.CREATE_NEW_PROCESS_GROUP
     assert result.returncode == 0
