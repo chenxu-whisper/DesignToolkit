@@ -981,6 +981,10 @@ _RELEASE_COMMITTED_ASSET_SCRIPT = """-- release_committed_asset
 local session_id = ARGV[1]
 local asset_id = ARGV[2]
 local released_bytes = tonumber(ARGV[3])
+local expected_remaining = nil
+if ARGV[4] ~= "" then
+    expected_remaining = tonumber(ARGV[4])
+end
 if redis.call("EXISTS", KEYS[2]) == 1 then
     local marker_session = redis.call("HGET", KEYS[2], "session_id")
     local marker_asset = redis.call("HGET", KEYS[2], "asset_id")
@@ -999,13 +1003,24 @@ end
 
 local field = "session:" .. session_id .. ":committed_bytes"
 local current = tonumber(redis.call("HGET", KEYS[1], field) or "0")
-if released_bytes == 0 then
-    return 4
+local remaining = nil
+if expected_remaining then
+    if current == expected_remaining then
+        remaining = current
+    elseif current == expected_remaining + released_bytes then
+        remaining = expected_remaining
+    else
+        return 5
+    end
+else
+    if released_bytes == 0 then
+        return 4
+    end
+    if released_bytes > current then
+        return 3
+    end
+    remaining = current - released_bytes
 end
-if released_bytes > current then
-    return 3
-end
-local remaining = current - released_bytes
 if remaining > 0 then
     redis.call("HSET", KEYS[1], field, remaining)
 else
@@ -2077,10 +2092,17 @@ class RedisResourceCoordinator:
         session_id: str,
         asset_id: str,
         released_bytes: int,
+        *,
+        expected_remaining_bytes: int | None = None,
     ) -> bool:
         _validate_session_id(session_id)
         _validate_asset_id(asset_id)
         released_bytes = _nonnegative_int(released_bytes, "released_bytes")
+        if expected_remaining_bytes is not None:
+            expected_remaining_bytes = _nonnegative_int(
+                expected_remaining_bytes,
+                "expected_remaining_bytes",
+            )
         result = int(
             self._release_committed_asset_script(
                 keys=[
@@ -2092,6 +2114,11 @@ class RedisResourceCoordinator:
                     session_id,
                     asset_id,
                     released_bytes,
+                    (
+                        ""
+                        if expected_remaining_bytes is None
+                        else expected_remaining_bytes
+                    ),
                 ],
             )
         )
@@ -2102,6 +2129,10 @@ class RedisResourceCoordinator:
         if result == 3:
             raise ResourceUnavailableError(
                 "Asset release bytes do not match committed usage"
+            )
+        if result == 5:
+            raise ResourceUnavailableError(
+                "Asset release does not match audited committed usage"
             )
         return result == 1
 

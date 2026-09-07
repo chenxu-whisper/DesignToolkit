@@ -719,8 +719,11 @@ class DeterministicRedis(fakeredis.FakeRedis):
 
     def _eval_release_committed_asset(self, keys, args):  # noqa: ANN001, ANN202
         state_key, marker_key, marker_index_key = keys
-        session_id, asset_id, released_bytes = args
+        session_id, asset_id, released_bytes, expected_remaining = args
         released_bytes = int(released_bytes)
+        expected_remaining = (
+            None if expected_remaining == "" else int(expected_remaining)
+        )
         if self.exists(marker_key):
             existing_session = self._text(self.hget(marker_key, "session_id"))
             existing_asset = self._text(self.hget(marker_key, "asset_id"))
@@ -736,11 +739,19 @@ class DeterministicRedis(fakeredis.FakeRedis):
             return 0
         field = f"session:{session_id}:committed_bytes"
         current = self._number(state_key, field)
-        if released_bytes == 0:
-            return 4
-        if released_bytes > current:
-            return 3
-        remaining = current - released_bytes
+        if expected_remaining is not None:
+            if current == expected_remaining:
+                remaining = current
+            elif current == expected_remaining + released_bytes:
+                remaining = expected_remaining
+            else:
+                return 5
+        else:
+            if released_bytes == 0:
+                return 4
+            if released_bytes > current:
+                return 3
+            remaining = current - released_bytes
         if remaining:
             self.hset(state_key, field, remaining)
         else:
@@ -1260,6 +1271,76 @@ def test_release_committed_asset_is_idempotent_and_session_scoped(
         resources.release_committed_asset(SESSION_A, asset_id, 3)
     with pytest.raises(ResourceUnavailableError, match="session"):
         resources.reserve_upload(SESSION_B, 5, free_bytes=100)
+
+
+def test_orphan_release_removes_committed_bytes_above_audited_assets(
+    redis_connection: DeterministicRedis,
+) -> None:
+    resources = coordinator(redis_connection, max_session_bytes=10)
+    published = resources.reserve_upload(SESSION_A, 4, free_bytes=100)
+    orphan = resources.reserve_upload(SESSION_A, 5, free_bytes=100)
+    published.commit()
+    orphan.commit()
+    asset_id = "1" * 32
+
+    resources.release_committed_asset(
+        SESSION_A,
+        asset_id,
+        5,
+        expected_remaining_bytes=4,
+    )
+    resources.release_committed_asset(
+        SESSION_A,
+        asset_id,
+        5,
+        expected_remaining_bytes=4,
+    )
+
+    replacement = resources.reserve_upload(SESSION_A, 6, free_bytes=100)
+    replacement.release()
+    assert resources.is_committed_asset_released(SESSION_A, asset_id) is True
+
+
+def test_orphan_release_preserves_audited_assets_when_upload_never_committed(
+    redis_connection: DeterministicRedis,
+) -> None:
+    resources = coordinator(redis_connection, max_session_bytes=10)
+    published = resources.reserve_upload(SESSION_A, 4, free_bytes=100)
+    published.commit()
+    asset_id = "1" * 32
+
+    resources.release_committed_asset(
+        SESSION_A,
+        asset_id,
+        5,
+        expected_remaining_bytes=4,
+    )
+    resources.release_committed_asset(
+        SESSION_A,
+        asset_id,
+        5,
+        expected_remaining_bytes=4,
+    )
+
+    replacement = resources.reserve_upload(SESSION_A, 6, free_bytes=100)
+    replacement.release()
+    assert resources.is_committed_asset_released(SESSION_A, asset_id) is True
+
+
+def test_orphan_release_rejects_unauditable_committed_usage(
+    redis_connection: DeterministicRedis,
+) -> None:
+    resources = coordinator(redis_connection, max_session_bytes=10)
+    unexplained = resources.reserve_upload(SESSION_A, 6, free_bytes=100)
+    unexplained.commit()
+
+    with pytest.raises(ResourceUnavailableError, match="committed usage"):
+        resources.release_committed_asset(
+            SESSION_A,
+            "1" * 32,
+            5,
+            expected_remaining_bytes=4,
+        )
 
 
 def test_asset_release_marker_remains_persistent_until_finalized(

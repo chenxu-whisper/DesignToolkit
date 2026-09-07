@@ -1465,13 +1465,25 @@ def create_router(
                     409,
                 )
             if deletion is not None and deletion.size > 0:
-                operation.commit(
-                    lambda: resources.release_committed_asset(
-                        session_id,
-                        deletion.asset_id,
-                        deletion.size,
+                if deletion.expected_remaining_bytes is None:
+                    operation.commit(
+                        lambda: resources.release_committed_asset(
+                            session_id,
+                            deletion.asset_id,
+                            deletion.size,
+                        )
                     )
-                )
+                else:
+                    operation.commit(
+                        lambda: resources.release_committed_asset(
+                            session_id,
+                            deletion.asset_id,
+                            deletion.size,
+                            expected_remaining_bytes=(
+                                deletion.expected_remaining_bytes
+                            ),
+                        )
+                    )
             operation.commit(
                 lambda: storage.finalize_asset_deletion(
                     session_id,

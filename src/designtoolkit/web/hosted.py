@@ -502,6 +502,7 @@ class AssetDeletion:
     reference: str
     size: int
     pending: bool = False
+    expected_remaining_bytes: int | None = None
 
 
 class HostedStorage:
@@ -758,6 +759,42 @@ class HostedStorage:
                     size=0,
                     pending=True,
                 )
+
+            if (
+                not cancel_inflight
+                and orphan_stale_after_seconds is not None
+                and self._upload_state_is_stale(
+                    session_id,
+                    asset_id,
+                    stale_after_seconds=orphan_stale_after_seconds,
+                )
+            ):
+                orphan_size = _unpublished_upload_size(asset_dir)
+                expected_remaining_bytes = _auditable_session_upload_bytes(
+                    session_dir,
+                    excluded_asset_id=asset_id,
+                )
+                if (
+                    orphan_size is not None
+                    and expected_remaining_bytes is not None
+                ):
+                    tombstone.parent.mkdir(parents=True, exist_ok=True)
+                    deletion = AssetDeletion(
+                        asset_id=asset_id,
+                        reference=f"asset:{asset_id}",
+                        size=orphan_size,
+                        expected_remaining_bytes=expected_remaining_bytes,
+                    )
+                    try:
+                        _write_asset_deletion(asset_dir, deletion)
+                        asset_dir.replace(tombstone)
+                    except OSError:
+                        if tombstone.is_dir():
+                            return _read_asset_deletion(tombstone, asset_id)
+                        raise
+                    self._clear_orphaned_upload_state(session_id, asset_id)
+                    os.utime(session_dir, None)
+                    return deletion
 
             self._mark_upload_cancelled(session_id, asset_id)
             if (asset_dir / ".uploading").is_file():
@@ -1142,14 +1179,37 @@ class HostedStorage:
         )
         if not markers:
             return False
-        if stale_after_seconds is not None:
-            cutoff = time() - stale_after_seconds
-            if any(marker.stat().st_mtime > cutoff for marker in markers):
-                return False
+        if stale_after_seconds is not None and not self._upload_state_is_stale(
+            session_id,
+            asset_id,
+            stale_after_seconds=stale_after_seconds,
+        ):
+            return False
         generation.unlink(missing_ok=True)
         cancellation.unlink(missing_ok=True)
         self._remove_empty_session(session_id)
         return True
+
+    def _upload_state_is_stale(
+        self,
+        session_id: str,
+        asset_id: str,
+        *,
+        stale_after_seconds: float,
+    ) -> bool:
+        session_dir = self._session_dir(session_id)
+        markers = tuple(
+            marker
+            for marker in (
+                session_dir / _UPLOAD_GENERATIONS_NAME / asset_id,
+                session_dir / _UPLOAD_CANCELLATIONS_NAME / asset_id,
+            )
+            if marker.is_file()
+        )
+        if not markers:
+            return False
+        cutoff = time() - stale_after_seconds
+        return all(marker.stat().st_mtime <= cutoff for marker in markers)
 
     def _refresh_upload_generation(
         self,
@@ -1448,7 +1508,11 @@ def _asset_payload_size(asset_dir: Path) -> int:
     )
 
 
-def _auditable_session_upload_bytes(session_dir: Path) -> int | None:
+def _auditable_session_upload_bytes(
+    session_dir: Path,
+    *,
+    excluded_asset_id: str | None = None,
+) -> int | None:
     assets_dir = session_dir / "assets"
     if not assets_dir.exists():
         return 0
@@ -1457,6 +1521,8 @@ def _auditable_session_upload_bytes(session_dir: Path) -> int | None:
 
     total = 0
     for asset_dir in assets_dir.iterdir():
+        if asset_dir.name == excluded_asset_id:
+            continue
         if (
             not asset_dir.is_dir()
             or not _SESSION_PATTERN.fullmatch(asset_dir.name)
@@ -1477,6 +1543,17 @@ def _auditable_session_upload_bytes(session_dir: Path) -> int | None:
     return total
 
 
+def _unpublished_upload_size(asset_dir: Path) -> int | None:
+    uploading_size: int | None = None
+    for path in asset_dir.iterdir():
+        path_stat = path.lstat()
+        if not path.name.startswith(".") or not S_ISREG(path_stat.st_mode):
+            return None
+        if path.name == ".uploading":
+            uploading_size = path_stat.st_size
+    return uploading_size
+
+
 def _write_asset_deletion(asset_dir: Path, deletion: AssetDeletion) -> None:
     metadata_path = asset_dir / _DELETION_METADATA_NAME
     temporary_path = asset_dir / f"{_DELETION_METADATA_NAME}.{uuid4().hex}.tmp"
@@ -1485,6 +1562,8 @@ def _write_asset_deletion(asset_dir: Path, deletion: AssetDeletion) -> None:
         "reference": deletion.reference,
         "bytes": deletion.size,
     }
+    if deletion.expected_remaining_bytes is not None:
+        payload["expected_remaining_bytes"] = deletion.expected_remaining_bytes
     try:
         with temporary_path.open("x", encoding="utf-8") as metadata:
             json.dump(payload, metadata, separators=(",", ":"), sort_keys=True)
@@ -1502,17 +1581,31 @@ def _read_asset_deletion(tombstone: Path, asset_id: str) -> AssetDeletion:
         )
         reference = payload["reference"]
         size = payload["bytes"]
+        expected_remaining_bytes = payload.get("expected_remaining_bytes")
         if (
             payload["asset_id"] != asset_id
             or reference != f"asset:{asset_id}"
             or isinstance(size, bool)
             or not isinstance(size, int)
             or size <= 0
+            or (
+                expected_remaining_bytes is not None
+                and (
+                    isinstance(expected_remaining_bytes, bool)
+                    or not isinstance(expected_remaining_bytes, int)
+                    or expected_remaining_bytes < 0
+                )
+            )
         ):
             raise ValueError
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise AssetDeletionStateError(asset_id) from exc
-    return AssetDeletion(asset_id=asset_id, reference=reference, size=size)
+    return AssetDeletion(
+        asset_id=asset_id,
+        reference=reference,
+        size=size,
+        expected_remaining_bytes=expected_remaining_bytes,
+    )
 
 
 def _safe_filename(value: str | None) -> str:

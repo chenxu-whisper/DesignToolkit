@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import shutil
+from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import ContextVar
 from io import BytesIO
@@ -221,6 +222,8 @@ class StubCoordinator:
         session_id: str,
         asset_id: str,
         released_bytes: int,
+        *,
+        expected_remaining_bytes: int | None = None,
     ) -> None:
         self.release_calls += 1
         released = self.released_assets.get(asset_id)
@@ -230,12 +233,22 @@ class StubCoordinator:
             if released_bytes != 0 and released[1] != released_bytes:
                 raise ResourceUnavailableError("Asset release metadata mismatch")
             return
-        if released_bytes == 0:
-            return
         current = self.committed.get(session_id, 0)
-        if released_bytes > current:
-            raise ResourceUnavailableError("Asset release bytes mismatch")
-        remaining = current - released_bytes
+        if expected_remaining_bytes is not None:
+            if current == expected_remaining_bytes:
+                remaining = current
+            elif current == expected_remaining_bytes + released_bytes:
+                remaining = expected_remaining_bytes
+            else:
+                raise ResourceUnavailableError(
+                    "Asset release does not match audited committed usage"
+                )
+        else:
+            if released_bytes == 0:
+                return
+            if released_bytes > current:
+                raise ResourceUnavailableError("Asset release bytes mismatch")
+            remaining = current - released_bytes
         if remaining:
             self.committed[session_id] = remaining
         else:
@@ -836,6 +849,273 @@ def test_orphaned_upload_delete_converges_after_restart_and_allows_retry(
     assert uploaded.status_code == 201
     assert not cancellation.exists()
     assert restarted_storage.resolve(
+        session_id,
+        uploaded.json()["reference"],
+    ).read_bytes() == b"image"
+
+
+def test_delete_reclaims_upload_crashed_after_quota_commit_before_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SimulatedProcessCrash(BaseException):
+        pass
+
+    upload_id = "1" * 32
+    session_id = "a" * 32
+    coordinator = StubCoordinator(
+        max_upload_concurrency=4,
+        max_session_bytes=5,
+        min_free_bytes=0,
+    )
+    storage = HostedStorage(tmp_path, max_upload_bytes=5)
+    original_replace = Path.replace
+
+    def crash_before_publish(source: Path, target: Path) -> Path:
+        if source.name == ".uploading":
+            raise SimulatedProcessCrash
+        return original_replace(source, target)
+
+    async def upload_body() -> AsyncIterator[bytes]:
+        yield b"image"
+
+    registration = coordinator.register_upload(session_id, upload_id)
+    storage.claim_upload_generation(
+        session_id,
+        upload_id,
+        token=registration.token,
+    )
+    reservation = coordinator.reserve_upload(
+        session_id,
+        5,
+        free_bytes=10**12,
+    )
+    lease = coordinator.acquire_session(session_id)
+    with monkeypatch.context() as crash:
+        crash.setattr(Path, "replace", crash_before_publish)
+        with pytest.raises(SimulatedProcessCrash):
+            asyncio.run(
+                storage.store_stream(
+                    session_id,
+                    asset_id=upload_id,
+                    filename="screen.png",
+                    content_length=5,
+                    chunks=upload_body(),
+                    reservation=reservation,
+                    lease=lease,
+                    registration=registration,
+                )
+            )
+    registration.finish()
+    lease.release()
+    generation = (
+        tmp_path
+        / "sessions"
+        / session_id
+        / ".upload-generations"
+        / upload_id
+    )
+    os.utime(generation, (1.0, 1.0))
+
+    with _client(
+        tmp_path,
+        max_session_bytes=5,
+        resource_coordinator=coordinator,
+        hosted_storage=storage,
+    ) as client:
+        client.cookies.set("dt_session", session_id)
+        deleted = client.delete(f"/api/uploads/{upload_id}")
+        assert not generation.exists()
+        assert not (
+            tmp_path
+            / "sessions"
+            / session_id
+            / ".upload-cancellations"
+            / upload_id
+        ).exists()
+        replacement = _upload(
+            client,
+            "screen.png",
+            b"image",
+            upload_id=upload_id,
+        )
+
+    assert deleted.status_code == 204
+    assert replacement.status_code == 201
+    assert coordinator.committed[session_id] == 5
+    assert coordinator.release_calls == 1
+    assert list(tmp_path.rglob(".uploading")) == []
+    assert storage.resolve(
+        session_id,
+        replacement.json()["reference"],
+    ).read_bytes() == b"image"
+
+
+def test_delete_reclaims_precommit_partial_without_releasing_published_quota(
+    tmp_path: Path,
+) -> None:
+    stale_upload_id = "1" * 32
+    published_upload_id = "2" * 32
+    session_id = "a" * 32
+    coordinator = StubCoordinator(
+        max_upload_concurrency=4,
+        max_session_bytes=9,
+        min_free_bytes=0,
+    )
+    storage = HostedStorage(tmp_path, max_upload_bytes=5)
+
+    with _client(
+        tmp_path,
+        max_session_bytes=9,
+        resource_coordinator=coordinator,
+        hosted_storage=storage,
+    ) as client:
+        client.cookies.set("dt_session", session_id)
+        published = _upload(
+            client,
+            "published.png",
+            b"live",
+            upload_id=published_upload_id,
+        )
+        stale_dir = (
+            tmp_path / "sessions" / session_id / "assets" / stale_upload_id
+        )
+        stale_dir.mkdir()
+        (stale_dir / ".uploading").write_bytes(b"image")
+        generation = (
+            tmp_path
+            / "sessions"
+            / session_id
+            / ".upload-generations"
+            / stale_upload_id
+        )
+        generation.parent.mkdir(exist_ok=True)
+        generation.write_text("3" * 32, encoding="ascii")
+        os.utime(generation, (1.0, 1.0))
+
+        deleted = client.delete(f"/api/uploads/{stale_upload_id}")
+        assert not generation.exists()
+        assert not (
+            tmp_path
+            / "sessions"
+            / session_id
+            / ".upload-cancellations"
+            / stale_upload_id
+        ).exists()
+        replacement = _upload(
+            client,
+            "replacement.png",
+            b"image",
+            upload_id=stale_upload_id,
+        )
+
+    assert published.status_code == 201
+    assert deleted.status_code == 204
+    assert replacement.status_code == 201
+    assert coordinator.committed[session_id] == 9
+    assert storage.resolve(
+        session_id,
+        published.json()["reference"],
+    ).read_bytes() == b"live"
+
+
+def test_delete_does_not_reclaim_active_partial_upload(tmp_path: Path) -> None:
+    upload_id = "1" * 32
+    session_id = "a" * 32
+    coordinator = StubCoordinator(
+        max_upload_concurrency=4,
+        max_session_bytes=5,
+        min_free_bytes=0,
+    )
+    coordinator.inflight[(session_id, upload_id)] = False
+    asset_dir = tmp_path / "sessions" / session_id / "assets" / upload_id
+    asset_dir.mkdir(parents=True)
+    partial = asset_dir / ".uploading"
+    partial.write_bytes(b"image")
+    generation = (
+        tmp_path / "sessions" / session_id / ".upload-generations" / upload_id
+    )
+    generation.parent.mkdir(parents=True)
+    generation.write_text("2" * 32, encoding="ascii")
+    os.utime(generation, (1.0, 1.0))
+
+    with _client(tmp_path, resource_coordinator=coordinator) as client:
+        client.cookies.set("dt_session", session_id)
+        deleted = client.delete(f"/api/uploads/{upload_id}")
+
+    assert deleted.status_code == 409
+    assert partial.read_bytes() == b"image"
+    assert coordinator.release_calls == 0
+
+
+def test_delete_does_not_reclaim_recent_partial_after_inflight_ack_loss(
+    tmp_path: Path,
+) -> None:
+    upload_id = "1" * 32
+    session_id = "a" * 32
+    coordinator = StubCoordinator(
+        max_upload_concurrency=4,
+        max_session_bytes=5,
+        min_free_bytes=0,
+    )
+    coordinator.committed[session_id] = 5
+    asset_dir = tmp_path / "sessions" / session_id / "assets" / upload_id
+    asset_dir.mkdir(parents=True)
+    partial = asset_dir / ".uploading"
+    partial.write_bytes(b"image")
+    generation = (
+        tmp_path / "sessions" / session_id / ".upload-generations" / upload_id
+    )
+    generation.parent.mkdir(parents=True)
+    generation.write_text("2" * 32, encoding="ascii")
+
+    with _client(tmp_path, resource_coordinator=coordinator) as client:
+        client.cookies.set("dt_session", session_id)
+        deleted = client.delete(f"/api/uploads/{upload_id}")
+
+    assert deleted.status_code == 409
+    assert partial.read_bytes() == b"image"
+    assert coordinator.committed[session_id] == 5
+    assert coordinator.release_calls == 0
+
+
+def test_stale_generation_does_not_make_published_asset_an_orphan(
+    tmp_path: Path,
+) -> None:
+    upload_id = "1" * 32
+    storage = HostedStorage(tmp_path, max_upload_bytes=5)
+
+    with _client(
+        tmp_path,
+        max_session_bytes=10,
+        hosted_storage=storage,
+    ) as client:
+        uploaded = _upload(
+            client,
+            "screen.png",
+            b"image",
+            upload_id=upload_id,
+        )
+        session_id = client.cookies["dt_session"]
+        generation = (
+            tmp_path
+            / "sessions"
+            / session_id
+            / ".upload-generations"
+            / upload_id
+        )
+        os.utime(generation, (1.0, 1.0))
+
+        duplicate = _upload(
+            client,
+            "replacement.png",
+            b"other",
+            upload_id=upload_id,
+        )
+
+    assert uploaded.status_code == 201
+    assert duplicate.status_code == 409
+    assert storage.resolve(
         session_id,
         uploaded.json()["reference"],
     ).read_bytes() == b"image"
