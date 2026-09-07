@@ -133,6 +133,7 @@ class StubUploadRegistration:
         self.coordinator = coordinator
         self.session_id = session_id
         self.upload_id = upload_id
+        self.token = uuid4().hex
 
     def refresh(self) -> bool:
         if (self.session_id, self.upload_id) not in self.coordinator.inflight:
@@ -169,6 +170,7 @@ class StubCoordinator:
         self.fail_lease_refresh = False
         self.session_lease_heartbeat_interval = 5.0
         self.reservation_heartbeat_interval = 5.0
+        self.upload_registration_ttl_seconds = 60.0
         self.inflight: dict[tuple[str, str], bool] = {}
 
     def register_upload(
@@ -783,6 +785,181 @@ def test_random_delete_returns_404_without_blocking_later_upload(
     assert not (
         tmp_path / "sessions" / session_id / ".upload-cancellations" / upload_id
     ).exists()
+
+
+def test_orphaned_upload_delete_converges_after_restart_and_allows_retry(
+    tmp_path: Path,
+) -> None:
+    upload_id = "1" * 32
+    session_id = "a" * 32
+    coordinator = StubCoordinator(
+        max_upload_concurrency=4,
+        max_session_bytes=5,
+        min_free_bytes=0,
+    )
+    generation = (
+        tmp_path / "sessions" / session_id / ".upload-generations" / upload_id
+    )
+    generation.parent.mkdir(parents=True)
+    generation.write_text("2" * 32, encoding="ascii")
+    coordinator.inflight[(session_id, upload_id)] = False
+
+    with _client(tmp_path, resource_coordinator=coordinator) as interrupted:
+        interrupted.cookies.set("dt_session", session_id)
+        pending = interrupted.delete(f"/api/uploads/{upload_id}")
+
+    cancellation = (
+        tmp_path / "sessions" / session_id / ".upload-cancellations" / upload_id
+    )
+    assert pending.status_code == 409
+    coordinator.inflight.pop((session_id, upload_id))
+    for marker in (generation, cancellation):
+        os.utime(marker, (1.0, 1.0))
+
+    restarted_storage = HostedStorage(tmp_path, max_upload_bytes=5)
+    with _client(
+        tmp_path,
+        max_session_bytes=5,
+        resource_coordinator=coordinator,
+        hosted_storage=restarted_storage,
+    ) as restarted:
+        restarted.cookies.set("dt_session", session_id)
+        deleted = restarted.delete(f"/api/uploads/{upload_id}")
+        uploaded = _upload(
+            restarted,
+            "screen.png",
+            b"image",
+            upload_id=upload_id,
+        )
+
+    assert deleted.status_code == 404
+    assert uploaded.status_code == 201
+    assert not cancellation.exists()
+    assert restarted_storage.resolve(
+        session_id,
+        uploaded.json()["reference"],
+    ).read_bytes() == b"image"
+
+
+def test_new_upload_recovers_stale_generation_and_cancellation(
+    tmp_path: Path,
+) -> None:
+    upload_id = "1" * 32
+    session_id = "a" * 32
+    session_dir = tmp_path / "sessions" / session_id
+    generation = session_dir / ".upload-generations" / upload_id
+    cancellation = session_dir / ".upload-cancellations" / upload_id
+    generation.parent.mkdir(parents=True)
+    cancellation.parent.mkdir(parents=True)
+    generation.write_text("2" * 32, encoding="ascii")
+    cancellation.touch()
+    for marker in (generation, cancellation):
+        os.utime(marker, (1.0, 1.0))
+
+    with _client(tmp_path, max_session_bytes=5) as client:
+        client.cookies.set("dt_session", session_id)
+        uploaded = _upload(
+            client,
+            "screen.png",
+            b"image",
+            upload_id=upload_id,
+        )
+
+    assert uploaded.status_code == 201
+    assert not cancellation.exists()
+    assert generation.read_text(encoding="ascii") != "2" * 32
+
+
+def test_active_upload_state_is_not_recovered_even_when_marker_is_old(
+    tmp_path: Path,
+) -> None:
+    upload_id = "1" * 32
+    session_id = "a" * 32
+    coordinator = StubCoordinator(
+        max_upload_concurrency=4,
+        max_session_bytes=5,
+        min_free_bytes=0,
+    )
+    generation = (
+        tmp_path / "sessions" / session_id / ".upload-generations" / upload_id
+    )
+    generation.parent.mkdir(parents=True)
+    generation.write_text("2" * 32, encoding="ascii")
+    os.utime(generation, (1.0, 1.0))
+    coordinator.inflight[(session_id, upload_id)] = False
+
+    with _client(tmp_path, resource_coordinator=coordinator) as client:
+        client.cookies.set("dt_session", session_id)
+        deleted = client.delete(f"/api/uploads/{upload_id}")
+        duplicate = _upload(
+            client,
+            "screen.png",
+            b"image",
+            upload_id=upload_id,
+        )
+
+    assert deleted.status_code == 409
+    assert duplicate.status_code == 409
+    assert generation.is_file()
+
+
+def test_recent_generation_is_not_recovered_when_inflight_is_not_visible(
+    tmp_path: Path,
+) -> None:
+    upload_id = "1" * 32
+    session_id = "a" * 32
+    generation = (
+        tmp_path / "sessions" / session_id / ".upload-generations" / upload_id
+    )
+    generation.parent.mkdir(parents=True)
+    generation.write_text("2" * 32, encoding="ascii")
+
+    with _client(tmp_path) as client:
+        client.cookies.set("dt_session", session_id)
+        deleted = client.delete(f"/api/uploads/{upload_id}")
+        cancellation = (
+            tmp_path
+            / "sessions"
+            / session_id
+            / ".upload-cancellations"
+            / upload_id
+        )
+        os.utime(cancellation, (1.0, 1.0))
+        retried = client.delete(f"/api/uploads/{upload_id}")
+
+    assert deleted.status_code == 409
+    assert retried.status_code == 409
+    assert generation.is_file()
+    assert cancellation.stat().st_mtime == 1.0
+
+
+def test_orphaned_upload_recovery_is_owner_scoped(tmp_path: Path) -> None:
+    upload_id = "1" * 32
+    owner_session = "a" * 32
+    stranger_session = "b" * 32
+    generation = (
+        tmp_path
+        / "sessions"
+        / owner_session
+        / ".upload-generations"
+        / upload_id
+    )
+    generation.parent.mkdir(parents=True)
+    generation.write_text("2" * 32, encoding="ascii")
+    os.utime(generation, (1.0, 1.0))
+
+    with _client(tmp_path) as stranger:
+        stranger.cookies.set("dt_session", stranger_session)
+        stranger_delete = stranger.delete(f"/api/uploads/{upload_id}")
+    assert generation.exists()
+
+    with _client(tmp_path) as owner:
+        owner.cookies.set("dt_session", owner_session)
+        owner_delete = owner.delete(f"/api/uploads/{upload_id}")
+
+    assert stranger_delete.status_code == 404
+    assert owner_delete.status_code == 404
+    assert not generation.exists()
 
 
 def test_random_delete_does_not_scan_other_session_namespaces(

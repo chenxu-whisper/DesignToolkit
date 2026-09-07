@@ -1317,6 +1317,7 @@ def create_router(
             storage.claim_upload_generation(
                 http_request.state.session_id,
                 upload_id,
+                token=registration.token,
             )
             reservation = resources.reserve_upload(
                 http_request.state.session_id,
@@ -1439,6 +1440,9 @@ def create_router(
                         session_id,
                         f"asset:{asset_id}",
                         cancel_inflight=inflight,
+                        orphan_stale_after_seconds=(
+                            resources.upload_registration_ttl_seconds
+                        ),
                     )
                 )
             except AssetDeletionStateError as exc:

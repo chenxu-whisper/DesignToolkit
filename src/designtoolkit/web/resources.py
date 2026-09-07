@@ -1418,6 +1418,7 @@ class RedisResourceCoordinator:
             ),
         )
         self.reservation_heartbeat_interval = reservation_heartbeat_interval
+        self.upload_registration_ttl_seconds = self._reservation_ttl_ms / 1000
         self._register_upload_script = self._redis.register_script(
             _REGISTER_UPLOAD_SCRIPT
         )

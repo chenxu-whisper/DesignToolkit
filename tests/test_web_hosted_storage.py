@@ -145,6 +145,7 @@ class RecordingUploadRegistration:
         self.coordinator = SimpleNamespace(
             heartbeat_stop_timeout_seconds=1.0,
         )
+        self.token = "2" * 32
         self.cancelled = False
         self.refresh_count = 0
 
@@ -685,6 +686,11 @@ async def test_upload_registration_heartbeat_aborts_cancelled_upload(
     storage = HostedStorage(tmp_path, max_upload_bytes=16)
     reservation = RecordingReservation()
     registration = RecordingUploadRegistration()
+    storage.claim_upload_generation(
+        "a" * 32,
+        "1" * 32,
+        token=registration.token,
+    )
 
     async def cancelled_chunks() -> AsyncIterator[bytes]:
         yield b"im"
@@ -707,6 +713,39 @@ async def test_upload_registration_heartbeat_aborts_cancelled_upload(
     assert reservation.committed is False
     assert reservation.released is True
     assert list(tmp_path.rglob("screen.png")) == []
+
+
+@pytest.mark.anyio
+async def test_upload_registration_heartbeat_refreshes_generation_fence(
+    tmp_path: Path,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    reservation = RecordingReservation()
+    registration = RecordingUploadRegistration()
+    session_id = "a" * 32
+    upload_id = "1" * 32
+    storage.claim_upload_generation(
+        session_id,
+        upload_id,
+        token=registration.token,
+    )
+    generation = (
+        tmp_path / "sessions" / session_id / ".upload-generations" / upload_id
+    )
+    os.utime(generation, (1.0, 1.0))
+
+    await storage.store_stream(
+        session_id,
+        asset_id=upload_id,
+        filename="screen.png",
+        content_length=4,
+        chunks=_slow_chunks(b"im", b"ag"),
+        reservation=reservation,
+        registration=registration,
+    )
+
+    assert generation.stat().st_mtime > 1.0
+    assert registration.refresh_count >= 4
 
 
 @pytest.mark.anyio

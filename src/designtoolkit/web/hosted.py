@@ -210,10 +210,12 @@ class _UploadResourceHeartbeat:
         reservation: RedisReservation,
         lease: RedisSessionLease | None,
         registration: RedisUploadRegistration | None,
+        refresh_generation: Callable[[], None] | None,
     ) -> None:
         self._reservation = reservation
         self._lease = lease
         self._registration = registration
+        self._refresh_generation = refresh_generation
         intervals = [
             getattr(
                 getattr(reservation, "coordinator", None),
@@ -289,6 +291,8 @@ class _UploadResourceHeartbeat:
             and self._registration.refresh()
         ):
             raise UploadConflictError("Upload was cancelled")
+        if self._refresh_generation is not None:
+            self._refresh_generation()
 
     def _run(self) -> None:
         while not self._stopped.wait(self._interval):
@@ -563,10 +567,20 @@ class HostedStorage:
         committed = False
         owns_asset_dir = False
         try:
+            def refresh_generation() -> None:
+                if registration is None:
+                    return
+                self._refresh_upload_generation(
+                    session_id,
+                    asset_id,
+                    registration.token,
+                )
+
             with _UploadResourceHeartbeat(
                 reservation,
                 lease,
                 registration,
+                refresh_generation,
             ) as heartbeat:
                 with self._deletion_lock:
                     self._raise_if_upload_cancelled(
@@ -654,22 +668,35 @@ class HostedStorage:
             size=size,
         )
 
-    def claim_upload_generation(self, session_id: str, asset_id: str) -> None:
+    def claim_upload_generation(
+        self,
+        session_id: str,
+        asset_id: str,
+        *,
+        token: str,
+    ) -> None:
         session_id = _validate_session_id(session_id)
         asset_id = _asset_id(f"asset:{asset_id}")
+        if not _SESSION_PATTERN.fullmatch(token):
+            raise UploadRejectedError("Upload generation token is invalid")
         session_dir = self._session_dir(session_id)
         generation = session_dir / _UPLOAD_GENERATIONS_NAME / asset_id
+        cancellation = session_dir / _UPLOAD_CANCELLATIONS_NAME / asset_id
         with self._deletion_lock:
-            if (
-                (session_dir / _UPLOAD_CANCELLATIONS_NAME / asset_id).is_file()
-                or (session_dir / "assets" / asset_id).exists()
-                or (session_dir / ".trash" / asset_id).exists()
-                or generation.exists()
-            ):
+            if (session_dir / "assets" / asset_id).exists() or (
+                session_dir / ".trash" / asset_id
+            ).exists():
                 raise UploadConflictError("Upload ID already exists")
+            if generation.exists() or cancellation.exists():
+                # The successful Redis registration fences every older token.
+                self._clear_orphaned_upload_state(
+                    session_id,
+                    asset_id,
+                )
             generation.parent.mkdir(parents=True, exist_ok=True)
             try:
-                generation.touch(exist_ok=False)
+                with generation.open("x", encoding="ascii") as marker:
+                    marker.write(token)
             except FileExistsError as exc:
                 raise UploadConflictError("Upload ID already exists") from exc
 
@@ -693,6 +720,7 @@ class HostedStorage:
         reference: str,
         *,
         cancel_inflight: bool = False,
+        orphan_stale_after_seconds: float | None = None,
     ) -> AssetDeletion | None:
         session_id = _validate_session_id(session_id)
         asset_id = _asset_id(reference)
@@ -711,6 +739,16 @@ class HostedStorage:
                     cancel_inflight
                     or generation.is_file()
                     or cancellation.is_file()
+                ):
+                    return None
+                if (
+                    not cancel_inflight
+                    and orphan_stale_after_seconds is not None
+                    and self._clear_orphaned_upload_state(
+                        session_id,
+                        asset_id,
+                        stale_after_seconds=orphan_stale_after_seconds,
+                    )
                 ):
                     return None
                 self._mark_upload_cancelled(session_id, asset_id)
@@ -1086,7 +1124,52 @@ class HostedStorage:
     def _mark_upload_cancelled(self, session_id: str, asset_id: str) -> None:
         marker = self._session_dir(session_id) / _UPLOAD_CANCELLATIONS_NAME / asset_id
         marker.parent.mkdir(parents=True, exist_ok=True)
-        marker.touch(exist_ok=True)
+        if not marker.is_file():
+            marker.touch(exist_ok=False)
+
+    def _clear_orphaned_upload_state(
+        self,
+        session_id: str,
+        asset_id: str,
+        *,
+        stale_after_seconds: float | None = None,
+    ) -> bool:
+        session_dir = self._session_dir(session_id)
+        generation = session_dir / _UPLOAD_GENERATIONS_NAME / asset_id
+        cancellation = session_dir / _UPLOAD_CANCELLATIONS_NAME / asset_id
+        markers = tuple(
+            marker for marker in (generation, cancellation) if marker.is_file()
+        )
+        if not markers:
+            return False
+        if stale_after_seconds is not None:
+            cutoff = time() - stale_after_seconds
+            if any(marker.stat().st_mtime > cutoff for marker in markers):
+                return False
+        generation.unlink(missing_ok=True)
+        cancellation.unlink(missing_ok=True)
+        self._remove_empty_session(session_id)
+        return True
+
+    def _refresh_upload_generation(
+        self,
+        session_id: str,
+        asset_id: str,
+        token: str,
+    ) -> None:
+        generation = (
+            self._session_dir(session_id) / _UPLOAD_GENERATIONS_NAME / asset_id
+        )
+        with self._deletion_lock:
+            try:
+                owner = generation.read_text(encoding="ascii")
+            except (FileNotFoundError, OSError, UnicodeError) as exc:
+                raise ResourceUnavailableError(
+                    "Upload generation expired"
+                ) from exc
+            if owner != token:
+                raise ResourceUnavailableError("Upload generation expired")
+            generation.touch()
 
     def _raise_if_upload_cancelled(
         self,
