@@ -3229,6 +3229,49 @@ def test_batch_video_frames_disambiguates_duplicate_input_names(
     )
 
 
+def test_batch_video_frames_without_output_dir_disambiguates_matching_stems(
+    tmp_path: Path,
+) -> None:
+    options = video_frame_options_list_from_request(
+        VideoFramesTaskRequest(
+            input_paths=[
+                str(tmp_path / "clip.mp4"),
+                str(tmp_path / "clip.mov"),
+            ]
+        )
+    )
+
+    assert [option.output_dir for option in options] == [
+        tmp_path / "001_clip_frames",
+        tmp_path / "002_clip_frames",
+    ]
+
+
+def test_batch_video_frames_without_output_dir_disambiguates_repeated_path(
+    tmp_path: Path,
+) -> None:
+    input_path = str(tmp_path / "clip.mp4")
+
+    options = video_frame_options_list_from_request(
+        VideoFramesTaskRequest(input_paths=[input_path, input_path])
+    )
+
+    assert [option.output_dir for option in options] == [
+        tmp_path / "001_clip_frames",
+        tmp_path / "002_clip_frames",
+    ]
+
+
+def test_single_video_frames_without_output_dir_keeps_default_naming(
+    tmp_path: Path,
+) -> None:
+    options = video_frame_options_list_from_request(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4"))
+    )
+
+    assert options[0].output_dir is None
+
+
 def test_worker_packages_duplicate_video_names_without_overwriting(
     tmp_path: Path,
 ) -> None:

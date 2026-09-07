@@ -108,9 +108,9 @@ def video_frame_options_list_from_request(
             VideoFrameOptions(
                 input_path=input_path_obj,
                 output_dir=(
-                    output_root
+                    (output_root or input_path_obj.parent)
                     / f"{index:03d}_{default_output_dir(input_path_obj).name}"
-                    if output_root is not None and is_batch
+                    if is_batch
                     else output_root
                 ),
                 image_format=request.image_format,
