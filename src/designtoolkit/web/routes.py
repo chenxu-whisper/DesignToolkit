@@ -72,6 +72,10 @@ from designtoolkit.web.native_picker import (
     LocalPathPickerError,
     TkinterLocalPathPicker,
 )
+from designtoolkit.web.redis_errors import (
+    is_redis_unavailable,
+    storage_unavailable_payload,
+)
 from designtoolkit.web.redis_tasks import RedisAssetReadPin, RedisTaskManager
 from designtoolkit.web.resources import (
     AssetReleaseMismatchError,
@@ -794,6 +798,16 @@ def _sse_line(event) -> str:
     return f"data: {payload}\n\n"
 
 
+def _sse_storage_unavailable() -> str:
+    payload = json.dumps(
+        storage_unavailable_payload(
+            "Task event storage is temporarily unavailable",
+        ),
+        separators=(",", ":"),
+    )
+    return f"event: error\ndata: {payload}\n\n"
+
+
 def _is_terminal_event(event: LogEventResponse) -> bool:
     return event.phase in _TERMINAL_PHASES
 
@@ -1027,7 +1041,7 @@ def create_router(
             else:
                 try:
                     _stop_session_lease_heartbeat(heartbeat)
-                except (RedisError, ResourceUnavailableError) as exc:
+                except ResourceUnavailableError as exc:
                     raise ApiError("storage_unavailable", str(exc), 503) from exc
         finally:
             if heartbeat.quiesced:
@@ -1098,8 +1112,6 @@ def create_router(
             )
         except TaskConflictError as exc:
             raise ApiError("task_conflict", str(exc), 409) from exc
-        except RedisError as exc:
-            raise ApiError("storage_unavailable", str(exc), 503) from exc
         heartbeat = _AssetReadPinHeartbeat(
             pin,
             task_manager.asset_read_pin_heartbeat_interval,
@@ -1124,7 +1136,7 @@ def create_router(
         else:
             try:
                 _stop_asset_read_pin_heartbeat(heartbeat)
-            except (RedisError, ResourceUnavailableError) as exc:
+            except ResourceUnavailableError as exc:
                 raise ApiError("storage_unavailable", str(exc), 503) from exc
         finally:
             if heartbeat.quiesced:
@@ -1418,7 +1430,7 @@ def create_router(
             ) from exc
         except TaskConflictError as exc:
             raise ApiError("asset_in_use", str(exc), 409) from exc
-        except (RedisError, ResourceUnavailableError) as exc:
+        except ResourceUnavailableError as exc:
             raise ApiError("storage_unavailable", str(exc), 503) from exc
         except OSError as exc:
             raise ApiError(
@@ -2051,9 +2063,9 @@ def create_router(
         )
         if task is None:
             raise ApiError("task_not_found", f"Task not found: {task_id}", 404)
+        history, subscriber = task_manager.log_store.history_and_subscribe(task_id)
 
         def event_stream() -> Iterator[str]:
-            history, subscriber = task_manager.log_store.history_and_subscribe(task_id)
             try:
                 terminal_event_seen = False
                 for event in history:
@@ -2076,6 +2088,10 @@ def create_router(
 
                     yield _sse_line(event)
                     terminal_event_seen = _is_terminal_event(event)
+            except RedisError as exc:
+                if not is_redis_unavailable(exc):
+                    raise
+                yield _sse_storage_unavailable()
             finally:
                 task_manager.log_store.unsubscribe(task_id, subscriber)
 

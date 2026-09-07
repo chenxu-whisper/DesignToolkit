@@ -18,8 +18,14 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.testclient import TestClient
 from PIL import Image
 from redis import Redis
+from redis.exceptions import (
+    BusyLoadingError,
+    OutOfMemoryError,
+    ReadOnlyError,
+    RedisError,
+    ResponseError,
+)
 from redis.exceptions import ConnectionError as RedisConnectionError
-from redis.exceptions import RedisError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 from rq import Queue
 
@@ -289,6 +295,7 @@ def _client(
     max_video_height: int = 2160,
     max_video_duration_seconds: float = 1800.0,
     video_decoder: StubHostedVideoDecoder | None = None,
+    raise_server_exceptions: bool = True,
 ) -> TestClient:
     if task_manager is None:
         redis_connection = fakeredis.FakeRedis(decode_responses=False)
@@ -329,7 +336,8 @@ def _client(
             or HostedStorage(tmp_path, max_upload_bytes=max_bytes),
             resource_coordinator=coordinator,
             video_decoder=video_decoder or StubHostedVideoDecoder(),
-        )
+        ),
+        raise_server_exceptions=raise_server_exceptions,
     )
 
 
@@ -1306,9 +1314,23 @@ def test_hosted_static_frontend_and_health_are_not_rate_limited(
     [
         RedisConnectionError("rate limit store unavailable"),
         RedisTimeoutError("rate limit store timed out"),
+        BusyLoadingError("Redis is loading the dataset in memory"),
+        ReadOnlyError("You can't write against a read only replica"),
+        OutOfMemoryError("command not allowed when used memory > maxmemory"),
+        ResponseError("LOADING Redis is loading the dataset in memory"),
+        ResponseError("READONLY You can't write against a read only replica"),
+        ResponseError("OOM command not allowed when used memory > maxmemory"),
+        ResponseError(
+            "Command # 1 (SET key value) of pipeline caused error: "
+            "READONLY You can't write against a read only replica"
+        ),
+        ResponseError(
+            "Command # 1 (SET key value) of pipeline caused error: "
+            "OOM command not allowed when used memory > maxmemory"
+        ),
     ],
 )
-def test_rate_limit_redis_transport_failure_returns_structured_503(
+def test_rate_limit_redis_unavailability_returns_structured_503(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     error: Exception,
@@ -1327,6 +1349,169 @@ def test_rate_limit_redis_transport_failure_returns_structured_503(
         }
     }
     assert "dt_session=" in response.headers["set-cookie"]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ResponseError("WRONGTYPE Operation against a key holding the wrong kind"),
+        ResponseError("Error running script: @user_script:1: programming error"),
+    ],
+)
+def test_rate_limit_redis_programming_failure_is_not_mapped_to_503(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error: ResponseError,
+) -> None:
+    with _client(tmp_path, raise_server_exceptions=False) as client:
+        manager = client.app.state.task_manager
+        monkeypatch.setattr(manager, "allow_request", Mock(side_effect=error))
+
+        response = client.get("/api/config")
+
+    assert response.status_code == 500
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ResponseError("WRONGTYPE Operation against a key holding the wrong kind"),
+        ResponseError("Error running script: @user_script:1: programming error"),
+    ],
+)
+def test_hosted_task_redis_programming_failure_is_not_mapped_to_503(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error: ResponseError,
+) -> None:
+    with _client(tmp_path, raise_server_exceptions=False) as client:
+        manager = client.app.state.task_manager
+        reference = _upload(client, "clip.mp4", b"video").json()["reference"]
+        monkeypatch.setattr(
+            manager,
+            "acquire_asset_read_pin",
+            Mock(side_effect=error),
+        )
+
+        response = client.post(
+            "/api/tasks/video-frames",
+            json={"input_path": reference, "image_format": "png"},
+        )
+
+    assert response.status_code == 500
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        f"/api/tasks/{'0' * 32}",
+        f"/api/tasks/{'0' * 32}/download",
+        f"/api/tasks/{'0' * 32}/events",
+    ],
+)
+def test_hosted_task_redis_read_outage_after_rate_limit_returns_503(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+) -> None:
+    with _client(tmp_path, raise_server_exceptions=False) as client:
+        manager = client.app.state.task_manager
+        monkeypatch.setattr(
+            manager,
+            "get_task",
+            Mock(side_effect=RedisConnectionError("task storage unavailable")),
+        )
+
+        response = client.get(path)
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "storage_unavailable"
+    assert "dt_session=" in response.headers["set-cookie"]
+
+
+def test_hosted_event_subscription_outage_before_response_returns_503(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = RedisTaskManager(
+        redis_connection=redis_connection,
+        queue=Queue("designtoolkit", connection=redis_connection),
+        data_dir=tmp_path,
+        max_queued_tasks=20,
+        retention_seconds=7200,
+    )
+    with _client(
+        tmp_path,
+        task_manager=manager,
+        raise_server_exceptions=False,
+    ) as client:
+        reference = _upload(client, "clip.mp4", b"video").json()["reference"]
+        task_id = client.post(
+            "/api/tasks/video-frames",
+            json={"input_path": reference, "image_format": "png"},
+        ).json()["task_id"]
+        monkeypatch.setattr(
+            manager.log_store,
+            "history_and_subscribe",
+            Mock(side_effect=ResponseError("LOADING Redis is loading the dataset")),
+        )
+
+        response = client.get(f"/api/tasks/{task_id}/events")
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "storage_unavailable"
+    assert "dt_session=" in response.headers["set-cookie"]
+
+
+def test_hosted_event_stream_emits_error_and_closes_on_midstream_redis_outage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class DisconnectedSubscriber:
+        calls = 0
+
+        def get(self, timeout: float):
+            del timeout
+            type(self).calls += 1
+            raise RedisConnectionError("event storage disconnected")
+
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = RedisTaskManager(
+        redis_connection=redis_connection,
+        queue=Queue("designtoolkit", connection=redis_connection),
+        data_dir=tmp_path,
+        max_queued_tasks=20,
+        retention_seconds=7200,
+    )
+    unsubscribe = Mock()
+    with _client(
+        tmp_path,
+        task_manager=manager,
+        raise_server_exceptions=False,
+    ) as client:
+        reference = _upload(client, "clip.mp4", b"video").json()["reference"]
+        task_id = client.post(
+            "/api/tasks/video-frames",
+            json={"input_path": reference, "image_format": "png"},
+        ).json()["task_id"]
+        monkeypatch.setattr(
+            manager.log_store,
+            "history_and_subscribe",
+            Mock(return_value=([], DisconnectedSubscriber())),
+        )
+        monkeypatch.setattr(manager.log_store, "unsubscribe", unsubscribe)
+
+        response = client.get(f"/api/tasks/{task_id}/events")
+
+    assert response.status_code == 200
+    assert response.text == (
+        "event: error\n"
+        'data: {"error":{"code":"storage_unavailable",'
+        '"message":"Task event storage is temporarily unavailable"}}\n\n'
+    )
+    assert DisconnectedSubscriber.calls == 1
+    unsubscribe.assert_called_once()
 
 
 def test_rate_limit_unknown_failure_is_not_suppressed(

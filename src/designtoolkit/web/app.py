@@ -8,8 +8,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from redis import Redis
-from redis.exceptions import ConnectionError as RedisConnectionError
-from redis.exceptions import TimeoutError as RedisTimeoutError
+from redis.exceptions import RedisError
 from rq import Queue
 
 from designtoolkit.chroma_keyer.video_io import ImageioVideoDecoder
@@ -23,6 +22,11 @@ from designtoolkit.web.hosted import (
 )
 from designtoolkit.web.logs import LogStore
 from designtoolkit.web.native_picker import LocalPathPicker
+from designtoolkit.web.redis_errors import (
+    STORAGE_UNAVAILABLE_STATUS,
+    is_redis_unavailable,
+    storage_unavailable_payload,
+)
 from designtoolkit.web.redis_tasks import RedisTaskManager
 from designtoolkit.web.resources import RedisResourceCoordinator
 from designtoolkit.web.routes import ApiError, create_router, error_response
@@ -125,7 +129,9 @@ def create_app(
                     session_id=session_id,
                     rate_limits=rate_limits,
                 )
-            except (RedisConnectionError, RedisTimeoutError):
+            except RedisError as exc:
+                if not is_redis_unavailable(exc):
+                    raise
                 response = _middleware_error_response(
                     "storage_unavailable",
                     "Rate limit storage is temporarily unavailable",
@@ -166,6 +172,15 @@ def create_app(
                 secure=settings.secure_cookies,
             )
             return response
+
+    @app.exception_handler(RedisError)
+    def handle_redis_error(_request: Request, exc: RedisError) -> JSONResponse:
+        if not is_redis_unavailable(exc):
+            raise exc
+        return JSONResponse(
+            status_code=STORAGE_UNAVAILABLE_STATUS,
+            content=storage_unavailable_payload(),
+        )
 
     @app.exception_handler(ApiError)
     def handle_api_error(_request: Request, exc: ApiError) -> JSONResponse:
