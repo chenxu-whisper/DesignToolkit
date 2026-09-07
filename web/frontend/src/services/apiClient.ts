@@ -230,11 +230,14 @@ export async function uploadFiles(
   signal?: AbortSignal,
 ): Promise<readonly string[]> {
   const uploaded: UploadResponse[] = []
+  const attemptedUploadIds: string[] = []
   try {
     for (let index = 0; index < files.length; index += 1) {
       throwIfUploadAborted(signal)
       const file = files[index]
-      const response = await uploadFile(file, (fileProgress) => {
+      const uploadId = createUploadId()
+      attemptedUploadIds.push(uploadId)
+      const response = await uploadFile(file, uploadId, (fileProgress) => {
         onProgress(Math.round(((index + fileProgress) / files.length) * 100))
       }, signal)
       uploaded.push(response)
@@ -242,7 +245,7 @@ export async function uploadFiles(
     }
   } catch (error) {
     const cleanupResults = await Promise.allSettled(
-      uploaded.map(({ reference }) => deleteUploadedAsset(reference)),
+      attemptedUploadIds.map((uploadId) => deleteUploadedAsset(uploadId)),
     )
     const cleanupErrors = cleanupResults.flatMap((result) =>
       result.status === 'rejected' ? [result.reason] : [],
@@ -261,11 +264,7 @@ export async function uploadFiles(
   return uploaded.map(({ reference }) => reference)
 }
 
-async function deleteUploadedAsset(reference: string): Promise<void> {
-  const assetId = /^asset:([a-f0-9]{32})(?::|$)/.exec(reference)?.[1]
-  if (!assetId) {
-    return
-  }
+async function deleteUploadedAsset(assetId: string): Promise<void> {
   const maximumAttempts = 3
   for (let attempt = 1; attempt <= maximumAttempts; attempt += 1) {
     let response: Response
@@ -286,7 +285,10 @@ async function deleteUploadedAsset(reference: string): Promise<void> {
     const failure = new Error(
       `Failed to delete uploaded asset ${assetId}: ${response.status}`,
     )
-    if (response.status < 500 || attempt === maximumAttempts) {
+    if (
+      (response.status !== 409 && response.status < 500)
+      || attempt === maximumAttempts
+    ) {
       throw failure
     }
   }
@@ -294,6 +296,7 @@ async function deleteUploadedAsset(reference: string): Promise<void> {
 
 function uploadFile(
   file: File,
+  uploadId: string,
   onProgress: (fraction: number) => void,
   signal?: AbortSignal,
 ): Promise<UploadResponse> {
@@ -319,6 +322,7 @@ function uploadFile(
     request.responseType = 'json'
     request.setRequestHeader('Content-Type', file.type || 'application/octet-stream')
     request.setRequestHeader('X-Upload-Filename', encodeURIComponent(file.name))
+    request.setRequestHeader('X-Upload-Id', uploadId)
     signal?.addEventListener('abort', abortRequest, { once: true })
     request.upload.addEventListener('progress', (event) => {
       if (event.lengthComputable && event.total > 0) {
@@ -346,6 +350,10 @@ function uploadFile(
     })
     request.send(file)
   })
+}
+
+function createUploadId(): string {
+  return crypto.randomUUID().replaceAll('-', '')
 }
 
 function throwIfUploadAborted(signal?: AbortSignal): void {

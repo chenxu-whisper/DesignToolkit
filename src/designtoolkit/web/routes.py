@@ -57,6 +57,7 @@ from designtoolkit.web.hosted import (
     AssetDeletionStateError,
     HostedSettings,
     HostedStorage,
+    UploadConflictError,
     UploadRejectedError,
     _asset_id,
     _safe_filename,
@@ -1290,6 +1291,7 @@ def create_router(
         )
         encoded_filename = http_request.headers.get("x-upload-filename")
         filename = _upload_filename(encoded_filename)
+        upload_id = _upload_id(http_request.headers.get("x-upload-id"))
         if content_length > settings.max_upload_bytes:
             raise ApiError(
                 "upload_too_large",
@@ -1301,6 +1303,10 @@ def create_router(
         lease = None
         release_resources = True
         try:
+            storage.claim_upload_generation(
+                http_request.state.session_id,
+                upload_id,
+            )
             reservation = resources.reserve_upload(
                 http_request.state.session_id,
                 content_length,
@@ -1309,12 +1315,15 @@ def create_router(
             lease = resources.acquire_session(http_request.state.session_id)
             asset = await storage.store_stream(
                 http_request.state.session_id,
+                asset_id=upload_id,
                 filename=filename,
                 content_length=content_length,
                 chunks=http_request.stream(),
                 reservation=reservation,
                 lease=lease,
             )
+        except UploadConflictError as exc:
+            raise ApiError("upload_conflict", str(exc), 409) from exc
         except UploadRejectedError as exc:
             code = "upload_too_large" if "file limit" in str(exc) else "invalid_upload"
             status_code = 413 if code == "upload_too_large" else 400
@@ -1385,7 +1394,13 @@ def create_router(
                 ):
                     raise
                 deletion = None
-            if deletion is not None:
+            if deletion is not None and deletion.pending:
+                raise ApiError(
+                    "upload_in_progress",
+                    "Upload cancellation is pending",
+                    409,
+                )
+            if deletion is not None and deletion.size > 0:
                 operation.commit(
                     lambda: resources.release_committed_asset(
                         session_id,
@@ -1413,6 +1428,7 @@ def create_router(
                         "Failed to finalize release marker for absent asset",
                         exc_info=True,
                     )
+                return Response(status_code=404)
             else:
                 operation.commit(
                     lambda: resources.finalize_asset_release(
@@ -2198,3 +2214,13 @@ def _upload_filename(value: str | None) -> str:
         return _safe_filename(filename)
     except UploadRejectedError as exc:
         raise ApiError("invalid_upload", str(exc), 400) from exc
+
+
+def _upload_id(value: str | None) -> str:
+    if value is None or re.fullmatch(r"[a-f0-9]{32}", value) is None:
+        raise ApiError(
+            "invalid_upload",
+            "X-Upload-Id must be 32 lowercase hexadecimal characters",
+            400,
+        )
+    return value

@@ -36,6 +36,9 @@ afterEach(() => {
 describe('apiClient', () => {
   it('uploads files sequentially as raw bodies with aggregate progress', async () => {
     const requests: MockUploadRequest[] = []
+    vi.spyOn(globalThis.crypto, 'randomUUID')
+      .mockReturnValueOnce('11111111-1111-1111-1111-111111111111')
+      .mockReturnValueOnce('22222222-2222-2222-2222-222222222222')
 
     class MockUploadRequest {
       method = ''
@@ -89,6 +92,7 @@ describe('apiClient', () => {
     expect(requests[0].headers.get('X-Upload-Filename')).toBe(
       encodeURIComponent(first.name),
     )
+    expect(requests[0].headers.get('X-Upload-Id')).toBe('1'.repeat(32))
     expect(requests[0].sentBody).toBe(first)
 
     requests[0].uploadListeners.get('progress')?.(
@@ -109,6 +113,7 @@ describe('apiClient', () => {
     expect(requests[1].headers.get('X-Upload-Filename')).toBe(
       encodeURIComponent(second.name),
     )
+    expect(requests[1].headers.get('X-Upload-Id')).toBe('2'.repeat(32))
     expect(requests[1].sentBody).toBe(second)
 
     requests[1].response = {
@@ -124,10 +129,13 @@ describe('apiClient', () => {
 
   it('aborts an in-flight upload when its signal is cancelled', async () => {
     const requests: MockUploadRequest[] = []
+    const uploadUuid = '11111111-1111-1111-1111-111111111111'
+    const uploadId = uploadUuid.replaceAll('-', '')
 
     class MockUploadRequest {
       response: unknown = null
       status = 0
+      headers = new Map<string, string>()
       listeners = new Map<string, () => void>()
       upload = {
         addEventListener: () => undefined,
@@ -140,7 +148,9 @@ describe('apiClient', () => {
 
       open() {}
 
-      setRequestHeader() {}
+      setRequestHeader(name: string, value: string) {
+        this.headers.set(name, value)
+      }
 
       addEventListener(type: string, listener: () => void) {
         this.listeners.set(type, listener)
@@ -150,6 +160,10 @@ describe('apiClient', () => {
     }
 
     vi.stubGlobal('XMLHttpRequest', MockUploadRequest)
+    vi.spyOn(globalThis.crypto, 'randomUUID').mockReturnValue(uploadUuid)
+    const cleanup = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(new Response(null, { status: 404 }))
     const controller = new AbortController()
     const pending = uploadFiles(
       [new File(['image'], 'image.png')],
@@ -161,14 +175,22 @@ describe('apiClient', () => {
 
     await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
     expect(requests[0].abort).toHaveBeenCalledOnce()
+    expect(requests[0].headers.get('X-Upload-Id')).toBe(uploadId)
+    expect(cleanup).toHaveBeenCalledOnce()
+    expect(cleanup).toHaveBeenCalledWith(`/api/uploads/${uploadId}`, {
+      method: 'DELETE',
+    })
   })
 
   it('deletes a committed upload when cancellation wins the response race', async () => {
     const requests: MockUploadRequest[] = []
+    const uploadUuid = '11111111-1111-1111-1111-111111111111'
+    const assetId = uploadUuid.replaceAll('-', '')
 
     class MockUploadRequest {
       response: unknown = null
       status = 201
+      headers = new Map<string, string>()
       listeners = new Map<string, () => void>()
       upload = {
         addEventListener: () => undefined,
@@ -181,7 +203,9 @@ describe('apiClient', () => {
 
       open() {}
 
-      setRequestHeader() {}
+      setRequestHeader(name: string, value: string) {
+        this.headers.set(name, value)
+      }
 
       addEventListener(type: string, listener: () => void) {
         this.listeners.set(type, listener)
@@ -191,6 +215,7 @@ describe('apiClient', () => {
     }
 
     vi.stubGlobal('XMLHttpRequest', MockUploadRequest)
+    vi.spyOn(globalThis.crypto, 'randomUUID').mockReturnValue(uploadUuid)
     const cleanup = vi
       .spyOn(globalThis, 'fetch')
       .mockResolvedValue(new Response(null, { status: 204 }))
@@ -200,7 +225,6 @@ describe('apiClient', () => {
       () => undefined,
       controller.signal,
     )
-    const assetId = '1'.repeat(32)
 
     requests[0].response = {
       filename: 'image.png',
@@ -211,6 +235,7 @@ describe('apiClient', () => {
     controller.abort()
 
     await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
+    expect(requests[0].headers.get('X-Upload-Id')).toBe(assetId)
     expect(cleanup).toHaveBeenCalledOnce()
     expect(cleanup).toHaveBeenCalledWith(`/api/uploads/${assetId}`, {
       method: 'DELETE',
@@ -219,6 +244,8 @@ describe('apiClient', () => {
 
   it('retries network and transient server cleanup failures without masking the upload error', async () => {
     const requests: MockUploadRequest[] = []
+    const firstId = '1'.repeat(32)
+    const secondId = '2'.repeat(32)
 
     class MockUploadRequest {
       status = 201
@@ -244,16 +271,31 @@ describe('apiClient', () => {
     }
 
     vi.stubGlobal('XMLHttpRequest', MockUploadRequest)
+    vi.spyOn(globalThis.crypto, 'randomUUID')
+      .mockReturnValueOnce('11111111-1111-1111-1111-111111111111')
+      .mockReturnValueOnce('22222222-2222-2222-2222-222222222222')
+    const cleanupAttempts = new Map<string, number>()
     const cleanup = vi
       .spyOn(globalThis, 'fetch')
-      .mockRejectedValueOnce(new Error('network unavailable'))
-      .mockResolvedValueOnce(new Response(null, { status: 503 }))
-      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+      .mockImplementation(async (input) => {
+        const assetId = String(input).split('/').at(-1) ?? ''
+        const attempt = (cleanupAttempts.get(assetId) ?? 0) + 1
+        cleanupAttempts.set(assetId, attempt)
+        if (assetId === firstId && attempt === 1) {
+          throw new Error('network unavailable')
+        }
+        if (assetId === firstId && attempt === 2) {
+          return new Response(null, { status: 503 })
+        }
+        if (assetId === secondId && attempt === 1) {
+          return new Response(null, { status: 409 })
+        }
+        return new Response(null, { status: 204 })
+      })
     const pending = uploadFiles(
       [new File(['first'], 'first.png'), new File(['second'], 'second.png')],
       () => undefined,
     )
-    const firstId = '1'.repeat(32)
 
     requests[0].response = {
       filename: 'first.png',
@@ -269,14 +311,20 @@ describe('apiClient', () => {
     requests[1].listeners.get('load')?.()
 
     await expect(pending).rejects.toThrow('Second upload rejected')
-    expect(cleanup).toHaveBeenCalledTimes(3)
+    expect(cleanup).toHaveBeenCalledTimes(5)
     expect(cleanup).toHaveBeenCalledWith(`/api/uploads/${firstId}`, {
+      method: 'DELETE',
+    })
+    expect(cleanup).toHaveBeenCalledWith(`/api/uploads/${secondId}`, {
       method: 'DELETE',
     })
   })
 
   it('reports a persistent cleanup failure while preserving the upload error as cause', async () => {
     const requests: MockUploadRequest[] = []
+    const firstId = '1'.repeat(32)
+    const secondId = '2'.repeat(32)
+    const thirdId = '3'.repeat(32)
 
     class MockUploadRequest {
       status = 201
@@ -302,6 +350,10 @@ describe('apiClient', () => {
     }
 
     vi.stubGlobal('XMLHttpRequest', MockUploadRequest)
+    vi.spyOn(globalThis.crypto, 'randomUUID')
+      .mockReturnValueOnce('11111111-1111-1111-1111-111111111111')
+      .mockReturnValueOnce('22222222-2222-2222-2222-222222222222')
+      .mockReturnValueOnce('33333333-3333-3333-3333-333333333333')
     const cleanup = vi
       .spyOn(globalThis, 'fetch')
       .mockResolvedValue(new Response(null, { status: 503 }))
@@ -313,8 +365,6 @@ describe('apiClient', () => {
       ],
       () => undefined,
     )
-    const firstId = '1'.repeat(32)
-    const secondId = '2'.repeat(32)
 
     requests[0].response = {
       filename: 'first.png',
@@ -349,13 +399,19 @@ describe('apiClient', () => {
         expect.objectContaining({
           message: expect.stringContaining(`Failed to delete uploaded asset ${secondId}: 503`),
         }),
+        expect.objectContaining({
+          message: expect.stringContaining(`Failed to delete uploaded asset ${thirdId}: 503`),
+        }),
       ],
     })
-    expect(cleanup).toHaveBeenCalledTimes(6)
+    expect(cleanup).toHaveBeenCalledTimes(9)
   })
 
   it('treats a missing uploaded asset as an idempotent cleanup success', async () => {
     const requests: MockUploadRequest[] = []
+    vi.spyOn(globalThis.crypto, 'randomUUID')
+      .mockReturnValueOnce('11111111-1111-1111-1111-111111111111')
+      .mockReturnValueOnce('22222222-2222-2222-2222-222222222222')
 
     class MockUploadRequest {
       status = 201
@@ -407,7 +463,7 @@ describe('apiClient', () => {
     expect(error).toBeInstanceOf(Error)
     expect(error).not.toBeInstanceOf(AggregateError)
     expect(error).toMatchObject({ message: 'Second upload rejected' })
-    expect(cleanup).toHaveBeenCalledOnce()
+    expect(cleanup).toHaveBeenCalledTimes(2)
   })
 
   it('models chroma payloads with exactly one RGB sample', () => {

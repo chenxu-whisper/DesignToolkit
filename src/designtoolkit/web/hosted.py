@@ -49,6 +49,8 @@ _DEFAULT_TASK_TIMEOUT_SECONDS = 2 * 60 * 60
 _UPLOAD_CHUNK_BYTES = 1024 * 1024
 _RESOURCE_RECOVERY_ATTEMPTS = 3
 _DELETION_METADATA_NAME = ".deletion.json"
+_UPLOAD_CANCELLATIONS_NAME = ".upload-cancellations"
+_UPLOAD_GENERATIONS_NAME = ".upload-generations"
 _CLEANUP_GENERATION_NAME = ".cleanup-generation.json"
 _DEFAULT_MEDIA_LIMITS = HostedMediaLimits()
 _ALLOWED_SUFFIXES = frozenset(
@@ -78,6 +80,10 @@ _LOGGER = logging.getLogger(__name__)
 
 
 class UploadRejectedError(ValueError):
+    pass
+
+
+class UploadConflictError(UploadRejectedError):
     pass
 
 
@@ -467,6 +473,7 @@ class AssetDeletion:
     asset_id: str
     reference: str
     size: int
+    pending: bool = False
 
 
 class HostedStorage:
@@ -488,6 +495,7 @@ class HostedStorage:
         self,
         session_id: str,
         *,
+        asset_id: str | None = None,
         filename: str,
         content_length: int,
         chunks: AsyncIterable[bytes],
@@ -503,6 +511,9 @@ class HostedStorage:
         """
         try:
             session_id = _validate_session_id(session_id)
+            asset_id = (
+                uuid4().hex if asset_id is None else _asset_id(f"asset:{asset_id}")
+            )
             filename = _safe_filename(filename)
             suffix = Path(filename).suffix.lower()
             if suffix not in _ALLOWED_SUFFIXES:
@@ -519,19 +530,26 @@ class HostedStorage:
             _release_best_effort(reservation)
             raise
 
-        asset_id = uuid4().hex
         session_dir = self._session_dir(session_id)
         asset_dir = session_dir / "assets" / asset_id
         temporary_path = asset_dir / ".uploading"
         final_path = asset_dir / filename
         size = 0
         committed = False
+        owns_asset_dir = False
         try:
             with _UploadResourceHeartbeat(reservation, lease) as heartbeat:
-                asset_dir.mkdir(parents=True, exist_ok=False)
+                with self._deletion_lock:
+                    self._raise_if_upload_cancelled(session_id, asset_id)
+                    try:
+                        asset_dir.mkdir(parents=True, exist_ok=False)
+                    except FileExistsError as exc:
+                        raise UploadConflictError("Upload ID already exists") from exc
+                    owns_asset_dir = True
                 with temporary_path.open("xb") as destination:
                     async for chunk in chunks:
                         heartbeat.raise_if_failed()
+                        self._raise_if_upload_cancelled(session_id, asset_id)
                         if not chunk:
                             continue
                         size += len(chunk)
@@ -549,23 +567,30 @@ class HostedStorage:
                     raise UploadRejectedError(
                         "Upload size does not match declared Content-Length"
                     )
+                self._raise_if_upload_cancelled(session_id, asset_id)
                 os.utime(self._session_dir(session_id), None)
                 heartbeat.seal()
                 _commit_with_recovery(reservation)
                 committed = True
-                temporary_path.replace(final_path)
+                with self._deletion_lock:
+                    self._raise_if_upload_cancelled(session_id, asset_id)
+                    temporary_path.replace(final_path)
+                    self._raise_if_upload_cancelled(session_id, asset_id)
         except HeartbeatStopTimeoutError:
-            self._discard_asset(session_id, asset_dir)
+            if owns_asset_dir:
+                self._discard_asset(session_id, asset_dir)
             raise
         except _AmbiguousCommitError:
             raise
         except Exception:
             if committed:
                 if _rollback_with_recovery(reservation):
-                    self._discard_asset(session_id, asset_dir)
+                    if owns_asset_dir:
+                        self._discard_asset(session_id, asset_dir)
             else:
                 _release_best_effort(reservation)
-                self._discard_asset(session_id, asset_dir)
+                if owns_asset_dir:
+                    self._discard_asset(session_id, asset_dir)
             raise
 
         _finalize_best_effort(reservation)
@@ -574,6 +599,25 @@ class HostedStorage:
             filename=filename,
             size=size,
         )
+
+    def claim_upload_generation(self, session_id: str, asset_id: str) -> None:
+        session_id = _validate_session_id(session_id)
+        asset_id = _asset_id(f"asset:{asset_id}")
+        session_dir = self._session_dir(session_id)
+        generation = session_dir / _UPLOAD_GENERATIONS_NAME / asset_id
+        with self._deletion_lock:
+            if (
+                (session_dir / _UPLOAD_CANCELLATIONS_NAME / asset_id).is_file()
+                or (session_dir / "assets" / asset_id).exists()
+                or (session_dir / ".trash" / asset_id).exists()
+                or generation.exists()
+            ):
+                raise UploadConflictError("Upload ID already exists")
+            generation.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                generation.touch(exist_ok=False)
+            except FileExistsError as exc:
+                raise UploadConflictError("Upload ID already exists") from exc
 
     def resolve(self, session_id: str, reference: str) -> Path:
         session_id = _validate_session_id(session_id)
@@ -589,37 +633,53 @@ class HostedStorage:
         os.utime(self._session_dir(session_id), None)
         return matches[0]
 
-    def delete_asset(self, session_id: str, reference: str) -> AssetDeletion:
+    def delete_asset(
+        self,
+        session_id: str,
+        reference: str,
+    ) -> AssetDeletion:
         session_id = _validate_session_id(session_id)
         asset_id = _asset_id(reference)
         session_dir = self._session_dir(session_id)
         assets_dir = session_dir / "assets"
         asset_dir = assets_dir / asset_id
         tombstone = session_dir / ".trash" / asset_id
-        if tombstone.is_dir():
-            return _read_asset_deletion(tombstone, asset_id)
-        if not asset_dir.is_dir():
-            if self._asset_belongs_to_other_session(session_id, asset_id):
-                raise UploadRejectedError("Uploaded asset is not available")
-            return AssetDeletion(
+        with self._deletion_lock:
+            if tombstone.is_dir():
+                self._mark_upload_cancelled(session_id, asset_id)
+                return _read_asset_deletion(tombstone, asset_id)
+            if not asset_dir.is_dir():
+                if self._asset_belongs_to_other_session(session_id, asset_id):
+                    raise UploadRejectedError("Uploaded asset is not available")
+                self._mark_upload_cancelled(session_id, asset_id)
+                return AssetDeletion(
+                    asset_id=asset_id,
+                    reference=f"asset:{asset_id}",
+                    size=0,
+                )
+
+            self._mark_upload_cancelled(session_id, asset_id)
+            if (asset_dir / ".uploading").is_file():
+                return AssetDeletion(
+                    asset_id=asset_id,
+                    reference=f"asset:{asset_id}",
+                    size=0,
+                    pending=True,
+                )
+
+            tombstone.parent.mkdir(parents=True, exist_ok=True)
+            deletion = AssetDeletion(
                 asset_id=asset_id,
                 reference=f"asset:{asset_id}",
-                size=0,
+                size=_asset_payload_size(asset_dir),
             )
-
-        tombstone.parent.mkdir(parents=True, exist_ok=True)
-        deletion = AssetDeletion(
-            asset_id=asset_id,
-            reference=f"asset:{asset_id}",
-            size=_asset_payload_size(asset_dir),
-        )
-        try:
-            _write_asset_deletion(asset_dir, deletion)
-            asset_dir.replace(tombstone)
-        except OSError:
-            if tombstone.is_dir():
-                return _read_asset_deletion(tombstone, asset_id)
-            raise
+            try:
+                _write_asset_deletion(asset_dir, deletion)
+                asset_dir.replace(tombstone)
+            except OSError:
+                if tombstone.is_dir():
+                    return _read_asset_deletion(tombstone, asset_id)
+                raise
 
         os.utime(session_dir, None)
         return deletion
@@ -921,6 +981,12 @@ class HostedStorage:
         trash_dir = session_dir / ".trash"
         if trash_dir.is_dir() and not any(trash_dir.iterdir()):
             trash_dir.rmdir()
+        cancellations_dir = session_dir / _UPLOAD_CANCELLATIONS_NAME
+        if cancellations_dir.is_dir() and not any(cancellations_dir.iterdir()):
+            cancellations_dir.rmdir()
+        generations_dir = session_dir / _UPLOAD_GENERATIONS_NAME
+        if generations_dir.is_dir() and not any(generations_dir.iterdir()):
+            generations_dir.rmdir()
         if session_dir.is_dir() and not any(session_dir.iterdir()):
             session_dir.rmdir()
         sessions_dir = self.root / "sessions"
@@ -944,10 +1010,26 @@ class HostedStorage:
             and (
                 (candidate / "assets" / asset_id).is_dir()
                 or (candidate / ".trash" / asset_id).is_dir()
+                or (candidate / _UPLOAD_CANCELLATIONS_NAME / asset_id).is_file()
+                or (candidate / _UPLOAD_GENERATIONS_NAME / asset_id).is_file()
             )
             for candidate in sessions_dir.iterdir()
             if candidate.is_dir()
         )
+
+    def _mark_upload_cancelled(self, session_id: str, asset_id: str) -> None:
+        marker = self._session_dir(session_id) / _UPLOAD_CANCELLATIONS_NAME / asset_id
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.touch(exist_ok=True)
+
+    def _raise_if_upload_cancelled(
+        self,
+        session_id: str,
+        asset_id: str,
+    ) -> None:
+        marker = self._session_dir(session_id) / _UPLOAD_CANCELLATIONS_NAME / asset_id
+        if marker.is_file():
+            raise UploadConflictError("Upload was cancelled")
 
 
 def _write_session_usage_generation(

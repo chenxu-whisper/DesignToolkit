@@ -488,6 +488,141 @@ async def test_upload_is_streamed_to_an_opaque_session_asset(
 
 
 @pytest.mark.anyio
+async def test_delete_before_upload_prevents_later_publication(tmp_path: Path) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    session_id = "a" * 32
+    upload_id = "1" * 32
+    reservation = RecordingReservation()
+
+    deletion = storage.delete_asset(session_id, f"asset:{upload_id}")
+
+    with pytest.raises(UploadRejectedError, match="cancelled"):
+        await storage.store_stream(
+            session_id,
+            asset_id=upload_id,
+            filename="screen.png",
+            content_length=4,
+            chunks=_chunks(b"data"),
+            reservation=reservation,
+        )
+
+    assert deletion.size == 0
+    assert reservation.committed is False
+    assert reservation.released is True
+    assert list(tmp_path.rglob("screen.png")) == []
+    assert (
+        tmp_path / "sessions" / session_id / ".upload-cancellations" / upload_id
+    ).is_file()
+
+
+@pytest.mark.anyio
+async def test_delete_during_upload_cancels_before_commit(tmp_path: Path) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    session_id = "a" * 32
+    upload_id = "1" * 32
+    reservation = RecordingReservation()
+    stream_started = asyncio.Event()
+    resume_stream = asyncio.Event()
+
+    async def blocked_chunks() -> AsyncIterator[bytes]:
+        yield b"im"
+        stream_started.set()
+        await resume_stream.wait()
+        yield b"ag"
+
+    upload = asyncio.create_task(
+        storage.store_stream(
+            session_id,
+            asset_id=upload_id,
+            filename="screen.png",
+            content_length=4,
+            chunks=blocked_chunks(),
+            reservation=reservation,
+        )
+    )
+    await stream_started.wait()
+
+    deletion = storage.delete_asset(session_id, f"asset:{upload_id}")
+    resume_stream.set()
+
+    with pytest.raises(UploadRejectedError, match="cancelled"):
+        await upload
+    assert deletion.pending is True
+    assert reservation.committed is False
+    assert reservation.released is True
+    assert list(tmp_path.rglob("screen.png")) == []
+
+
+@pytest.mark.anyio
+async def test_delete_at_publication_boundary_rolls_back_committed_upload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    session_id = "a" * 32
+    upload_id = "1" * 32
+    reservation = RecordingReservation(root=tmp_path)
+    original_replace = Path.replace
+
+    def cancel_during_publication(source: Path, target: Path) -> Path:
+        if source.name == ".uploading":
+            deletion = storage.delete_asset(session_id, f"asset:{upload_id}")
+            assert deletion.pending is True
+        return original_replace(source, target)
+
+    monkeypatch.setattr(Path, "replace", cancel_during_publication)
+
+    with pytest.raises(UploadRejectedError, match="cancelled"):
+        await storage.store_stream(
+            session_id,
+            asset_id=upload_id,
+            filename="screen.png",
+            content_length=4,
+            chunks=_chunks(b"data"),
+            reservation=reservation,
+        )
+
+    assert reservation.committed is False
+    assert reservation.rolled_back is True
+    assert list(tmp_path.rglob("screen.png")) == []
+
+
+@pytest.mark.anyio
+async def test_duplicate_upload_id_never_overwrites_existing_asset(
+    tmp_path: Path,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    session_id = "a" * 32
+    upload_id = "1" * 32
+    first_reservation = RecordingReservation()
+    duplicate_reservation = RecordingReservation()
+
+    first = await storage.store_stream(
+        session_id,
+        asset_id=upload_id,
+        filename="first.png",
+        content_length=5,
+        chunks=_chunks(b"first"),
+        reservation=first_reservation,
+    )
+
+    with pytest.raises(UploadRejectedError, match="already exists"):
+        await storage.store_stream(
+            session_id,
+            asset_id=upload_id,
+            filename="second.png",
+            content_length=6,
+            chunks=_chunks(b"second"),
+            reservation=duplicate_reservation,
+        )
+
+    assert storage.resolve(session_id, first.reference).read_bytes() == b"first"
+    assert first_reservation.charge_count == 1
+    assert duplicate_reservation.charge_count == 0
+    assert duplicate_reservation.released is True
+
+
+@pytest.mark.anyio
 async def test_upload_heartbeats_resources_while_waiting_for_next_chunk(
     tmp_path: Path,
 ) -> None:
@@ -519,7 +654,7 @@ async def test_upload_aborts_before_commit_after_background_heartbeat_failure(
 
     with pytest.raises(ResourceUnavailableError, match="reservation expired"):
         await storage.store_stream(
-            "a" * 32,
+        "a" * 32,
             filename="screen.png",
             content_length=4,
             chunks=_slow_chunks(b"data"),
@@ -1012,7 +1147,7 @@ async def test_upload_releases_reservation_when_stream_disconnects(
 
     with pytest.raises(ConnectionError, match="disconnected"):
         await storage.store_stream(
-        "a" * 32,
+            "a" * 32,
             filename="screen.png",
             content_length=4,
             chunks=disconnected_chunks(),

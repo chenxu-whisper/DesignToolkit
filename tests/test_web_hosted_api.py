@@ -10,6 +10,7 @@ from threading import BoundedSemaphore, Event
 from time import monotonic, sleep
 from unittest.mock import Mock
 from urllib.parse import quote
+from uuid import uuid4
 
 import fakeredis
 import numpy as np
@@ -347,6 +348,7 @@ def _upload(
     content: bytes,
     *,
     content_length: int | None = None,
+    upload_id: str | None = None,
 ):
     return client.post(
         "/api/uploads",
@@ -357,6 +359,7 @@ def _upload(
             ),
             "content-type": "application/octet-stream",
             "x-upload-filename": quote(filename, safe=""),
+            "x-upload-id": upload_id or uuid4().hex,
         },
     )
 
@@ -461,6 +464,56 @@ def test_hosted_config_and_upload_issue_anonymous_session(tmp_path: Path) -> Non
     assert upload.status_code == 201
     assert upload.json()["reference"].startswith("asset:")
     assert upload.json()["filename"] == "screen.png"
+
+
+def test_hosted_upload_uses_validated_client_upload_id(tmp_path: Path) -> None:
+    upload_id = "1" * 32
+
+    with _client(tmp_path) as client:
+        upload = _upload(
+            client,
+            "screen.png",
+            b"image",
+            upload_id=upload_id,
+        )
+
+    assert upload.status_code == 201
+    assert upload.json()["reference"] == f"asset:{upload_id}:screen.png"
+    session_id = client.cookies["dt_session"]
+    assert (
+        tmp_path / "sessions" / session_id / ".upload-generations" / upload_id
+    ).is_file()
+
+
+@pytest.mark.parametrize(
+    "upload_id",
+    [
+        None,
+        "",
+        "1" * 31,
+        "1" * 33,
+        "G" * 32,
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "11111111-1111-1111-1111-111111111111",
+    ],
+)
+def test_hosted_upload_requires_canonical_upload_id(
+    tmp_path: Path,
+    upload_id: str | None,
+) -> None:
+    headers = {
+        "content-length": "5",
+        "x-upload-filename": "screen.png",
+    }
+    if upload_id is not None:
+        headers["x-upload-id"] = upload_id
+
+    with _client(tmp_path) as client:
+        response = client.post("/api/uploads", content=b"image", headers=headers)
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_upload"
+    assert list(tmp_path.rglob(".uploading")) == []
 
 
 def test_hosted_upload_requires_content_length(tmp_path: Path) -> None:
@@ -620,6 +673,90 @@ def test_hosted_upload_session_quota_returns_413(tmp_path: Path) -> None:
     assert second.json()["error"]["code"] == "upload_too_large"
 
 
+def test_duplicate_upload_id_does_not_overwrite_or_double_charge(
+    tmp_path: Path,
+) -> None:
+    upload_id = "1" * 32
+    with _client(tmp_path, max_session_bytes=5) as client:
+        first = _upload(client, "first.png", b"image", upload_id=upload_id)
+        duplicate = _upload(client, "second.png", b"image", upload_id=upload_id)
+        overflow = _upload(client, "overflow.png", b"x")
+        session_id = client.cookies["dt_session"]
+        coordinator = client.app.state.resource_coordinator
+
+    assert first.status_code == 201
+    assert duplicate.status_code == 409
+    assert duplicate.json()["error"]["code"] == "upload_conflict"
+    assert overflow.status_code == 413
+    assert coordinator.committed[session_id] == 5
+    assert coordinator.reserve_calls == 2
+    assert len(list(tmp_path.rglob("first.png"))) == 1
+    assert list(tmp_path.rglob("second.png")) == []
+
+
+def test_known_upload_id_recovers_committed_upload_after_response_loss(
+    tmp_path: Path,
+) -> None:
+    upload_id = "1" * 32
+    with _client(tmp_path, max_session_bytes=5) as client:
+        uploaded = _upload(
+            client,
+            "screen.png",
+            b"image",
+            upload_id=upload_id,
+        )
+        deleted = client.delete(f"/api/uploads/{upload_id}")
+        replacement = _upload(client, "replacement.png", b"12345")
+        session_id = client.cookies["dt_session"]
+        coordinator = client.app.state.resource_coordinator
+
+    assert uploaded.status_code == 201
+    assert deleted.status_code == 204
+    assert replacement.status_code == 201
+    assert coordinator.committed[session_id] == 5
+    assert list(tmp_path.rglob("screen.png")) == []
+
+
+def test_delete_before_upload_returns_404_and_prevents_later_publication(
+    tmp_path: Path,
+) -> None:
+    upload_id = "1" * 32
+    with _client(tmp_path, max_session_bytes=5) as client:
+        client.get("/api/config")
+        deleted = client.delete(f"/api/uploads/{upload_id}")
+        rejected = _upload(
+            client,
+            "screen.png",
+            b"image",
+            upload_id=upload_id,
+        )
+        session_id = client.cookies["dt_session"]
+        coordinator = client.app.state.resource_coordinator
+
+    assert deleted.status_code == 404
+    assert rejected.status_code == 409
+    assert coordinator.committed.get(session_id, 0) == 0
+    assert list(tmp_path.rglob("screen.png")) == []
+
+
+def test_delete_in_progress_upload_returns_409_with_cancellation_marker(
+    tmp_path: Path,
+) -> None:
+    upload_id = "1" * 32
+    with _client(tmp_path) as client:
+        client.get("/api/config")
+        session_id = client.cookies["dt_session"]
+        asset_dir = tmp_path / "sessions" / session_id / "assets" / upload_id
+        asset_dir.mkdir(parents=True)
+        (asset_dir / ".uploading").write_bytes(b"partial")
+
+        deleted = client.delete(f"/api/uploads/{upload_id}")
+
+    assert deleted.status_code == 409
+    assert (asset_dir.parent.parent / ".upload-cancellations" / upload_id).is_file()
+    assert (asset_dir / ".uploading").read_bytes() == b"partial"
+
+
 def test_delete_upload_is_owner_scoped_idempotent_and_reclaims_quota(
     tmp_path: Path,
 ) -> None:
@@ -633,7 +770,7 @@ def test_delete_upload_is_owner_scoped_idempotent_and_reclaims_quota(
         replacement = _upload(owner, "replacement.png", b"12345")
 
     assert first_delete.status_code == 204
-    assert second_delete.status_code == 204
+    assert second_delete.status_code == 404
     assert replacement.status_code == 201
     assert coordinator.finalize_release_calls == 2
     assert coordinator.finalized_assets == {
@@ -797,7 +934,7 @@ def test_delete_absent_upload_best_effort_finalizes_known_release_marker(
 
         response = owner.delete(f"/api/uploads/{asset_id}")
 
-    assert response.status_code == 204
+    assert response.status_code == 404
     assert finalize_attempts == 1
     assert asset_id in coordinator.released_assets
 
@@ -1003,7 +1140,8 @@ def test_concurrent_retries_recover_partial_tombstone_once(
                 )
             )
 
-    assert statuses == [204, 204]
+    assert 204 in statuses
+    assert set(statuses) <= {204, 404}
     assert owner.app.state.resource_coordinator.release_calls == 1
     assert not tombstone.exists()
 
@@ -1289,7 +1427,7 @@ def test_hosted_delete_is_rate_limited_before_second_lease(
         first = client.delete(f"/api/uploads/{'0' * 32}")
         second = client.delete(f"/api/uploads/{'0' * 32}")
 
-    assert first.status_code == 204
+    assert first.status_code == 404
     assert second.status_code == 429
     assert second.json()["error"]["code"] == "rate_limited"
     assert coordinator.lease_acquisitions == 1
