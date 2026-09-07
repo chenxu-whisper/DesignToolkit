@@ -7,6 +7,7 @@ import re
 from collections import OrderedDict
 from collections.abc import Callable, Hashable, Iterator
 from concurrent.futures import Future
+from contextlib import contextmanager
 from dataclasses import dataclass
 from hashlib import sha256
 from inspect import Parameter, signature
@@ -71,7 +72,7 @@ from designtoolkit.web.native_picker import (
     LocalPathPickerError,
     TkinterLocalPathPicker,
 )
-from designtoolkit.web.redis_tasks import RedisTaskManager
+from designtoolkit.web.redis_tasks import RedisAssetReadPin, RedisTaskManager
 from designtoolkit.web.resources import (
     AssetReleaseMismatchError,
     RedisResourceCoordinator,
@@ -185,6 +186,60 @@ class _SessionLeaseHeartbeat:
                 return
 
 
+class _AssetReadPinHeartbeat:
+    def __init__(
+        self,
+        pin: RedisAssetReadPin,
+        interval: float,
+        stop_timeout: float,
+    ) -> None:
+        self._pin = pin
+        self._interval = interval
+        self._stop_timeout = stop_timeout
+        self._stopped = Event()
+        self._failure: BaseException | None = None
+        self._thread = Thread(target=self._run, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        try:
+            stop_heartbeat_thread(
+                self._stopped,
+                self._thread,
+                timeout=self._stop_timeout,
+                heartbeat_name="Asset read pin heartbeat",
+            )
+        except HeartbeatStopTimeoutError as exc:
+            self._failure = exc
+            raise
+
+    def raise_if_failed(self) -> None:
+        if self._failure is not None:
+            raise self._failure
+
+    @property
+    def quiesced(self) -> bool:
+        return not self._thread.is_alive()
+
+    def commit[T](self, action: Callable[[], T]) -> T:
+        self.stop()
+        self.raise_if_failed()
+        self._pin.refresh()
+        return action()
+
+    def _run(self) -> None:
+        while not self._stopped.wait(self._interval):
+            if self._stopped.is_set():
+                return
+            try:
+                self._pin.refresh()
+            except BaseException as exc:
+                self._failure = exc
+                return
+
+
 @dataclass
 class _HostedSessionOperation:
     lease: RedisSessionLease | None = None
@@ -203,6 +258,18 @@ class _HostedSessionOperation:
 
     def mark_committed(self) -> None:
         self.committed = True
+
+
+@dataclass(frozen=True)
+class _HostedTaskAssets:
+    asset_ids: tuple[str, ...]
+    pin: RedisAssetReadPin | None = None
+    heartbeat: _AssetReadPinHeartbeat | None = None
+
+    def commit[T](self, action: Callable[[], T]) -> T:
+        if self.heartbeat is None:
+            return action()
+        return self.heartbeat.commit(action)
 
 
 class _LeaseProtectedFileResponse(FileResponse):
@@ -949,16 +1016,23 @@ def create_router(
         create_task: Callable[..., TaskRecord],
         payload: object,
         *,
-        asset_ids: tuple[str, ...] = (),
+        task_assets: _HostedTaskAssets,
     ) -> TaskRecord:
         operation = http_request.state.hosted_session_operation
         owner_id = getattr(http_request.state, "session_id", None)
         if isinstance(task_manager, RedisTaskManager):
-            task = create_task(
-                payload,
-                owner_id=owner_id,
-                commit=operation.commit,
-                asset_ids=asset_ids,
+            task = task_assets.commit(
+                lambda: create_task(
+                    payload,
+                    owner_id=owner_id,
+                    commit=operation.commit,
+                    asset_ids=task_assets.asset_ids,
+                    asset_read_pin_token=(
+                        task_assets.pin.token
+                        if task_assets.pin is not None
+                        else None
+                    ),
+                )
             )
             operation.mark_committed()
             return task
@@ -978,6 +1052,61 @@ def create_router(
             )
         except UploadRejectedError as exc:
             raise ApiError("asset_not_found", str(exc), 404) from exc
+
+    @contextmanager
+    def pin_hosted_task_assets(
+        http_request: Request,
+        payload: object,
+    ) -> Iterator[_HostedTaskAssets]:
+        asset_ids = hosted_task_asset_ids(payload)
+        if (
+            storage is None
+            or not asset_ids
+            or not isinstance(task_manager, RedisTaskManager)
+        ):
+            yield _HostedTaskAssets(asset_ids)
+            return
+        try:
+            pin = task_manager.acquire_asset_read_pin(
+                http_request.state.session_id,
+                asset_ids,
+            )
+        except TaskConflictError as exc:
+            raise ApiError("task_conflict", str(exc), 409) from exc
+        except RedisError as exc:
+            raise ApiError("storage_unavailable", str(exc), 503) from exc
+        heartbeat = _AssetReadPinHeartbeat(
+            pin,
+            task_manager.asset_read_pin_heartbeat_interval,
+            task_manager.heartbeat_stop_timeout_seconds,
+        )
+        heartbeat.start()
+        task_assets = _HostedTaskAssets(
+            asset_ids=asset_ids,
+            pin=pin,
+            heartbeat=heartbeat,
+        )
+        try:
+            yield task_assets
+        except BaseException:
+            _stop_asset_read_pin_heartbeat(
+                heartbeat,
+                failure_context=(
+                    "asset read pin heartbeat failed during endpoint error"
+                ),
+            )
+            raise
+        else:
+            try:
+                _stop_asset_read_pin_heartbeat(heartbeat)
+            except (RedisError, ResourceUnavailableError) as exc:
+                raise ApiError("storage_unavailable", str(exc), 503) from exc
+        finally:
+            if heartbeat.quiesced:
+                _release_redis_resource_best_effort(
+                    pin.release,
+                    "asset read pin",
+                )
 
     def resolve_input_references(
         http_request: Request,
@@ -1382,24 +1511,24 @@ def create_router(
         payload: VideoFramesTaskRequest,
         http_request: Request,
     ) -> TaskCreateResponse:
-        asset_ids = hosted_task_asset_ids(payload)
-        hosted_payload = hosted_video_frames_request(http_request, payload)
-        try:
-            task = create_task_with_session_commit(
-                http_request,
-                task_manager.create_video_frames_task,
-                hosted_payload,
-                asset_ids=asset_ids,
-            )
-        except Exception as exc:
-            discard_failed_hosted_task_dir(http_request, hosted_payload)
-            if isinstance(exc, TaskConflictError):
-                raise ApiError("task_conflict", str(exc), 409) from exc
-            if isinstance(exc, (RedisError, ResourceUnavailableError)):
-                raise ApiError("storage_unavailable", str(exc), 503) from exc
-            if isinstance(exc, _INVALID_REQUEST_ERRORS):
-                raise ApiError("invalid_request", str(exc), 400) from exc
-            raise
+        with pin_hosted_task_assets(http_request, payload) as task_assets:
+            hosted_payload = hosted_video_frames_request(http_request, payload)
+            try:
+                task = create_task_with_session_commit(
+                    http_request,
+                    task_manager.create_video_frames_task,
+                    hosted_payload,
+                    task_assets=task_assets,
+                )
+            except Exception as exc:
+                discard_failed_hosted_task_dir(http_request, hosted_payload)
+                if isinstance(exc, TaskConflictError):
+                    raise ApiError("task_conflict", str(exc), 409) from exc
+                if isinstance(exc, (RedisError, ResourceUnavailableError)):
+                    raise ApiError("storage_unavailable", str(exc), 503) from exc
+                if isinstance(exc, _INVALID_REQUEST_ERRORS):
+                    raise ApiError("invalid_request", str(exc), 400) from exc
+                raise
         return TaskCreateResponse(task_id=task.task_id, status=task.status)
 
     @router.post(
@@ -1412,24 +1541,24 @@ def create_router(
         payload: MediaResizeTaskRequest,
         http_request: Request,
     ) -> TaskCreateResponse:
-        asset_ids = hosted_task_asset_ids(payload)
-        hosted_payload = hosted_media_resize_request(http_request, payload)
-        try:
-            task = create_task_with_session_commit(
-                http_request,
-                task_manager.create_media_resize_task,
-                hosted_payload,
-                asset_ids=asset_ids,
-            )
-        except Exception as exc:
-            discard_failed_hosted_task_dir(http_request, hosted_payload)
-            if isinstance(exc, TaskConflictError):
-                raise ApiError("task_conflict", str(exc), 409) from exc
-            if isinstance(exc, (RedisError, ResourceUnavailableError)):
-                raise ApiError("storage_unavailable", str(exc), 503) from exc
-            if isinstance(exc, _INVALID_REQUEST_ERRORS):
-                raise ApiError("invalid_request", str(exc), 400) from exc
-            raise
+        with pin_hosted_task_assets(http_request, payload) as task_assets:
+            hosted_payload = hosted_media_resize_request(http_request, payload)
+            try:
+                task = create_task_with_session_commit(
+                    http_request,
+                    task_manager.create_media_resize_task,
+                    hosted_payload,
+                    task_assets=task_assets,
+                )
+            except Exception as exc:
+                discard_failed_hosted_task_dir(http_request, hosted_payload)
+                if isinstance(exc, TaskConflictError):
+                    raise ApiError("task_conflict", str(exc), 409) from exc
+                if isinstance(exc, (RedisError, ResourceUnavailableError)):
+                    raise ApiError("storage_unavailable", str(exc), 503) from exc
+                if isinstance(exc, _INVALID_REQUEST_ERRORS):
+                    raise ApiError("invalid_request", str(exc), 400) from exc
+                raise
         return TaskCreateResponse(task_id=task.task_id, status=task.status)
 
     @router.post(
@@ -1442,24 +1571,24 @@ def create_router(
         payload: ChromaKeyerTaskRequest,
         http_request: Request,
     ) -> TaskCreateResponse:
-        asset_ids = hosted_task_asset_ids(payload)
-        hosted_payload = hosted_chroma_keyer_request(http_request, payload)
-        try:
-            task = create_task_with_session_commit(
-                http_request,
-                task_manager.create_chroma_keyer_task,
-                hosted_payload,
-                asset_ids=asset_ids,
-            )
-        except Exception as exc:
-            discard_failed_hosted_task_dir(http_request, hosted_payload)
-            if isinstance(exc, TaskConflictError):
-                raise ApiError("task_conflict", str(exc), 409) from exc
-            if isinstance(exc, (RedisError, ResourceUnavailableError)):
-                raise ApiError("storage_unavailable", str(exc), 503) from exc
-            if isinstance(exc, KeyerError):
-                raise _chroma_keyer_error_response(exc) from exc
-            raise
+        with pin_hosted_task_assets(http_request, payload) as task_assets:
+            hosted_payload = hosted_chroma_keyer_request(http_request, payload)
+            try:
+                task = create_task_with_session_commit(
+                    http_request,
+                    task_manager.create_chroma_keyer_task,
+                    hosted_payload,
+                    task_assets=task_assets,
+                )
+            except Exception as exc:
+                discard_failed_hosted_task_dir(http_request, hosted_payload)
+                if isinstance(exc, TaskConflictError):
+                    raise ApiError("task_conflict", str(exc), 409) from exc
+                if isinstance(exc, (RedisError, ResourceUnavailableError)):
+                    raise ApiError("storage_unavailable", str(exc), 503) from exc
+                if isinstance(exc, KeyerError):
+                    raise _chroma_keyer_error_response(exc) from exc
+                raise
         return TaskCreateResponse(task_id=task.task_id, status=task.status)
 
     @router.post(
@@ -1472,24 +1601,24 @@ def create_router(
         payload: ChromaVideoKeyerTaskRequest,
         http_request: Request,
     ) -> TaskCreateResponse:
-        asset_ids = hosted_task_asset_ids(payload)
-        hosted_payload = hosted_chroma_video_request(http_request, payload)
-        try:
-            task = create_task_with_session_commit(
-                http_request,
-                task_manager.create_chroma_video_keyer_task,
-                hosted_payload,
-                asset_ids=asset_ids,
-            )
-        except Exception as exc:
-            discard_failed_hosted_task_dir(http_request, hosted_payload)
-            if isinstance(exc, TaskConflictError):
-                raise ApiError("task_conflict", str(exc), 409) from exc
-            if isinstance(exc, (RedisError, ResourceUnavailableError)):
-                raise ApiError("storage_unavailable", str(exc), 503) from exc
-            if isinstance(exc, KeyerError):
-                raise _chroma_video_error_response(exc) from exc
-            raise
+        with pin_hosted_task_assets(http_request, payload) as task_assets:
+            hosted_payload = hosted_chroma_video_request(http_request, payload)
+            try:
+                task = create_task_with_session_commit(
+                    http_request,
+                    task_manager.create_chroma_video_keyer_task,
+                    hosted_payload,
+                    task_assets=task_assets,
+                )
+            except Exception as exc:
+                discard_failed_hosted_task_dir(http_request, hosted_payload)
+                if isinstance(exc, TaskConflictError):
+                    raise ApiError("task_conflict", str(exc), 409) from exc
+                if isinstance(exc, (RedisError, ResourceUnavailableError)):
+                    raise ApiError("storage_unavailable", str(exc), 503) from exc
+                if isinstance(exc, KeyerError):
+                    raise _chroma_video_error_response(exc) from exc
+                raise
         return TaskCreateResponse(task_id=task.task_id, status=task.status)
 
     @router.post(
@@ -1947,6 +2076,24 @@ def _release_redis_resource_best_effort(
 
 def _stop_session_lease_heartbeat(
     heartbeat: _SessionLeaseHeartbeat,
+    *,
+    failure_context: str | None = None,
+) -> None:
+    heartbeat.stop()
+    try:
+        heartbeat.raise_if_failed()
+    except BaseException:
+        if failure_context is None:
+            raise
+        _LOGGER.error(
+            "storage_unavailable: %s",
+            failure_context,
+            exc_info=True,
+        )
+
+
+def _stop_asset_read_pin_heartbeat(
+    heartbeat: _AssetReadPinHeartbeat,
     *,
     failure_context: str | None = None,
 ) -> None:

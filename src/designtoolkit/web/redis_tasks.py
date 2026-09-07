@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from redis import Redis
-from redis.exceptions import ResponseError, WatchError
+from redis.exceptions import RedisError, ResponseError, WatchError
 from rq import Queue
 from rq.job import Callback, Job, JobStatus
 from rq.registry import FailedJobRegistry, StartedJobRegistry
@@ -45,6 +45,7 @@ from designtoolkit.web.resources import (
     _task_pin_key,
     _validate_asset_id,
     _validate_session_id,
+    _validate_token,
 )
 from designtoolkit.web.schemas import (
     ChromaKeyerTaskRequest,
@@ -68,6 +69,10 @@ _ENQUEUE_INTENT_TTL_SECONDS = 60.0
 _ENQUEUE_INTENT_HEARTBEAT_SECONDS = 10.0
 _ASSET_DELETE_PREFIX = "dt:resource:asset-delete:"
 _ASSET_DELETE_TTL_MS = 60_000
+_ASSET_READ_PIN_PREFIX = "dt:resource:asset-read-pin:"
+_ASSET_READERS_PREFIX = "dt:resource:asset-readers:"
+_ASSET_READ_PIN_TTL_SECONDS = 60.0
+_ASSET_READ_PIN_HEARTBEAT_SECONDS = 10.0
 _RESERVE_ENQUEUE_SCRIPT = """-- reserve_enqueue_intent
 local queue_key = KEYS[1]
 local intent_key = KEYS[2]
@@ -86,6 +91,8 @@ local owner_ttl_ms = tonumber(ARGV[8])
 local asset_ids = cjson.decode(ARGV[9])
 local asset_task_prefix = ARGV[10]
 local asset_delete_prefix = ARGV[11]
+local asset_read_pin_token = ARGV[12]
+local asset_readers_prefix = ARGV[13]
 
 if owner_id ~= "" then
     local deleting = redis.call("HGET", session_state_key, "deleting")
@@ -106,6 +113,13 @@ for _, asset_id in ipairs(asset_ids) do
     redis.call("ZREMRANGEBYSCORE", delete_key, "-inf", now_ms)
     if redis.call("ZCARD", delete_key) ~= 0 then
         return 3
+    end
+end
+if asset_read_pin_token ~= "" then
+    if redis.call("HGET", KEYS[7], "token") ~= asset_read_pin_token
+        or redis.call("HGET", KEYS[7], "session_id") ~= owner_id
+        or redis.call("HGET", KEYS[7], "asset_ids") ~= ARGV[9] then
+        return 4
     end
 end
 
@@ -150,6 +164,16 @@ if owner_id ~= "" then
         )
     end
 end
+if asset_read_pin_token ~= "" then
+    for _, asset_id in ipairs(asset_ids) do
+        local readers_key = asset_readers_prefix .. owner_id .. ":" .. asset_id
+        redis.call("ZREM", readers_key, asset_read_pin_token)
+        if redis.call("ZCARD", readers_key) == 0 then
+            redis.call("DEL", readers_key)
+        end
+    end
+    redis.call("DEL", KEYS[7])
+end
 return 0
 """
 _ROLLBACK_ENQUEUE_SCRIPT = """-- rollback_enqueue_intent
@@ -192,6 +216,10 @@ end
 local redis_time = redis.call("TIME")
 local now_ms = redis_time[1] * 1000 + math.floor(redis_time[2] / 1000)
 redis.call("ZREMRANGEBYSCORE", KEYS[2], "-inf", now_ms)
+redis.call("ZREMRANGEBYSCORE", KEYS[3], "-inf", now_ms)
+if redis.call("ZCARD", KEYS[3]) ~= 0 then
+    return 1
+end
 redis.call("ZADD", KEYS[2], now_ms + tonumber(ARGV[2]), ARGV[1])
 redis.call("PEXPIRE", KEYS[2], ARGV[2])
 return 0
@@ -202,6 +230,76 @@ if redis.call("ZCARD", KEYS[1]) == 0 then
     redis.call("DEL", KEYS[1])
 end
 return removed
+"""
+_ACQUIRE_ASSET_READ_PIN_SCRIPT = """-- acquire_asset_read_pin
+local token = ARGV[1]
+local session_id = ARGV[2]
+local ttl_ms = tonumber(ARGV[3])
+local asset_ids_json = ARGV[4]
+local asset_count = tonumber(ARGV[5])
+local redis_time = redis.call("TIME")
+local now_ms = redis_time[1] * 1000 + math.floor(redis_time[2] / 1000)
+local expires_at = now_ms + ttl_ms
+
+for index = 1, asset_count do
+    local delete_key = KEYS[1 + index]
+    redis.call("ZREMRANGEBYSCORE", delete_key, "-inf", now_ms)
+    if redis.call("ZCARD", delete_key) ~= 0 then
+        return 1
+    end
+end
+
+redis.call(
+    "HMSET",
+    KEYS[1],
+    "token",
+    token,
+    "session_id",
+    session_id,
+    "asset_ids",
+    asset_ids_json
+)
+redis.call("PEXPIRE", KEYS[1], ttl_ms)
+for index = 1, asset_count do
+    local readers_key = KEYS[1 + asset_count + index]
+    redis.call("ZREMRANGEBYSCORE", readers_key, "-inf", now_ms)
+    redis.call("ZADD", readers_key, expires_at, token)
+end
+return 0
+"""
+_REFRESH_ASSET_READ_PIN_SCRIPT = """-- refresh_asset_read_pin
+if redis.call("HGET", KEYS[1], "token") ~= ARGV[1]
+    or redis.call("HGET", KEYS[1], "session_id") ~= ARGV[2]
+    or redis.call("HGET", KEYS[1], "asset_ids") ~= ARGV[4] then
+    return 0
+end
+local redis_time = redis.call("TIME")
+local now_ms = redis_time[1] * 1000 + math.floor(redis_time[2] / 1000)
+local expires_at = now_ms + tonumber(ARGV[3])
+redis.call("PEXPIRE", KEYS[1], ARGV[3])
+for index = 2, #KEYS do
+    redis.call("ZREMRANGEBYSCORE", KEYS[index], "-inf", now_ms)
+    redis.call("ZADD", KEYS[index], expires_at, ARGV[1])
+end
+return 1
+"""
+_RELEASE_ASSET_READ_PIN_SCRIPT = """-- release_asset_read_pin
+if redis.call("EXISTS", KEYS[1]) == 0 then
+    return 0
+end
+if redis.call("HGET", KEYS[1], "token") ~= ARGV[1]
+    or redis.call("HGET", KEYS[1], "session_id") ~= ARGV[2]
+    or redis.call("HGET", KEYS[1], "asset_ids") ~= ARGV[3] then
+    return 2
+end
+for index = 2, #KEYS do
+    redis.call("ZREM", KEYS[index], ARGV[1])
+    if redis.call("ZCARD", KEYS[index]) == 0 then
+        redis.call("DEL", KEYS[index])
+    end
+end
+redis.call("DEL", KEYS[1])
+return 1
 """
 _REFRESH_ENQUEUE_OWNER_SCRIPT = """-- refresh_enqueue_owner
 local owner_token = ARGV[1]
@@ -444,6 +542,35 @@ class RedisLogStore:
         del task_id, subscriber
 
 
+class RedisAssetReadPin:
+    def __init__(
+        self,
+        manager: RedisTaskManager,
+        session_id: str,
+        asset_ids: tuple[str, ...],
+        token: str,
+    ) -> None:
+        self._manager = manager
+        self.session_id = session_id
+        self.asset_ids = asset_ids
+        self.token = token
+
+    def refresh(self) -> None:
+        if not self._manager.refresh_asset_read_pin(
+            self.session_id,
+            self.asset_ids,
+            self.token,
+        ):
+            raise TaskConflictError("Asset read pin expired")
+
+    def release(self) -> bool:
+        return self._manager.release_asset_read_pin(
+            self.session_id,
+            self.asset_ids,
+            self.token,
+        )
+
+
 class RedisTaskManager:
     def __init__(
         self,
@@ -459,6 +586,10 @@ class RedisTaskManager:
         enqueue_intent_heartbeat_interval: float = (
             _ENQUEUE_INTENT_HEARTBEAT_SECONDS
         ),
+        asset_read_pin_ttl: float = _ASSET_READ_PIN_TTL_SECONDS,
+        asset_read_pin_heartbeat_interval: float = (
+            _ASSET_READ_PIN_HEARTBEAT_SECONDS
+        ),
         heartbeat_stop_timeout_seconds: float = (
             DEFAULT_HEARTBEAT_STOP_TIMEOUT_SECONDS
         ),
@@ -468,6 +599,12 @@ class RedisTaskManager:
         if enqueue_intent_heartbeat_interval <= 0:
             raise ValueError(
                 "enqueue_intent_heartbeat_interval must be positive"
+            )
+        if asset_read_pin_ttl <= 0:
+            raise ValueError("asset_read_pin_ttl must be positive")
+        if asset_read_pin_heartbeat_interval <= 0:
+            raise ValueError(
+                "asset_read_pin_heartbeat_interval must be positive"
             )
         if heartbeat_stop_timeout_seconds <= 0:
             raise ValueError("heartbeat_stop_timeout_seconds must be positive")
@@ -484,6 +621,9 @@ class RedisTaskManager:
         self.enqueue_intent_heartbeat_interval = (
             enqueue_intent_heartbeat_interval
         )
+        self.asset_read_pin_heartbeat_interval = (
+            asset_read_pin_heartbeat_interval
+        )
         self.heartbeat_stop_timeout_seconds = heartbeat_stop_timeout_seconds
         self._enqueue_intent_ttl_ms = max(
             1,
@@ -491,6 +631,16 @@ class RedisTaskManager:
                 max(
                     enqueue_intent_ttl,
                     enqueue_intent_heartbeat_interval * 2,
+                )
+                * 1000
+            ),
+        )
+        self._asset_read_pin_ttl_ms = max(
+            1,
+            round(
+                max(
+                    asset_read_pin_ttl,
+                    asset_read_pin_heartbeat_interval * 2,
                 )
                 * 1000
             ),
@@ -524,6 +674,15 @@ class RedisTaskManager:
         self._release_asset_deletion_script = self._redis.register_script(
             _RELEASE_ASSET_DELETION_SCRIPT
         )
+        self._acquire_asset_read_pin_script = self._redis.register_script(
+            _ACQUIRE_ASSET_READ_PIN_SCRIPT
+        )
+        self._refresh_asset_read_pin_script = self._redis.register_script(
+            _REFRESH_ASSET_READ_PIN_SCRIPT
+        )
+        self._release_asset_read_pin_script = self._redis.register_script(
+            _RELEASE_ASSET_READ_PIN_SCRIPT
+        )
         self.log_store = RedisLogStore(
             redis_connection,
             retention_seconds=retention_seconds,
@@ -536,6 +695,7 @@ class RedisTaskManager:
         owner_id: str | None = None,
         commit: Callable[[Callable[[], Job]], Job] | None = None,
         asset_ids: tuple[str, ...] = (),
+        asset_read_pin_token: str | None = None,
     ) -> TaskRecord:
         options = video_frame_options_list_from_request(request)
         return self._enqueue(
@@ -546,6 +706,7 @@ class RedisTaskManager:
             input_path=_joined_input_names(options),
             commit=commit,
             asset_ids=asset_ids,
+            asset_read_pin_token=asset_read_pin_token,
         )
 
     def create_media_resize_task(
@@ -555,6 +716,7 @@ class RedisTaskManager:
         owner_id: str | None = None,
         commit: Callable[[Callable[[], Job]], Job] | None = None,
         asset_ids: tuple[str, ...] = (),
+        asset_read_pin_token: str | None = None,
     ) -> TaskRecord:
         options = media_resize_options_list_from_request(request)
         return self._enqueue(
@@ -565,6 +727,7 @@ class RedisTaskManager:
             input_path="\n".join(option.input_path.name for option in options),
             commit=commit,
             asset_ids=asset_ids,
+            asset_read_pin_token=asset_read_pin_token,
         )
 
     def create_chroma_keyer_task(
@@ -574,6 +737,7 @@ class RedisTaskManager:
         owner_id: str | None = None,
         commit: Callable[[Callable[[], Job]], Job] | None = None,
         asset_ids: tuple[str, ...] = (),
+        asset_read_pin_token: str | None = None,
     ) -> TaskRecord:
         options, _model, _params = chroma_keyer_options_from_request(request)
         output_path = options.output_path or default_output_path(options.input_path)
@@ -586,6 +750,7 @@ class RedisTaskManager:
             input_path=options.input_path.name,
             commit=commit,
             asset_ids=asset_ids,
+            asset_read_pin_token=asset_read_pin_token,
         )
 
     def create_chroma_video_keyer_task(
@@ -595,6 +760,7 @@ class RedisTaskManager:
         owner_id: str | None = None,
         commit: Callable[[Callable[[], Job]], Job] | None = None,
         asset_ids: tuple[str, ...] = (),
+        asset_read_pin_token: str | None = None,
     ) -> TaskRecord:
         options, _model, _params = chroma_video_keyer_options_from_request(request)
         output_root = options.output_root or options.input_path.parent
@@ -611,6 +777,7 @@ class RedisTaskManager:
             input_path=options.input_path.name,
             commit=commit,
             asset_ids=asset_ids,
+            asset_read_pin_token=asset_read_pin_token,
         )
 
     def get_task(
@@ -713,7 +880,7 @@ class RedisTaskManager:
                 queue=self.queue,
             ).get_job_ids()
         )
-        reconciled = 0
+        reconciled = self._reconcile_asset_read_pins()
         for task in self._tasks_requiring_failure_cleanup():
             message = task.error or "Task failed"
             if self._finalize_external_failure(task.task_id, message):
@@ -826,16 +993,308 @@ class RedisTaskManager:
             self._redis.expire(key, window + 1)
         return count <= limit
 
+    def acquire_asset_read_pin(
+        self,
+        session_id: str,
+        asset_ids: tuple[str, ...],
+    ) -> RedisAssetReadPin:
+        session_id = _validate_session_id(session_id)
+        asset_ids = tuple(dict.fromkeys(asset_ids))
+        if not asset_ids:
+            raise ValueError("Asset read pin requires at least one asset")
+        for asset_id in asset_ids:
+            _validate_asset_id(asset_id)
+        token = uuid4().hex
+        asset_ids_json = _asset_ids_json(asset_ids)
+        keys = [
+            _asset_read_pin_key(token),
+            *(
+                _asset_delete_key(session_id, asset_id)
+                for asset_id in asset_ids
+            ),
+            *(
+                _asset_readers_key(session_id, asset_id)
+                for asset_id in asset_ids
+            ),
+        ]
+        try:
+            try:
+                result = int(
+                    self._acquire_asset_read_pin_script(
+                        keys=keys,
+                        args=[
+                            token,
+                            session_id,
+                            self._asset_read_pin_ttl_ms,
+                            asset_ids_json,
+                            len(asset_ids),
+                        ],
+                    )
+                )
+            except ResponseError as error_response:
+                if "unknown command" not in str(error_response).lower():
+                    raise
+                result = self._acquire_asset_read_pin_without_lua(
+                    session_id,
+                    asset_ids,
+                    token,
+                )
+        except RedisError as acquire_error:
+            try:
+                acquired = self._asset_read_pin_matches(
+                    session_id,
+                    asset_ids,
+                    token,
+                )
+            except RedisError as confirmation_error:
+                raise acquire_error from confirmation_error
+            if not acquired:
+                raise acquire_error
+            result = 0
+        if result == 1:
+            raise TaskConflictError("Asset deletion is already in progress")
+        return RedisAssetReadPin(self, session_id, asset_ids, token)
+
+    def refresh_asset_read_pin(
+        self,
+        session_id: str,
+        asset_ids: tuple[str, ...],
+        token: str,
+    ) -> bool:
+        session_id = _validate_session_id(session_id)
+        asset_ids = tuple(dict.fromkeys(asset_ids))
+        _validate_token(token)
+        for asset_id in asset_ids:
+            _validate_asset_id(asset_id)
+        keys = [
+            _asset_read_pin_key(token),
+            *(
+                _asset_readers_key(session_id, asset_id)
+                for asset_id in asset_ids
+            ),
+        ]
+        try:
+            try:
+                return bool(
+                    self._refresh_asset_read_pin_script(
+                        keys=keys,
+                        args=[
+                            token,
+                            session_id,
+                            self._asset_read_pin_ttl_ms,
+                            _asset_ids_json(asset_ids),
+                        ],
+                    )
+                )
+            except ResponseError as error_response:
+                if "unknown command" not in str(error_response).lower():
+                    raise
+                return self._refresh_asset_read_pin_without_lua(
+                    session_id,
+                    asset_ids,
+                    token,
+                )
+        except RedisError as refresh_error:
+            try:
+                return self._asset_read_pin_matches(
+                    session_id,
+                    asset_ids,
+                    token,
+                )
+            except RedisError as confirmation_error:
+                raise refresh_error from confirmation_error
+
+    def release_asset_read_pin(
+        self,
+        session_id: str,
+        asset_ids: tuple[str, ...],
+        token: str,
+    ) -> bool:
+        session_id = _validate_session_id(session_id)
+        asset_ids = tuple(dict.fromkeys(asset_ids))
+        _validate_token(token)
+        for asset_id in asset_ids:
+            _validate_asset_id(asset_id)
+        keys = [
+            _asset_read_pin_key(token),
+            *(
+                _asset_readers_key(session_id, asset_id)
+                for asset_id in asset_ids
+            ),
+        ]
+        try:
+            try:
+                result = int(
+                    self._release_asset_read_pin_script(
+                        keys=keys,
+                        args=[
+                            token,
+                            session_id,
+                            _asset_ids_json(asset_ids),
+                        ],
+                    )
+                )
+            except ResponseError as error_response:
+                if "unknown command" not in str(error_response).lower():
+                    raise
+                result = self._release_asset_read_pin_without_lua(
+                    session_id,
+                    asset_ids,
+                    token,
+                )
+        except RedisError as release_error:
+            try:
+                if not self._asset_read_pin_matches(
+                    session_id,
+                    asset_ids,
+                    token,
+                ):
+                    return True
+            except RedisError:
+                pass
+            raise release_error
+        if result == 2:
+            raise TaskConflictError("Asset read pin ownership is invalid")
+        return result == 1
+
+    def _acquire_asset_read_pin_without_lua(
+        self,
+        session_id: str,
+        asset_ids: tuple[str, ...],
+        token: str,
+    ) -> int:
+        claim_keys = [
+            _asset_delete_key(session_id, asset_id) for asset_id in asset_ids
+        ]
+        reader_keys = [
+            _asset_readers_key(session_id, asset_id) for asset_id in asset_ids
+        ]
+        pin_key = _asset_read_pin_key(token)
+        while True:
+            with self._redis.pipeline() as pipeline:
+                try:
+                    pipeline.watch(pin_key, *claim_keys, *reader_keys)
+                    now_ms = round(time() * 1000)
+                    if any(
+                        pipeline.zcount(key, now_ms, "+inf")
+                        for key in claim_keys
+                    ):
+                        pipeline.unwatch()
+                        return 1
+                    expires_at = now_ms + self._asset_read_pin_ttl_ms
+                    pipeline.multi()
+                    for key in claim_keys:
+                        pipeline.zremrangebyscore(key, "-inf", now_ms)
+                    pipeline.hset(
+                        pin_key,
+                        mapping={
+                            "token": token,
+                            "session_id": session_id,
+                            "asset_ids": _asset_ids_json(asset_ids),
+                        },
+                    )
+                    pipeline.pexpire(pin_key, self._asset_read_pin_ttl_ms)
+                    for key in reader_keys:
+                        pipeline.zremrangebyscore(key, "-inf", now_ms)
+                        pipeline.zadd(key, {token: expires_at})
+                    pipeline.execute()
+                    return 0
+                except WatchError:
+                    continue
+
+    def _refresh_asset_read_pin_without_lua(
+        self,
+        session_id: str,
+        asset_ids: tuple[str, ...],
+        token: str,
+    ) -> bool:
+        pin_key = _asset_read_pin_key(token)
+        reader_keys = [
+            _asset_readers_key(session_id, asset_id) for asset_id in asset_ids
+        ]
+        while True:
+            with self._redis.pipeline() as pipeline:
+                try:
+                    pipeline.watch(pin_key, *reader_keys)
+                    if not _asset_read_pin_metadata_matches(
+                        pipeline.hgetall(pin_key),
+                        session_id,
+                        asset_ids,
+                        token,
+                    ):
+                        pipeline.unwatch()
+                        return False
+                    now_ms = round(time() * 1000)
+                    expires_at = now_ms + self._asset_read_pin_ttl_ms
+                    pipeline.multi()
+                    pipeline.pexpire(pin_key, self._asset_read_pin_ttl_ms)
+                    for key in reader_keys:
+                        pipeline.zremrangebyscore(key, "-inf", now_ms)
+                        pipeline.zadd(key, {token: expires_at})
+                    pipeline.execute()
+                    return True
+                except WatchError:
+                    continue
+
+    def _release_asset_read_pin_without_lua(
+        self,
+        session_id: str,
+        asset_ids: tuple[str, ...],
+        token: str,
+    ) -> int:
+        pin_key = _asset_read_pin_key(token)
+        reader_keys = [
+            _asset_readers_key(session_id, asset_id) for asset_id in asset_ids
+        ]
+        while True:
+            with self._redis.pipeline() as pipeline:
+                try:
+                    pipeline.watch(pin_key, *reader_keys)
+                    metadata = pipeline.hgetall(pin_key)
+                    if not metadata:
+                        pipeline.unwatch()
+                        return 0
+                    if not _asset_read_pin_metadata_matches(
+                        metadata,
+                        session_id,
+                        asset_ids,
+                        token,
+                    ):
+                        pipeline.unwatch()
+                        return 2
+                    pipeline.multi()
+                    for key in reader_keys:
+                        pipeline.zrem(key, token)
+                    pipeline.delete(pin_key)
+                    pipeline.execute()
+                    return 1
+                except WatchError:
+                    continue
+
+    def _asset_read_pin_matches(
+        self,
+        session_id: str,
+        asset_ids: tuple[str, ...],
+        token: str,
+    ) -> bool:
+        return _asset_read_pin_metadata_matches(
+            self._redis.hgetall(_asset_read_pin_key(token)),
+            session_id,
+            asset_ids,
+            token,
+        )
+
     def claim_asset_deletion(self, session_id: str, asset_id: str) -> str:
         session_id = _validate_session_id(session_id)
         asset_id = _validate_asset_id(asset_id)
         token = uuid4().hex
         asset_tasks_key = _asset_tasks_key(session_id, asset_id)
         claim_key = _asset_delete_key(session_id, asset_id)
+        readers_key = _asset_readers_key(session_id, asset_id)
         try:
             result = int(
                 self._claim_asset_deletion_script(
-                    keys=[asset_tasks_key, claim_key],
+                    keys=[asset_tasks_key, claim_key, readers_key],
                     args=[token, _ASSET_DELETE_TTL_MS],
                 )
             )
@@ -845,14 +1304,19 @@ class RedisTaskManager:
             while True:
                 with self._redis.pipeline() as pipeline:
                     try:
-                        pipeline.watch(asset_tasks_key, claim_key)
-                        if pipeline.scard(asset_tasks_key):
+                        pipeline.watch(asset_tasks_key, claim_key, readers_key)
+                        now_ms = round(time() * 1000)
+                        if pipeline.scard(asset_tasks_key) or pipeline.zcount(
+                            readers_key,
+                            now_ms,
+                            "+inf",
+                        ):
                             pipeline.unwatch()
                             result = 1
                             break
-                        now_ms = round(time() * 1000)
                         pipeline.multi()
                         pipeline.zremrangebyscore(claim_key, "-inf", now_ms)
+                        pipeline.zremrangebyscore(readers_key, "-inf", now_ms)
                         pipeline.zadd(
                             claim_key,
                             {token: now_ms + _ASSET_DELETE_TTL_MS},
@@ -911,10 +1375,15 @@ class RedisTaskManager:
         input_path: str,
         commit: Callable[[Callable[[], Job]], Job] | None,
         asset_ids: tuple[str, ...],
+        asset_read_pin_token: str | None,
     ) -> TaskRecord:
         asset_ids = tuple(dict.fromkeys(asset_ids))
         if asset_ids and owner_id is None:
             raise ValueError("Hosted asset references require a task owner")
+        if asset_read_pin_token is not None:
+            _validate_token(asset_read_pin_token)
+            if not asset_ids:
+                raise ValueError("Asset read pin requires hosted asset references")
         for asset_id in asset_ids:
             _validate_asset_id(asset_id)
         task_id = str(uuid4())
@@ -931,7 +1400,12 @@ class RedisTaskManager:
             owner_id=owner_id,
         )
         owner_token = uuid4().hex
-        self._reserve_enqueue_intent(task, owner_token, asset_ids)
+        self._reserve_enqueue_intent(
+            task,
+            owner_token,
+            asset_ids,
+            asset_read_pin_token,
+        )
         heartbeat = _EnqueueIntentHeartbeat(
             lambda: self._refresh_enqueue_intent(task.task_id, owner_token),
             self.enqueue_intent_heartbeat_interval,
@@ -1045,6 +1519,7 @@ class RedisTaskManager:
         task: TaskRecord,
         owner_token: str,
         asset_ids: tuple[str, ...],
+        asset_read_pin_token: str | None,
     ) -> None:
         owner_id = task.owner_id or ""
         session_state_key = (
@@ -1067,6 +1542,9 @@ class RedisTaskManager:
                         session_state_key,
                         session_task_pins_key,
                         _task_pin_key(task.task_id),
+                        _asset_read_pin_key(asset_read_pin_token)
+                        if asset_read_pin_token is not None
+                        else _enqueue_intent_key(task.task_id),
                     ],
                     args=[
                         task.task_id,
@@ -1077,9 +1555,11 @@ class RedisTaskManager:
                         _CLEANUP_PREFIX,
                         owner_token,
                         self._enqueue_intent_ttl_ms,
-                        json.dumps(asset_ids, separators=(",", ":")),
+                        _asset_ids_json(asset_ids),
                         _ASSET_TASK_PREFIX,
                         _ASSET_DELETE_PREFIX,
+                        asset_read_pin_token or "",
+                        _ASSET_READERS_PREFIX,
                     ],
                 )
             )
@@ -1090,6 +1570,7 @@ class RedisTaskManager:
                 task,
                 owner_token,
                 asset_ids,
+                asset_read_pin_token,
             )
         if result == 1:
             raise TaskConflictError("The task queue is full")
@@ -1097,12 +1578,15 @@ class RedisTaskManager:
             raise SessionDeletingError("Session is being deleted")
         if result == 3:
             raise TaskConflictError("Asset deletion is already in progress")
+        if result == 4:
+            raise TaskConflictError("Asset read pin expired")
 
     def _reserve_enqueue_intent_without_lua(
         self,
         task: TaskRecord,
         owner_token: str,
         asset_ids: tuple[str, ...],
+        asset_read_pin_token: str | None,
     ) -> int:
         owner_id = task.owner_id or ""
         state_key = (
@@ -1113,6 +1597,14 @@ class RedisTaskManager:
         asset_claim_keys = [
             _asset_delete_key(owner_id, asset_id) for asset_id in asset_ids
         ]
+        asset_reader_keys = [
+            _asset_readers_key(owner_id, asset_id) for asset_id in asset_ids
+        ]
+        read_pin_key = (
+            _asset_read_pin_key(asset_read_pin_token)
+            if asset_read_pin_token is not None
+            else _enqueue_intent_key(task.task_id)
+        )
         while True:
             with self._redis.pipeline() as pipeline:
                 try:
@@ -1120,6 +1612,8 @@ class RedisTaskManager:
                         _queue_reservations_key(),
                         state_key,
                         *asset_claim_keys,
+                        *asset_reader_keys,
+                        read_pin_key,
                     )
                     deleting = pipeline.hget(state_key, "deleting")
                     if owner_id and deleting is not None:
@@ -1140,6 +1634,16 @@ class RedisTaskManager:
                     ):
                         pipeline.unwatch()
                         return 3
+                    if asset_read_pin_token is not None:
+                        read_pin_metadata = pipeline.hgetall(read_pin_key)
+                        if not _asset_read_pin_metadata_matches(
+                            read_pin_metadata,
+                            owner_id,
+                            asset_ids,
+                            asset_read_pin_token,
+                        ):
+                            pipeline.unwatch()
+                            return 4
                     pipeline.multi()
                     for key in asset_claim_keys:
                         pipeline.zremrangebyscore(key, "-inf", now_ms)
@@ -1168,10 +1672,7 @@ class RedisTaskManager:
                             mapping={
                                 "task_id": task.task_id,
                                 "session_id": owner_id,
-                                "asset_ids": json.dumps(
-                                    asset_ids,
-                                    separators=(",", ":"),
-                                ),
+                                "asset_ids": _asset_ids_json(asset_ids),
                             },
                         )
                         pipeline.sadd(
@@ -1183,6 +1684,13 @@ class RedisTaskManager:
                                 _asset_tasks_key(owner_id, asset_id),
                                 task.task_id,
                             )
+                    if asset_read_pin_token is not None:
+                        for asset_reader_key in asset_reader_keys:
+                            pipeline.zrem(
+                                asset_reader_key,
+                                asset_read_pin_token,
+                            )
+                        pipeline.delete(read_pin_key)
                     pipeline.execute()
                     return 0
                 except WatchError:
@@ -1651,6 +2159,17 @@ class RedisTaskManager:
         cleaned = self._cleanup_failed_task(task_id)
         return transitioned or cleaned
 
+    def _reconcile_asset_read_pins(self) -> int:
+        now_ms = round(time() * 1000)
+        reconciled = 0
+        for key in self._redis.scan_iter(match=f"{_ASSET_READERS_PREFIX}*"):
+            reconciled += int(
+                self._redis.zremrangebyscore(key, "-inf", now_ms)
+            )
+            if not self._redis.zcard(key):
+                self._redis.delete(key)
+        return reconciled
+
     def _reconcile_stale_task_pins(self, started_ids: set[str]) -> int:
         coordinator = self.resource_coordinator
         reconciled = 0
@@ -2048,6 +2567,31 @@ def _task_work_key(task_id: str) -> str:
 
 def _asset_delete_key(session_id: str, asset_id: str) -> str:
     return f"{_ASSET_DELETE_PREFIX}{session_id}:{asset_id}"
+
+
+def _asset_read_pin_key(token: str) -> str:
+    return f"{_ASSET_READ_PIN_PREFIX}{token}"
+
+
+def _asset_readers_key(session_id: str, asset_id: str) -> str:
+    return f"{_ASSET_READERS_PREFIX}{session_id}:{asset_id}"
+
+
+def _asset_ids_json(asset_ids: tuple[str, ...]) -> str:
+    return json.dumps(asset_ids, separators=(",", ":"))
+
+
+def _asset_read_pin_metadata_matches(
+    metadata: dict[bytes | str, bytes | str],
+    session_id: str,
+    asset_ids: tuple[str, ...],
+    token: str,
+) -> bool:
+    return (
+        _redis_hash_text(metadata, "token") == token
+        and _redis_hash_text(metadata, "session_id") == session_id
+        and _redis_hash_text(metadata, "asset_ids") == _asset_ids_json(asset_ids)
+    )
 
 
 def _asset_ids_from_pin_metadata(

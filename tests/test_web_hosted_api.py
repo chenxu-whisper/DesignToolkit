@@ -32,6 +32,7 @@ from designtoolkit.web.hosted import (
     UploadRejectedError,
 )
 from designtoolkit.web.logs import LogStore
+from designtoolkit.web.media_limits import HostedMediaValidator, MediaLimitError
 from designtoolkit.web.redis_tasks import RedisTaskManager
 from designtoolkit.web.resources import (
     AssetReleaseMismatchError,
@@ -1311,6 +1312,146 @@ def test_in_memory_hosted_task_retains_session_owner(tmp_path: Path) -> None:
     assert own_status.status_code == 200
     assert stranger_status.status_code == 404
     assert manager.get_task(task_id) is not None
+
+
+def test_delete_upload_is_blocked_from_validation_through_task_terminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = RedisTaskManager(
+        redis_connection=redis_connection,
+        queue=Queue("designtoolkit", connection=redis_connection),
+        data_dir=tmp_path,
+        max_queued_tasks=20,
+        retention_seconds=7200,
+        asset_read_pin_ttl=0.05,
+        asset_read_pin_heartbeat_interval=0.01,
+    )
+    validation_complete = Event()
+    allow_enqueue = Event()
+    original_validate = HostedMediaValidator.validate_media_many
+
+    def pause_after_validation(self, paths):
+        validated = original_validate(self, paths)
+        validation_complete.set()
+        assert allow_enqueue.wait(timeout=5)
+        return validated
+
+    monkeypatch.setattr(
+        HostedMediaValidator,
+        "validate_media_many",
+        pause_after_validation,
+    )
+    with _client(tmp_path, task_manager=manager) as client:
+        reference = _upload(client, "clip.mp4", b"video").json()["reference"]
+        asset_id = reference.split(":", 2)[1]
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            create = executor.submit(
+                client.post,
+                "/api/tasks/video-frames",
+                json={"input_path": reference, "image_format": "png"},
+            )
+            try:
+                assert validation_complete.wait(timeout=5)
+                sleep(0.1)
+                during_validation = client.delete(f"/api/uploads/{asset_id}")
+            finally:
+                allow_enqueue.set()
+            created = create.result(timeout=5)
+
+        after_handoff = client.delete(f"/api/uploads/{asset_id}")
+        manager.mark_finished(
+            created.json()["task_id"],
+            status=TaskStatus.SUCCEEDED,
+        )
+        after_terminal = client.delete(f"/api/uploads/{asset_id}")
+
+    assert during_validation.status_code == 409
+    assert during_validation.json()["error"]["code"] == "asset_in_use"
+    assert created.status_code == 202
+    assert after_handoff.status_code == 409
+    assert after_terminal.status_code == 204
+
+
+def test_failed_hosted_task_validation_releases_asset_read_pin(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = RedisTaskManager(
+        redis_connection=redis_connection,
+        queue=Queue("designtoolkit", connection=redis_connection),
+        data_dir=tmp_path,
+        max_queued_tasks=20,
+        retention_seconds=7200,
+    )
+
+    def reject_media(_self, _paths):
+        raise MediaLimitError("invalid_media", "Media validation failed")
+
+    monkeypatch.setattr(
+        HostedMediaValidator,
+        "validate_media_many",
+        reject_media,
+    )
+    with _client(tmp_path, task_manager=manager) as client:
+        reference = _upload(client, "clip.mp4", b"video").json()["reference"]
+        asset_id = reference.split(":", 2)[1]
+        rejected = client.post(
+            "/api/tasks/video-frames",
+            json={"input_path": reference, "image_format": "png"},
+        )
+        deleted = client.delete(f"/api/uploads/{asset_id}")
+
+    assert rejected.status_code == 422
+    assert deleted.status_code == 204
+    assert list(
+        redis_connection.scan_iter(match="dt:resource:asset-read-pin:*")
+    ) == []
+    assert list(
+        redis_connection.scan_iter(match="dt:resource:asset-readers:*")
+    ) == []
+
+
+def test_interrupted_hosted_task_validation_releases_asset_read_pin(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = RedisTaskManager(
+        redis_connection=redis_connection,
+        queue=Queue("designtoolkit", connection=redis_connection),
+        data_dir=tmp_path,
+        max_queued_tasks=20,
+        retention_seconds=7200,
+    )
+
+    def interrupt_validation(_self, _paths):
+        raise RuntimeError("client disconnected")
+
+    monkeypatch.setattr(
+        HostedMediaValidator,
+        "validate_media_many",
+        interrupt_validation,
+    )
+    with _client(tmp_path, task_manager=manager) as client:
+        reference = _upload(client, "clip.mp4", b"video").json()["reference"]
+        asset_id = reference.split(":", 2)[1]
+        with pytest.raises(RuntimeError, match="client disconnected"):
+            client.post(
+                "/api/tasks/video-frames",
+                json={"input_path": reference, "image_format": "png"},
+            )
+        deleted = client.delete(f"/api/uploads/{asset_id}")
+
+    assert deleted.status_code == 204
+    assert list(
+        redis_connection.scan_iter(match="dt:resource:asset-read-pin:*")
+    ) == []
+    assert list(
+        redis_connection.scan_iter(match="dt:resource:asset-readers:*")
+    ) == []
 
 
 @pytest.mark.parametrize("status", [TaskStatus.QUEUED, TaskStatus.RUNNING])

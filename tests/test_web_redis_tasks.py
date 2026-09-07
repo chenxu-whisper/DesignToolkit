@@ -488,6 +488,179 @@ def test_real_redis_asset_deletion_claim_blocks_enqueue(
     assert task.status is TaskStatus.QUEUED
 
 
+def test_real_redis_asset_read_pin_handoff_is_multi_asset_and_generation_safe(
+    real_redis_connection: Redis,
+    tmp_path: Path,
+) -> None:
+    manager = _manager(real_redis_connection, tmp_path)
+    session_id = "a" * 32
+    asset_ids = ("1" * 32, "2" * 32)
+    deletion_claim = manager.claim_asset_deletion(session_id, asset_ids[0])
+    with pytest.raises(TaskConflictError, match="deletion is already in progress"):
+        manager.acquire_asset_read_pin(session_id, asset_ids)
+    manager.release_asset_deletion(session_id, asset_ids[0], deletion_claim)
+    released_generation = manager.acquire_asset_read_pin(session_id, asset_ids)
+    assert released_generation.release()
+    active_generation = manager.acquire_asset_read_pin(session_id, asset_ids)
+
+    assert not released_generation.release()
+    for asset_id in asset_ids:
+        with pytest.raises(
+            TaskConflictError,
+            match="referenced by an active task",
+        ):
+            manager.claim_asset_deletion(session_id, asset_id)
+
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_paths=[str(tmp_path / "clip.mp4")] * 2),
+        owner_id=session_id,
+        asset_ids=asset_ids,
+        asset_read_pin_token=active_generation.token,
+    )
+
+    assert not active_generation.release()
+    for asset_id in asset_ids:
+        with pytest.raises(
+            TaskConflictError,
+            match="referenced by an active task",
+        ):
+            manager.claim_asset_deletion(session_id, asset_id)
+
+    manager.mark_finished(task.task_id, status=TaskStatus.SUCCEEDED)
+    for asset_id in asset_ids:
+        claim = manager.claim_asset_deletion(session_id, asset_id)
+        manager.release_asset_deletion(session_id, asset_id, claim)
+
+
+def test_real_redis_multiple_asset_read_pins_handoff_independently(
+    real_redis_connection: Redis,
+    tmp_path: Path,
+) -> None:
+    manager = _manager(real_redis_connection, tmp_path)
+    session_id = "a" * 32
+    asset_id = "1" * 32
+    pins = [
+        manager.acquire_asset_read_pin(session_id, (asset_id,))
+        for _index in range(2)
+    ]
+    tasks = [
+        manager.create_video_frames_task(
+            VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+            owner_id=session_id,
+            asset_ids=(asset_id,),
+            asset_read_pin_token=pin.token,
+        )
+        for pin in pins
+    ]
+
+    manager.mark_finished(tasks[0].task_id, status=TaskStatus.SUCCEEDED)
+    with pytest.raises(
+        TaskConflictError,
+        match="referenced by an active task",
+    ):
+        manager.claim_asset_deletion(session_id, asset_id)
+
+    manager.mark_finished(tasks[1].task_id, status=TaskStatus.FAILED, error="failed")
+    claim = manager.claim_asset_deletion(session_id, asset_id)
+    manager.release_asset_deletion(session_id, asset_id, claim)
+
+
+def test_real_redis_asset_read_pin_refresh_and_stale_reconcile(
+    real_redis_connection: Redis,
+    tmp_path: Path,
+) -> None:
+    manager = _manager(real_redis_connection, tmp_path)
+    session_id = "a" * 32
+    asset_id = "1" * 32
+    pin = manager.acquire_asset_read_pin(session_id, (asset_id,))
+    pin_key = f"dt:resource:asset-read-pin:{pin.token}"
+    readers_key = f"dt:resource:asset-readers:{session_id}:{asset_id}"
+    real_redis_connection.pexpire(pin_key, 1_000)
+    real_redis_connection.zadd(readers_key, {pin.token: 0})
+
+    pin.refresh()
+
+    assert real_redis_connection.pttl(pin_key) > 1_000
+    assert real_redis_connection.zscore(readers_key, pin.token) > time.time() * 1000
+    real_redis_connection.delete(pin_key)
+    real_redis_connection.zadd(readers_key, {pin.token: 0})
+    assert manager.reconcile_tasks(grace_seconds=60) == 1
+    claim = manager.claim_asset_deletion(session_id, asset_id)
+    manager.release_asset_deletion(session_id, asset_id, claim)
+
+
+def test_real_redis_asset_read_pin_release_recovers_acknowledgement_loss(
+    real_redis_connection: Redis,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(real_redis_connection, tmp_path)
+    session_id = "a" * 32
+    asset_id = "1" * 32
+    pin = manager.acquire_asset_read_pin(session_id, (asset_id,))
+    release = manager._release_asset_read_pin_script
+
+    def release_then_lose_ack(*args, **kwargs):
+        release(*args, **kwargs)
+        raise RedisConnectionError("asset read pin release acknowledgement lost")
+
+    monkeypatch.setattr(
+        manager,
+        "_release_asset_read_pin_script",
+        release_then_lose_ack,
+    )
+
+    assert pin.release()
+    claim = manager.claim_asset_deletion(session_id, asset_id)
+    manager.release_asset_deletion(session_id, asset_id, claim)
+
+
+def test_real_redis_asset_read_pin_handoff_ack_loss_is_reconciled(
+    real_redis_connection: Redis,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(real_redis_connection, tmp_path)
+    session_id = "a" * 32
+    asset_id = "1" * 32
+    pin = manager.acquire_asset_read_pin(session_id, (asset_id,))
+    reserve = manager._reserve_enqueue_script
+
+    def reserve_then_lose_ack(*args, **kwargs):
+        reserve(*args, **kwargs)
+        raise RedisConnectionError("asset read pin handoff acknowledgement lost")
+
+    monkeypatch.setattr(manager, "_reserve_enqueue_script", reserve_then_lose_ack)
+
+    with pytest.raises(RedisConnectionError, match="acknowledgement lost"):
+        manager.create_video_frames_task(
+            VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+            owner_id=session_id,
+            asset_ids=(asset_id,),
+            asset_read_pin_token=pin.token,
+        )
+
+    assert not pin.release()
+    assert list(
+        real_redis_connection.scan_iter(match="dt:resource:asset-read-pin:*")
+    ) == []
+    assert list(
+        real_redis_connection.scan_iter(match="dt:resource:asset-readers:*")
+    ) == []
+    with pytest.raises(
+        TaskConflictError,
+        match="referenced by an active task",
+    ):
+        manager.claim_asset_deletion(session_id, asset_id)
+
+    monkeypatch.setattr(manager, "_reserve_enqueue_script", reserve)
+    for key in real_redis_connection.scan_iter(match="dt:enqueue-owner:*"):
+        real_redis_connection.delete(key)
+    assert manager.reconcile_tasks(grace_seconds=0) == 1
+    claim = manager.claim_asset_deletion(session_id, asset_id)
+    manager.release_asset_deletion(session_id, asset_id, claim)
+
+
 def test_real_redis_reconcile_releases_terminal_asset_pin_after_ack_loss(
     real_redis_connection: Redis,
     tmp_path: Path,
