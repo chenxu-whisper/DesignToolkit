@@ -347,6 +347,7 @@ class FakeWindowsLaunchGate:
         self.claim_calls = 0
         self.close_calls = 0
         self.closed = False
+        self.has_job = False
 
     def start_launcher(
         self,
@@ -356,13 +357,13 @@ class FakeWindowsLaunchGate:
         self.start_calls += 1
         return popen(self.launcher_command, **popen_kwargs)
 
-    def claim_and_release(
-        self,
-        process: FakePopen,
-        cancel: Event | None = None,
-    ) -> None:
-        del process, cancel
+    def prepare(self, process: FakePopen) -> None:
+        del process
         self.claim_calls += 1
+        self.has_job = True
+
+    def release(self) -> None:
+        pass
 
     def read_startup_error(self, returncode: int | None) -> OSError | None:
         return self.startup_error if returncode == 126 else None
@@ -533,24 +534,22 @@ def test_windows_launch_transaction_cancels_each_blocked_startup_stage(
             self.target_alive = False
             self.target_was_released = False
 
-        def claim_and_release(
-            self,
-            process: FakePopen,
-            cancel: Event | None = None,
-        ) -> None:
+        def prepare(self, process: FakePopen) -> None:
             del process
             self.claim_calls += 1
-            for operation in ("create_job", "set_info", "assign", "set_event"):
+            for operation in ("create_job", "set_info", "assign"):
                 if operation == "create_job":
                     self.has_job = True
-                elif operation == "set_event":
-                    self.target_alive = True
-                    self.target_was_released = True
                 if interrupted_stage == operation:
                     stage_entered.set()
                     assert release_stage.wait(2)
-                if cancel is not None and cancel.is_set():
-                    return
+
+        def release(self) -> None:
+            self.target_alive = True
+            self.target_was_released = True
+            if interrupted_stage == "set_event":
+                stage_entered.set()
+                assert release_stage.wait(2)
 
         def close(self) -> None:
             self.target_alive = False
@@ -570,8 +569,12 @@ def test_windows_launch_transaction_cancels_each_blocked_startup_stage(
             raise interruption
 
         def cancel() -> None:
-            original_cancel()
-            release_stage.set()
+            if interrupted_stage == "set_event":
+                release_stage.set()
+                original_cancel()
+            else:
+                original_cancel()
+                release_stage.set()
 
         transaction.wait = interrupting_wait
         transaction.cancel = cancel
@@ -690,6 +693,109 @@ def test_windows_launch_transaction_preserves_gate_factory_timeout(
     assert exc_info.value is interruption
 
 
+def test_windows_launch_transaction_cancel_wins_before_commit(tmp_path: Path) -> None:
+    prepared = Event()
+    continue_commit = Event()
+    operations: list[str] = []
+    marker = tmp_path / "target-started.txt"
+
+    class PreparedGate(FakeWindowsLaunchGate):
+        has_job = True
+
+        def prepare(self, process: FakePopen) -> None:
+            del process
+            operations.append("prepare")
+            self.has_job = True
+            prepared.set()
+            assert continue_commit.wait(2)
+
+        def release(self) -> None:
+            operations.append("set_event")
+            marker.touch()
+
+        def close(self) -> None:
+            operations.append("close")
+            super().close()
+
+    process = FakePopen([], wait_times_out=True)
+    gate = PreparedGate()
+    transaction = ffmpeg_backend._WindowsLaunchTransaction(
+        ["ffmpeg", "out.mp4"],
+        lambda _command: gate,  # type: ignore[arg-type]
+        _popen_factory(process, []),  # type: ignore[arg-type]
+        {},
+        FfmpegBackend._abort_windows_launch,
+    )
+
+    transaction.start()
+    assert prepared.wait(2)
+    transaction.cancel()
+    continue_commit.set()
+    transaction.wait_for_cleanup()
+
+    assert "set_event" not in operations
+    assert not marker.exists()
+    assert gate.closed
+    assert process.kill_called
+    assert not transaction._thread.is_alive()
+
+
+def test_windows_launch_transaction_commit_wins_and_cancel_aborts_immediately() -> None:
+    worker_waiting = Event()
+    release_worker = Event()
+    operations: list[str] = []
+
+    class BlockingDecision:
+        def set(self) -> None:
+            pass
+
+        def wait(self) -> None:
+            worker_waiting.set()
+            assert release_worker.wait(2)
+
+    class PreparedGate(FakeWindowsLaunchGate):
+        has_job = True
+        target_alive = False
+
+        def prepare(self, process: FakePopen) -> None:
+            del process
+            operations.append("prepare")
+            self.has_job = True
+
+        def release(self) -> None:
+            operations.append("set_event")
+            self.target_alive = True
+
+        def close(self) -> None:
+            operations.append("close")
+            self.target_alive = False
+            super().close()
+
+    process = FakePopen([], wait_times_out=True)
+    gate = PreparedGate()
+    transaction = ffmpeg_backend._WindowsLaunchTransaction(
+        ["ffmpeg", "out.mp4"],
+        lambda _command: gate,  # type: ignore[arg-type]
+        _popen_factory(process, []),  # type: ignore[arg-type]
+        {},
+        FfmpegBackend._abort_windows_launch,
+    )
+    transaction._decision = BlockingDecision()  # type: ignore[assignment]
+
+    transaction.start()
+    assert transaction.wait().process is process
+    assert worker_waiting.wait(2)
+    transaction.cancel()
+
+    assert operations == ["prepare", "set_event", "close"]
+    assert not gate.target_alive
+    assert process.kill_called
+
+    release_worker.set()
+    transaction.wait_for_cleanup()
+    assert not transaction._thread.is_alive()
+
+
 def test_windows_launcher_popen_failure_preserves_original_when_cleanup_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -736,12 +842,9 @@ def test_windows_gate_setup_failure_closes_job_before_kill_even_if_close_fails(
     class JobOwningGate(FakeWindowsLaunchGate):
         has_job = True
 
-        def claim_and_release(
-            self,
-            process: FakePopen,
-            cancel: Event | None = None,
-        ) -> None:
-            del process, cancel
+        def prepare(self, process: FakePopen) -> None:
+            del process
+            self.has_job = True
             raise ffmpeg_backend._WindowsContainmentError(OSError("assign failed"))
 
         def close(self) -> None:
@@ -887,7 +990,8 @@ def test_windows_gate_close_attempts_event_after_job_close_failure() -> None:
     gate = ffmpeg_backend._WindowsLaunchGate.create(["ffmpeg"], api=api)
     process = FakePopen([])
     process._handle = 456  # type: ignore[attr-defined]
-    gate.claim_and_release(process)  # type: ignore[arg-type]
+    gate.prepare(process)  # type: ignore[arg-type]
+    gate.release()
 
     with pytest.raises(PermissionError, match="job close denied"):
         gate.close()
@@ -1296,6 +1400,84 @@ def test_ffmpeg_backend_does_not_signal_reused_posix_group_after_term_esrch(
     assert exc_info.value is timeout
     assert signals == [(process.pid, signal.SIGTERM)]
     assert process.wait_calls == [ffmpeg_backend._PROCESS_CLEANUP_TIMEOUT_SECONDS]
+
+
+def test_ffmpeg_backend_does_not_signal_reaped_posix_group_after_finish_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timeout = JobTimeoutException("worker timed out after communicate")
+
+    class GroupedPopen(FakePopen):
+        pid = 4321
+
+    process = GroupedPopen([("", "")])
+    signals: list[tuple[int, int]] = []
+
+    def fail_finish(_monitor: OutputTargetMonitor) -> None:
+        raise timeout
+
+    monkeypatch.setattr(ffmpeg_backend, "os_name", "posix")
+    monkeypatch.setattr(ffmpeg_backend.OutputTargetMonitor, "finish", fail_finish)
+    monkeypatch.setattr(
+        os,
+        "killpg",
+        lambda process_group, sent_signal: signals.append(
+            (process_group, sent_signal)
+        ),
+        raising=False,
+    )
+    backend = FfmpegBackend(
+        output_guard=OutputBudgetGuard(tmp_path, max_bytes=80, safety_bytes=1),
+        popen=_popen_factory(process, []),
+    )
+
+    with pytest.raises(JobTimeoutException) as exc_info:
+        backend.run(["ffmpeg", str(tmp_path / "out.mp4")])
+
+    assert exc_info.value is timeout
+    assert process.returncode == 0
+    assert signals == []
+    assert process.wait_calls == []
+
+
+def test_ffmpeg_backend_does_not_signal_posix_group_reaped_by_poll(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timeout = JobTimeoutException("worker timed out before communicate reaped")
+
+    class GroupedPopen(FakePopen):
+        pid = 4321
+
+        def __init__(self) -> None:
+            super().__init__([timeout])
+            self.poll_calls = 0
+
+        def poll(self) -> int:
+            self.poll_calls += 1
+            self.returncode = 0
+            return 0
+
+    process = GroupedPopen()
+    signals: list[tuple[int, int]] = []
+    monkeypatch.setattr(ffmpeg_backend, "os_name", "posix")
+    monkeypatch.setattr(
+        os,
+        "killpg",
+        lambda process_group, sent_signal: signals.append(
+            (process_group, sent_signal)
+        ),
+        raising=False,
+    )
+    backend = FfmpegBackend(popen=_popen_factory(process, []))
+
+    with pytest.raises(JobTimeoutException) as exc_info:
+        backend.run(["ffmpeg", "out.mp4"])
+
+    assert exc_info.value is timeout
+    assert process.poll_calls == 1
+    assert signals == []
+    assert process.wait_calls == []
 
 
 def _windows_process_is_active(pid: int) -> bool:

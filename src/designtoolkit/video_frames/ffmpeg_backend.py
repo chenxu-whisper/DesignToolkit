@@ -553,11 +553,7 @@ class _WindowsLaunchGate:
             )
         return _windows_startup_error(bytes(payload))
 
-    def claim_and_release(
-        self,
-        process: subprocess.Popen[str],
-        cancel: Event | None = None,
-    ) -> None:
+    def prepare(self, process: subprocess.Popen[str]) -> None:
         if self._released:
             raise RuntimeError("Windows FFmpeg launch gate was already released")
         process_handle = getattr(process, "_handle", None)
@@ -565,16 +561,14 @@ class _WindowsLaunchGate:
             raise RuntimeError("Windows launcher process handle is unavailable")
         job_handle = self._call_containment_api(self._api.create_job)
         self._job_handle = job_handle
-        if cancel is not None and cancel.is_set():
-            return
         self._call_containment_api(lambda: self._api.set_job_kill_on_close(job_handle))
-        if cancel is not None and cancel.is_set():
-            return
         self._call_containment_api(
             lambda: self._api.assign_process(job_handle, process_handle)
         )
-        if cancel is not None and cancel.is_set():
-            return
+
+    def release(self) -> None:
+        if self._released:
+            raise RuntimeError("Windows FFmpeg launch gate was already released")
         self._call_containment_api(lambda: self._api.set_event(self._event_handle))
         self._released = True
 
@@ -645,7 +639,13 @@ class _WindowsLaunchTransaction:
         self._decision = Event()
         self._done = Event()
         self._state_lock = Lock()
+        self._commit_lock = RLock()
+        self._abort_lock = Lock()
         self._accepted = False
+        self._committed = False
+        self._aborted = False
+        self._process: subprocess.Popen[str] | None = None
+        self._gate: _WindowsLaunchGate | None = None
         self._result: _WindowsLaunchResult | None = None
         self._thread = Thread(
             target=self._run,
@@ -668,16 +668,21 @@ class _WindowsLaunchTransaction:
         return result
 
     def accept(self) -> None:
-        with self._state_lock:
+        with self._commit_lock, self._state_lock:
             if self._cancel.is_set():
                 raise RuntimeError("Windows FFmpeg launch was already cancelled")
             self._accepted = True
             self._decision.set()
 
     def cancel(self) -> None:
-        with self._state_lock:
+        abort_committed = False
+        with self._commit_lock:
             self._cancel.set()
+            with self._state_lock:
+                abort_committed = self._committed and not self._accepted
             self._decision.set()
+        if abort_committed:
+            self._abort_owned_launch()
 
     @property
     def was_accepted(self) -> bool:
@@ -693,17 +698,26 @@ class _WindowsLaunchTransaction:
         process: subprocess.Popen[str] | None = None
         try:
             gate = self._gate_factory(self._command)
+            self._gate = gate
             if self._cancel.is_set():
                 self._close_gate(gate)
                 return
 
             process = gate.start_launcher(self._popen, self._popen_kwargs)
+            self._process = process
             if self._cancel.is_set():
                 self._abort_launch(process, gate)
                 return
 
-            gate.claim_and_release(process, self._cancel)
-            if self._cancel.is_set():
+            gate.prepare(process)
+            cancelled_before_commit = False
+            with self._commit_lock:
+                if self._cancel.is_set():
+                    cancelled_before_commit = True
+                else:
+                    gate.release()
+                    self._committed = True
+            if cancelled_before_commit:
                 self._abort_launch(process, gate)
                 return
 
@@ -731,11 +745,21 @@ class _WindowsLaunchTransaction:
                 self._ready.set()
             self._done.set()
 
+    def _abort_owned_launch(self) -> None:
+        process = self._process
+        gate = self._gate
+        if process is not None and gate is not None:
+            self._abort_launch(process, gate)
+
     def _abort_launch(
         self,
         process: subprocess.Popen[str],
         gate: _WindowsLaunchGate,
     ) -> None:
+        with self._abort_lock:
+            if self._aborted:
+                return
+            self._aborted = True
         try:
             self._abort(process, gate)
         except BaseException:
@@ -995,6 +1019,8 @@ class FfmpegBackend:
     ) -> None:
         pid = getattr(process, "pid", None)
         if os_name == "posix" and pid is not None:
+            if process.returncode is not None or not self._process_is_running(process):
+                return
             try:
                 os.killpg(pid, signal.SIGTERM)
             except ProcessLookupError:
