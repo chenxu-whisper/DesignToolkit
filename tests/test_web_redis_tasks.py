@@ -754,31 +754,59 @@ def test_real_redis_old_worker_releases_new_generation_task_pin(
 
 @pytest.mark.parametrize("use_lua", [True, False], ids=["lua", "fallback"])
 @pytest.mark.parametrize(
-    "legacy_asset_ids",
+    "corruption",
     [
-        json.dumps(["f" * 32]),
-        '{"not":"an-asset-list"}',
+        "asset-divergent",
+        "asset-malformed",
+        "task-mismatch",
+        "session-mismatch",
+        "session-malformed",
     ],
-    ids=["divergent", "malformed"],
 )
-def test_real_redis_task_pin_release_preserves_divergent_metadata(
+def test_real_redis_task_pin_release_repairs_untrusted_metadata(
     real_redis_connection: Redis,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     use_lua: bool,
-    legacy_asset_ids: str,
+    corruption: str,
 ) -> None:
     manager = _manager(real_redis_connection, tmp_path)
     session_id = "a" * 32
-    asset_id = "1" * 32
+    shared_asset_id = "1" * 32
+    exclusive_asset_id = "2" * 32
     task = manager.create_video_frames_task(
-        VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+        VideoFramesTaskRequest(input_paths=[str(tmp_path / "clip.mp4")] * 2),
         owner_id=session_id,
-        asset_identities=((asset_id, "2" * 32),),
+        asset_identities=(
+            (shared_asset_id, "3" * 32),
+            (exclusive_asset_id, "4" * 32),
+        ),
+    )
+    other_task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "other.mp4")),
+        owner_id=session_id,
+        asset_identities=((shared_asset_id, "5" * 32),),
     )
     pin_key = f"dt:resource:task-pin:{task.task_id}"
-    asset_tasks_key = f"dt:resource:asset-tasks:{session_id}:{asset_id}"
-    real_redis_connection.hset(pin_key, "asset_ids", legacy_asset_ids)
+    session_pins_key = f"dt:resource:session:{session_id}:task-pins"
+    if corruption == "asset-divergent":
+        real_redis_connection.hset(
+            pin_key,
+            "asset_ids",
+            json.dumps(["f" * 32]),
+        )
+    elif corruption == "asset-malformed":
+        real_redis_connection.hset(pin_key, "asset_identities", "{")
+    elif corruption == "task-mismatch":
+        real_redis_connection.hset(
+            pin_key,
+            "task_id",
+            "ffffffff-ffff-4fff-bfff-ffffffffffff",
+        )
+    elif corruption == "session-mismatch":
+        real_redis_connection.hset(pin_key, "session_id", "b" * 32)
+    else:
+        real_redis_connection.hset(pin_key, "session_id", "not-a-session")
     if not use_lua:
         monkeypatch.setattr(
             manager,
@@ -788,13 +816,18 @@ def test_real_redis_task_pin_release_preserves_divergent_metadata(
             ),
         )
 
-    with pytest.raises(TaskConflictError, match="asset metadata is invalid"):
-        manager.release_task_pin(task.task_id)
+    assert manager.release_task_pin(task.task_id)
 
-    assert real_redis_connection.exists(pin_key)
-    assert real_redis_connection.sismember(asset_tasks_key, task.task_id)
-    with pytest.raises(TaskConflictError, match="active task"):
-        manager.claim_asset_deletion(session_id, asset_id)
+    assert not real_redis_connection.exists(pin_key)
+    assert real_redis_connection.smembers(session_pins_key) == {
+        other_task.task_id.encode()
+    }
+    assert real_redis_connection.smembers(
+        f"dt:resource:asset-tasks:{session_id}:{shared_asset_id}"
+    ) == {other_task.task_id.encode()}
+    assert not real_redis_connection.exists(
+        f"dt:resource:asset-tasks:{session_id}:{exclusive_asset_id}"
+    )
 
 
 @pytest.mark.parametrize("use_lua", [True, False], ids=["lua", "fallback"])
@@ -921,13 +954,39 @@ def test_real_redis_corrupt_task_pin_uses_task_owner_when_session_is_missing(
     manager.release_asset_deletion(session_id, asset_id, claim)
 
 
+def test_real_redis_missing_task_pin_repairs_reverse_indexes(
+    real_redis_connection: Redis,
+    tmp_path: Path,
+) -> None:
+    manager = _manager(real_redis_connection, tmp_path)
+    session_id = "a" * 32
+    asset_id = "1" * 32
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+        owner_id=session_id,
+        asset_identities=((asset_id, "2" * 32),),
+    )
+    pin_key = f"dt:resource:task-pin:{task.task_id}"
+    real_redis_connection.delete(pin_key)
+
+    assert manager.release_task_pin(task.task_id)
+    assert manager.release_task_pin(task.task_id)
+
+    assert not real_redis_connection.exists(
+        f"dt:resource:session:{session_id}:task-pins"
+    )
+    assert not real_redis_connection.exists(
+        f"dt:resource:asset-tasks:{session_id}:{asset_id}"
+    )
+
+
 def test_real_redis_corrupt_task_pin_scans_session_indexes_without_owner(
     real_redis_connection: Redis,
     tmp_path: Path,
 ) -> None:
     manager = _manager(real_redis_connection, tmp_path)
     session_id = "a" * 32
-    task_id = "orphaned-task"
+    task_id = "ffffffff-ffff-4fff-bfff-ffffffffffff"
     asset_id = "1" * 32
     pin_key = f"dt:resource:task-pin:{task_id}"
     session_pins_key = f"dt:resource:session:{session_id}:task-pins"
@@ -965,7 +1024,7 @@ def test_real_redis_corrupt_task_pin_repair_is_idempotent_after_ack_loss(
     )
     pin_key = f"dt:resource:task-pin:{task.task_id}"
     real_redis_connection.hdel(pin_key, "asset_ids", "asset_identities")
-    repair = manager._repair_corrupt_task_pin_indexes
+    repair = manager._repair_task_reverse_indexes
 
     def repair_then_lose_ack(*args, **kwargs):
         repair(*args, **kwargs)
@@ -973,14 +1032,15 @@ def test_real_redis_corrupt_task_pin_repair_is_idempotent_after_ack_loss(
 
     monkeypatch.setattr(
         manager,
-        "_repair_corrupt_task_pin_indexes",
+        "_repair_task_reverse_indexes",
         repair_then_lose_ack,
     )
     with pytest.raises(RedisConnectionError, match="acknowledgement lost"):
         manager.release_task_pin(task.task_id)
 
-    monkeypatch.setattr(manager, "_repair_corrupt_task_pin_indexes", repair)
-    assert not manager.release_task_pin(task.task_id)
+    monkeypatch.setattr(manager, "_repair_task_reverse_indexes", repair)
+    assert manager.release_task_pin(task.task_id)
+    assert manager._repair_task_reverse_indexes(task.task_id)
     assert not real_redis_connection.exists(pin_key)
     assert not real_redis_connection.exists(
         f"dt:resource:session:{session_id}:task-pins"
@@ -1027,7 +1087,15 @@ def test_real_redis_task_pin_normal_release_does_not_scan(
 @pytest.mark.parametrize("use_lua", [True, False], ids=["lua", "fallback"])
 @pytest.mark.parametrize(
     "corruption",
-    ["missing", "divergent"],
+    [
+        "asset-missing",
+        "asset-divergent",
+        "asset-malformed",
+        "pin-missing",
+        "task-mismatch",
+        "session-mismatch",
+        "session-malformed",
+    ],
 )
 def test_real_redis_enqueue_rollback_repairs_corrupt_task_pin_indexes(
     real_redis_connection: Redis,
@@ -1077,18 +1145,32 @@ def test_real_redis_enqueue_rollback_repairs_corrupt_task_pin_indexes(
             f"dt:resource:asset-tasks:{session_id}:{orphan_asset_id}",
             task_id,
         )
-        if corruption == "missing":
+        if corruption == "asset-missing":
             real_redis_connection.hdel(
                 pin_key,
                 "asset_ids",
                 "asset_identities",
             )
-        else:
+        elif corruption == "asset-divergent":
             real_redis_connection.hset(
                 pin_key,
                 "asset_ids",
                 json.dumps(["f" * 32]),
             )
+        elif corruption == "asset-malformed":
+            real_redis_connection.hset(pin_key, "asset_identities", "{")
+        elif corruption == "pin-missing":
+            real_redis_connection.delete(pin_key)
+        elif corruption == "task-mismatch":
+            real_redis_connection.hset(
+                pin_key,
+                "task_id",
+                "ffffffff-ffff-4fff-bfff-ffffffffffff",
+            )
+        elif corruption == "session-mismatch":
+            real_redis_connection.hset(pin_key, "session_id", "b" * 32)
+        else:
+            real_redis_connection.hset(pin_key, "session_id", "not-a-session")
         raise TaskConflictError("enqueue rejected")
 
     with pytest.raises(TaskConflictError, match="enqueue rejected"):
@@ -1120,7 +1202,7 @@ def test_real_redis_enqueue_rollback_repairs_corrupt_task_pin_indexes(
     assert not real_redis_connection.exists(
         f"dt:resource:asset-tasks:{session_id}:{orphan_asset_id}"
     )
-    assert not manager._rollback_enqueue(
+    assert manager._rollback_enqueue(
         task_id,
         owner_id=session_id,
         owner_token=owner_token,
@@ -1285,7 +1367,7 @@ def test_real_redis_enqueue_rollback_repairs_corrupt_pin_after_ack_loss(
         owner_id=session_id,
         owner_token=owner_token,
     )
-    assert not manager._rollback_enqueue(
+    assert manager._rollback_enqueue(
         task_id,
         owner_id=session_id,
         owner_token=owner_token,

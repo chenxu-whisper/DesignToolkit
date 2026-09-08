@@ -9,7 +9,7 @@ from queue import Empty
 from threading import Event, Thread
 from time import monotonic, sleep, time
 from typing import TYPE_CHECKING, Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from redis import Redis
 from redis.exceptions import RedisError, ResponseError, WatchError
@@ -309,10 +309,12 @@ local release_pin = false
 local repair_pin = false
 local asset_ids = {}
 if owner_id ~= "" then
+    release_pin = true
     local pin_session = redis.call("HGET", KEYS[6], "session_id")
     local pin_task = redis.call("HGET", KEYS[6], "task_id")
-    if pin_session == owner_id and pin_task == task_id then
-        release_pin = true
+    if pin_session ~= owner_id or pin_task ~= task_id then
+        repair_pin = true
+    else
         local identities_json = redis.call(
             "HGET",
             KEYS[6],
@@ -322,78 +324,91 @@ if owner_id ~= "" then
         if not identities_json and not asset_ids_json then
             repair_pin = true
         end
-        if identities_json then
+        if identities_json and not repair_pin then
             if string.sub(identities_json, 1, 1) ~= "[" then
-                return 2
-            end
-            local decoded, identities = pcall(cjson.decode, identities_json)
-            if not decoded or type(identities) ~= "table" then
-                return 2
-            end
-            for index, identity in ipairs(identities) do
-                if type(identity) ~= "table"
-                    or #identity ~= 2
-                    or type(identity[1]) ~= "string"
-                    or (
-                        identity[2] ~= cjson.null
-                        and type(identity[2]) ~= "string"
-                    ) then
-                    return 2
+                repair_pin = true
+            else
+                local decoded, identities = pcall(cjson.decode, identities_json)
+                if not decoded or type(identities) ~= "table" then
+                    repair_pin = true
+                else
+                    for index, identity in ipairs(identities) do
+                        if type(identity) ~= "table"
+                            or #identity ~= 2
+                            or type(identity[1]) ~= "string"
+                            or (
+                                identity[2] ~= cjson.null
+                                and type(identity[2]) ~= "string"
+                            )
+                            or (
+                                type(identity[2]) == "string"
+                                and (
+                                    string.len(identity[2]) ~= 32
+                                    or string.match(
+                                        identity[2],
+                                        "^[0-9a-f]+$"
+                                    ) == nil
+                                )
+                            ) then
+                            repair_pin = true
+                            break
+                        end
+                        asset_ids[index] = identity[1]
+                    end
                 end
-                if type(identity[2]) == "string"
-                    and (
-                        string.len(identity[2]) ~= 32
-                        or string.match(identity[2], "^[0-9a-f]+$") == nil
-                    ) then
-                    return 2
-                end
-                asset_ids[index] = identity[1]
             end
-            if asset_ids_json then
+            if asset_ids_json and not repair_pin then
                 if string.sub(asset_ids_json, 1, 1) ~= "[" then
-                    return 2
+                    repair_pin = true
+                else
+                    local decoded_ids, legacy_asset_ids = pcall(
+                        cjson.decode,
+                        asset_ids_json
+                    )
+                    if not decoded_ids
+                        or type(legacy_asset_ids) ~= "table"
+                        or #legacy_asset_ids ~= #asset_ids then
+                        repair_pin = true
+                    end
+                    if not repair_pin then
+                        for index, asset_id in ipairs(legacy_asset_ids) do
+                            if type(asset_id) ~= "string"
+                                or asset_id ~= asset_ids[index] then
+                                repair_pin = true
+                                break
+                            end
+                        end
+                    end
                 end
-                local decoded_ids, legacy_asset_ids = pcall(
+            end
+        elseif asset_ids_json and not repair_pin then
+            if string.sub(asset_ids_json, 1, 1) ~= "[" then
+                repair_pin = true
+            else
+                local decoded, legacy_asset_ids = pcall(
                     cjson.decode,
                     asset_ids_json
                 )
-                if not decoded_ids or type(legacy_asset_ids) ~= "table" then
-                    return 2
-                end
-                if #legacy_asset_ids ~= #asset_ids then
+                if not decoded or type(legacy_asset_ids) ~= "table" then
                     repair_pin = true
-                end
-                for index, asset_id in ipairs(legacy_asset_ids) do
-                    if type(asset_id) ~= "string" then
-                        return 2
+                else
+                    for index, asset_id in ipairs(legacy_asset_ids) do
+                        if type(asset_id) ~= "string" then
+                            repair_pin = true
+                            break
+                        end
+                        asset_ids[index] = asset_id
                     end
-                    if asset_id ~= asset_ids[index] then
-                        repair_pin = true
-                    end
                 end
-            end
-        elseif asset_ids_json then
-            if string.sub(asset_ids_json, 1, 1) ~= "[" then
-                return 2
-            end
-            local decoded, legacy_asset_ids = pcall(
-                cjson.decode,
-                asset_ids_json
-            )
-            if not decoded or type(legacy_asset_ids) ~= "table" then
-                return 2
-            end
-            for index, asset_id in ipairs(legacy_asset_ids) do
-                if type(asset_id) ~= "string" then
-                    return 2
-                end
-                asset_ids[index] = asset_id
             end
         end
-        for _, asset_id in ipairs(asset_ids) do
-            if string.len(asset_id) ~= 32
-                or string.match(asset_id, "^[0-9a-f]+$") == nil then
-                return 2
+        if not repair_pin then
+            for _, asset_id in ipairs(asset_ids) do
+                if string.len(asset_id) ~= 32
+                    or string.match(asset_id, "^[0-9a-f]+$") == nil then
+                    repair_pin = true
+                    break
+                end
             end
         end
     end
@@ -2427,15 +2442,10 @@ class RedisTaskManager:
                     args=[task_id, owner, owner_token, _ASSET_TASK_PREFIX],
                 )
             )
-            if result == 2:
-                raise TaskConflictError("Task pin asset metadata is invalid")
-            if result in {0, 4} and self._repair_corrupt_rolled_back_enqueue_pin(
-                task_id,
-                owner,
+            if result in {0, 4} and self._repair_rolled_back_enqueue_indexes(
+                task_id
             ):
                 return True
-            if result == 4:
-                raise TaskConflictError("Task pin asset metadata is invalid")
             return result == 1
         except ResponseError as error_response:
             if "unknown command" not in str(error_response).lower():
@@ -2463,17 +2473,17 @@ class RedisTaskManager:
                     )
                     if _redis_text(token) != owner_token:
                         pipeline.unwatch()
-                        return self._repair_corrupt_rolled_back_enqueue_pin(
-                            task_id,
-                            owner,
+                        return self._repair_rolled_back_enqueue_indexes(
+                            task_id
                         )
                     pin_metadata = pipeline.hgetall(_task_pin_key(task_id))
                     release_pin = bool(owner) and (
                         _redis_hash_text(pin_metadata, "session_id") == owner
                         and _redis_hash_text(pin_metadata, "task_id") == task_id
                     )
-                    repair_pin = release_pin and _task_pin_asset_metadata_corrupt(
-                        pin_metadata
+                    repair_pin = bool(owner) and (
+                        not release_pin
+                        or _task_pin_asset_metadata_corrupt(pin_metadata)
                     )
                     asset_ids = (
                         ()
@@ -2504,36 +2514,24 @@ class RedisTaskManager:
                         pipeline.srem(_session_task_pins_key(owner), task_id)
                     pipeline.execute()
                     if repair_pin:
-                        return self._repair_corrupt_rolled_back_enqueue_pin(
-                            task_id,
-                            owner,
+                        return self._repair_rolled_back_enqueue_indexes(
+                            task_id
                         )
                     return True
                 except WatchError:
                     continue
 
-    def _repair_corrupt_rolled_back_enqueue_pin(
+    def _repair_rolled_back_enqueue_indexes(
         self,
         task_id: str,
-        owner_id: str,
     ) -> bool:
-        if not owner_id:
-            return False
         pipeline = self._redis.pipeline(transaction=False)
         pipeline.get(_task_key(task_id))
         pipeline.hgetall(_enqueue_intent_key(task_id))
-        pipeline.hgetall(_task_pin_key(task_id))
-        task_value, intent_metadata, pin_metadata = pipeline.execute()
+        task_value, intent_metadata = pipeline.execute()
         if task_value is not None or intent_metadata:
             return False
-        if (
-            _redis_hash_text(pin_metadata, "session_id") != owner_id
-            or _redis_hash_text(pin_metadata, "task_id") != task_id
-            or not _task_pin_asset_metadata_corrupt(pin_metadata)
-        ):
-            return False
-        self._repair_corrupt_task_pin_indexes(task_id, pin_metadata)
-        return True
+        return self._repair_task_reverse_indexes(task_id)
 
     def _clear_enqueue_intent(
         self,
@@ -3005,15 +3003,25 @@ class RedisTaskManager:
         pin_key = _task_pin_key(task_id)
         metadata = self._redis.hgetall(pin_key)
         if not metadata:
-            return False
+            task = self.get_task(task_id)
+            if task is not None and task.owner_id is None:
+                return False
+            return self._repair_task_reverse_indexes(task_id)
         session_id = _redis_hash_text(metadata, "session_id")
-        if session_id is None:
-            if _task_pin_asset_metadata_missing(metadata):
-                return self._repair_corrupt_task_pin_indexes(
-                    task_id,
-                    metadata,
-                )
-            return False
+        if (
+            _redis_hash_text(metadata, "task_id") != task_id
+            or session_id is None
+            or _task_pin_asset_metadata_corrupt(metadata)
+        ):
+            return self._repair_task_reverse_indexes(task_id)
+        try:
+            _validate_session_id(session_id)
+        except ValueError:
+            return self._repair_task_reverse_indexes(task_id)
+        task = self.get_task(task_id)
+        if task is not None and task.owner_id != session_id:
+            return self._repair_task_reverse_indexes(task_id)
+
         session_task_pins_key = _session_task_pins_key(session_id)
         try:
             result = int(
@@ -3039,15 +3047,13 @@ class RedisTaskManager:
                         metadata = pipeline.hgetall(pin_key)
                         if not metadata:
                             pipeline.unwatch()
-                            return False
+                            result = 4
+                            break
                         if (
                             _redis_hash_text(metadata, "session_id") != session_id
                             or _redis_hash_text(metadata, "task_id") != task_id
+                            or _task_pin_asset_metadata_corrupt(metadata)
                         ):
-                            pipeline.unwatch()
-                            result = 2
-                            break
-                        if _task_pin_asset_metadata_missing(metadata):
                             pipeline.unwatch()
                             result = 4
                             break
@@ -3067,78 +3073,27 @@ class RedisTaskManager:
                         break
                     except WatchError:
                         continue
-        if result == 2:
-            raise TaskConflictError("Task pin ownership is invalid")
-        if result == 3:
-            raise TaskConflictError("Task pin asset metadata is invalid")
-        if result == 4:
-            return self._repair_corrupt_task_pin_indexes(task_id, metadata)
+        if result in {0, 2, 3, 4}:
+            return self._repair_task_reverse_indexes(task_id)
         return result == 1
 
-    def _repair_corrupt_task_pin_indexes(
-        self,
-        task_id: str,
-        metadata: dict[bytes | str, bytes | str],
-    ) -> bool:
-        if _redis_hash_text(metadata, "task_id") != task_id:
-            raise TaskConflictError("Task pin ownership is invalid")
-        if not _task_pin_asset_metadata_corrupt(metadata):
-            raise TaskConflictError("Task pin asset metadata is invalid")
-
-        session_id = _redis_hash_text(metadata, "session_id")
-        if session_id is None:
-            task = self.get_task(task_id)
-            session_id = task.owner_id if task is not None else None
-        if session_id is not None:
-            try:
-                session_keys: list[bytes | str] = [
-                    _session_task_pins_key(_validate_session_id(session_id))
-                ]
-            except ValueError as exc:
-                raise TaskConflictError("Task pin ownership is invalid") from exc
-        else:
-            session_keys = []
-
+    def _repair_task_reverse_indexes(self, task_id: str) -> bool:
+        _validate_task_id(task_id)
         self._remove_task_from_index_scan(
             task_id,
             match=f"{_ASSET_TASK_PREFIX}*",
             validator=_is_asset_tasks_key,
         )
-        if session_id is None:
-            self._remove_task_from_index_scan(
-                task_id,
-                match=(
-                    f"{_SESSION_TASK_PINS_PREFIX}*"
-                    f"{_SESSION_TASK_PINS_SUFFIX}"
-                ),
-                validator=_is_session_task_pins_key,
-            )
-
-        pin_key = _task_pin_key(task_id)
-        while True:
-            with self._redis.pipeline() as pipeline:
-                try:
-                    pipeline.watch(pin_key)
-                    current = pipeline.hgetall(pin_key)
-                    if not current:
-                        pipeline.unwatch()
-                        return False
-                    if _redis_hash_text(current, "task_id") != task_id:
-                        pipeline.unwatch()
-                        raise TaskConflictError("Task pin ownership is invalid")
-                    if not _task_pin_asset_metadata_corrupt(current):
-                        pipeline.unwatch()
-                        raise TaskConflictError(
-                            "Task pin asset metadata is invalid"
-                        )
-                    pipeline.multi()
-                    for key in session_keys:
-                        pipeline.srem(key, task_id)
-                    pipeline.delete(pin_key)
-                    pipeline.execute()
-                    return True
-                except WatchError:
-                    continue
+        self._remove_task_from_index_scan(
+            task_id,
+            match=(
+                f"{_SESSION_TASK_PINS_PREFIX}*"
+                f"{_SESSION_TASK_PINS_SUFFIX}"
+            ),
+            validator=_is_session_task_pins_key,
+        )
+        self._redis.delete(_task_pin_key(task_id))
+        return True
 
     def _remove_task_from_index_scan(
         self,
@@ -3154,10 +3109,30 @@ class RedisTaskManager:
             ),
             validator,
         ):
+            for key in keys:
+                self._remove_task_from_index(task_id, key)
+
+    def _remove_task_from_index(
+        self,
+        task_id: str,
+        key: bytes | str,
+    ) -> None:
+        while True:
             with self._redis.pipeline() as pipeline:
-                for key in keys:
+                try:
+                    pipeline.watch(key)
+                    cardinality = pipeline.scard(key)
+                    contains_task = pipeline.sismember(key, task_id)
+                    pipeline.multi()
                     pipeline.srem(key, task_id)
-                pipeline.execute()
+                    if cardinality == 0 or (
+                        cardinality == 1 and contains_task
+                    ):
+                        pipeline.delete(key)
+                    pipeline.execute()
+                    return
+                except WatchError:
+                    continue
 
     def _release_queue_slot(self, task_id: str) -> None:
         self._redis.lrem(_queue_reservations_key(), 0, task_id)
@@ -3554,6 +3529,16 @@ def _joined_input_names(options: list[VideoFrameOptions]) -> str:
     return "\n".join(option.input_path.name for option in options)
 
 
+def _validate_task_id(task_id: str) -> str:
+    try:
+        parsed = UUID(task_id)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError("Invalid task id") from exc
+    if str(parsed) != task_id:
+        raise ValueError("Invalid task id")
+    return task_id
+
+
 def _task_key(task_id: str) -> str:
     return f"dt:task:{task_id}"
 
@@ -3740,18 +3725,11 @@ def _task_pin_asset_metadata_corrupt(
 ) -> bool:
     if _task_pin_asset_metadata_missing(metadata):
         return True
-    identities_value = _redis_hash_text(metadata, "asset_identities")
-    legacy_value = _redis_hash_text(metadata, "asset_ids")
-    if identities_value is None or legacy_value is None:
-        return False
     try:
-        identity_asset_ids = _asset_ids_from_pin_metadata(
-            {"asset_identities": identities_value}
-        )
-        legacy_asset_ids = _decode_legacy_asset_ids(legacy_value)
-    except (TaskConflictError, TypeError, ValueError, json.JSONDecodeError):
-        return False
-    return identity_asset_ids != legacy_asset_ids
+        _asset_ids_from_pin_metadata(metadata)
+    except TaskConflictError:
+        return True
+    return False
 
 
 def _validated_index_key_batches(
