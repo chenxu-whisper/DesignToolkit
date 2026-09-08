@@ -9,11 +9,12 @@ import subprocess
 import sys
 import uuid
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from importlib import resources
 from os import name as os_name
 from pathlib import Path
 from shutil import which
-from threading import RLock
+from threading import Event, Lock, RLock, Thread
 from typing import Protocol
 
 import imageio_ffmpeg
@@ -26,6 +27,7 @@ _LOGGER = logging.getLogger(__name__)
 _POSIX_SIGKILL = getattr(signal, "SIGKILL", 9)
 _WINDOWS_NEW_PROCESS_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200)
 _PROCESS_CLEANUP_TIMEOUT_SECONDS = 5.0
+_WINDOWS_LAUNCH_CLEANUP_TIMEOUT_SECONDS = 5.0
 _WINDOWS_STARTUP_ERROR_RETURN_CODE = 126
 _WINDOWS_STARTUP_ERROR_MAX_BYTES = 4096
 _WINDOWS_HANDLE_INHERITANCE_LOCK = RLock()
@@ -443,7 +445,9 @@ class _WindowsLaunchGate:
 
         kernel_api = api or _WindowsKernelApi()
         event_name = f"Local\\DesignToolkit.FFmpeg.{uuid.uuid4().hex}"
-        event_handle = kernel_api.create_event(event_name)
+        event_handle = cls._call_containment_api(
+            lambda: kernel_api.create_event(event_name)
+        )
         status_read_fd: int | None = None
         status_write_fd: int | None = None
         try:
@@ -549,7 +553,11 @@ class _WindowsLaunchGate:
             )
         return _windows_startup_error(bytes(payload))
 
-    def claim_and_release(self, process: subprocess.Popen[str]) -> None:
+    def claim_and_release(
+        self,
+        process: subprocess.Popen[str],
+        cancel: Event | None = None,
+    ) -> None:
         if self._released:
             raise RuntimeError("Windows FFmpeg launch gate was already released")
         process_handle = getattr(process, "_handle", None)
@@ -557,10 +565,16 @@ class _WindowsLaunchGate:
             raise RuntimeError("Windows launcher process handle is unavailable")
         job_handle = self._call_containment_api(self._api.create_job)
         self._job_handle = job_handle
+        if cancel is not None and cancel.is_set():
+            return
         self._call_containment_api(lambda: self._api.set_job_kill_on_close(job_handle))
+        if cancel is not None and cancel.is_set():
+            return
         self._call_containment_api(
             lambda: self._api.assign_process(job_handle, process_handle)
         )
+        if cancel is not None and cancel.is_set():
+            return
         self._call_containment_api(lambda: self._api.set_event(self._event_handle))
         self._released = True
 
@@ -603,6 +617,144 @@ class _WindowsLaunchGate:
                     errors.append(exc)
         if errors:
             raise errors[0]
+
+
+@dataclass(frozen=True)
+class _WindowsLaunchResult:
+    process: subprocess.Popen[str] | None = None
+    gate: _WindowsLaunchGate | None = None
+    exception: BaseException | None = None
+
+
+class _WindowsLaunchTransaction:
+    def __init__(
+        self,
+        command: Sequence[str],
+        gate_factory: Callable[[Sequence[str]], _WindowsLaunchGate],
+        popen: PopenFactory,
+        popen_kwargs: dict[str, object],
+        abort: Callable[[subprocess.Popen[str], _WindowsLaunchGate], None],
+    ) -> None:
+        self._command = list(command)
+        self._gate_factory = gate_factory
+        self._popen = popen
+        self._popen_kwargs = dict(popen_kwargs)
+        self._abort = abort
+        self._cancel = Event()
+        self._ready = Event()
+        self._decision = Event()
+        self._done = Event()
+        self._state_lock = Lock()
+        self._accepted = False
+        self._result: _WindowsLaunchResult | None = None
+        self._thread = Thread(
+            target=self._run,
+            name="designtoolkit-ffmpeg-windows-launch",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def wait(self) -> _WindowsLaunchResult:
+        self._ready.wait()
+        result = self._result
+        if result is None:
+            raise RuntimeError("Windows FFmpeg launch produced no result")
+        if result.exception is not None:
+            raise result.exception
+        if result.process is None or result.gate is None:
+            raise RuntimeError("Windows FFmpeg launch result was incomplete")
+        return result
+
+    def accept(self) -> None:
+        with self._state_lock:
+            if self._cancel.is_set():
+                raise RuntimeError("Windows FFmpeg launch was already cancelled")
+            self._accepted = True
+            self._decision.set()
+
+    def cancel(self) -> None:
+        with self._state_lock:
+            self._cancel.set()
+            self._decision.set()
+
+    @property
+    def was_accepted(self) -> bool:
+        with self._state_lock:
+            return self._accepted
+
+    def wait_for_cleanup(self) -> None:
+        if self._done.wait(_WINDOWS_LAUNCH_CLEANUP_TIMEOUT_SECONDS):
+            self._thread.join()
+
+    def _run(self) -> None:
+        gate: _WindowsLaunchGate | None = None
+        process: subprocess.Popen[str] | None = None
+        try:
+            gate = self._gate_factory(self._command)
+            if self._cancel.is_set():
+                self._close_gate(gate)
+                return
+
+            process = gate.start_launcher(self._popen, self._popen_kwargs)
+            if self._cancel.is_set():
+                self._abort_launch(process, gate)
+                return
+
+            gate.claim_and_release(process, self._cancel)
+            if self._cancel.is_set():
+                self._abort_launch(process, gate)
+                return
+
+            self._result = _WindowsLaunchResult(process=process, gate=gate)
+            self._ready.set()
+            self._decision.wait()
+            with self._state_lock:
+                cancelled_before_accept = (
+                    self._cancel.is_set() and not self._accepted
+                )
+            if cancelled_before_accept:
+                self._abort_launch(process, gate)
+        except BaseException as exc:
+            if process is not None and gate is not None:
+                self._abort_launch(process, gate)
+            elif gate is not None:
+                self._close_gate(gate)
+            self._result = _WindowsLaunchResult(exception=exc)
+            self._ready.set()
+        finally:
+            if self._result is None:
+                self._result = _WindowsLaunchResult(
+                    exception=RuntimeError("Windows FFmpeg launch was cancelled")
+                )
+                self._ready.set()
+            self._done.set()
+
+    def _abort_launch(
+        self,
+        process: subprocess.Popen[str],
+        gate: _WindowsLaunchGate,
+    ) -> None:
+        try:
+            self._abort(process, gate)
+        except BaseException:
+            try:
+                _LOGGER.exception("Failed to abort cancelled FFmpeg Windows launch")
+            except BaseException:
+                pass
+
+    @staticmethod
+    def _close_gate(gate: _WindowsLaunchGate) -> None:
+        try:
+            gate.close()
+        except BaseException:
+            try:
+                _LOGGER.exception(
+                    "Failed to close cancelled FFmpeg Windows launch gate"
+                )
+            except BaseException:
+                pass
 
 
 def _bundled_binary_dir() -> Path:
@@ -713,42 +865,38 @@ class FfmpegBackend:
             popen_kwargs["creationflags"] = _WINDOWS_NEW_PROCESS_GROUP
         gated_command = _file_size_limited_command(command, self._max_file_bytes)
         process_tree_owner: _WindowsLaunchGate | None = None
+        launch_transaction: _WindowsLaunchTransaction | None = None
+        process: subprocess.Popen[str] | None = None
         if os_name == "nt":
-            try:
-                process_tree_owner = self._windows_launch_gate_factory(gated_command)
-            except Exception as exc:
-                raise BackendUnavailableError(
-                    "Windows FFmpeg launch containment could not be established."
-                ) from exc
-            try:
-                process = process_tree_owner.start_launcher(
-                    self._popen,
-                    popen_kwargs,
-                )
-            except BaseException:
+            launch_transaction = _WindowsLaunchTransaction(
+                gated_command,
+                self._windows_launch_gate_factory,
+                self._popen,
+                popen_kwargs,
+                self._abort_windows_launch,
+            )
+        try:
+            if launch_transaction is not None:
                 try:
-                    process_tree_owner.close()
-                except BaseException:
-                    try:
-                        _LOGGER.exception("Failed to close FFmpeg Windows launch gate")
-                    except BaseException:
-                        pass
-                raise
-            try:
-                process_tree_owner.claim_and_release(process)
-            except BaseException as exc:
-                self._abort_windows_launch(process, process_tree_owner)
-                if isinstance(exc, _WindowsContainmentError):
+                    launch_transaction.start()
+                    launch_result = launch_transaction.wait()
+                except _WindowsContainmentError as exc:
                     raise BackendUnavailableError(
                         "Windows FFmpeg launch containment could not be established."
                     ) from exc.original_error
-                raise
-        else:
-            process = self._popen(gated_command, **popen_kwargs)
-        try:
+                process = launch_result.process
+                process_tree_owner = launch_result.gate
+                if process is None or process_tree_owner is None:
+                    raise RuntimeError("Windows FFmpeg launch result was incomplete")
+                launch_transaction.accept()
+            else:
+                process = self._popen(gated_command, **popen_kwargs)
+
             while True:
                 try:
-                    _stdout, stderr = process.communicate(timeout=self._poll_interval)
+                    _stdout, stderr = process.communicate(
+                        timeout=self._poll_interval
+                    )
                 except subprocess.TimeoutExpired:
                     if self._output_guard is None:
                         continue
@@ -772,16 +920,34 @@ class FfmpegBackend:
                     stderr=stderr or "",
                 )
         except BaseException:
-            try:
-                self._stop_process(process, process_tree_owner)
-            except BaseException:
+            if launch_transaction is not None:
+                launch_transaction.cancel()
+                launch_transaction.wait_for_cleanup()
+            if (
+                process is not None
+                and (
+                    launch_transaction is None
+                    or launch_transaction.was_accepted
+                )
+            ):
                 try:
-                    _LOGGER.exception("Failed to stop FFmpeg after worker interruption")
+                    self._stop_process(process, process_tree_owner)
                 except BaseException:
-                    pass
+                    try:
+                        _LOGGER.exception(
+                            "Failed to stop FFmpeg after worker interruption"
+                        )
+                    except BaseException:
+                        pass
             raise
         finally:
-            if process_tree_owner is not None:
+            if (
+                process_tree_owner is not None
+                and (
+                    launch_transaction is None
+                    or launch_transaction.was_accepted
+                )
+            ):
                 try:
                     process_tree_owner.close()
                 except BaseException:
@@ -832,8 +998,8 @@ class FfmpegBackend:
             try:
                 os.killpg(pid, signal.SIGTERM)
             except ProcessLookupError:
-                pass
-            self._wait_for_process(process)
+                self._wait_for_process(process)
+                return
             try:
                 os.killpg(pid, _POSIX_SIGKILL)
             except ProcessLookupError:

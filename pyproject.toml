@@ -23,6 +23,7 @@ dev = [
   "fakeredis>=2.26",
   "httpx>=0.28.0",
   "pytest>=8.4.1",
+  "pytest-timeout>=2.4.0",
   "ruff>=0.12.0",
 ]
 
@@ -34,6 +35,8 @@ build-backend = "uv_build"
 testpaths = ["tests"]
 addopts = "-ra --basetemp=.temp/pytest-tmp"
 cache_dir = ".temp/pytest/cache"
+timeout = 30
+timeout_method = "thread"
 
 [tool.ruff]
 cache-dir = ".temp/ruff/cache"
