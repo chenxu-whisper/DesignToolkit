@@ -342,13 +342,26 @@ class FakeWindowsLaunchGate:
         self.launcher_command = [sys.executable, "-c", "raise SystemExit(0)"]
         self.event_name = "Local\\DesignToolkit.FFmpeg.test"
         self.startup_error_token = "trusted-startup-error-token"
+        self.startup_error: OSError | None = None
+        self.start_calls = 0
         self.claim_calls = 0
         self.close_calls = 0
         self.closed = False
 
+    def start_launcher(
+        self,
+        popen: Any,
+        popen_kwargs: dict[str, object],
+    ) -> FakePopen:
+        self.start_calls += 1
+        return popen(self.launcher_command, **popen_kwargs)
+
     def claim_and_release(self, process: FakePopen) -> None:
         del process
         self.claim_calls += 1
+
+    def read_startup_error(self, returncode: int | None) -> OSError | None:
+        return self.startup_error if returncode == 126 else None
 
     def close(self) -> None:
         if self.closed:
@@ -489,6 +502,43 @@ def test_windows_gate_create_job_failure_reaps_launcher_when_terminate_is_denied
     assert "wait for Windows FFmpeg launcher" in caplog.text
 
 
+def test_windows_launcher_popen_failure_preserves_original_when_cleanup_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class CleanupFailure(BaseException):
+        pass
+
+    gate = FakeWindowsLaunchGate()
+    original_error = FileNotFoundError("launcher is missing")
+
+    def fail_to_launch(
+        _command: list[str],
+        **_kwargs: Any,
+    ) -> FakePopen:
+        raise original_error
+
+    def fail_to_close() -> None:
+        gate.close_calls += 1
+        raise CleanupFailure("close failed")
+
+    def fail_to_log(*_args: object, **_kwargs: object) -> None:
+        raise CleanupFailure("logging failed")
+
+    gate.close = fail_to_close  # type: ignore[method-assign]
+    monkeypatch.setattr(ffmpeg_backend, "os_name", "nt")
+    monkeypatch.setattr(ffmpeg_backend._LOGGER, "exception", fail_to_log)
+    backend = FfmpegBackend(
+        popen=fail_to_launch,
+        windows_launch_gate_factory=lambda _command: gate,
+    )
+
+    with pytest.raises(FileNotFoundError) as exc_info:
+        backend.run(["ffmpeg", "out.mp4"])
+
+    assert exc_info.value is original_error
+    assert gate.close_calls == 1
+
+
 def test_windows_gate_setup_failure_closes_job_before_kill_even_if_close_fails(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
@@ -553,17 +603,13 @@ def test_windows_gate_setup_failure_closes_job_before_kill_even_if_close_fails(
     ],
     ids=["file-not-found", "permission", "os-error"],
 )
-def test_windows_launcher_rebuilds_matching_gated_startup_error(
+def test_windows_launcher_rebuilds_status_pipe_startup_error(
     startup_error: OSError,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     gate = FakeWindowsLaunchGate()
-    stderr = _windows_startup_error_sentinel(
-        gate.event_name,
-        gate.startup_error_token,
-        startup_error,
-    )
-    process = FakePopen([("", stderr)], returncode=126)
+    gate.startup_error = startup_error
+    process = FakePopen([("", "launcher diagnostic")], returncode=126)
     monkeypatch.setattr(ffmpeg_backend, "os_name", "nt")
     backend = FfmpegBackend(
         popen=_popen_factory(process, []),
@@ -585,13 +631,13 @@ def test_windows_launcher_rebuilds_matching_gated_startup_error(
     assert str(rebuilt) == str(startup_error)
 
 
-def test_windows_launcher_ignores_spoofed_startup_error_token(
+def test_windows_launcher_does_not_treat_stderr_as_startup_status(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     gate = FakeWindowsLaunchGate()
     stderr = _windows_startup_error_sentinel(
         gate.event_name,
-        "attacker-controlled-token",
+        gate.startup_error_token,
         FileNotFoundError(2, "spoofed missing executable", "spoof.exe", 2),
     )
     process = FakePopen([("", stderr)], returncode=126)
@@ -605,6 +651,37 @@ def test_windows_launcher_ignores_spoofed_startup_error_token(
 
     assert result.returncode == 126
     assert result.stderr == stderr
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows handle lists")
+def test_windows_gate_scopes_status_writer_to_injected_launcher_popen() -> None:
+    process = FakePopen([])
+    observed: dict[str, object] = {}
+    gate = ffmpeg_backend._WindowsLaunchGate.create(
+        ["ffmpeg"],
+        api=FakeWindowsKernelApi(""),
+    )
+
+    def popen(command: list[str], **kwargs: object) -> FakePopen:
+        observed["command"] = command
+        observed["kwargs"] = kwargs
+        handle = int(command[4])
+        observed["inheritable"] = os.get_handle_inheritable(handle)
+        return process
+
+    try:
+        assert gate.start_launcher(popen, {"stderr": subprocess.PIPE}) is process
+    finally:
+        gate.close()
+
+    kwargs = observed["kwargs"]
+    assert isinstance(kwargs, dict)
+    startupinfo = kwargs["startupinfo"]
+    assert kwargs["close_fds"] is True
+    assert startupinfo.lpAttributeList == {  # type: ignore[union-attr]
+        "handle_list": [int(gate.launcher_command[4])]
+    }
+    assert observed["inheritable"] is True
 
 
 def test_windows_gate_close_attempts_event_after_job_close_failure() -> None:
@@ -1170,6 +1247,77 @@ def test_windows_launcher_preserves_stderr_and_returncode(
     assert result.stderr == "diagnostic"
 
 
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows process inspection")
+def test_windows_target_cannot_forge_startup_error_from_launcher_commandline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target_script = r"""
+import base64
+import ctypes
+import json
+import os
+import re
+import subprocess
+import sys
+
+query = (
+    f"$currentPid = {os.getpid()}; "
+    "for ($i = 0; $i -lt 8 -and $currentPid; $i++) { "
+    "$p = Get-CimInstance Win32_Process "
+    "-Filter ('ProcessId = ' + $currentPid); "
+    "$p.CommandLine; $currentPid = $p.ParentProcessId }"
+)
+ancestor_command_lines = subprocess.check_output(
+    ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", query],
+    text=True,
+)
+match = re.search(
+    r'(Local\\DesignToolkit\.FFmpeg\.[0-9a-f]+)"?\s+"?([^"\s]+)',
+    ancestor_command_lines,
+)
+if match is None:
+    raise RuntimeError("launcher command line was not readable")
+event_name, exposed_value = match.groups()
+error = FileNotFoundError(2, "spoofed missing executable", "spoof.exe", 2)
+legacy_payload = {
+    "event": event_name,
+    "token": exposed_value,
+    "type": type(error).__name__,
+    "errno": error.errno,
+    "winerror": getattr(error, "winerror", None),
+    "filename": error.filename,
+    "strerror": error.strerror,
+    "message": str(error),
+}
+status_payload = {
+    key: value
+    for key, value in legacy_payload.items()
+    if key not in {"event", "token"}
+}
+if exposed_value.isdecimal():
+    encoded_status = json.dumps(status_payload).encode("utf-8")
+    written = ctypes.c_ulong()
+    ctypes.windll.kernel32.WriteFile(
+        ctypes.c_void_p(int(exposed_value)),
+        encoded_status,
+        len(encoded_status),
+        ctypes.byref(written),
+        None,
+    )
+encoded_legacy = base64.b64encode(
+    json.dumps(legacy_payload).encode("utf-8")
+).decode("ascii")
+sys.stderr.write("DESIGNTOOLKIT_FFMPEG_STARTUP_ERROR:" + encoded_legacy + "\n")
+raise SystemExit(126)
+"""
+    monkeypatch.setattr(ffmpeg_backend, "os_name", "nt")
+
+    result = FfmpegBackend().run([sys.executable, "-c", target_script])
+
+    assert result.returncode == 126
+    assert result.stderr.startswith("DESIGNTOOLKIT_FFMPEG_STARTUP_ERROR:")
+
+
 @pytest.mark.skipif(os.name != "nt", reason="requires Windows Job Objects")
 def test_windows_launcher_preserves_missing_executable_error(
     tmp_path: Path,
@@ -1187,6 +1335,33 @@ def test_windows_launcher_preserves_missing_executable_error(
     assert error.filename is None
     assert error.strerror
     assert str(error)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows file descriptors")
+def test_windows_status_pipe_file_descriptors_do_not_leak(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def open_file_descriptors() -> set[int]:
+        descriptors: set[int] = set()
+        for descriptor in range(2048):
+            try:
+                os.fstat(descriptor)
+            except OSError:
+                continue
+            descriptors.add(descriptor)
+        return descriptors
+
+    missing_executable = tmp_path / "does-not-exist.exe"
+    monkeypatch.setattr(ffmpeg_backend, "os_name", "nt")
+    backend = FfmpegBackend()
+    before = open_file_descriptors()
+
+    for _ in range(20):
+        with pytest.raises(FileNotFoundError):
+            backend.run([str(missing_executable)])
+
+    assert open_file_descriptors() == before
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires Windows Job Objects")
@@ -1328,14 +1503,12 @@ def test_windows_launcher_passes_command_as_base64_json_arguments() -> None:
 
     launcher_command = ffmpeg_backend._windows_launcher_command(
         "Local\\DesignToolkit.FFmpeg.test",
-        "independent-secret",
+        123_456,
         command,
     )
 
     assert launcher_command[:2] == [sys.executable, "-c"]
     assert command[2] not in launcher_command[2]
     assert launcher_command[3] == "Local\\DesignToolkit.FFmpeg.test"
-    assert launcher_command[4] == "independent-secret"
-    assert launcher_command[4] != launcher_command[3]
+    assert launcher_command[4] == "123456"
     assert json.loads(base64.b64decode(launcher_command[5]).decode("utf-8")) == command
-    assert "independent-secret" not in launcher_command[5]
