@@ -1397,43 +1397,66 @@ def create_router(
         status_code=204,
         dependencies=[Depends(hosted_session_operation, scope="function")],
     )
-    def delete_upload(http_request: Request, asset_id: str) -> Response:
+    def delete_upload(
+        http_request: Request,
+        asset_id: str,
+        generation: str | None = None,
+    ) -> Response:
         if storage is None or resources is None:
             raise ApiError("hosted_mode_disabled", "Uploads are unavailable", 404)
         asset_id = _delete_asset_id(asset_id)
+        expected_generation = _delete_generation(
+            generation,
+            http_request.headers.get("x-upload-generation"),
+        )
         operation = http_request.state.hosted_session_operation
         session_id = http_request.state.session_id
         deletion_claim: str | None = None
         release_generation: str | None = None
         try:
-            inflight = operation.commit(
-                lambda: resources.cancel_upload(session_id, asset_id)
-            )
             has_local_state = storage.has_upload_state(
                 session_id,
                 asset_id,
             )
-            if not inflight and not has_local_state:
-                release_generation = operation.commit(
-                    lambda: resources.pending_asset_release_generation(
-                        session_id,
-                        asset_id,
-                    )
+            if (
+                has_local_state
+                and not storage.asset_generation_matches_deletion(
+                    session_id,
+                    asset_id,
+                    expected_generation,
                 )
-                already_released = operation.commit(
-                    lambda: (
-                        release_generation is not None
-                        or resources.is_committed_asset_released(
+            ):
+                return Response(status_code=404)
+            inflight = operation.commit(
+                lambda: resources.cancel_upload(
+                    session_id,
+                    asset_id,
+                    expected_generation,
+                )
+            )
+            if not inflight and not has_local_state:
+                if expected_generation is not None:
+                    release_generation = expected_generation
+                    already_released = operation.commit(
+                        lambda: resources.is_committed_asset_released(
+                            session_id,
+                            asset_id,
+                            expected_generation,
+                        )
+                    )
+                else:
+                    already_released = operation.commit(
+                        lambda: resources.is_committed_asset_released(
                             session_id,
                             asset_id,
                         )
                     )
-                )
                 if already_released:
                     operation.commit(
                         lambda: storage.finalize_asset_deletion(
                             session_id,
                             asset_id,
+                            expected_generation,
                         )
                     )
                     try:
@@ -1471,6 +1494,7 @@ def create_router(
                     lambda: storage.delete_asset(
                         session_id,
                         f"asset:{asset_id}",
+                        expected_generation=expected_generation,
                         cancel_inflight=inflight,
                         orphan_stale_after_seconds=(
                             resources.upload_registration_ttl_seconds
@@ -1479,21 +1503,23 @@ def create_router(
                 )
             except AssetDeletionStateError as exc:
                 invalid_asset_id = exc.asset_id
-                release_generation = operation.commit(
-                    lambda: resources.pending_asset_release_generation(
-                        session_id,
-                        invalid_asset_id,
+                if expected_generation is not None:
+                    release_generation = expected_generation
+                    already_released = operation.commit(
+                        lambda: resources.is_committed_asset_released(
+                            session_id,
+                            invalid_asset_id,
+                            expected_generation,
+                        )
                     )
-                )
-                if (
-                    release_generation is None
-                    and not operation.commit(
+                else:
+                    already_released = operation.commit(
                         lambda: resources.is_committed_asset_released(
                             session_id,
                             invalid_asset_id,
                         )
                     )
-                ):
+                if not already_released:
                     raise
                 deletion = None
                 recovered_deletion = True
@@ -1539,6 +1565,7 @@ def create_router(
                 lambda: storage.finalize_asset_deletion(
                     session_id,
                     asset_id,
+                    expected_generation,
                 )
             )
             if release_generation is None:
@@ -2378,3 +2405,24 @@ def _delete_asset_id(value: str) -> str:
             404,
         )
     return value
+
+
+def _delete_generation(
+    query_generation: str | None,
+    header_generation: str | None,
+) -> str | None:
+    generations = tuple(
+        value
+        for value in (query_generation, header_generation)
+        if value is not None
+    )
+    if (
+        any(_HOSTED_ID_PATTERN.fullmatch(value) is None for value in generations)
+        or len(set(generations)) > 1
+    ):
+        raise ApiError(
+            "asset_not_found",
+            "Uploaded asset is not available",
+            404,
+        )
+    return generations[0] if generations else None

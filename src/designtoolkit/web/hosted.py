@@ -515,6 +515,7 @@ class AssetDeletion:
     pending: bool = False
     expected_remaining_bytes: int | None = None
     generation_id: str | None = None
+    generation_required: bool = False
 
 
 class HostedStorage:
@@ -758,11 +759,17 @@ class HostedStorage:
         session_id: str,
         reference: str,
         *,
+        expected_generation: str | None = None,
         cancel_inflight: bool = False,
         orphan_stale_after_seconds: float | None = None,
     ) -> AssetDeletion | None:
         session_id = _validate_session_id(session_id)
         asset_id = _asset_id(reference)
+        if (
+            expected_generation is not None
+            and not _SESSION_PATTERN.fullmatch(expected_generation)
+        ):
+            raise UploadRejectedError("Upload generation token is invalid")
         session_dir = self._session_dir(session_id)
         assets_dir = session_dir / "assets"
         asset_dir = assets_dir / asset_id
@@ -770,6 +777,12 @@ class HostedStorage:
         generation = session_dir / _UPLOAD_GENERATIONS_NAME / asset_id
         cancellation = session_dir / _UPLOAD_CANCELLATIONS_NAME / asset_id
         with self._deletion_lock:
+            if not self._asset_generation_matches_deletion(
+                session_dir,
+                asset_id,
+                expected_generation,
+            ):
+                return None
             if tombstone.is_dir():
                 self._mark_upload_cancelled(session_id, asset_id)
                 return _read_asset_deletion(tombstone, asset_id)
@@ -838,6 +851,7 @@ class HostedStorage:
                         size=orphan_size,
                         expected_remaining_bytes=expected_remaining_bytes,
                         generation_id=generation_id,
+                        generation_required=False,
                     )
                     try:
                         _write_asset_deletion(asset_dir, deletion)
@@ -874,6 +888,10 @@ class HostedStorage:
                     if manifest is not None
                     else None
                 ),
+                generation_required=(
+                    manifest is not None
+                    and manifest["reference_version"] == 2
+                ),
             )
             try:
                 _write_asset_deletion(asset_dir, deletion)
@@ -885,6 +903,100 @@ class HostedStorage:
 
         os.utime(session_dir, None)
         return deletion
+
+    def asset_generation_matches_deletion(
+        self,
+        session_id: str,
+        asset_id: str,
+        expected_generation: str | None,
+    ) -> bool:
+        session_id = _validate_session_id(session_id)
+        asset_id = _asset_id(f"asset:{asset_id}")
+        if (
+            expected_generation is not None
+            and not _SESSION_PATTERN.fullmatch(expected_generation)
+        ):
+            raise UploadRejectedError("Upload generation token is invalid")
+        with self._deletion_lock:
+            return self._asset_generation_matches_deletion(
+                self._session_dir(session_id),
+                asset_id,
+                expected_generation,
+            )
+
+    def _asset_generation_matches_deletion(
+        self,
+        session_dir: Path,
+        asset_id: str,
+        expected_generation: str | None,
+    ) -> bool:
+        asset_dir = session_dir / "assets" / asset_id
+        tombstone = session_dir / ".trash" / asset_id
+        generation_marker = (
+            session_dir / _UPLOAD_GENERATIONS_NAME / asset_id
+        )
+        cancellation = session_dir / _UPLOAD_CANCELLATIONS_NAME / asset_id
+        marker_generation = _read_upload_generation_marker(
+            generation_marker,
+            asset_id,
+        )
+        if tombstone.is_dir():
+            try:
+                deletion = _read_asset_deletion(tombstone, asset_id)
+            except AssetDeletionStateError:
+                if marker_generation is not None:
+                    return _generation_matches(
+                        expected_generation,
+                        marker_generation,
+                    )
+                return expected_generation is None
+            if not deletion.generation_required and expected_generation is None:
+                return True
+            return _generation_matches(
+                expected_generation,
+                deletion.generation_id,
+            )
+        if asset_dir.is_dir():
+            manifest = _read_asset_manifest(asset_dir, asset_id)
+            manifest_generation_value = (
+                manifest.get("generation_id")
+                if manifest is not None
+                else None
+            )
+            manifest_generation = (
+                manifest_generation_value
+                if isinstance(manifest_generation_value, str)
+                else None
+            )
+            if (
+                marker_generation is not None
+                and manifest_generation is not None
+                and not compare_digest(
+                    marker_generation,
+                    manifest_generation,
+                )
+            ):
+                raise AssetDeletionStateError(asset_id)
+            if (asset_dir / ".uploading").is_file():
+                if expected_generation is None:
+                    return True
+                return _generation_matches(
+                    expected_generation,
+                    marker_generation or manifest_generation,
+                )
+            if manifest is None:
+                return expected_generation is None
+            return _asset_generation_matches(
+                expected_generation,
+                manifest_generation,
+                manifest["reference_version"],
+            )
+        if marker_generation is not None:
+            return (
+                expected_generation is None
+                or compare_digest(expected_generation, marker_generation)
+            )
+        return cancellation.is_file() and expected_generation is None
 
     def has_upload_state(self, session_id: str, asset_id: str) -> bool:
         session_id = _validate_session_id(session_id)
@@ -902,12 +1014,23 @@ class HostedStorage:
                 )
             )
 
-    def finalize_asset_deletion(self, session_id: str, asset_id: str) -> None:
+    def finalize_asset_deletion(
+        self,
+        session_id: str,
+        asset_id: str,
+        expected_generation: str | None = None,
+    ) -> None:
         session_id = _validate_session_id(session_id)
         asset_id = _asset_id(f"asset:{asset_id}")
         session_dir = self._session_dir(session_id)
         tombstone = session_dir / ".trash" / asset_id
         with self._deletion_lock:
+            if not self._asset_generation_matches_deletion(
+                session_dir,
+                asset_id,
+                expected_generation,
+            ):
+                return
             shutil.rmtree(tombstone, ignore_errors=True)
             if tombstone.exists():
                 raise OSError("Asset tombstone removal failed")
@@ -1687,6 +1810,32 @@ def _asset_generation_matches(
     )
 
 
+def _read_upload_generation_marker(
+    marker: Path,
+    asset_id: str,
+) -> str | None:
+    if not marker.is_file():
+        return None
+    try:
+        generation_id = marker.read_text(encoding="ascii")
+    except (OSError, UnicodeError) as exc:
+        raise AssetDeletionStateError(asset_id) from exc
+    if not _SESSION_PATTERN.fullmatch(generation_id):
+        raise AssetDeletionStateError(asset_id)
+    return generation_id
+
+
+def _generation_matches(
+    expected_generation: str | None,
+    current_generation: str | None,
+) -> bool:
+    return (
+        expected_generation is not None
+        and current_generation is not None
+        and compare_digest(expected_generation, current_generation)
+    )
+
+
 def _asset_payload_size(asset_dir: Path) -> int:
     return sum(
         path.stat().st_size
@@ -1772,6 +1921,7 @@ def _write_asset_deletion(asset_dir: Path, deletion: AssetDeletion) -> None:
         payload["expected_remaining_bytes"] = deletion.expected_remaining_bytes
     if deletion.generation_id is not None:
         payload["generation_id"] = deletion.generation_id
+    payload["generation_required"] = deletion.generation_required
     try:
         with temporary_path.open("x", encoding="utf-8") as metadata:
             json.dump(payload, metadata, separators=(",", ":"), sort_keys=True)
@@ -1791,6 +1941,10 @@ def _read_asset_deletion(tombstone: Path, asset_id: str) -> AssetDeletion:
         size = payload["bytes"]
         expected_remaining_bytes = payload.get("expected_remaining_bytes")
         generation_id = payload.get("generation_id")
+        generation_required = payload.get(
+            "generation_required",
+            generation_id is not None,
+        )
         if (
             payload["asset_id"] != asset_id
             or reference != f"asset:{asset_id}"
@@ -1812,6 +1966,7 @@ def _read_asset_deletion(tombstone: Path, asset_id: str) -> AssetDeletion:
                     or not _SESSION_PATTERN.fullmatch(generation_id)
                 )
             )
+            or not isinstance(generation_required, bool)
         ):
             raise ValueError
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -1822,6 +1977,7 @@ def _read_asset_deletion(tombstone: Path, asset_id: str) -> AssetDeletion:
         size=size,
         expected_remaining_bytes=expected_remaining_bytes,
         generation_id=generation_id,
+        generation_required=generation_required,
     )
 
 

@@ -1012,10 +1012,132 @@ async def test_published_asset_deletion_carries_manifest_generation(
         reservation=RecordingReservation(),
         registration=registration,
     )
-    deletion = storage.delete_asset(session_id, f"asset:{asset_id}")
+    deletion = storage.delete_asset(
+        session_id,
+        f"asset:{asset_id}",
+        expected_generation=registration.token,
+    )
 
     assert deletion is not None
     assert deletion.generation_id == registration.token
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "expected_generation",
+    [None, "3" * 32],
+    ids=["missing", "stale"],
+)
+async def test_v2_asset_deletion_requires_matching_generation(
+    tmp_path: Path,
+    expected_generation: str | None,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    session_id = "a" * 32
+    asset_id = "1" * 32
+    registration = RecordingUploadRegistration()
+    storage.claim_upload_generation(
+        session_id,
+        asset_id,
+        token=registration.token,
+    )
+    asset = await storage.store_stream(
+        session_id,
+        asset_id=asset_id,
+        filename="screen.png",
+        content_length=4,
+        chunks=_chunks(b"data"),
+        reservation=RecordingReservation(),
+        registration=registration,
+    )
+
+    deletion = storage.delete_asset(
+        session_id,
+        f"asset:{asset_id}",
+        expected_generation=expected_generation,
+    )
+
+    assert deletion is None
+    assert storage.resolve(session_id, asset.reference).read_bytes() == b"data"
+    assert not (
+        tmp_path
+        / "sessions"
+        / session_id
+        / ".upload-cancellations"
+        / asset_id
+    ).exists()
+    assert not (
+        tmp_path / "sessions" / session_id / ".trash" / asset_id
+    ).exists()
+
+
+@pytest.mark.anyio
+async def test_generation_bound_deletion_is_idempotent_for_same_tombstone(
+    tmp_path: Path,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    session_id = "a" * 32
+    asset_id = "1" * 32
+    registration = RecordingUploadRegistration()
+    storage.claim_upload_generation(
+        session_id,
+        asset_id,
+        token=registration.token,
+    )
+    await storage.store_stream(
+        session_id,
+        asset_id=asset_id,
+        filename="screen.png",
+        content_length=4,
+        chunks=_chunks(b"data"),
+        reservation=RecordingReservation(),
+        registration=registration,
+    )
+
+    deletion = storage.delete_asset(
+        session_id,
+        f"asset:{asset_id}",
+        expected_generation=registration.token,
+    )
+    retry = storage.delete_asset(
+        session_id,
+        f"asset:{asset_id}",
+        expected_generation=registration.token,
+    )
+    stale = storage.delete_asset(
+        session_id,
+        f"asset:{asset_id}",
+        expected_generation="3" * 32,
+    )
+
+    assert deletion is not None
+    assert retry == deletion
+    assert stale is None
+
+
+def test_legacy_v1_asset_deletion_without_generation_remains_supported(
+    tmp_path: Path,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    session_id = "a" * 32
+    asset_id = "1" * 32
+    asset_dir = tmp_path / "sessions" / session_id / "assets" / asset_id
+    asset_dir.mkdir(parents=True)
+    (asset_dir / "legacy.png").write_bytes(b"data")
+    (asset_dir / ".asset.json").write_text(
+        json.dumps({"asset_id": asset_id, "bytes": 4}),
+        encoding="utf-8",
+    )
+
+    deletion = storage.delete_asset(
+        session_id,
+        f"asset:{asset_id}",
+        expected_generation=None,
+    )
+
+    assert deletion is not None
+    assert deletion.generation_id is None
+    assert deletion.size == 4
 
 
 def test_asset_reference_parser_decodes_generation_and_quoted_filename() -> None:
@@ -1071,9 +1193,17 @@ async def test_reused_asset_id_cannot_resolve_previous_generation(
         reservation=RecordingReservation(),
         registration=first_registration,
     )
-    deletion = storage.delete_asset(session_id, f"asset:{asset_id}")
+    deletion = storage.delete_asset(
+        session_id,
+        f"asset:{asset_id}",
+        expected_generation=first_registration.token,
+    )
     assert deletion is not None
-    storage.finalize_asset_deletion(session_id, asset_id)
+    storage.finalize_asset_deletion(
+        session_id,
+        asset_id,
+        first_registration.token,
+    )
 
     second_registration = RecordingUploadRegistration()
     second_registration.token = "3" * 32

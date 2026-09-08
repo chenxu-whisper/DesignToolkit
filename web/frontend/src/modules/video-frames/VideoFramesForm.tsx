@@ -6,6 +6,7 @@ import { SizeInput } from '../../components/SizeInput'
 import { SubmitButton } from '../../components/SubmitButton'
 import { hostedMode } from '../../app/runtimeConfig'
 import {
+  deleteUploadedAsset,
   pickLocalDirectory,
   pickLocalFiles,
   resolveDroppedFilePaths,
@@ -82,6 +83,7 @@ export function VideoFramesForm({ disabled, onSubmit }: VideoFramesFormProps) {
   return (
     <form className="module-form" onSubmit={handleSubmit}>
       <PathInput
+        deleteUploadedAsset={hostedMode ? deleteUploadedAsset : undefined}
         disabled={formDisabled}
         error={errors.inputPath}
         id="video-frames-input-path"

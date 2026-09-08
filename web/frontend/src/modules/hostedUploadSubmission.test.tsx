@@ -15,6 +15,7 @@ const apiMocks = vi.hoisted(() => ({
   createChromaVideoPreview: vi.fn(),
   createMediaResizeTask: vi.fn(),
   createVideoFramesTask: vi.fn(),
+  deleteUploadedAsset: vi.fn(),
   inspectChromaImage: vi.fn(),
   inspectChromaVideo: vi.fn(),
   pickLocalDirectory: vi.fn(),
@@ -32,10 +33,10 @@ vi.mock('../app/runtimeConfig', () => ({
 
 vi.mock('../services/apiClient', () => apiMocks)
 
-const oldImageReference = 'asset:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:old.png'
-const newImageReference = 'asset:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:new.png'
-const oldVideoReference = 'asset:cccccccccccccccccccccccccccccccc:old.mp4'
-const newVideoReference = 'asset:dddddddddddddddddddddddddddddddd:new.mp4'
+const oldImageReference = `asset:${'a'.repeat(32)}:${'1'.repeat(32)}:old.png`
+const newImageReference = `asset:${'b'.repeat(32)}:${'2'.repeat(32)}:new.png`
+const oldVideoReference = `asset:${'c'.repeat(32)}:${'3'.repeat(32)}:old.mp4`
+const newVideoReference = `asset:${'d'.repeat(32)}:${'4'.repeat(32)}:new.mp4`
 
 beforeEach(() => {
   for (const mock of Object.values(apiMocks)) {
@@ -56,6 +57,7 @@ beforeEach(() => {
     status: 'queued',
     task_id: 'frames-task',
   })
+  apiMocks.deleteUploadedAsset.mockResolvedValue(undefined)
   apiMocks.inspectChromaImage.mockResolvedValue({
     height: 400,
     input_path: oldImageReference,
@@ -97,6 +99,7 @@ describe('hosted replacement uploads', () => {
     })
 
     expect(screen.getByLabelText('输入视频')).toHaveValue('new.mp4')
+    expect(apiMocks.deleteUploadedAsset).toHaveBeenCalledWith(oldVideoReference)
     expect(submit).toBeEnabled()
     fireEvent.click(submit)
     await waitFor(() =>

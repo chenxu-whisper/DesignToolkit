@@ -162,7 +162,9 @@ class StubUploadRegistration:
         return self.coordinator.inflight[(self.session_id, self.upload_id)]
 
     def finish(self) -> None:
-        self.coordinator.inflight.pop((self.session_id, self.upload_id), None)
+        key = (self.session_id, self.upload_id)
+        self.coordinator.inflight.pop(key, None)
+        self.coordinator.inflight_generations.pop(key, None)
 
 
 class StubCoordinator:
@@ -196,6 +198,7 @@ class StubCoordinator:
         self.reservation_heartbeat_interval = 5.0
         self.upload_registration_ttl_seconds = 60.0
         self.inflight: dict[tuple[str, str], bool] = {}
+        self.inflight_generations: dict[tuple[str, str], str] = {}
 
     def register_upload(
         self,
@@ -213,12 +216,24 @@ class StubCoordinator:
             self.finalized_assets.discard(key)
         if key in self.pending_release_generations:
             raise ResourceUnavailableError("Upload deletion is still pending")
+        registration = StubUploadRegistration(self, session_id, upload_id)
         self.inflight[key] = False
-        return StubUploadRegistration(self, session_id, upload_id)
+        self.inflight_generations[key] = registration.token
+        return registration
 
-    def cancel_upload(self, session_id: str, upload_id: str) -> bool:
+    def cancel_upload(
+        self,
+        session_id: str,
+        upload_id: str,
+        expected_generation: str | None = None,
+    ) -> bool:
         key = (session_id, upload_id)
         if key not in self.inflight:
+            return False
+        if (
+            expected_generation is not None
+            and self.inflight_generations.get(key) != expected_generation
+        ):
             return False
         self.inflight[key] = True
         return True
@@ -520,6 +535,13 @@ def _upload(
             "x-upload-filename": quote(filename, safe=""),
             "x-upload-id": upload_id or uuid4().hex,
         },
+    )
+
+
+def _delete_uploaded_asset(client: TestClient, reference: str):
+    _scheme, asset_id, generation_id, _filename = reference.split(":", 3)
+    return client.delete(
+        f"/api/uploads/{asset_id}?generation={generation_id}"
     )
 
 
@@ -937,7 +959,10 @@ def test_known_upload_id_recovers_committed_upload_after_response_loss(
             b"image",
             upload_id=upload_id,
         )
-        deleted = client.delete(f"/api/uploads/{upload_id}")
+        deleted = _delete_uploaded_asset(
+            client,
+            uploaded.json()["reference"],
+        )
         replacement = _upload(client, "replacement.png", b"12345")
         session_id = client.cookies["dt_session"]
         coordinator = client.app.state.resource_coordinator
@@ -958,14 +983,11 @@ def test_reused_upload_id_releases_each_generation_quota(tmp_path: Path) -> None
             b"first",
             upload_id=upload_id,
         )
-        first_delete = client.delete(f"/api/uploads/{upload_id}")
-        first_generation = next(
-            generation_id
-            for release_session, release_asset, generation_id in (
-                client.app.state.resource_coordinator.released_generations
-            )
-            if release_session == client.cookies["dt_session"]
-            and release_asset == upload_id
+        first_reference = first_upload.json()["reference"]
+        first_generation = first_reference.split(":", 3)[2]
+        first_delete = _delete_uploaded_asset(
+            client,
+            first_reference,
         )
         second_upload = _upload(
             client,
@@ -981,7 +1003,10 @@ def test_reused_upload_id_releases_each_generation_quota(tmp_path: Path) -> None
             first_generation,
         )
         assert coordinator.committed[session_id] == 5
-        second_delete = client.delete(f"/api/uploads/{upload_id}")
+        second_delete = _delete_uploaded_asset(
+            client,
+            second_upload.json()["reference"],
+        )
 
     assert first_upload.status_code == 201
     assert first_delete.status_code == 204
@@ -989,6 +1014,150 @@ def test_reused_upload_id_releases_each_generation_quota(tmp_path: Path) -> None
     assert second_delete.status_code == 204
     assert coordinator.committed.get(session_id, 0) == 0
     assert coordinator.release_calls == 3
+
+
+@pytest.mark.parametrize("generation_transport", ["query", "header"])
+def test_v2_delete_requires_and_accepts_matching_generation(
+    tmp_path: Path,
+    generation_transport: str,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=5)
+    with _client(
+        tmp_path,
+        max_session_bytes=5,
+        hosted_storage=storage,
+    ) as client:
+        uploaded = _upload(client, "screen.png", b"image")
+        reference = uploaded.json()["reference"]
+        _scheme, asset_id, generation_id, _filename = reference.split(":", 3)
+        session_id = client.cookies["dt_session"]
+        coordinator = client.app.state.resource_coordinator
+        inflight_key = (session_id, asset_id)
+        coordinator.inflight[inflight_key] = False
+        coordinator.inflight_generations[inflight_key] = generation_id
+
+        missing_generation = client.delete(f"/api/uploads/{asset_id}")
+        preserved_contents = storage.resolve(
+            session_id,
+            reference,
+        ).read_bytes()
+        cancellation_state = coordinator.inflight[inflight_key]
+        release_calls = coordinator.release_calls
+        coordinator.inflight.pop(inflight_key)
+        coordinator.inflight_generations.pop(inflight_key)
+        if generation_transport == "query":
+            matching = client.delete(
+                f"/api/uploads/{asset_id}?generation={generation_id}"
+            )
+        else:
+            matching = client.delete(
+                f"/api/uploads/{asset_id}",
+                headers={"X-Upload-Generation": generation_id},
+            )
+
+    assert missing_generation.status_code == 404
+    assert cancellation_state is False
+    assert release_calls == 0
+    assert preserved_contents == b"image"
+    assert matching.status_code == 204
+    assert coordinator.committed.get(session_id, 0) == 0
+
+
+def test_v1_delete_without_generation_remains_supported(tmp_path: Path) -> None:
+    session_id = "a" * 32
+    asset_id = "1" * 32
+    asset_dir = tmp_path / "sessions" / session_id / "assets" / asset_id
+    asset_dir.mkdir(parents=True)
+    (asset_dir / "legacy.png").write_bytes(b"data")
+    (asset_dir / ".asset.json").write_text(
+        json.dumps({"asset_id": asset_id, "bytes": 4}),
+        encoding="utf-8",
+    )
+
+    with _client(tmp_path, max_session_bytes=5) as client:
+        client.cookies.set("dt_session", session_id)
+        coordinator = client.app.state.resource_coordinator
+        coordinator.committed[session_id] = 4
+        deleted = client.delete(f"/api/uploads/{asset_id}")
+
+    assert deleted.status_code == 204
+    assert coordinator.committed.get(session_id, 0) == 0
+    assert not asset_dir.exists()
+
+
+def test_stale_generation_delete_does_not_affect_reused_upload_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    upload_id = "1" * 32
+    storage = HostedStorage(tmp_path, max_upload_bytes=5)
+    second_started = Event()
+    resume_second = Event()
+    original_store = storage.store_stream
+
+    async def pause_second(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        second_started.set()
+        while not resume_second.is_set():
+            await asyncio.sleep(0.005)
+        return await original_store(*args, **kwargs)
+
+    with _client(
+        tmp_path,
+        max_session_bytes=5,
+        hosted_storage=storage,
+    ) as client:
+        first = _upload(
+            client,
+            "first.png",
+            b"first",
+            upload_id=upload_id,
+        )
+        first_reference = first.json()["reference"]
+        first_generation = first_reference.split(":", 3)[2]
+        first_delete = client.delete(
+            f"/api/uploads/{upload_id}?generation={first_generation}"
+        )
+        monkeypatch.setattr(storage, "store_stream", pause_second)
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            second_future = executor.submit(
+                _upload,
+                client,
+                "second.png",
+                b"other",
+                upload_id=upload_id,
+            )
+            try:
+                assert second_started.wait(timeout=2)
+                stale_inflight = client.delete(
+                    f"/api/uploads/{upload_id}?generation={first_generation}"
+                )
+            finally:
+                resume_second.set()
+            second = second_future.result(timeout=2)
+
+        second_reference = second.json()["reference"]
+        second_generation = second_reference.split(":", 3)[2]
+        session_id = client.cookies["dt_session"]
+        stale_published = client.delete(
+            f"/api/uploads/{upload_id}?generation={first_generation}"
+        )
+        second_contents = storage.resolve(
+            session_id,
+            second_reference,
+        ).read_bytes()
+        matching_delete = client.delete(
+            f"/api/uploads/{upload_id}?generation={second_generation}"
+        )
+        coordinator = client.app.state.resource_coordinator
+
+    assert first_delete.status_code == 204
+    assert stale_inflight.status_code == 404
+    assert second.status_code == 201
+    assert stale_published.status_code == 404
+    assert second_contents == b"other"
+    assert matching_delete.status_code == 204
+    assert coordinator.committed.get(session_id, 0) == 0
 
 
 def test_random_delete_returns_404_without_blocking_later_upload(
@@ -1312,7 +1481,8 @@ def test_delete_reclaims_multiple_stale_partials_and_reuses_their_ids(
             for index, (upload_id, content) in enumerate(uploads.items())
         ]
         replacement_deletes = [
-            client.delete(f"/api/uploads/{upload_id}") for upload_id in uploads
+            _delete_uploaded_asset(client, response.json()["reference"])
+            for response in replacements
         ]
 
     assert [response.status_code for response in deleted] == [204, 204]
@@ -1712,8 +1882,8 @@ def test_delete_upload_is_owner_scoped_idempotent_and_reclaims_quota(
         uploaded = _upload(owner, "screen.png", b"image")
         reference = uploaded.json()["reference"]
         asset_id = reference.split(":", 2)[1]
-        first_delete = owner.delete(f"/api/uploads/{asset_id}")
-        second_delete = owner.delete(f"/api/uploads/{asset_id}")
+        first_delete = _delete_uploaded_asset(owner, reference)
+        second_delete = _delete_uploaded_asset(owner, reference)
         replacement = _upload(owner, "replacement.png", b"12345")
 
     assert first_delete.status_code == 204
@@ -1743,7 +1913,7 @@ def test_delete_upload_heartbeat_failure_before_start_preserves_asset_and_usage(
         coordinator = owner.app.state.resource_coordinator
         coordinator.fail_lease_refresh = True
 
-        response = owner.delete(f"/api/uploads/{asset_id}")
+        response = _delete_uploaded_asset(owner, reference)
 
     assert response.status_code == 503
     assert response.json()["error"]["code"] == "storage_unavailable"
@@ -1766,7 +1936,6 @@ def test_delete_upload_heartbeat_failure_after_quiesce_blocks_rename(
     ) as owner:
         uploaded = _upload(owner, "screen.png", b"image")
         reference = uploaded.json()["reference"]
-        asset_id = reference.split(":", 2)[1]
         session_id = owner.cookies["dt_session"]
         asset_path = storage.resolve(session_id, reference)
         coordinator = owner.app.state.resource_coordinator
@@ -1784,7 +1953,7 @@ def test_delete_upload_heartbeat_failure_after_quiesce_blocks_rename(
             stop_then_fail,
         )
 
-        response = owner.delete(f"/api/uploads/{asset_id}")
+        response = _delete_uploaded_asset(owner, reference)
 
     assert response.status_code == 503
     assert asset_path.read_bytes() == b"image"
@@ -1804,7 +1973,8 @@ def test_delete_upload_has_no_periodic_refresh_during_slow_removal(
         hosted_storage=storage,
     ) as owner:
         uploaded = _upload(owner, "screen.png", b"image")
-        asset_id = uploaded.json()["reference"].split(":", 2)[1]
+        reference = uploaded.json()["reference"]
+        asset_id = reference.split(":", 2)[1]
         session_id = owner.cookies["dt_session"]
         tombstone = tmp_path / "sessions" / session_id / ".trash" / asset_id
         coordinator = owner.app.state.resource_coordinator
@@ -1832,7 +2002,7 @@ def test_delete_upload_has_no_periodic_refresh_during_slow_removal(
             slow_rmtree,
         )
 
-        response = owner.delete(f"/api/uploads/{asset_id}")
+        response = _delete_uploaded_asset(owner, reference)
     assert response.status_code == 204
     assert len(refreshes_during_removal) == 1
     assert refreshes_during_removal[0][0] >= 3
@@ -1856,19 +2026,32 @@ def test_delete_absent_upload_best_effort_finalizes_known_release_marker(
         hosted_storage=storage,
     ) as owner:
         uploaded = _upload(owner, "screen.png", b"image")
-        asset_id = uploaded.json()["reference"].split(":", 2)[1]
+        reference = uploaded.json()["reference"]
+        _scheme, asset_id, generation_id, _filename = reference.split(":", 3)
         session_id = owner.cookies["dt_session"]
         coordinator = owner.app.state.resource_coordinator
-        deletion = storage.delete_asset(session_id, f"asset:{asset_id}")
+        deletion = storage.delete_asset(
+            session_id,
+            f"asset:{asset_id}",
+            expected_generation=generation_id,
+        )
         coordinator.release_committed_asset(
             session_id,
             deletion.asset_id,
-            deletion.size,
+            generation_id,
         )
-        storage.finalize_asset_deletion(session_id, asset_id)
+        storage.finalize_asset_deletion(
+            session_id,
+            asset_id,
+            generation_id,
+        )
         finalize_attempts = 0
 
-        def fail_finalize(_session_id: str, _asset_id: str) -> None:
+        def fail_finalize(
+            _session_id: str,
+            _asset_id: str,
+            _generation_id: str,
+        ) -> None:
             nonlocal finalize_attempts
             finalize_attempts += 1
             raise RedisConnectionError("finalize unavailable")
@@ -1879,7 +2062,7 @@ def test_delete_absent_upload_best_effort_finalizes_known_release_marker(
             fail_finalize,
         )
 
-        response = owner.delete(f"/api/uploads/{asset_id}")
+        response = _delete_uploaded_asset(owner, reference)
 
     assert response.status_code == 404
     assert finalize_attempts == 1
@@ -1892,7 +2075,8 @@ def test_delete_upload_retries_quota_release_from_durable_tombstone(
 ) -> None:
     with _client(tmp_path, max_session_bytes=5) as owner:
         uploaded = _upload(owner, "screen.png", b"image")
-        asset_id = uploaded.json()["reference"].split(":", 2)[1]
+        reference = uploaded.json()["reference"]
+        asset_id = reference.split(":", 2)[1]
         session_id = owner.cookies["dt_session"]
         coordinator = owner.app.state.resource_coordinator
         original_release = coordinator.release_committed_asset
@@ -1901,7 +2085,7 @@ def test_delete_upload_retries_quota_release_from_durable_tombstone(
         def fail_once(
             release_session_id: str,
             release_asset_id: str,
-            released_bytes: int,
+            generation_or_released_bytes: str | int,
         ) -> None:
             nonlocal attempts
             attempts += 1
@@ -1910,17 +2094,17 @@ def test_delete_upload_retries_quota_release_from_durable_tombstone(
             original_release(
                 release_session_id,
                 release_asset_id,
-                released_bytes,
+                generation_or_released_bytes,
             )
 
         monkeypatch.setattr(coordinator, "release_committed_asset", fail_once)
 
-        first_delete = owner.delete(f"/api/uploads/{asset_id}")
+        first_delete = _delete_uploaded_asset(owner, reference)
         tombstone = tmp_path / "sessions" / session_id / ".trash" / asset_id
         assert first_delete.status_code == 503
         assert tombstone.is_dir()
         blocked_replacement = _upload(owner, "blocked.png", b"12345")
-        retry = owner.delete(f"/api/uploads/{asset_id}")
+        retry = _delete_uploaded_asset(owner, reference)
         replacement = _upload(owner, "replacement.png", b"12345")
 
     assert blocked_replacement.status_code == 413
@@ -1937,7 +2121,8 @@ def test_delete_upload_retries_tombstone_removal_without_double_release(
     removal_attempts = 0
     with _client(tmp_path, max_session_bytes=5) as owner:
         uploaded = _upload(owner, "screen.png", b"image")
-        asset_id = uploaded.json()["reference"].split(":", 2)[1]
+        reference = uploaded.json()["reference"]
+        asset_id = reference.split(":", 2)[1]
         session_id = owner.cookies["dt_session"]
         tombstone = tmp_path / "sessions" / session_id / ".trash" / asset_id
         coordinator = owner.app.state.resource_coordinator
@@ -1956,13 +2141,13 @@ def test_delete_upload_retries_tombstone_removal_without_double_release(
             fail_removal_once,
         )
 
-        first_delete = owner.delete(f"/api/uploads/{asset_id}")
+        first_delete = _delete_uploaded_asset(owner, reference)
         assert first_delete.status_code == 503
         assert tombstone.is_dir()
         assert coordinator.finalize_release_calls == 0
         assert asset_id in coordinator.released_assets
         replacement = _upload(owner, "replacement.png", b"12345")
-        retry = owner.delete(f"/api/uploads/{asset_id}")
+        retry = _delete_uploaded_asset(owner, reference)
         overflow = _upload(owner, "overflow.png", b"x")
 
     assert replacement.status_code == 201
@@ -1981,7 +2166,8 @@ def test_delete_upload_recovers_when_rmtree_removed_metadata_before_failure(
     removal_attempts = 0
     with _client(tmp_path, max_session_bytes=5) as owner:
         uploaded = _upload(owner, "screen.png", b"image")
-        asset_id = uploaded.json()["reference"].split(":", 2)[1]
+        reference = uploaded.json()["reference"]
+        asset_id = reference.split(":", 2)[1]
         session_id = owner.cookies["dt_session"]
         tombstone = tmp_path / "sessions" / session_id / ".trash" / asset_id
         metadata = tombstone / ".deletion.json"
@@ -2006,12 +2192,12 @@ def test_delete_upload_recovers_when_rmtree_removed_metadata_before_failure(
             delete_metadata_then_fail_once,
         )
 
-        first_delete = owner.delete(f"/api/uploads/{asset_id}")
+        first_delete = _delete_uploaded_asset(owner, reference)
         assert first_delete.status_code == 503
         assert tombstone.is_dir()
         assert not metadata.exists()
 
-        retry = owner.delete(f"/api/uploads/{asset_id}")
+        retry = _delete_uploaded_asset(owner, reference)
         replacement = _upload(owner, "replacement.png", b"12345")
 
     assert retry.status_code == 204
@@ -2036,10 +2222,15 @@ def test_delete_upload_retains_invalid_tombstone_without_release_marker(
         asset_id = reference.split(":", 2)[1]
         session_id = owner.cookies["dt_session"]
         tombstone = tmp_path / "sessions" / session_id / ".trash" / asset_id
-        storage.delete_asset(session_id, reference)
+        generation_id = reference.split(":", 3)[2]
+        storage.delete_asset(
+            session_id,
+            reference,
+            expected_generation=generation_id,
+        )
         (tombstone / ".deletion.json").unlink()
 
-        rejected = owner.delete(f"/api/uploads/{asset_id}")
+        rejected = _delete_uploaded_asset(owner, reference)
 
     assert rejected.status_code == 503
     assert tombstone.is_dir()
@@ -2052,7 +2243,8 @@ def test_concurrent_retries_recover_partial_tombstone_once(
 ) -> None:
     with _client(tmp_path, max_session_bytes=5) as owner:
         uploaded = _upload(owner, "screen.png", b"image")
-        asset_id = uploaded.json()["reference"].split(":", 2)[1]
+        reference = uploaded.json()["reference"]
+        asset_id = reference.split(":", 2)[1]
         session_id = owner.cookies["dt_session"]
         tombstone = tmp_path / "sessions" / session_id / ".trash" / asset_id
         metadata = tombstone / ".deletion.json"
@@ -2075,13 +2267,14 @@ def test_concurrent_retries_recover_partial_tombstone_once(
             "designtoolkit.web.hosted.shutil.rmtree",
             fail_after_metadata_once,
         )
-        assert owner.delete(f"/api/uploads/{asset_id}").status_code == 503
+        assert _delete_uploaded_asset(owner, reference).status_code == 503
 
         with ThreadPoolExecutor(max_workers=2) as executor:
             statuses = list(
                 executor.map(
-                    lambda _index: owner.delete(
-                        f"/api/uploads/{asset_id}"
+                    lambda _index: _delete_uploaded_asset(
+                        owner,
+                        reference,
                     ).status_code,
                     range(2),
                 )
@@ -2121,8 +2314,9 @@ def test_deleted_asset_token_remains_isolated_from_other_sessions(
     )
     with _client(tmp_path, resource_coordinator=coordinator) as owner:
         uploaded = _upload(owner, "screen.png", b"image")
-        asset_id = uploaded.json()["reference"].split(":", 2)[1]
-        deleted = owner.delete(f"/api/uploads/{asset_id}")
+        reference = uploaded.json()["reference"]
+        asset_id = reference.split(":", 2)[1]
+        deleted = _delete_uploaded_asset(owner, reference)
 
         with _client(tmp_path, resource_coordinator=coordinator) as stranger:
             rejected = stranger.delete(f"/api/uploads/{asset_id}")
@@ -3077,7 +3271,7 @@ def test_reused_upload_id_rejects_stale_generation_without_pin_or_task_leak(
             b"first",
             upload_id=upload_id,
         ).json()["reference"]
-        assert client.delete(f"/api/uploads/{upload_id}").status_code == 204
+        assert _delete_uploaded_asset(client, first_reference).status_code == 204
         second_reference = _upload(
             client,
             "second.mp4",
@@ -3223,7 +3417,7 @@ def test_hosted_batch_rejects_conflicting_asset_generations_without_state(
             content,
             upload_id=upload_id,
         ).json()["reference"]
-        assert client.delete(f"/api/uploads/{upload_id}").status_code == 204
+        assert _delete_uploaded_asset(client, stale_reference).status_code == 204
         current_reference = _upload(
             client,
             filename,
@@ -3374,7 +3568,6 @@ def test_delete_upload_is_blocked_from_validation_through_task_terminal(
     )
     with _client(tmp_path, task_manager=manager) as client:
         reference = _upload(client, "clip.mp4", b"video").json()["reference"]
-        asset_id = reference.split(":", 2)[1]
         with ThreadPoolExecutor(max_workers=1) as executor:
             create = executor.submit(
                 client.post,
@@ -3384,17 +3577,17 @@ def test_delete_upload_is_blocked_from_validation_through_task_terminal(
             try:
                 assert validation_complete.wait(timeout=5)
                 sleep(0.1)
-                during_validation = client.delete(f"/api/uploads/{asset_id}")
+                during_validation = _delete_uploaded_asset(client, reference)
             finally:
                 allow_enqueue.set()
             created = create.result(timeout=5)
 
-        after_handoff = client.delete(f"/api/uploads/{asset_id}")
+        after_handoff = _delete_uploaded_asset(client, reference)
         manager.mark_finished(
             created.json()["task_id"],
             status=TaskStatus.SUCCEEDED,
         )
-        after_terminal = client.delete(f"/api/uploads/{asset_id}")
+        after_terminal = _delete_uploaded_asset(client, reference)
 
     assert during_validation.status_code == 409
     assert during_validation.json()["error"]["code"] == "asset_in_use"
@@ -3426,12 +3619,11 @@ def test_failed_hosted_task_validation_releases_asset_read_pin(
     )
     with _client(tmp_path, task_manager=manager) as client:
         reference = _upload(client, "clip.mp4", b"video").json()["reference"]
-        asset_id = reference.split(":", 2)[1]
         rejected = client.post(
             "/api/tasks/video-frames",
             json={"input_path": reference, "image_format": "png"},
         )
-        deleted = client.delete(f"/api/uploads/{asset_id}")
+        deleted = _delete_uploaded_asset(client, reference)
 
     assert rejected.status_code == 422
     assert deleted.status_code == 204
@@ -3466,13 +3658,12 @@ def test_interrupted_hosted_task_validation_releases_asset_read_pin(
     )
     with _client(tmp_path, task_manager=manager) as client:
         reference = _upload(client, "clip.mp4", b"video").json()["reference"]
-        asset_id = reference.split(":", 2)[1]
         with pytest.raises(RuntimeError, match="client disconnected"):
             client.post(
                 "/api/tasks/video-frames",
                 json={"input_path": reference, "image_format": "png"},
             )
-        deleted = client.delete(f"/api/uploads/{asset_id}")
+        deleted = _delete_uploaded_asset(client, reference)
 
     assert deleted.status_code == 204
     assert list(
@@ -3498,7 +3689,7 @@ def test_delete_upload_rejects_asset_referenced_by_active_task(
     )
     with _client(tmp_path, task_manager=manager) as client:
         reference = _upload(client, "clip.mp4", b"video").json()["reference"]
-        asset_id = reference.split(":", 2)[1]
+        _scheme, asset_id, generation_id, _filename = reference.split(":", 3)
         session_id = client.cookies["dt_session"]
         asset_path = HostedStorage(tmp_path, max_upload_bytes=1024).resolve(
             session_id,
@@ -3512,9 +3703,15 @@ def test_delete_upload_rejects_asset_referenced_by_active_task(
         if status is TaskStatus.RUNNING:
             manager.mark_running(task_id)
 
-        deleted = client.delete(f"/api/uploads/{asset_id}")
+        stale = client.delete(
+            f"/api/uploads/{asset_id}?generation={'f' * 32}"
+        )
+        deleted = client.delete(
+            f"/api/uploads/{asset_id}?generation={generation_id}"
+        )
 
     assert created.status_code == 202
+    assert stale.status_code == 404
     assert deleted.status_code == 409
     assert deleted.json()["error"]["code"] == "asset_in_use"
     assert asset_path.read_bytes() == b"video"
@@ -3543,7 +3740,7 @@ def test_delete_upload_accepts_asset_after_task_becomes_terminal(
             status=TaskStatus.SUCCEEDED,
         )
 
-        deleted = client.delete(f"/api/uploads/{asset_id}")
+        deleted = _delete_uploaded_asset(client, reference)
 
     assert created.status_code == 202
     assert deleted.status_code == 204
@@ -3563,7 +3760,6 @@ def test_delete_upload_waits_for_all_tasks_sharing_asset_to_finish(
     )
     with _client(tmp_path, task_manager=manager) as client:
         reference = _upload(client, "clip.mp4", b"video").json()["reference"]
-        asset_id = reference.split(":", 2)[1]
         task_ids = [
             client.post(
                 "/api/tasks/video-frames",
@@ -3573,9 +3769,9 @@ def test_delete_upload_waits_for_all_tasks_sharing_asset_to_finish(
         ]
         manager.mark_finished(task_ids[0], status=TaskStatus.SUCCEEDED)
 
-        still_referenced = client.delete(f"/api/uploads/{asset_id}")
+        still_referenced = _delete_uploaded_asset(client, reference)
         manager.mark_finished(task_ids[1], status=TaskStatus.FAILED, error="failed")
-        deleted = client.delete(f"/api/uploads/{asset_id}")
+        deleted = _delete_uploaded_asset(client, reference)
 
     assert still_referenced.status_code == 409
     assert deleted.status_code == 204

@@ -230,22 +230,23 @@ export async function uploadFiles(
   signal?: AbortSignal,
 ): Promise<readonly string[]> {
   const uploaded: UploadResponse[] = []
-  const attemptedUploadIds: string[] = []
+  const cleanupTargets: string[] = []
   try {
     for (let index = 0; index < files.length; index += 1) {
       throwIfUploadAborted(signal)
       const file = files[index]
       const uploadId = createUploadId()
-      attemptedUploadIds.push(uploadId)
+      const cleanupIndex = cleanupTargets.push(uploadId) - 1
       const response = await uploadFile(file, uploadId, (fileProgress) => {
         onProgress(Math.round(((index + fileProgress) / files.length) * 100))
       }, signal)
       uploaded.push(response)
+      cleanupTargets[cleanupIndex] = response.reference
       throwIfUploadAborted(signal)
     }
   } catch (error) {
     const cleanupResults = await Promise.allSettled(
-      attemptedUploadIds.map((uploadId) => deleteUploadedAsset(uploadId)),
+      cleanupTargets.map((target) => deleteUploadedAsset(target)),
     )
     const cleanupErrors = cleanupResults.flatMap((result) =>
       result.status === 'rejected' ? [result.reason] : [],
@@ -264,12 +265,19 @@ export async function uploadFiles(
   return uploaded.map(({ reference }) => reference)
 }
 
-async function deleteUploadedAsset(assetId: string): Promise<void> {
+export async function deleteUploadedAsset(
+  assetIdOrReference: string,
+): Promise<void> {
+  const { assetId, generation } = uploadedAssetDeletionTarget(assetIdOrReference)
+  const generationQuery = generation === undefined
+    ? ''
+    : `?generation=${encodeURIComponent(generation)}`
+  const url = `/api/uploads/${encodeURIComponent(assetId)}${generationQuery}`
   const maximumAttempts = 3
   for (let attempt = 1; attempt <= maximumAttempts; attempt += 1) {
     let response: Response
     try {
-      response = await fetch(`/api/uploads/${assetId}`, { method: 'DELETE' })
+      response = await fetch(url, { method: 'DELETE' })
     } catch (error) {
       if (attempt === maximumAttempts) {
         throw new Error(
@@ -292,6 +300,24 @@ async function deleteUploadedAsset(assetId: string): Promise<void> {
       throw failure
     }
   }
+}
+
+function uploadedAssetDeletionTarget(value: string): {
+  assetId: string
+  generation?: string
+} {
+  const parts = value.split(':')
+  if (
+    parts[0] === 'asset'
+    && (parts.length === 3 || parts.length === 4)
+    && parts[1]
+  ) {
+    return {
+      assetId: parts[1],
+      generation: parts.length === 4 && parts[2] ? parts[2] : undefined,
+    }
+  }
+  return { assetId: value }
 }
 
 function uploadFile(

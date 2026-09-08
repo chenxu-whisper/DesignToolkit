@@ -6,6 +6,7 @@ const DROP_PATH_ERROR = '浏览器未提供文件真实路径，请使用文件�
 const PICKER_ERROR = '无法打开系统选择器，请手动输入本地路径'
 
 type PathInputProps = {
+  deleteUploadedAsset?: (reference: string) => Promise<void>
   disabled?: boolean
   error?: string
   id?: string
@@ -29,6 +30,7 @@ type PathInputProps = {
 }
 
 export function PathInput({
+  deleteUploadedAsset,
   disabled = false,
   error,
   id,
@@ -229,9 +231,31 @@ export function PathInput({
         controller.signal,
       )
       if (isLatestIntent(intent) && references.length > 0) {
-        commitValue(
-          valueWithDroppedPaths('', references, multiline),
-        )
+        const previousValue = currentValueRef.current
+        const nextValue = valueWithDroppedPaths('', references, multiline)
+        commitValue(nextValue)
+        if (deleteUploadedAsset) {
+          const retainedReferences = new Set(assetReferences(nextValue))
+          const removedReferences = assetReferences(previousValue).filter(
+            (reference) => !retainedReferences.has(reference),
+          )
+          const cleanupResults = await Promise.allSettled(
+            removedReferences.map((reference) =>
+              deleteUploadedAsset(reference)),
+          )
+          const cleanupErrors = cleanupResults.flatMap((result) =>
+            result.status === 'rejected' ? [result.reason] : [],
+          )
+          if (cleanupErrors.length > 0) {
+            const firstError = cleanupErrors[0]
+            throw new AggregateError(
+              cleanupErrors,
+              firstError instanceof Error && firstError.message
+                ? firstError.message
+                : `${cleanupErrors.length} 个旧文件清理失败`,
+            )
+          }
+        }
       }
     } catch (error) {
       if (isLatestIntent(intent)) {
@@ -562,15 +586,33 @@ function uniquePaths(paths: string[]): string[] {
 function uploadedFileNames(value: string): string {
   return pathLines(value)
     .map((reference) => {
-      const parts = reference.split(':', 3)
-      if (parts[0] !== 'asset' || !parts[2]) {
+      const parts = reference.split(':')
+      const encodedFilename = parts.at(-1)
+      if (
+        parts[0] !== 'asset'
+        || (parts.length !== 3 && parts.length !== 4)
+        || !encodedFilename
+      ) {
         return reference
       }
       try {
-        return decodeURIComponent(parts[2])
+        return decodeURIComponent(encodedFilename)
       } catch {
-        return parts[2]
+        return encodedFilename
       }
     })
     .join('\n')
+}
+
+function assetReferences(value: string): string[] {
+  return uniquePaths(
+    pathLines(value).filter((reference) => {
+      const parts = reference.split(':')
+      return (
+        parts[0] === 'asset'
+        && (parts.length === 3 || parts.length === 4)
+        && parts.slice(1).every(Boolean)
+      )
+    }),
+  )
 }

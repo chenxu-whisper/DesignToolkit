@@ -94,6 +94,10 @@ _CANCEL_UPLOAD_SCRIPT = """-- cancel_upload
 if redis.call("EXISTS", KEYS[1]) == 0 then
     return 0
 end
+if ARGV[2] ~= ""
+    and redis.call("HGET", KEYS[1], "token") ~= ARGV[2] then
+    return 0
+end
 redis.call("HSET", KEYS[1], "state", "cancelled")
 redis.call("PEXPIRE", KEYS[1], tonumber(ARGV[1]))
 return 1
@@ -2280,13 +2284,23 @@ class RedisResourceCoordinator:
             raise ResourceUnavailableError("Upload is already in progress")
         raise last_transport_error
 
-    def cancel_upload(self, session_id: str, upload_id: str) -> bool:
+    def cancel_upload(
+        self,
+        session_id: str,
+        upload_id: str,
+        expected_generation: str | None = None,
+    ) -> bool:
         _validate_session_id(session_id)
         _validate_asset_id(upload_id)
+        if expected_generation is not None:
+            _validate_token(expected_generation)
         return bool(
             self._cancel_upload_script(
                 keys=[_upload_inflight_key(session_id, upload_id)],
-                args=[self._reservation_ttl_ms],
+                args=[
+                    self._reservation_ttl_ms,
+                    expected_generation or "",
+                ],
             )
         )
 

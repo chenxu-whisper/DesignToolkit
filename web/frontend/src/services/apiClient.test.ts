@@ -7,6 +7,7 @@ import {
   createChromaVideoPreview,
   createMediaResizeTask,
   createVideoFramesTask,
+  deleteUploadedAsset,
   getTask,
   inspectChromaImage,
   inspectChromaVideo,
@@ -34,6 +35,23 @@ afterEach(() => {
 })
 
 describe('apiClient', () => {
+  it('deletes a four-part asset reference with an encoded generation URL', async () => {
+    const cleanup = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(new Response(null, { status: 204 }))
+    const assetId = 'asset/id with space'
+    const generation = 'generation/value'
+
+    await deleteUploadedAsset(
+      `asset:${assetId}:${generation}:素材%3A100%25.png`,
+    )
+
+    expect(cleanup).toHaveBeenCalledWith(
+      `/api/uploads/${encodeURIComponent(assetId)}?generation=${encodeURIComponent(generation)}`,
+      { method: 'DELETE' },
+    )
+  })
+
   it('uploads files sequentially as raw bodies with aggregate progress', async () => {
     const requests: MockUploadRequest[] = []
     vi.spyOn(globalThis.crypto, 'randomUUID')
@@ -186,6 +204,7 @@ describe('apiClient', () => {
     const requests: MockUploadRequest[] = []
     const uploadUuid = '11111111-1111-1111-1111-111111111111'
     const assetId = uploadUuid.replaceAll('-', '')
+    const generation = '2'.repeat(32)
 
     class MockUploadRequest {
       response: unknown = null
@@ -228,7 +247,7 @@ describe('apiClient', () => {
 
     requests[0].response = {
       filename: 'image.png',
-      reference: `asset:${assetId}:image.png`,
+      reference: `asset:${assetId}:${generation}:image.png`,
       size: 5,
     }
     requests[0].listeners.get('load')?.()
@@ -237,15 +256,17 @@ describe('apiClient', () => {
     await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
     expect(requests[0].headers.get('X-Upload-Id')).toBe(assetId)
     expect(cleanup).toHaveBeenCalledOnce()
-    expect(cleanup).toHaveBeenCalledWith(`/api/uploads/${assetId}`, {
-      method: 'DELETE',
-    })
+    expect(cleanup).toHaveBeenCalledWith(
+      `/api/uploads/${assetId}?generation=${generation}`,
+      { method: 'DELETE' },
+    )
   })
 
   it('retries network and transient server cleanup failures without masking the upload error', async () => {
     const requests: MockUploadRequest[] = []
     const firstId = '1'.repeat(32)
     const secondId = '2'.repeat(32)
+    const firstGeneration = '3'.repeat(32)
 
     class MockUploadRequest {
       status = 201
@@ -278,7 +299,8 @@ describe('apiClient', () => {
     const cleanup = vi
       .spyOn(globalThis, 'fetch')
       .mockImplementation(async (input) => {
-        const assetId = String(input).split('/').at(-1) ?? ''
+        const url = new URL(String(input), 'http://localhost')
+        const assetId = decodeURIComponent(url.pathname.split('/').at(-1) ?? '')
         const attempt = (cleanupAttempts.get(assetId) ?? 0) + 1
         cleanupAttempts.set(assetId, attempt)
         if (assetId === firstId && attempt === 1) {
@@ -299,7 +321,7 @@ describe('apiClient', () => {
 
     requests[0].response = {
       filename: 'first.png',
-      reference: `asset:${firstId}:first.png`,
+      reference: `asset:${firstId}:${firstGeneration}:first.png`,
       size: 5,
     }
     requests[0].listeners.get('load')?.()
@@ -312,9 +334,10 @@ describe('apiClient', () => {
 
     await expect(pending).rejects.toThrow('Second upload rejected')
     expect(cleanup).toHaveBeenCalledTimes(5)
-    expect(cleanup).toHaveBeenCalledWith(`/api/uploads/${firstId}`, {
-      method: 'DELETE',
-    })
+    expect(cleanup).toHaveBeenCalledWith(
+      `/api/uploads/${firstId}?generation=${firstGeneration}`,
+      { method: 'DELETE' },
+    )
     expect(cleanup).toHaveBeenCalledWith(`/api/uploads/${secondId}`, {
       method: 'DELETE',
     })

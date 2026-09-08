@@ -73,11 +73,13 @@ function ControlledBatchPathInputWithPicker({
 }
 
 function ControlledUploadPathInput({
+  deleteUploadedAsset,
   disabled = false,
   initialValue = '',
   onUploadPendingChange,
   uploadFiles,
 }: {
+  deleteUploadedAsset?: (reference: string) => Promise<void>
   disabled?: boolean
   initialValue?: string
   onUploadPendingChange?: (pending: boolean) => void
@@ -91,6 +93,7 @@ function ControlledUploadPathInput({
 
   return (
     <PathInput
+      deleteUploadedAsset={deleteUploadedAsset}
       disabled={disabled}
       label="输入媒体路径"
       multiline
@@ -992,6 +995,81 @@ describe('PathInput', () => {
     expect(uploadFiles).toHaveBeenCalledOnce()
   })
 
+  it('displays the decoded final filename segment of four-part references', () => {
+    render(
+      <ControlledUploadPathInput
+        initialValue={`asset:${'1'.repeat(32)}:${'2'.repeat(32)}:${encodeURIComponent('素材:100%.png')}`}
+        uploadFiles={vi.fn()}
+      />,
+    )
+
+    expect(screen.getByLabelText('输入媒体路径')).toHaveValue('素材:100%.png')
+  })
+
+  it('commits replacements before deleting only unretained old references', async () => {
+    const retained = `asset:${'1'.repeat(32)}:${'2'.repeat(32)}:retained.png`
+    const removed = `asset:${'3'.repeat(32)}:${'4'.repeat(32)}:old.png`
+    const added = `asset:${'5'.repeat(32)}:${'6'.repeat(32)}:new.png`
+    const deleteUploadedAsset = vi.fn().mockResolvedValue(undefined)
+    const uploadFiles = vi.fn().mockResolvedValue([retained, added])
+    const { container } = render(
+      <ControlledUploadPathInput
+        deleteUploadedAsset={deleteUploadedAsset}
+        initialValue={`${removed}\n${retained}`}
+        uploadFiles={uploadFiles}
+      />,
+    )
+    const fileInput = container.querySelector<HTMLInputElement>('input[type="file"]')
+    if (!fileInput) {
+      throw new Error('upload input missing')
+    }
+
+    fireEvent.change(fileInput, {
+      target: {
+        files: [
+          new File(['retained'], 'retained.png', { type: 'image/png' }),
+          new File(['new'], 'new.png', { type: 'image/png' }),
+        ],
+      },
+    })
+
+    await waitFor(() =>
+      expect(screen.getByLabelText('输入媒体路径')).toHaveValue(
+        'retained.png\nnew.png',
+      ),
+    )
+    expect(deleteUploadedAsset).toHaveBeenCalledOnce()
+    expect(deleteUploadedAsset).toHaveBeenCalledWith(removed)
+  })
+
+  it('keeps the committed replacement visible when old asset cleanup fails', async () => {
+    const previous = `asset:${'1'.repeat(32)}:${'2'.repeat(32)}:old.png`
+    const replacement = `asset:${'3'.repeat(32)}:${'4'.repeat(32)}:new.png`
+    const deleteUploadedAsset = vi
+      .fn()
+      .mockRejectedValue(new Error('旧文件清理失败'))
+    const uploadFiles = vi.fn().mockResolvedValue([replacement])
+    const { container } = render(
+      <ControlledUploadPathInput
+        deleteUploadedAsset={deleteUploadedAsset}
+        initialValue={previous}
+        uploadFiles={uploadFiles}
+      />,
+    )
+    const fileInput = container.querySelector<HTMLInputElement>('input[type="file"]')
+    if (!fileInput) {
+      throw new Error('upload input missing')
+    }
+
+    fireEvent.change(fileInput, {
+      target: { files: [new File(['new'], 'new.png', { type: 'image/png' })] },
+    })
+
+    expect(await screen.findByText('旧文件清理失败')).toBeInTheDocument()
+    expect(screen.getByLabelText('输入媒体路径')).toHaveValue('new.png')
+    expect(deleteUploadedAsset).toHaveBeenCalledWith(previous)
+  })
+
   it('reports upload pending until a replacement upload resolves', async () => {
     const uploadRequest = deferred<readonly string[]>()
     const uploadFiles = vi.fn(() => uploadRequest.promise)
@@ -1057,9 +1135,11 @@ describe('PathInput', () => {
       .fn()
       .mockReturnValueOnce(firstRequest.promise)
       .mockReturnValueOnce(secondRequest.promise)
+    const deleteUploadedAsset = vi.fn().mockResolvedValue(undefined)
     const onUploadPendingChange = vi.fn()
     const renderInput = (disabled: boolean) => (
       <ControlledUploadPathInput
+        deleteUploadedAsset={deleteUploadedAsset}
         disabled={disabled}
         initialValue="asset:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:old.png"
         onUploadPendingChange={onUploadPendingChange}
@@ -1090,6 +1170,7 @@ describe('PathInput', () => {
     })
     expect(onUploadPendingChange.mock.calls).toEqual([[true], [false], [true]])
     expect(screen.getByLabelText('输入媒体路径')).toHaveValue('old.png')
+    expect(deleteUploadedAsset).not.toHaveBeenCalled()
 
     await act(async () => {
       secondRequest.resolve(['asset:cccccccccccccccccccccccccccccccc:second.png'])
@@ -1097,6 +1178,10 @@ describe('PathInput', () => {
     })
     expect(onUploadPendingChange.mock.calls).toEqual([[true], [false], [true], [false]])
     expect(screen.getByLabelText('输入媒体路径')).toHaveValue('second.png')
+    expect(deleteUploadedAsset).toHaveBeenCalledOnce()
+    expect(deleteUploadedAsset).toHaveBeenCalledWith(
+      'asset:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:old.png',
+    )
   })
 
   it('keeps the active upload intent when another file is dropped', async () => {
@@ -1184,6 +1269,7 @@ describe('PathInput', () => {
     let uploadSignal: AbortSignal | undefined
     const uploadRequest = deferred<readonly string[]>()
     const onUploadPendingChange = vi.fn()
+    const deleteUploadedAsset = vi.fn().mockResolvedValue(undefined)
     const uploadFiles = vi.fn(
       (
         _files: readonly File[],
@@ -1196,6 +1282,8 @@ describe('PathInput', () => {
     )
     const { container, unmount } = render(
       <ControlledUploadPathInput
+        deleteUploadedAsset={deleteUploadedAsset}
+        initialValue={`asset:${'1'.repeat(32)}:${'2'.repeat(32)}:current.png`}
         onUploadPendingChange={onUploadPendingChange}
         uploadFiles={uploadFiles}
       />,
@@ -1218,10 +1306,13 @@ describe('PathInput', () => {
     expect(uploadSignal?.aborted).toBe(true)
     expect(onUploadPendingChange.mock.calls).toEqual([[true], [false]])
     await act(async () => {
-      uploadRequest.resolve([])
+      uploadRequest.resolve([
+        `asset:${'3'.repeat(32)}:${'4'.repeat(32)}:stale.png`,
+      ])
       await uploadRequest.promise
     })
     expect(onUploadPendingChange.mock.calls).toEqual([[true], [false]])
+    expect(deleteUploadedAsset).not.toHaveBeenCalled()
   })
 
   it('ignores stale upload progress after its intent is invalidated', async () => {

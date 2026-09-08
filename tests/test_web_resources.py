@@ -93,6 +93,12 @@ class DeterministicRedis(fakeredis.FakeRedis):
         key = keys[0]
         if not self.exists(key):
             return 0
+        expected_generation = str(args[1])
+        if (
+            expected_generation
+            and self._text(self.hget(key, "token")) != expected_generation
+        ):
+            return 0
         self.hset(key, "state", "cancelled")
         self.pexpire(key, int(args[0]))
         return 1
@@ -1641,6 +1647,45 @@ def test_upload_registration_is_session_scoped_and_cancellable(
     assert list(
         redis_connection.scan_iter(match="dt:resource:upload-inflight:*")
     ) == []
+
+
+def test_upload_cancellation_is_bound_to_registration_generation(
+    redis_connection: DeterministicRedis,
+) -> None:
+    resources = coordinator(redis_connection)
+    upload_id = "1" * 32
+    stale_generation = "2" * 32
+    registration = resources.register_upload(SESSION_A, upload_id)
+
+    assert (
+        resources.cancel_upload(
+            SESSION_A,
+            upload_id,
+            stale_generation,
+        )
+        is False
+    )
+    assert registration.refresh() is False
+    assert (
+        resources.cancel_upload(
+            SESSION_A,
+            upload_id,
+            registration.token,
+        )
+        is True
+    )
+    assert registration.refresh() is True
+
+
+def test_upload_cancellation_without_generation_remains_supported(
+    redis_connection: DeterministicRedis,
+) -> None:
+    resources = coordinator(redis_connection)
+    upload_id = "1" * 32
+    registration = resources.register_upload(SESSION_A, upload_id)
+
+    assert resources.cancel_upload(SESSION_A, upload_id) is True
+    assert registration.refresh() is True
 
 
 def test_upload_registration_acknowledgement_loss_reuses_one_token() -> None:

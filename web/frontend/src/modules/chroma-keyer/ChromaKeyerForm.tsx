@@ -4,6 +4,7 @@ import { hostedMode } from '../../app/runtimeConfig'
 import { FieldError } from '../../components/FieldError'
 import { PathInput } from '../../components/PathInput'
 import {
+  deleteUploadedAsset,
   pickLocalDirectory,
   pickLocalFiles,
   pickLocalSaveFile,
@@ -79,6 +80,7 @@ export function ChromaKeyerForm({
           媒体
         </h2>
         <PathInput
+          deleteUploadedAsset={hostedMode ? deleteUploadedAsset : undefined}
           disabled={disabled}
           error={errors.inputPath}
           id="chroma-keyer-input-path"
