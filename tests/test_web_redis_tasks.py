@@ -12,6 +12,7 @@ from zipfile import ZipFile
 
 import fakeredis
 import pytest
+from pydantic import ValidationError
 from redis import Redis
 from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import RedisError, ResponseError
@@ -2231,17 +2232,54 @@ def test_redis_event_cursor_uses_lua_result_and_propagates_redis_errors() -> Non
         store._event_at_cursor("task-1", "generation-b", 1)
 
 
-def test_redis_subscriber_rejects_malformed_event_like_history() -> None:
+@pytest.mark.parametrize("use_lua", [True, False], ids=["lua", "fallback"])
+@pytest.mark.parametrize(
+    ("payload", "cause_type"),
+    [
+        (b'{"task_id":', ValidationError),
+        (b'{"task_id":"malformed-events"}', ValidationError),
+        (b"\xff", UnicodeDecodeError),
+    ],
+    ids=["malformed-json", "wrong-schema", "invalid-utf8"],
+)
+def test_redis_event_cursor_reports_corrupt_indexed_event_as_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+    use_lua: bool,
+    payload: bytes,
+    cause_type: type[Exception],
+) -> None:
     redis_connection = fakeredis.FakeRedis(decode_responses=False)
     store = RedisLogStore(redis_connection, retention_seconds=60)
     task_id = "malformed-events"
-    event_key = f"dt:task:{task_id}:events"
     generation_key = f"dt:event-generation:{task_id}"
-    redis_connection.rpush(event_key, '{"not":"a log event"}')
+    event_index_key = f"dt:task:{task_id}:event-index"
     redis_connection.set(generation_key, "generation-a")
+    redis_connection.hset(
+        event_index_key,
+        mapping={"next_sequence": 1, "1": payload},
+    )
+    if use_lua:
+        monkeypatch.setattr(
+            store,
+            "_read_event_at_cursor_script",
+            lambda **_kwargs: ["ok", "generation-a", payload, "2"],
+        )
+    else:
 
-    with pytest.raises(ValueError) as history_error:
-        store.history(task_id)
+        def unknown_command(**_kwargs):
+            raise ResponseError("unknown command 'evalsha'")
+
+        monkeypatch.setattr(
+            store,
+            "_read_event_at_cursor_script",
+            unknown_command,
+        )
+    pipeline_type = type(redis_connection.pipeline())
+
+    def forbidden_full_scan(*_args, **_kwargs):
+        raise AssertionError("cursor read performed a full event-log scan")
+
+    monkeypatch.setattr(pipeline_type, "lrange", forbidden_full_scan)
     subscriber = redis_tasks_module.RedisEventSubscriber(
         store,
         task_id,
@@ -2249,8 +2287,25 @@ def test_redis_subscriber_rejects_malformed_event_like_history() -> None:
         1,
     )
 
-    with pytest.raises(type(history_error.value)):
+    with pytest.raises(
+        redis_errors_module.EventCursorUnavailable,
+        match="cursor event",
+    ) as error:
         subscriber.get(timeout=0.2)
+    assert isinstance(error.value.__cause__, cause_type)
+
+
+def test_redis_history_keeps_existing_malformed_event_error() -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    store = RedisLogStore(redis_connection, retention_seconds=60)
+    task_id = "malformed-history"
+    event_key = f"dt:task:{task_id}:events"
+    generation_key = f"dt:event-generation:{task_id}"
+    redis_connection.rpush(event_key, '{"not":"a log event"}')
+    redis_connection.set(generation_key, "generation-a")
+
+    with pytest.raises(ValidationError):
+        store.history(task_id)
 
 
 def test_real_redis_subscriber_rejects_event_log_generation_after_expiry(

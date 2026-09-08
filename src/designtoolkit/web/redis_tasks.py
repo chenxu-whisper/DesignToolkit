@@ -830,11 +830,17 @@ class RedisLogStore:
                 "Task event cursor state is unavailable"
             )
         generation_text = _redis_text(generation) or None
-        event = (
-            LogEventResponse.model_validate_json(value)
-            if value is not None
-            else None
-        )
+        try:
+            event_json = value.decode() if isinstance(value, bytes) else value
+            event = (
+                LogEventResponse.model_validate_json(event_json)
+                if event_json is not None
+                else None
+            )
+        except ValueError as exc:
+            raise EventCursorUnavailable(
+                "Task cursor event is unavailable"
+            ) from exc
         return generation_text, event, int(next_sequence)
 
     def _append_without_lua(self, task_id: str, event_json: str) -> None:

@@ -2838,7 +2838,7 @@ def test_hosted_event_stream_emits_error_and_closes_on_midstream_redis_outage(
     unsubscribe.assert_called_once()
 
 
-def test_hosted_event_stream_reports_unavailable_cursor_without_hanging(
+def test_hosted_event_stream_reports_corrupt_cursor_event_once_and_unsubscribes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2851,17 +2851,29 @@ def test_hosted_event_stream_reports_unavailable_cursor_without_hanging(
         retention_seconds=7200,
     )
     original_subscribe = manager.log_store.history_and_subscribe
+    unsubscribe = Mock()
 
-    def subscribe_then_drop_index(task_id: str):
+    def subscribe_then_corrupt_next_event(task_id: str):
         history, subscriber = original_subscribe(task_id)
-        redis_connection.delete(f"dt:task:{task_id}:event-index")
+        event_index_key = f"dt:task:{task_id}:event-index"
+        next_sequence = int(
+            redis_connection.hget(event_index_key, "next_sequence")
+        ) + 1
+        redis_connection.hset(
+            event_index_key,
+            mapping={
+                "next_sequence": next_sequence,
+                str(next_sequence): b"\xff",
+            },
+        )
         return history, subscriber
 
     monkeypatch.setattr(
         manager.log_store,
         "history_and_subscribe",
-        subscribe_then_drop_index,
+        subscribe_then_corrupt_next_event,
     )
+    monkeypatch.setattr(manager.log_store, "unsubscribe", unsubscribe)
     with _client(
         tmp_path,
         task_manager=manager,
@@ -2876,11 +2888,14 @@ def test_hosted_event_stream_reports_unavailable_cursor_without_hanging(
         response = client.get(f"/api/tasks/{task_id}/events")
 
     assert response.status_code == 200
-    assert response.text.endswith(
+    unavailable_event = (
         "event: error\n"
         'data: {"error":{"code":"storage_unavailable",'
         '"message":"Task event storage is temporarily unavailable"}}\n\n'
     )
+    assert response.text.endswith(unavailable_event)
+    assert response.text.count(unavailable_event) == 1
+    unsubscribe.assert_called_once()
 
 
 def test_rate_limit_unknown_failure_is_not_suppressed(
