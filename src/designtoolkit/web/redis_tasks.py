@@ -307,7 +307,10 @@ if redis.call("HGET", KEYS[5], "owner_token") ~= owner_token then
     return 0
 end
 local release_pin = false
-local repair_pin = false
+local repair_pin = (
+    redis.call("HGET", KEYS[5], "task_id") ~= task_id
+    or redis.call("HGET", KEYS[5], "owner_id") ~= owner_id
+)
 local asset_ids = {}
 if owner_id ~= "" then
     release_pin = true
@@ -2468,23 +2471,33 @@ class RedisTaskManager:
                             )
                         )
                     pipeline.watch(*watched_keys)
-                    token = pipeline.hget(
-                        _enqueue_intent_key(task_id),
-                        "owner_token",
+                    intent_metadata = pipeline.hgetall(
+                        _enqueue_intent_key(task_id)
                     )
-                    if _redis_text(token) != owner_token:
+                    if (
+                        _redis_hash_text(intent_metadata, "owner_token")
+                        != owner_token
+                    ):
                         pipeline.unwatch()
                         return self._repair_rolled_back_enqueue_indexes(
                             task_id
                         )
+                    context_matches = (
+                        _redis_hash_text(intent_metadata, "task_id") == task_id
+                        and _redis_hash_text(intent_metadata, "owner_id")
+                        == owner
+                    )
                     pin_metadata = pipeline.hgetall(_task_pin_key(task_id))
                     release_pin = bool(owner) and (
                         _redis_hash_text(pin_metadata, "session_id") == owner
                         and _redis_hash_text(pin_metadata, "task_id") == task_id
                     )
-                    repair_pin = bool(owner) and (
-                        not release_pin
-                        or _task_pin_asset_metadata_corrupt(pin_metadata)
+                    repair_pin = not context_matches or (
+                        bool(owner)
+                        and (
+                            not release_pin
+                            or _task_pin_asset_metadata_corrupt(pin_metadata)
+                        )
                     )
                     asset_ids = (
                         ()
@@ -2995,9 +3008,17 @@ class RedisTaskManager:
                     continue
             if coordinator is not None:
                 try:
-                    coordinator.release_task_resources(task_id)
+                    coordinator.release_task_resources(
+                        task_id,
+                        expected_session_id=(
+                            task.owner_id if task is not None else None
+                        ),
+                    )
                 except CorruptTaskPinError:
                     self._repair_task_reverse_indexes(task_id)
+                else:
+                    if task is None:
+                        self._repair_task_reverse_indexes(task_id)
             else:
                 self.release_task_pin(task_id)
             if not self._redis.exists(key):
@@ -3005,11 +3026,13 @@ class RedisTaskManager:
         return reconciled
 
     def release_task_pin(self, task_id: str) -> bool:
+        task = self.get_task(task_id)
+        if task is None:
+            return self._repair_task_reverse_indexes(task_id)
         pin_key = _task_pin_key(task_id)
         metadata = self._redis.hgetall(pin_key)
         if not metadata:
-            task = self.get_task(task_id)
-            if task is not None and task.owner_id is None:
+            if task.owner_id is None:
                 return False
             return self._repair_task_reverse_indexes(task_id)
         session_id = _redis_hash_text(metadata, "session_id")
@@ -3023,8 +3046,7 @@ class RedisTaskManager:
             _validate_session_id(session_id)
         except ValueError:
             return self._repair_task_reverse_indexes(task_id)
-        task = self.get_task(task_id)
-        if task is not None and task.owner_id != session_id:
+        if task.owner_id != session_id:
             return self._repair_task_reverse_indexes(task_id)
 
         session_task_pins_key = _session_task_pins_key(session_id)
@@ -3440,6 +3462,7 @@ class RedisTaskManager:
         cleanup_key = _failure_cleanup_key(task_id)
         if self._redis.exists(cleanup_key):
             return False
+        task = self.get_task(task_id)
         self._release_queue_slot(task_id)
         from designtoolkit.web.worker import discard_failed_task_output
 
@@ -3447,7 +3470,12 @@ class RedisTaskManager:
             discard_failed_task_output(task_id, self)
         finally:
             if self.resource_coordinator is not None:
-                self.resource_coordinator.release_task_resources(task_id)
+                self.resource_coordinator.release_task_resources(
+                    task_id,
+                    expected_session_id=(
+                        task.owner_id if task is not None else None
+                    ),
+                )
         self._redis.set(cleanup_key, "1", ex=self.retention_seconds)
         return True
 

@@ -46,6 +46,7 @@ from designtoolkit.web.redis_tasks import (
     handle_job_stopped,
 )
 from designtoolkit.web.resources import (
+    CorruptTaskPinError,
     RedisResourceCoordinator,
     ResourceUnavailableError,
     SessionDeletingError,
@@ -97,7 +98,13 @@ class StubTaskResources:
     def __init__(self) -> None:
         self.released: list[str] = []
 
-    def release_task_resources(self, task_id: str) -> None:
+    def release_task_resources(
+        self,
+        task_id: str,
+        *,
+        expected_session_id: str | None = None,
+    ) -> None:
+        assert expected_session_id is not None
         self.released.append(task_id)
 
 
@@ -140,11 +147,22 @@ class TrackingTaskResources:
         )
         return self.output
 
-    def release_task_resources(self, task_id: str) -> None:
+    def release_task_resources(
+        self,
+        task_id: str,
+        *,
+        expected_session_id: str | None = None,
+    ) -> None:
+        assert expected_session_id is not None
         self.events.append(f"release-task:{task_id}")
 
-    def release_task_pin(self, _task_id: str) -> None:
-        pass
+    def release_task_pin(
+        self,
+        _task_id: str,
+        *,
+        expected_session_id: str | None = None,
+    ) -> None:
+        assert expected_session_id is not None
 
 
 def _manager(
@@ -831,6 +849,30 @@ def test_real_redis_task_pin_release_repairs_untrusted_metadata(
     )
 
 
+def test_real_redis_coordinator_rejects_task_pin_from_unexpected_session(
+    real_redis_connection: Redis,
+    tmp_path: Path,
+) -> None:
+    resources = _resources(real_redis_connection)
+    manager = _manager(real_redis_connection, tmp_path)
+    session_id = "a" * 32
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+        owner_id=session_id,
+        asset_identities=(("1" * 32, "2" * 32),),
+    )
+    pin_key = f"dt:resource:task-pin:{task.task_id}"
+    real_redis_connection.hset(pin_key, "session_id", "b" * 32)
+
+    with pytest.raises(CorruptTaskPinError, match="ownership is invalid"):
+        resources.release_task_pin(
+            task.task_id,
+            expected_session_id=session_id,
+        )
+
+    assert real_redis_connection.exists(pin_key)
+
+
 @pytest.mark.parametrize("use_lua", [True, False], ids=["lua", "fallback"])
 @pytest.mark.parametrize(
     "release_via_reconcile",
@@ -981,6 +1023,39 @@ def test_real_redis_missing_task_pin_repairs_reverse_indexes(
     )
 
 
+def test_real_redis_missing_task_record_repairs_indexes_by_task_id(
+    real_redis_connection: Redis,
+    tmp_path: Path,
+) -> None:
+    manager = _manager(real_redis_connection, tmp_path)
+    session_id = "a" * 32
+    asset_id = "1" * 32
+    orphan_asset_id = "2" * 32
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+        owner_id=session_id,
+        asset_identities=((asset_id, "3" * 32),),
+    )
+    orphan_asset_tasks_key = (
+        f"dt:resource:asset-tasks:{session_id}:{orphan_asset_id}"
+    )
+    real_redis_connection.sadd(orphan_asset_tasks_key, task.task_id)
+    real_redis_connection.delete(f"dt:task:{task.task_id}")
+
+    assert manager.release_task_pin(task.task_id)
+    assert not real_redis_connection.exists(
+        f"dt:resource:task-pin:{task.task_id}"
+    )
+    assert not real_redis_connection.exists(
+        f"dt:resource:session:{session_id}:task-pins"
+    )
+    assert not real_redis_connection.exists(
+        f"dt:resource:asset-tasks:{session_id}:{asset_id}"
+    )
+    assert not real_redis_connection.exists(orphan_asset_tasks_key)
+    assert manager.release_task_pin(task.task_id)
+
+
 def test_real_redis_corrupt_task_pin_scans_session_indexes_without_owner(
     real_redis_connection: Redis,
     tmp_path: Path,
@@ -1096,6 +1171,7 @@ def test_real_redis_task_pin_normal_release_does_not_scan(
         "task-mismatch",
         "session-mismatch",
         "session-malformed",
+        "intent-session-mismatch",
     ],
 )
 def test_real_redis_enqueue_rollback_repairs_corrupt_task_pin_indexes(
@@ -1170,8 +1246,14 @@ def test_real_redis_enqueue_rollback_repairs_corrupt_task_pin_indexes(
             )
         elif corruption == "session-mismatch":
             real_redis_connection.hset(pin_key, "session_id", "b" * 32)
-        else:
+        elif corruption == "session-malformed":
             real_redis_connection.hset(pin_key, "session_id", "not-a-session")
+        else:
+            real_redis_connection.hset(
+                f"dt:enqueue-intent:{task_id}",
+                "owner_id",
+                "b" * 32,
+            )
         raise TaskConflictError("enqueue rejected")
 
     with pytest.raises(TaskConflictError, match="enqueue rejected"):
@@ -1391,25 +1473,17 @@ def test_task_pin_release_conservatively_migrates_legacy_asset_id_metadata(
     manager = _manager(redis_connection, tmp_path)
     session_id = "a" * 32
     asset_id = "1" * 32
-    task_id = "legacy-task"
-    redis_connection.hset(
-        f"dt:resource:task-pin:{task_id}",
-        mapping={
-            "task_id": task_id,
-            "session_id": session_id,
-            "asset_ids": json.dumps([asset_id]),
-        },
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "legacy.mp4")),
+        owner_id=session_id,
+        asset_ids=(asset_id,),
     )
-    redis_connection.sadd(
-        f"dt:resource:session:{session_id}:task-pins",
-        task_id,
-    )
-    redis_connection.sadd(
-        f"dt:resource:asset-tasks:{session_id}:{asset_id}",
-        task_id,
+    redis_connection.hdel(
+        f"dt:resource:task-pin:{task.task_id}",
+        "asset_identities",
     )
 
-    assert manager.release_task_pin(task_id)
+    assert manager.release_task_pin(task.task_id)
     claim = manager.claim_asset_deletion(session_id, asset_id)
     manager.release_asset_deletion(session_id, asset_id, claim)
 
@@ -1676,6 +1750,61 @@ def test_real_redis_reconcile_repairs_all_corrupt_coordinator_task_pins(
     ) == {other_task.task_id.encode()}
 
 
+def test_real_redis_reconcile_repairs_valid_pin_with_wrong_owner_identity(
+    real_redis_connection: Redis,
+    tmp_path: Path,
+) -> None:
+    resources = _resources(real_redis_connection)
+    manager = _manager(
+        real_redis_connection,
+        tmp_path,
+        resource_coordinator=resources,
+    )
+    owner_id = "a" * 32
+    fake_owner_id = "b" * 32
+    asset_id = "1" * 32
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "terminal.mp4")),
+        owner_id=owner_id,
+        asset_identities=((asset_id, "2" * 32),),
+    )
+    fake_owner_task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "active.mp4")),
+        owner_id=fake_owner_id,
+        asset_identities=((asset_id, "3" * 32),),
+    )
+    task.status = TaskStatus.SUCCEEDED
+    manager._save_task(task)
+
+    pin_key = f"dt:resource:task-pin:{task.task_id}"
+    fake_owner_pins_key = (
+        f"dt:resource:session:{fake_owner_id}:task-pins"
+    )
+    fake_owner_asset_tasks_key = (
+        f"dt:resource:asset-tasks:{fake_owner_id}:{asset_id}"
+    )
+    real_redis_connection.hset(pin_key, "session_id", fake_owner_id)
+    real_redis_connection.sadd(fake_owner_pins_key, task.task_id)
+    real_redis_connection.sadd(fake_owner_asset_tasks_key, task.task_id)
+
+    assert manager.reconcile_tasks(grace_seconds=60) == 1
+    assert manager.reconcile_tasks(grace_seconds=60) == 0
+
+    assert not real_redis_connection.exists(pin_key)
+    assert not real_redis_connection.exists(
+        f"dt:resource:session:{owner_id}:task-pins"
+    )
+    assert not real_redis_connection.exists(
+        f"dt:resource:asset-tasks:{owner_id}:{asset_id}"
+    )
+    assert real_redis_connection.smembers(fake_owner_pins_key) == {
+        fake_owner_task.task_id.encode()
+    }
+    assert real_redis_connection.smembers(fake_owner_asset_tasks_key) == {
+        fake_owner_task.task_id.encode()
+    }
+
+
 def test_real_redis_reconcile_normal_coordinator_release_does_not_repair_scan(
     real_redis_connection: Redis,
     tmp_path: Path,
@@ -1731,7 +1860,12 @@ def test_real_redis_reconcile_does_not_treat_availability_errors_as_corruption(
     task.status = TaskStatus.SUCCEEDED
     manager._save_task(task)
 
-    def fail_release(_task_id: str) -> None:
+    def fail_release(
+        _task_id: str,
+        *,
+        expected_session_id: str | None = None,
+    ) -> None:
+        assert expected_session_id == "a" * 32
         raise error
 
     monkeypatch.setattr(resources, "release_task_resources", fail_release)
@@ -4325,7 +4459,13 @@ def test_external_failure_discards_output_before_releasing_task_lease(
     events: list[str] = []
 
     class OrderedResources:
-        def release_task_resources(self, _task_id: str) -> None:
+        def release_task_resources(
+            self,
+            _task_id: str,
+            *,
+            expected_session_id: str | None = None,
+        ) -> None:
+            assert expected_session_id is not None
             events.append("release")
 
     manager = _manager(

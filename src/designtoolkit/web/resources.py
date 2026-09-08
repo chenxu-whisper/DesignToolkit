@@ -3080,7 +3080,12 @@ class RedisResourceCoordinator:
             )
         )
 
-    def release_task_resources(self, task_id: str) -> None:
+    def release_task_resources(
+        self,
+        task_id: str,
+        *,
+        expected_session_id: str | None = None,
+    ) -> None:
         metadata = self._redis.hgetall(_task_resource_key(task_id))
         session_id = _decoded_hash_value(metadata, "session_id")
         output_token = _decoded_hash_value(metadata, "output_token")
@@ -3095,15 +3100,23 @@ class RedisResourceCoordinator:
                 task_id=task_id,
             )
         self.reconcile_reservations()
-        self.release_task_pin(task_id)
+        self.release_task_pin(
+            task_id,
+            expected_session_id=expected_session_id,
+        )
 
-    def release_task_pin(self, task_id: str) -> bool:
+    def release_task_pin(
+        self,
+        task_id: str,
+        *,
+        expected_session_id: str | None = None,
+    ) -> bool:
         pin_key = _task_pin_key(task_id)
         metadata = self._redis.hgetall(pin_key)
         if not metadata:
             return False
         session_id = _decoded_hash_value(metadata, "session_id")
-        if session_id is None:
+        if session_id is None or session_id != expected_session_id:
             raise CorruptTaskPinError("Task pin ownership is invalid")
         result = int(
             self._release_task_pin_script(
