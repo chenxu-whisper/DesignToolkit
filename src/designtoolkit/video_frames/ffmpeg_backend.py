@@ -13,6 +13,7 @@ from importlib import resources
 from os import name as os_name
 from pathlib import Path
 from shutil import which
+from threading import RLock
 from typing import Protocol
 
 import imageio_ffmpeg
@@ -27,6 +28,12 @@ _WINDOWS_NEW_PROCESS_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x2
 _PROCESS_CLEANUP_TIMEOUT_SECONDS = 5.0
 _WINDOWS_STARTUP_ERROR_RETURN_CODE = 126
 _WINDOWS_STARTUP_ERROR_MAX_BYTES = 4096
+_WINDOWS_HANDLE_INHERITANCE_LOCK = RLock()
+_WINDOWS_LAUNCHER_EXECUTABLE = getattr(
+    sys,
+    "_base_executable",
+    sys.executable,
+) or sys.executable
 _WINDOWS_LAUNCHER_CODE = """\
 import base64
 import ctypes
@@ -39,15 +46,114 @@ from ctypes import wintypes
 
 MAX_STATUS_BYTES = 4096
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+class STARTUPINFOW(ctypes.Structure):
+    _fields_ = [
+        ("cb", wintypes.DWORD),
+        ("lpReserved", wintypes.LPWSTR),
+        ("lpDesktop", wintypes.LPWSTR),
+        ("lpTitle", wintypes.LPWSTR),
+        ("dwX", wintypes.DWORD),
+        ("dwY", wintypes.DWORD),
+        ("dwXSize", wintypes.DWORD),
+        ("dwYSize", wintypes.DWORD),
+        ("dwXCountChars", wintypes.DWORD),
+        ("dwYCountChars", wintypes.DWORD),
+        ("dwFillAttribute", wintypes.DWORD),
+        ("dwFlags", wintypes.DWORD),
+        ("wShowWindow", wintypes.WORD),
+        ("cbReserved2", wintypes.WORD),
+        ("lpReserved2", ctypes.POINTER(wintypes.BYTE)),
+        ("hStdInput", wintypes.HANDLE),
+        ("hStdOutput", wintypes.HANDLE),
+        ("hStdError", wintypes.HANDLE),
+    ]
+
+class PROCESS_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("hProcess", wintypes.HANDLE),
+        ("hThread", wintypes.HANDLE),
+        ("dwProcessId", wintypes.DWORD),
+        ("dwThreadId", wintypes.DWORD),
+    ]
+
 open_event = kernel32.OpenEventW
 open_event.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
 open_event.restype = wintypes.HANDLE
+create_process = kernel32.CreateProcessW
+create_process.argtypes = [
+    wintypes.LPCWSTR,
+    wintypes.LPWSTR,
+    ctypes.c_void_p,
+    ctypes.c_void_p,
+    wintypes.BOOL,
+    wintypes.DWORD,
+    ctypes.c_void_p,
+    wintypes.LPCWSTR,
+    ctypes.POINTER(STARTUPINFOW),
+    ctypes.POINTER(PROCESS_INFORMATION),
+]
+create_process.restype = wintypes.BOOL
+get_std_handle = kernel32.GetStdHandle
+get_std_handle.argtypes = [wintypes.DWORD]
+get_std_handle.restype = wintypes.HANDLE
+resume_thread = kernel32.ResumeThread
+resume_thread.argtypes = [wintypes.HANDLE]
+resume_thread.restype = wintypes.DWORD
+terminate_process = kernel32.TerminateProcess
+terminate_process.argtypes = [wintypes.HANDLE, wintypes.UINT]
+terminate_process.restype = wintypes.BOOL
 wait_for_single_object = kernel32.WaitForSingleObject
 wait_for_single_object.argtypes = [wintypes.HANDLE, wintypes.DWORD]
 wait_for_single_object.restype = wintypes.DWORD
+get_exit_code_process = kernel32.GetExitCodeProcess
+get_exit_code_process.argtypes = [
+    wintypes.HANDLE,
+    ctypes.POINTER(wintypes.DWORD),
+]
+get_exit_code_process.restype = wintypes.BOOL
 close_handle = kernel32.CloseHandle
 close_handle.argtypes = [wintypes.HANDLE]
 close_handle.restype = wintypes.BOOL
+
+def write_startup_error(error_code):
+    exc = ctypes.WinError(error_code)
+
+    def bounded_text(value):
+        return None if value is None else str(value)[:256]
+
+    error_number = exc.errno if isinstance(exc.errno, int) else error_code
+    payload = {
+        "type": type(exc).__name__[:64],
+        "errno": error_number,
+        "winerror": getattr(exc, "winerror", error_code),
+        "filename": bounded_text(getattr(exc, "filename", None)),
+        "strerror": bounded_text(exc.strerror),
+        "message": bounded_text(str(exc)),
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    if len(encoded) > MAX_STATUS_BYTES:
+        encoded = json.dumps(
+            {
+                "type": "OSError",
+                "errno": error_number,
+                "winerror": error_code,
+                "filename": None,
+                "strerror": "Windows process creation failed",
+                "message": "Windows process creation failed",
+            },
+            separators=(",", ":"),
+        ).encode("ascii")
+    view = memoryview(encoded)
+    while view:
+        written = os.write(status_fd, view)
+        if written <= 0:
+            break
+        view = view[written:]
 
 status_fd = msvcrt.open_osfhandle(int(sys.argv[2]), os.O_WRONLY)
 try:
@@ -61,48 +167,48 @@ try:
         close_handle(event_handle)
 
     command = json.loads(base64.b64decode(sys.argv[3]).decode("utf-8"))
+    status_handle = msvcrt.get_osfhandle(status_fd)
     os.set_inheritable(status_fd, False)
-    try:
-        process = subprocess.Popen(command, shell=False)
-    except OSError as exc:
-        def bounded_text(value):
-            return None if value is None else str(value)[:256]
+    os.set_handle_inheritable(status_handle, False)
 
-        payload = {
-            "type": type(exc).__name__[:64],
-            "errno": exc.errno,
-            "winerror": getattr(exc, "winerror", None),
-            "filename": bounded_text(exc.filename),
-            "strerror": bounded_text(exc.strerror),
-            "message": bounded_text(str(exc)),
-        }
-        encoded = json.dumps(
-            payload,
-            ensure_ascii=False,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        if len(encoded) > MAX_STATUS_BYTES:
-            encoded = json.dumps(
-                {
-                    "type": "OSError",
-                    "errno": exc.errno,
-                    "winerror": getattr(exc, "winerror", None),
-                    "filename": None,
-                    "strerror": "Windows process creation failed",
-                    "message": "Windows process creation failed",
-                },
-                separators=(",", ":"),
-            ).encode("ascii")
-        view = memoryview(encoded)
-        while view:
-            written = os.write(status_fd, view)
-            if written <= 0:
-                break
-            view = view[written:]
+    startup_info = STARTUPINFOW()
+    startup_info.cb = ctypes.sizeof(startup_info)
+    startup_info.dwFlags = 0x00000100
+    startup_info.hStdInput = get_std_handle(-10)
+    startup_info.hStdOutput = get_std_handle(-11)
+    startup_info.hStdError = get_std_handle(-12)
+    process_info = PROCESS_INFORMATION()
+    command_line = ctypes.create_unicode_buffer(subprocess.list2cmdline(command))
+    if not create_process(
+        None,
+        command_line,
+        None,
+        None,
+        True,
+        0x00000004,
+        None,
+        None,
+        ctypes.byref(startup_info),
+        ctypes.byref(process_info),
+    ):
+        write_startup_error(ctypes.get_last_error())
         raise SystemExit(126)
+
     os.close(status_fd)
     status_fd = -1
-    raise SystemExit(process.wait())
+    if resume_thread(process_info.hThread) == 0xFFFFFFFF:
+        terminate_process(process_info.hProcess, 126)
+        wait_for_single_object(process_info.hProcess, 0xFFFFFFFF)
+        close_handle(process_info.hThread)
+        close_handle(process_info.hProcess)
+        raise SystemExit(126)
+    close_handle(process_info.hThread)
+    wait_for_single_object(process_info.hProcess, 0xFFFFFFFF)
+    exit_code = wintypes.DWORD()
+    if not get_exit_code_process(process_info.hProcess, ctypes.byref(exit_code)):
+        exit_code.value = 1
+    close_handle(process_info.hProcess)
+    raise SystemExit(exit_code.value)
 finally:
     if status_fd >= 0:
         os.close(status_fd)
@@ -254,7 +360,7 @@ def _windows_launcher_command(
         json.dumps(list(command), ensure_ascii=False).encode("utf-8")
     ).decode("ascii")
     return [
-        sys.executable,
+        _WINDOWS_LAUNCHER_EXECUTABLE,
         "-c",
         _WINDOWS_LAUNCHER_CODE,
         event_name,
@@ -337,7 +443,6 @@ class _WindowsLaunchGate:
         try:
             status_read_fd, status_write_fd = os.pipe()
             status_write_handle = msvcrt.get_osfhandle(status_write_fd)
-            os.set_handle_inheritable(status_write_handle, True)
             os.set_blocking(status_read_fd, False)
             return cls(
                 api=kernel_api,
@@ -377,19 +482,33 @@ class _WindowsLaunchGate:
             "startupinfo": startupinfo,
             "close_fds": True,
         }
-        process = popen(self.launcher_command, **kwargs)
         status_write_fd = self._status_write_fd
-        self._status_write_fd = None
-        if status_write_fd is not None:
+        if status_write_fd is None:
+            raise RuntimeError("Windows launcher status writer is unavailable")
+        with _WINDOWS_HANDLE_INHERITANCE_LOCK:
             try:
-                os.close(status_write_fd)
-            except BaseException:
+                os.set_handle_inheritable(self._status_write_handle, True)
+                process = popen(self.launcher_command, **kwargs)
+            finally:
+                self._status_write_fd = None
                 try:
-                    _LOGGER.exception(
-                        "Failed to close parent FFmpeg startup status writer"
-                    )
+                    os.set_handle_inheritable(self._status_write_handle, False)
                 except BaseException:
-                    pass
+                    try:
+                        _LOGGER.exception(
+                            "Failed to reset parent FFmpeg status writer inheritance"
+                        )
+                    except BaseException:
+                        pass
+                try:
+                    os.close(status_write_fd)
+                except BaseException:
+                    try:
+                        _LOGGER.exception(
+                            "Failed to close parent FFmpeg startup status writer"
+                        )
+                    except BaseException:
+                        pass
         return process
 
     def read_startup_error(self, returncode: int | None) -> OSError | None:

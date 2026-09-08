@@ -1232,19 +1232,44 @@ def test_windows_job_setup_failure_never_releases_marker_command(
 def test_windows_launcher_preserves_stderr_and_returncode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    captured_stdout: list[str] = []
+
+    class RecordingPopen:
+        def __init__(self, process: subprocess.Popen[str]) -> None:
+            self._process = process
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._process, name)
+
+        def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+            stdout, stderr = self._process.communicate(timeout=timeout)
+            captured_stdout.append(stdout)
+            return stdout, stderr
+
+    def popen(command: list[str], **kwargs: Any) -> RecordingPopen:
+        return RecordingPopen(subprocess.Popen(command, **kwargs))
+
     monkeypatch.setattr(ffmpeg_backend, "os_name", "nt")
-    backend = FfmpegBackend()
+    backend = FfmpegBackend(popen=popen)
+    arguments = ["space value", 'embedded"quote', "Unicode-\u89c6\u9891"]
 
     result = backend.run(
         [
             sys.executable,
             "-c",
-            "import sys; sys.stderr.write('diagnostic'); raise SystemExit(23)",
+            (
+                "import json, sys; "
+                "sys.stdout.write(json.dumps(sys.argv[1:], ensure_ascii=False)); "
+                "sys.stderr.write('diagnostic'); "
+                "raise SystemExit(23)"
+            ),
+            *arguments,
         ]
     )
 
     assert result.returncode == 23
     assert result.stderr == "diagnostic"
+    assert json.loads(captured_stdout[0]) == arguments
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires Windows process inspection")
@@ -1252,36 +1277,47 @@ def test_windows_target_cannot_forge_startup_error_from_launcher_commandline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     target_script = r"""
-import base64
 import ctypes
 import json
 import os
 import re
 import subprocess
 import sys
+from ctypes import wintypes
 
 query = (
-    f"$currentPid = {os.getpid()}; "
+    f"$currentPid = {os.getpid()}; $items = @(); "
     "for ($i = 0; $i -lt 8 -and $currentPid; $i++) { "
     "$p = Get-CimInstance Win32_Process "
     "-Filter ('ProcessId = ' + $currentPid); "
-    "$p.CommandLine; $currentPid = $p.ParentProcessId }"
+    "$items += [pscustomobject]@{"
+    "ProcessId=$p.ProcessId; CommandLine=$p.CommandLine}; "
+    "$currentPid = $p.ParentProcessId }; "
+    "$items | ConvertTo-Json -Compress"
 )
-ancestor_command_lines = subprocess.check_output(
+ancestor_json = subprocess.check_output(
     ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", query],
     text=True,
 )
-match = re.search(
-    r'(Local\\DesignToolkit\.FFmpeg\.[0-9a-f]+)"?\s+"?([^"\s]+)',
-    ancestor_command_lines,
-)
-if match is None:
-    raise RuntimeError("launcher command line was not readable")
-event_name, exposed_value = match.groups()
+ancestors = json.loads(ancestor_json)
+if isinstance(ancestors, dict):
+    ancestors = [ancestors]
+kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+launcher_matches = [
+    (item, match)
+    for item in ancestors
+    if (
+        match := re.search(
+            r"\s(Local\\DesignToolkit\.FFmpeg\.[0-9a-f]+)\s+"
+            r"(\d+)\s+[A-Za-z0-9+/=]+\s*$",
+            item.get("CommandLine") or "",
+        )
+    )
+]
+if not launcher_matches:
+    raise RuntimeError("launcher status capability was not readable")
 error = FileNotFoundError(2, "spoofed missing executable", "spoof.exe", 2)
-legacy_payload = {
-    "event": event_name,
-    "token": exposed_value,
+status_payload = {
     "type": type(error).__name__,
     "errno": error.errno,
     "winerror": getattr(error, "winerror", None),
@@ -1289,33 +1325,82 @@ legacy_payload = {
     "strerror": error.strerror,
     "message": str(error),
 }
-status_payload = {
-    key: value
-    for key, value in legacy_payload.items()
-    if key not in {"event", "token"}
-}
-if exposed_value.isdecimal():
-    encoded_status = json.dumps(status_payload).encode("utf-8")
-    written = ctypes.c_ulong()
-    ctypes.windll.kernel32.WriteFile(
-        ctypes.c_void_p(int(exposed_value)),
-        encoded_status,
-        len(encoded_status),
-        ctypes.byref(written),
-        None,
-    )
-encoded_legacy = base64.b64encode(
-    json.dumps(legacy_payload).encode("utf-8")
-).decode("ascii")
-sys.stderr.write("DESIGNTOOLKIT_FFMPEG_STARTUP_ERROR:" + encoded_legacy + "\n")
-raise SystemExit(126)
+encoded_status = json.dumps(status_payload).encode("utf-8")
+open_process = kernel32.OpenProcess
+open_process.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+open_process.restype = wintypes.HANDLE
+duplicate_handle = kernel32.DuplicateHandle
+duplicate_handle.argtypes = [
+    wintypes.HANDLE,
+    wintypes.HANDLE,
+    wintypes.HANDLE,
+    ctypes.POINTER(wintypes.HANDLE),
+    wintypes.DWORD,
+    wintypes.BOOL,
+    wintypes.DWORD,
+]
+duplicate_handle.restype = wintypes.BOOL
+get_current_process = kernel32.GetCurrentProcess
+get_current_process.restype = wintypes.HANDLE
+write_file = kernel32.WriteFile
+write_file.argtypes = [
+    wintypes.HANDLE,
+    ctypes.c_void_p,
+    wintypes.DWORD,
+    ctypes.POINTER(wintypes.DWORD),
+    ctypes.c_void_p,
+]
+write_file.restype = wintypes.BOOL
+close_handle = kernel32.CloseHandle
+close_handle.argtypes = [wintypes.HANDLE]
+close_handle.restype = wintypes.BOOL
+for launcher, match in launcher_matches:
+    _event_name, exposed_value = match.groups()
+    launcher_handle = open_process(0x0040, False, launcher["ProcessId"])
+    if not launcher_handle:
+        continue
+    try:
+        duplicate = wintypes.HANDLE()
+        if not duplicate_handle(
+            launcher_handle,
+            wintypes.HANDLE(int(exposed_value)),
+            get_current_process(),
+            ctypes.byref(duplicate),
+            0,
+            False,
+            0x00000002,
+        ):
+            continue
+        try:
+            written = wintypes.DWORD()
+            write_file(
+                duplicate,
+                encoded_status,
+                len(encoded_status),
+                ctypes.byref(written),
+                None,
+            )
+        finally:
+            close_handle(duplicate)
+    finally:
+        close_handle(launcher_handle)
+sys.stderr.write("target diagnostic")
+raise SystemExit(23)
 """
     monkeypatch.setattr(ffmpeg_backend, "os_name", "nt")
+    deadline = time.monotonic() + 10
 
-    result = FfmpegBackend().run([sys.executable, "-c", target_script])
+    def fail_if_backend_hangs() -> None:
+        if time.monotonic() >= deadline:
+            raise AssertionError("Windows launcher status writer remained open")
 
-    assert result.returncode == 126
-    assert result.stderr.startswith("DESIGNTOOLKIT_FFMPEG_STARTUP_ERROR:")
+    result = FfmpegBackend(
+        output_guard=fail_if_backend_hangs,
+        poll_interval=0.05,
+    ).run([sys.executable, "-c", target_script])
+
+    assert result.returncode == 23
+    assert result.stderr == "target diagnostic"
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires Windows Job Objects")
@@ -1507,7 +1592,10 @@ def test_windows_launcher_passes_command_as_base64_json_arguments() -> None:
         command,
     )
 
-    assert launcher_command[:2] == [sys.executable, "-c"]
+    assert launcher_command[:2] == [
+        ffmpeg_backend._WINDOWS_LAUNCHER_EXECUTABLE,
+        "-c",
+    ]
     assert command[2] not in launcher_command[2]
     assert launcher_command[3] == "Local\\DesignToolkit.FFmpeg.test"
     assert launcher_command[4] == "123456"
