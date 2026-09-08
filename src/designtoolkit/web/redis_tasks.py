@@ -39,6 +39,7 @@ from designtoolkit.web.resources import (
     _ASSET_TASK_PREFIX,
     _CLEANUP_PREFIX,
     _RELEASE_TASK_PIN_SCRIPT,
+    CorruptTaskPinError,
     SessionDeletingError,
     _asset_tasks_key,
     _session_state_key,
@@ -2993,8 +2994,12 @@ class RedisTaskManager:
                 if task_id in started_ids:
                     continue
             if coordinator is not None:
-                coordinator.release_task_resources(task_id)
-            self.release_task_pin(task_id)
+                try:
+                    coordinator.release_task_resources(task_id)
+                except CorruptTaskPinError:
+                    self._repair_task_reverse_indexes(task_id)
+            else:
+                self.release_task_pin(task_id)
             if not self._redis.exists(key):
                 reconciled += 1
         return reconciled

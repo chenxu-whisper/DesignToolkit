@@ -1792,6 +1792,10 @@ class ResourceUnavailableError(RuntimeError):
     pass
 
 
+class CorruptTaskPinError(ResourceUnavailableError):
+    pass
+
+
 class SessionDeletingError(ResourceUnavailableError):
     pass
 
@@ -3095,12 +3099,12 @@ class RedisResourceCoordinator:
 
     def release_task_pin(self, task_id: str) -> bool:
         pin_key = _task_pin_key(task_id)
-        session_id = _decoded_hash_value(
-            self._redis.hgetall(pin_key),
-            "session_id",
-        )
-        if session_id is None:
+        metadata = self._redis.hgetall(pin_key)
+        if not metadata:
             return False
+        session_id = _decoded_hash_value(metadata, "session_id")
+        if session_id is None:
+            raise CorruptTaskPinError("Task pin ownership is invalid")
         result = int(
             self._release_task_pin_script(
                 keys=[
@@ -3115,9 +3119,9 @@ class RedisResourceCoordinator:
             )
         )
         if result == 2:
-            raise ResourceUnavailableError("Task pin ownership is invalid")
-        if result == 3:
-            raise ResourceUnavailableError("Task pin asset metadata is invalid")
+            raise CorruptTaskPinError("Task pin ownership is invalid")
+        if result in {3, 4}:
+            raise CorruptTaskPinError("Task pin asset metadata is invalid")
         return result == 1
 
     def output_reserved_bytes(self) -> int:

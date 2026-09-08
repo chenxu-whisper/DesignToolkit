@@ -47,6 +47,7 @@ from designtoolkit.web.redis_tasks import (
 )
 from designtoolkit.web.resources import (
     RedisResourceCoordinator,
+    ResourceUnavailableError,
     SessionDeletingError,
 )
 from designtoolkit.web.schemas import (
@@ -1611,6 +1612,132 @@ def test_real_redis_reconcile_releases_terminal_asset_pin_after_ack_loss(
     ) == []
     claim = manager.claim_asset_deletion(session_id, asset_id)
     manager.release_asset_deletion(session_id, asset_id, claim)
+
+
+def test_real_redis_reconcile_repairs_all_corrupt_coordinator_task_pins(
+    real_redis_connection: Redis,
+    tmp_path: Path,
+) -> None:
+    resources = _resources(real_redis_connection)
+    manager = _manager(
+        real_redis_connection,
+        tmp_path,
+        resource_coordinator=resources,
+    )
+    session_id = "a" * 32
+    asset_id = "1" * 32
+    corrupt_tasks = [
+        manager.create_video_frames_task(
+            VideoFramesTaskRequest(
+                input_path=str(tmp_path / f"corrupt-{index}.mp4")
+            ),
+            owner_id=session_id,
+            asset_identities=((asset_id, f"{index + 2:032x}"),),
+        )
+        for index in range(3)
+    ]
+    other_task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "active.mp4")),
+        owner_id=session_id,
+        asset_identities=((asset_id, "f" * 32),),
+    )
+    for task in corrupt_tasks:
+        task.status = TaskStatus.SUCCEEDED
+        manager._save_task(task)
+
+    malformed, divergent, task_mismatch = corrupt_tasks
+    real_redis_connection.hset(
+        f"dt:resource:task-pin:{malformed.task_id}",
+        "asset_identities",
+        "{",
+    )
+    real_redis_connection.hset(
+        f"dt:resource:task-pin:{divergent.task_id}",
+        "asset_ids",
+        json.dumps(["e" * 32]),
+    )
+    real_redis_connection.hset(
+        f"dt:resource:task-pin:{task_mismatch.task_id}",
+        "task_id",
+        "ffffffff-ffff-4fff-bfff-ffffffffffff",
+    )
+
+    assert manager.reconcile_tasks(grace_seconds=60) == 3
+    assert manager.reconcile_tasks(grace_seconds=60) == 0
+
+    assert list(
+        real_redis_connection.scan_iter(match="dt:resource:task-pin:*")
+    ) == [f"dt:resource:task-pin:{other_task.task_id}".encode()]
+    assert real_redis_connection.smembers(
+        f"dt:resource:session:{session_id}:task-pins"
+    ) == {other_task.task_id.encode()}
+    assert real_redis_connection.smembers(
+        f"dt:resource:asset-tasks:{session_id}:{asset_id}"
+    ) == {other_task.task_id.encode()}
+
+
+def test_real_redis_reconcile_normal_coordinator_release_does_not_repair_scan(
+    real_redis_connection: Redis,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(
+        real_redis_connection,
+        tmp_path,
+        resource_coordinator=_resources(real_redis_connection),
+    )
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+        owner_id="a" * 32,
+        asset_identities=(("1" * 32, "2" * 32),),
+    )
+    task.status = TaskStatus.SUCCEEDED
+    manager._save_task(task)
+    monkeypatch.setattr(
+        manager,
+        "_repair_task_reverse_indexes",
+        lambda _task_id: pytest.fail("normal reconcile must not repair-scan"),
+    )
+
+    assert manager.reconcile_tasks(grace_seconds=60) == 1
+    assert manager.reconcile_tasks(grace_seconds=60) == 0
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        RedisConnectionError("task pin cleanup disconnected"),
+        ResourceUnavailableError("storage unavailable"),
+    ],
+    ids=["redis-transport", "storage-unavailable"],
+)
+def test_real_redis_reconcile_does_not_treat_availability_errors_as_corruption(
+    real_redis_connection: Redis,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error: Exception,
+) -> None:
+    resources = _resources(real_redis_connection)
+    manager = _manager(
+        real_redis_connection,
+        tmp_path,
+        resource_coordinator=resources,
+    )
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+        owner_id="a" * 32,
+        asset_identities=(("1" * 32, "2" * 32),),
+    )
+    task.status = TaskStatus.SUCCEEDED
+    manager._save_task(task)
+
+    def fail_release(_task_id: str) -> None:
+        raise error
+
+    monkeypatch.setattr(resources, "release_task_resources", fail_release)
+
+    with pytest.raises(type(error), match=str(error)):
+        manager.reconcile_tasks(grace_seconds=60)
 
 
 def test_real_redis_task_pin_release_ack_loss_leaves_no_asset_blocker(
