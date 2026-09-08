@@ -1140,6 +1140,96 @@ def test_legacy_v1_asset_deletion_without_generation_remains_supported(
     assert deletion.size == 4
 
 
+@pytest.mark.anyio
+async def test_late_legacy_finalizer_preserves_reused_active_generation(
+    tmp_path: Path,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    session_id = "a" * 32
+    asset_id = "1" * 32
+    asset_dir = tmp_path / "sessions" / session_id / "assets" / asset_id
+    asset_dir.mkdir(parents=True)
+    (asset_dir / "legacy.png").write_bytes(b"old")
+    (asset_dir / ".asset.json").write_text(
+        json.dumps({"asset_id": asset_id, "bytes": 3}),
+        encoding="utf-8",
+    )
+    deletion_identity = storage.inspect_upload_for_deletion(
+        session_id,
+        asset_id,
+    )
+    deletion = storage.delete_asset(
+        session_id,
+        f"asset:{asset_id}",
+        expected_identity=deletion_identity,
+    )
+    assert deletion is not None
+
+    storage.finalize_asset_deletion(
+        session_id,
+        asset_id,
+        expected_generation=None,
+        expected_identity=deletion_identity,
+    )
+
+    registration = RecordingUploadRegistration()
+    registration.token = "3" * 32
+    storage.claim_upload_generation(
+        session_id,
+        asset_id,
+        token=registration.token,
+    )
+    generation_marker = (
+        tmp_path
+        / "sessions"
+        / session_id
+        / ".upload-generations"
+        / asset_id
+    )
+    storage._refresh_upload_generation(
+        session_id,
+        asset_id,
+        registration.token,
+    )
+    heartbeat_mtime = generation_marker.stat().st_mtime_ns
+
+    storage.finalize_asset_deletion(
+        session_id,
+        asset_id,
+        expected_generation=None,
+        expected_identity=deletion_identity,
+    )
+    storage.finalize_asset_deletion(
+        session_id,
+        asset_id,
+        expected_generation=None,
+        expected_identity=deletion_identity,
+    )
+    storage.finalize_asset_deletion(
+        session_id,
+        asset_id,
+        expected_generation=None,
+    )
+
+    assert generation_marker.read_text(encoding="ascii") == registration.token
+    assert generation_marker.stat().st_mtime_ns == heartbeat_mtime
+    assert not (
+        tmp_path / "sessions" / session_id / ".trash" / asset_id
+    ).exists()
+
+    published = await storage.store_stream(
+        session_id,
+        asset_id=asset_id,
+        filename="new.png",
+        content_length=3,
+        chunks=_chunks(b"new"),
+        reservation=RecordingReservation(),
+        registration=registration,
+    )
+
+    assert storage.resolve(session_id, published.reference).read_bytes() == b"new"
+
+
 def test_asset_reference_parser_decodes_generation_and_quoted_filename() -> None:
     asset_id = "1" * 32
     generation_id = "2" * 32

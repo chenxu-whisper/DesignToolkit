@@ -1117,13 +1117,27 @@ class HostedStorage:
         session_id: str,
         asset_id: str,
         expected_generation: str | None = None,
+        *,
+        expected_identity: UploadDeletionInspection | None = None,
     ) -> None:
         session_id = _validate_session_id(session_id)
         asset_id = _asset_id(f"asset:{asset_id}")
         session_dir = self._session_dir(session_id)
         tombstone = session_dir / ".trash" / asset_id
+        asset_dir = session_dir / "assets" / asset_id
+        cancellation = session_dir / _UPLOAD_CANCELLATIONS_NAME / asset_id
+        generation = session_dir / _UPLOAD_GENERATIONS_NAME / asset_id
         with self._deletion_lock:
-            if not self._asset_generation_matches_deletion(
+            if expected_identity is not None:
+                if (
+                    expected_identity.asset_id != asset_id
+                    or expected_identity.storage_identity is None
+                    or not tombstone.is_dir()
+                    or _deletion_storage_identity(tombstone)
+                    != expected_identity.storage_identity
+                ):
+                    return
+            elif not self._asset_generation_matches_deletion(
                 session_dir,
                 asset_id,
                 expected_generation,
@@ -1132,12 +1146,29 @@ class HostedStorage:
             shutil.rmtree(tombstone, ignore_errors=True)
             if tombstone.exists():
                 raise OSError("Asset tombstone removal failed")
-            (
-                session_dir / _UPLOAD_CANCELLATIONS_NAME / asset_id
-            ).unlink(missing_ok=True)
-            (
-                session_dir / _UPLOAD_GENERATIONS_NAME / asset_id
-            ).unlink(missing_ok=True)
+            marker_generation = _read_upload_generation_marker(
+                generation,
+                asset_id,
+            )
+            if (
+                not asset_dir.exists()
+                and (
+                    (
+                        expected_generation is None
+                        and marker_generation is None
+                    )
+                    or (
+                        expected_generation is not None
+                        and marker_generation is not None
+                        and compare_digest(
+                            expected_generation,
+                            marker_generation,
+                        )
+                    )
+                )
+            ):
+                cancellation.unlink(missing_ok=True)
+                generation.unlink(missing_ok=True)
             self._remove_empty_session(session_id)
 
     def create_task_dir(self, session_id: str) -> Path:

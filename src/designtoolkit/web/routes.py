@@ -1522,6 +1522,7 @@ def create_router(
                     session_id,
                     asset_id,
                     effective_generation,
+                    expected_identity=deletion_identity,
                 )
             )
             if release_generation is None:

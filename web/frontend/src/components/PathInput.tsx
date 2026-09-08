@@ -61,8 +61,12 @@ export function PathInput({
   const [dropError, setDropError] = useState<string | null>(null)
   const [pickerError, setPickerError] = useState<string | null>(null)
   const [uploadProgress, setUploadProgress] = useState<number | null>(null)
+  const cleanupOperationRef = useRef(0)
+  const cleanupQueueRef = useRef(Promise.resolve())
   const currentValueRef = useRef(value)
   const latestIntentRef = useRef(0)
+  const mountedRef = useRef(true)
+  const pendingCleanupReferencesRef = useRef(new Set<string>())
   const pickerPointerSequenceRef = useRef(0)
   const suppressPickerBlurRef = useRef(false)
   const skipNextBlurRef = useRef(false)
@@ -96,7 +100,9 @@ export function PathInput({
   }, [disabled])
 
   useEffect(() => {
+    mountedRef.current = true
     return () => {
+      mountedRef.current = false
       latestIntentRef.current += 1
       const controller = uploadControllerRef.current
       if (controller) {
@@ -120,6 +126,44 @@ export function PathInput({
   }
 
   const isLatestIntent = (intent: number) => latestIntentRef.current === intent
+
+  const schedulePendingCleanup = (operation: number) => {
+    if (!deleteUploadedAsset) {
+      return
+    }
+    const cleanup = async () => {
+      const retainedReferences = new Set(
+        assetReferences(currentValueRef.current),
+      )
+      const references = Array.from(
+        pendingCleanupReferencesRef.current,
+      ).filter((reference) => !retainedReferences.has(reference))
+      const cleanupResults = await Promise.allSettled(
+        references.map((reference) => deleteUploadedAsset(reference)),
+      )
+      const cleanupErrors: unknown[] = []
+      cleanupResults.forEach((result, index) => {
+        if (result.status === 'fulfilled') {
+          pendingCleanupReferencesRef.current.delete(references[index])
+        } else {
+          cleanupErrors.push(result.reason)
+        }
+      })
+      if (
+        cleanupErrors.length > 0
+        && mountedRef.current
+        && cleanupOperationRef.current === operation
+      ) {
+        const firstError = cleanupErrors[0]
+        setPickerError(
+          firstError instanceof Error && firstError.message
+            ? firstError.message
+            : `${cleanupErrors.length} 个旧文件清理失败`,
+        )
+      }
+    }
+    cleanupQueueRef.current = cleanupQueueRef.current.then(cleanup, cleanup)
+  }
 
   const updateValue = (nextValue: string) => {
     currentValueRef.current = nextValue
@@ -212,6 +256,8 @@ export function PathInput({
     ) {
       return
     }
+    cleanupOperationRef.current += 1
+    const cleanupOperation = cleanupOperationRef.current
     const intent = beginIntent()
     const controller = new AbortController()
     uploadControllerRef.current = controller
@@ -233,29 +279,14 @@ export function PathInput({
       if (isLatestIntent(intent) && references.length > 0) {
         const previousValue = currentValueRef.current
         const nextValue = valueWithDroppedPaths('', references, multiline)
+        const retainedReferences = new Set(assetReferences(nextValue))
+        assetReferences(previousValue)
+          .filter((reference) => !retainedReferences.has(reference))
+          .forEach((reference) => {
+            pendingCleanupReferencesRef.current.add(reference)
+          })
         commitValue(nextValue)
-        if (deleteUploadedAsset) {
-          const retainedReferences = new Set(assetReferences(nextValue))
-          const removedReferences = assetReferences(previousValue).filter(
-            (reference) => !retainedReferences.has(reference),
-          )
-          const cleanupResults = await Promise.allSettled(
-            removedReferences.map((reference) =>
-              deleteUploadedAsset(reference)),
-          )
-          const cleanupErrors = cleanupResults.flatMap((result) =>
-            result.status === 'rejected' ? [result.reason] : [],
-          )
-          if (cleanupErrors.length > 0) {
-            const firstError = cleanupErrors[0]
-            throw new AggregateError(
-              cleanupErrors,
-              firstError instanceof Error && firstError.message
-                ? firstError.message
-                : `${cleanupErrors.length} 个旧文件清理失败`,
-            )
-          }
-        }
+        schedulePendingCleanup(cleanupOperation)
       }
     } catch (error) {
       if (isLatestIntent(intent)) {

@@ -244,6 +244,109 @@ describe('hosted replacement uploads', () => {
       ),
     )
   })
+
+  it('shows chroma cleanup failure while replacement inspection disables the input', async () => {
+    const inspection = deferred<{
+      height: number
+      input_path: string
+      preview_height: number
+      preview_url: string
+      preview_width: number
+      width: number
+    }>()
+    const cleanup = deferred<void>()
+    apiMocks.uploadFiles
+      .mockResolvedValueOnce([oldImageReference])
+      .mockResolvedValueOnce([newImageReference])
+    apiMocks.inspectChromaImage
+      .mockResolvedValueOnce({
+        height: 400,
+        input_path: oldImageReference,
+        preview_height: 200,
+        preview_url: '/api/previews/old.png',
+        preview_width: 400,
+        width: 800,
+      })
+      .mockReturnValueOnce(inspection.promise)
+    apiMocks.deleteUploadedAsset.mockReturnValueOnce(cleanup.promise)
+    const { container } = render(<ChromaKeyerPage />)
+
+    upload(container, new File(['old'], 'old.png', { type: 'image/png' }))
+    await waitFor(() => expect(screen.getByLabelText('输入图片或视频')).toHaveValue('old.png'))
+    upload(container, new File(['new'], 'new.png', { type: 'image/png' }))
+    await waitFor(() =>
+      expect(apiMocks.inspectChromaImage).toHaveBeenLastCalledWith({
+        inputPath: newImageReference,
+      }),
+    )
+    expect(screen.getByLabelText('输入图片或视频')).toBeDisabled()
+
+    await act(async () => {
+      cleanup.reject(new Error('旧文件清理失败'))
+      await cleanup.promise.catch(() => undefined)
+    })
+
+    expect(screen.getByText('旧文件清理失败')).toBeInTheDocument()
+    expect(screen.getByLabelText('输入图片或视频')).toHaveValue('new.png')
+
+    await act(async () => {
+      inspection.resolve({
+        height: 400,
+        input_path: newImageReference,
+        preview_height: 200,
+        preview_url: '/api/previews/new.png',
+        preview_width: 400,
+        width: 800,
+      })
+      await inspection.promise
+    })
+  })
+
+  it.each([
+    {
+      filenames: ['old.mp4', 'new.mp4'],
+      inputLabel: '输入视频',
+      page: () => <VideoFramesPage />,
+      replacements: [oldVideoReference, newVideoReference],
+    },
+    {
+      filenames: ['old.png', 'new.png'],
+      inputLabel: '输入媒体',
+      page: () => <MediaResizePage />,
+      replacements: [oldImageReference, newImageReference],
+    },
+  ])(
+    'retries failed old asset cleanup on the next $inputLabel upload',
+    async ({ filenames, inputLabel, page, replacements }) => {
+      const finalReference = `asset:${'e'.repeat(32)}:${'5'.repeat(32)}:final.bin`
+      apiMocks.uploadFiles
+        .mockResolvedValueOnce([replacements[0]])
+        .mockResolvedValueOnce([replacements[1]])
+        .mockResolvedValueOnce([finalReference])
+      apiMocks.deleteUploadedAsset
+        .mockRejectedValueOnce(new Error('旧文件清理失败'))
+        .mockResolvedValue(undefined)
+      const { container } = render(page())
+
+      upload(container, new File(['old'], 'old.bin'))
+      await waitFor(() =>
+        expect(screen.getByLabelText(inputLabel)).toHaveValue(filenames[0]),
+      )
+      upload(container, new File(['new'], 'new.bin'))
+      expect(await screen.findByText('旧文件清理失败')).toBeInTheDocument()
+      upload(container, new File(['final'], 'final.bin'))
+
+      await waitFor(() => {
+        expect(apiMocks.deleteUploadedAsset).toHaveBeenCalledTimes(3)
+      })
+      expect(apiMocks.deleteUploadedAsset.mock.calls).toEqual([
+        [replacements[0]],
+        [replacements[0]],
+        [replacements[1]],
+      ])
+      expect(screen.getByLabelText(inputLabel)).toHaveValue('final.bin')
+    },
+  )
 })
 
 function deferred<T>() {

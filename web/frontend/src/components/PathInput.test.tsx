@@ -5,11 +5,13 @@ import { describe, expect, it, vi } from 'vitest'
 import { PathInput } from './PathInput'
 
 function deferred<T>() {
+  let reject!: (reason?: unknown) => void
   let resolve!: (value: T | PromiseLike<T>) => void
-  const promise = new Promise<T>((resolvePromise) => {
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
     resolve = resolvePromise
+    reject = rejectPromise
   })
-  return { promise, resolve }
+  return { promise, reject, resolve }
 }
 
 function ControlledPathInput() {
@@ -1068,6 +1070,126 @@ describe('PathInput', () => {
     expect(await screen.findByText('旧文件清理失败')).toBeInTheDocument()
     expect(screen.getByLabelText('输入媒体路径')).toHaveValue('new.png')
     expect(deleteUploadedAsset).toHaveBeenCalledWith(previous)
+  })
+
+  it('reports replacement cleanup failure after the committed value disables the input', async () => {
+    const previous = `asset:${'1'.repeat(32)}:${'2'.repeat(32)}:old.png`
+    const replacement = `asset:${'3'.repeat(32)}:${'4'.repeat(32)}:new.png`
+    const cleanup = deferred<void>()
+    const deleteUploadedAsset = vi.fn(() => cleanup.promise)
+    const uploadFiles = vi.fn().mockResolvedValue([replacement])
+    const renderInput = (disabled: boolean) => (
+      <ControlledUploadPathInput
+        deleteUploadedAsset={deleteUploadedAsset}
+        disabled={disabled}
+        initialValue={previous}
+        uploadFiles={uploadFiles}
+      />
+    )
+    const { container, rerender } = render(renderInput(false))
+    const fileInput = container.querySelector<HTMLInputElement>('input[type="file"]')
+    if (!fileInput) {
+      throw new Error('upload input missing')
+    }
+
+    fireEvent.change(fileInput, {
+      target: { files: [new File(['new'], 'new.png', { type: 'image/png' })] },
+    })
+    await waitFor(() => expect(deleteUploadedAsset).toHaveBeenCalledWith(previous))
+    rerender(renderInput(true))
+
+    await act(async () => {
+      cleanup.reject(new Error('旧文件清理失败'))
+      await cleanup.promise.catch(() => undefined)
+    })
+
+    expect(screen.getByText('旧文件清理失败')).toBeInTheDocument()
+    expect(screen.getByLabelText('输入媒体路径')).toHaveValue('new.png')
+  })
+
+  it('retries retained replacement cleanup after the next successful upload', async () => {
+    const previous = `asset:${'1'.repeat(32)}:${'2'.repeat(32)}:old.png`
+    const firstReplacement = `asset:${'3'.repeat(32)}:${'4'.repeat(32)}:first.png`
+    const secondReplacement = `asset:${'5'.repeat(32)}:${'6'.repeat(32)}:second.png`
+    const deleteUploadedAsset = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('旧文件清理失败'))
+      .mockResolvedValue(undefined)
+    const uploadFiles = vi
+      .fn()
+      .mockResolvedValueOnce([firstReplacement])
+      .mockResolvedValueOnce([secondReplacement])
+    const { container } = render(
+      <ControlledUploadPathInput
+        deleteUploadedAsset={deleteUploadedAsset}
+        initialValue={previous}
+        uploadFiles={uploadFiles}
+      />,
+    )
+    const fileInput = container.querySelector<HTMLInputElement>('input[type="file"]')
+    if (!fileInput) {
+      throw new Error('upload input missing')
+    }
+
+    fireEvent.change(fileInput, {
+      target: { files: [new File(['first'], 'first.png', { type: 'image/png' })] },
+    })
+    expect(await screen.findByText('旧文件清理失败')).toBeInTheDocument()
+
+    fireEvent.change(fileInput, {
+      target: { files: [new File(['second'], 'second.png', { type: 'image/png' })] },
+    })
+
+    await waitFor(() => {
+      expect(deleteUploadedAsset).toHaveBeenCalledTimes(3)
+    })
+    expect(deleteUploadedAsset.mock.calls).toEqual([
+      [previous],
+      [previous],
+      [firstReplacement],
+    ])
+    expect(screen.getByLabelText('输入媒体路径')).toHaveValue('second.png')
+    expect(screen.queryByText('旧文件清理失败')).not.toBeInTheDocument()
+  })
+
+  it('does not let stale cleanup failure overwrite a newer upload error', async () => {
+    const previous = `asset:${'1'.repeat(32)}:${'2'.repeat(32)}:old.png`
+    const replacement = `asset:${'3'.repeat(32)}:${'4'.repeat(32)}:new.png`
+    const cleanup = deferred<void>()
+    const deleteUploadedAsset = vi.fn(() => cleanup.promise)
+    const uploadFiles = vi
+      .fn()
+      .mockResolvedValueOnce([replacement])
+      .mockRejectedValueOnce(new Error('新上传失败'))
+    const { container } = render(
+      <ControlledUploadPathInput
+        deleteUploadedAsset={deleteUploadedAsset}
+        initialValue={previous}
+        uploadFiles={uploadFiles}
+      />,
+    )
+    const fileInput = container.querySelector<HTMLInputElement>('input[type="file"]')
+    if (!fileInput) {
+      throw new Error('upload input missing')
+    }
+
+    fireEvent.change(fileInput, {
+      target: { files: [new File(['first'], 'first.png', { type: 'image/png' })] },
+    })
+    await waitFor(() => expect(deleteUploadedAsset).toHaveBeenCalledWith(previous))
+    fireEvent.change(fileInput, {
+      target: { files: [new File(['second'], 'second.png', { type: 'image/png' })] },
+    })
+    expect(await screen.findByText('新上传失败')).toBeInTheDocument()
+
+    await act(async () => {
+      cleanup.reject(new Error('过期清理失败'))
+      await cleanup.promise.catch(() => undefined)
+    })
+
+    expect(screen.getByText('新上传失败')).toBeInTheDocument()
+    expect(screen.queryByText('过期清理失败')).not.toBeInTheDocument()
+    expect(screen.getByLabelText('输入媒体路径')).toHaveValue('new.png')
   })
 
   it('reports upload pending until a replacement upload resolves', async () => {
