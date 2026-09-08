@@ -110,6 +110,35 @@ if not generation then
 end
 return {generation, redis.call("LRANGE", KEYS[1], 0, -1)}
 """
+_READ_EVENT_AT_CURSOR_SCRIPT = """-- read_task_event_at_cursor
+if redis.call("EXISTS", KEYS[1]) == 0 then
+    return {"", false, ARGV[2]}
+end
+
+local expected_generation = ARGV[1]
+local offset = tonumber(ARGV[2])
+local generation = redis.call("GET", KEYS[2])
+if not generation then
+    generation = ARGV[3]
+    local ttl_ms = redis.call("PTTL", KEYS[1])
+    redis.call("SET", KEYS[2], generation)
+    if ttl_ms > 0 then
+        redis.call("PEXPIRE", KEYS[2], ttl_ms)
+    else
+        redis.call("EXPIRE", KEYS[1], ARGV[4])
+        redis.call("EXPIRE", KEYS[2], ARGV[4])
+    end
+end
+
+if generation ~= expected_generation then
+    offset = 0
+end
+local event = redis.call("LINDEX", KEYS[1], offset)
+if not event then
+    return {generation, false, tostring(offset)}
+end
+return {generation, event, tostring(offset + 1)}
+"""
 _RESERVE_ENQUEUE_SCRIPT = """-- reserve_enqueue_intent
 local queue_key = KEYS[1]
 local intent_key = KEYS[2]
@@ -544,13 +573,14 @@ class RedisEventSubscriber:
     def get(self, timeout: float) -> LogEventResponse:
         deadline = monotonic() + timeout
         while monotonic() < deadline:
-            generation, events = self._store._snapshot(self._task_id)
-            if generation is not None and generation != self._generation:
-                self._generation = generation
-                self._offset = 0
-            if self._offset < len(events):
-                event = events[self._offset]
-                self._offset += 1
+            generation, event, next_offset = self._store._event_at_cursor(
+                self._task_id,
+                self._generation,
+                self._offset,
+            )
+            self._generation = generation
+            self._offset = next_offset
+            if event is not None:
                 return event
             sleep(min(0.05, max(0.0, deadline - monotonic())))
         raise Empty
@@ -570,6 +600,9 @@ class RedisLogStore:
         )
         self._read_event_log_script = self._redis.register_script(
             _READ_EVENT_LOG_SCRIPT
+        )
+        self._read_event_at_cursor_script = self._redis.register_script(
+            _READ_EVENT_AT_CURSOR_SCRIPT
         )
 
     def append(
@@ -653,6 +686,45 @@ class RedisLogStore:
         ]
         return generation_text, events
 
+    def _event_at_cursor(
+        self,
+        task_id: str,
+        expected_generation: str | None,
+        offset: int,
+    ) -> tuple[str | None, LogEventResponse | None, int]:
+        try:
+            generation, value, next_offset = (
+                self._read_event_at_cursor_script(
+                    keys=[
+                        _event_key(task_id),
+                        _event_generation_key(task_id),
+                    ],
+                    args=[
+                        expected_generation or "",
+                        offset,
+                        uuid4().hex,
+                        self._retention_seconds,
+                    ],
+                )
+            )
+        except ResponseError as error_response:
+            if "unknown command" not in str(error_response).lower():
+                raise
+            generation, value, next_offset = (
+                self._event_at_cursor_without_lua(
+                    task_id,
+                    expected_generation,
+                    offset,
+                )
+            )
+        generation_text = _redis_text(generation) or None
+        event = (
+            LogEventResponse.model_validate_json(value)
+            if value is not None
+            else None
+        )
+        return generation_text, event, int(next_offset)
+
     def _append_without_lua(self, task_id: str, event_json: str) -> None:
         event_key = _event_key(task_id)
         generation_key = _event_generation_key(task_id)
@@ -671,6 +743,57 @@ class RedisLogStore:
                     pipeline.expire(generation_key, self._retention_seconds)
                     pipeline.execute()
                     return
+                except WatchError:
+                    continue
+
+    def _event_at_cursor_without_lua(
+        self,
+        task_id: str,
+        expected_generation: str | None,
+        offset: int,
+    ) -> tuple[bytes | str | None, bytes | str | None, int]:
+        event_key = _event_key(task_id)
+        generation_key = _event_generation_key(task_id)
+        candidate = uuid4().hex
+        while True:
+            with self._redis.pipeline() as pipeline:
+                try:
+                    pipeline.watch(event_key, generation_key)
+                    if not pipeline.exists(event_key):
+                        pipeline.unwatch()
+                        return None, None, offset
+                    generation = pipeline.get(generation_key)
+                    ttl_ms = (
+                        pipeline.pttl(event_key)
+                        if generation is None
+                        else None
+                    )
+                    if generation is None:
+                        generation = candidate
+                    generation_text = _redis_text(generation)
+                    read_offset = (
+                        0
+                        if generation_text != (expected_generation or "")
+                        else offset
+                    )
+                    pipeline.multi()
+                    if ttl_ms is not None:
+                        pipeline.set(generation_key, generation)
+                        if ttl_ms > 0:
+                            pipeline.pexpire(generation_key, ttl_ms)
+                        else:
+                            pipeline.expire(
+                                event_key,
+                                self._retention_seconds,
+                            )
+                            pipeline.expire(
+                                generation_key,
+                                self._retention_seconds,
+                            )
+                    pipeline.lindex(event_key, read_offset)
+                    value = pipeline.execute()[-1]
+                    next_offset = read_offset + (value is not None)
+                    return generation, value, next_offset
                 except WatchError:
                     continue
 

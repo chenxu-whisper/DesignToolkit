@@ -52,7 +52,13 @@ from designtoolkit.web.resources import (
     RedisResourceCoordinator,
     ResourceUnavailableError,
 )
-from designtoolkit.web.schemas import LogLevel, LogPhase, TaskKind, TaskStatus
+from designtoolkit.web.schemas import (
+    LogLevel,
+    LogPhase,
+    TaskKind,
+    TaskStatus,
+    VideoFramesTaskRequest,
+)
 from designtoolkit.web.tasks import TaskManager
 
 
@@ -602,6 +608,71 @@ def test_task_event_stream_synthesizes_terminal_event_from_task_state(
         ]
     ) == 1
     assert EmptyThenFailSubscriber.calls == 1
+
+
+def test_task_event_stream_slow_subscriber_has_no_duplicates_or_lost_terminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = RedisTaskManager(
+        redis_connection=redis_connection,
+        queue=Queue("designtoolkit", connection=redis_connection),
+        data_dir=tmp_path,
+        max_queued_tasks=20,
+        retention_seconds=7200,
+    )
+    subscribed = Event()
+    original_subscribe = manager.log_store.history_and_subscribe
+
+    def tracked_subscribe(task_id: str):
+        result = original_subscribe(task_id)
+        subscribed.set()
+        return result
+
+    monkeypatch.setattr(
+        manager.log_store,
+        "history_and_subscribe",
+        tracked_subscribe,
+    )
+    with _client(tmp_path, task_manager=manager) as client:
+        client.get("/api/config")
+        task = manager.create_video_frames_task(
+            VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+            owner_id=client.cookies["dt_session"],
+        )
+
+        def publish_events() -> None:
+            assert subscribed.wait(timeout=1)
+            sleep(0.06)
+            manager.mark_running(task.task_id)
+            sleep(0.06)
+            manager.mark_finished(
+                task.task_id,
+                status=TaskStatus.FAILED,
+                error="worker failed",
+            )
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            publisher = executor.submit(publish_events)
+            response = client.get(f"/api/tasks/{task.task_id}/events")
+            publisher.result(timeout=2)
+
+    payloads = [
+        json.loads(line.removeprefix("data: "))
+        for line in response.text.splitlines()
+        if line.startswith("data: ")
+    ]
+    assert [payload["phase"] for payload in payloads] == [
+        "created",
+        "running",
+        "failed",
+    ]
+    assert [payload["message"] for payload in payloads] == [
+        "Created video_frames task",
+        "Task is running",
+        "worker failed",
+    ]
 
 
 def test_hosted_config_and_upload_issue_anonymous_session(tmp_path: Path) -> None:

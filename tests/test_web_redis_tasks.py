@@ -14,7 +14,7 @@ import fakeredis
 import pytest
 from redis import Redis
 from redis.exceptions import ConnectionError as RedisConnectionError
-from redis.exceptions import RedisError
+from redis.exceptions import RedisError, ResponseError
 from rq import Queue
 from rq.job import Job, JobStatus
 from rq.registry import FailedJobRegistry, StartedJobRegistry
@@ -1955,6 +1955,221 @@ def test_redis_log_store_persists_events_for_other_processes() -> None:
     assert events[0].details == {"position": 1}
 
 
+def test_redis_subscriber_polls_only_the_event_at_its_cursor() -> None:
+    event = redis_tasks_module.LogEventResponse(
+        task_id="task-1",
+        timestamp=datetime.now(UTC),
+        level=LogLevel.PROGRESS,
+        phase=LogPhase.RUNNING,
+        message="new event",
+        details={},
+    )
+
+    class CursorOnlyStore:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str | None, int]] = []
+            self.responses = [
+                ("generation-a", None, 10_000),
+                ("generation-a", event, 10_001),
+            ]
+
+        def _event_at_cursor(
+            self,
+            task_id: str,
+            generation: str | None,
+            offset: int,
+        ):
+            self.calls.append((task_id, generation, offset))
+            return self.responses.pop(0)
+
+        def _snapshot(self, task_id: str):
+            raise AssertionError(f"subscriber took a full snapshot for {task_id}")
+
+    store = CursorOnlyStore()
+    subscriber = redis_tasks_module.RedisEventSubscriber(
+        store,
+        "task-1",
+        "generation-a",
+        10_000,
+    )
+
+    assert subscriber.get(timeout=0.2) == event
+    assert store.calls == [
+        ("task-1", "generation-a", 10_000),
+        ("task-1", "generation-a", 10_000),
+    ]
+
+
+def test_redis_subscriber_fallback_reads_constant_data_after_large_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    store = RedisLogStore(redis_connection, retention_seconds=60)
+    task_id = "large-event-log"
+    event = redis_tasks_module.LogEventResponse(
+        task_id=task_id,
+        timestamp=datetime.now(UTC),
+        level=LogLevel.INFO,
+        phase=LogPhase.CREATED,
+        message="historical",
+        details={},
+    )
+    event_key = f"dt:task:{task_id}:events"
+    generation_key = f"dt:event-generation:{task_id}"
+    with redis_connection.pipeline() as pipeline:
+        for _ in range(10_000):
+            pipeline.rpush(event_key, event.model_dump_json())
+        pipeline.set(generation_key, "generation-a")
+        pipeline.expire(event_key, 60)
+        pipeline.expire(generation_key, 60)
+        pipeline.execute()
+
+    history, subscriber = store.history_and_subscribe(task_id)
+    assert len(history) == 10_000
+
+    def unknown_command(**_kwargs):
+        raise ResponseError("unknown command 'evalsha'")
+
+    store._read_event_at_cursor_script = unknown_command
+    pipeline_type = type(redis_connection.pipeline())
+    original_lindex = pipeline_type.lindex
+    original_lrange = pipeline_type.lrange
+    reads: list[tuple[str, int, int | None]] = []
+
+    def tracked_lindex(self, name: str, index: int):
+        reads.append((name, index, None))
+        return original_lindex(self, name, index)
+
+    def tracked_lrange(self, name: str, start: int, end: int):
+        reads.append((name, start, end))
+        return original_lrange(self, name, start, end)
+
+    monkeypatch.setattr(pipeline_type, "lindex", tracked_lindex)
+    monkeypatch.setattr(pipeline_type, "lrange", tracked_lrange)
+    store.append(
+        task_id=task_id,
+        level=LogLevel.SUCCESS,
+        phase=LogPhase.COMPLETED,
+        message="completed",
+    )
+
+    assert subscriber.get(timeout=0.2).message == "completed"
+    with pytest.raises(Empty):
+        subscriber.get(timeout=0.05)
+    assert reads[0] == (event_key, 10_000, None)
+    assert all(read == (event_key, 10_001, None) for read in reads[1:])
+
+
+def test_redis_subscriber_fallback_adopts_generation_and_resets_once() -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    store = RedisLogStore(redis_connection, retention_seconds=60)
+    task_id = "legacy-live-events"
+    store.append(
+        task_id=task_id,
+        level=LogLevel.INFO,
+        phase=LogPhase.CREATED,
+        message="queued",
+    )
+    history, subscriber = store.history_and_subscribe(task_id)
+    generation_key = f"dt:event-generation:{task_id}"
+    redis_connection.delete(generation_key)
+
+    assert [event.message for event in history] == ["queued"]
+    assert subscriber.get(timeout=0.2).message == "queued"
+    with pytest.raises(Empty):
+        subscriber.get(timeout=0.05)
+    event_ttl = redis_connection.pttl(f"dt:task:{task_id}:events")
+    generation_ttl = redis_connection.pttl(generation_key)
+    assert abs(event_ttl - generation_ttl) < 100
+
+
+def test_redis_subscriber_fallback_resets_cursor_after_log_recreation() -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    store = RedisLogStore(redis_connection, retention_seconds=60)
+    task_id = "recreated-events"
+    store.append(
+        task_id=task_id,
+        level=LogLevel.INFO,
+        phase=LogPhase.CREATED,
+        message="old",
+    )
+    _history, subscriber = store.history_and_subscribe(task_id)
+    redis_connection.delete(
+        f"dt:task:{task_id}:events",
+        f"dt:event-generation:{task_id}",
+    )
+    store.append(
+        task_id=task_id,
+        level=LogLevel.ERROR,
+        phase=LogPhase.FAILED,
+        message="new terminal",
+    )
+
+    assert subscriber.get(timeout=0.2).message == "new terminal"
+    with pytest.raises(Empty):
+        subscriber.get(timeout=0.05)
+
+
+def test_redis_event_cursor_uses_lua_result_and_propagates_redis_errors() -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    store = RedisLogStore(redis_connection, retention_seconds=60)
+    event = redis_tasks_module.LogEventResponse(
+        task_id="task-1",
+        timestamp=datetime.now(UTC),
+        level=LogLevel.SUCCESS,
+        phase=LogPhase.COMPLETED,
+        message="completed",
+        details={},
+    )
+    calls: list[tuple[list[str], list[object]]] = []
+
+    def read_script(*, keys: list[str], args: list[object]):
+        calls.append((keys, args))
+        return ["generation-b", event.model_dump_json(), "1"]
+
+    store._read_event_at_cursor_script = read_script
+
+    assert store._event_at_cursor("task-1", "generation-a", 10_000) == (
+        "generation-b",
+        event,
+        1,
+    )
+    assert calls[0][0] == [
+        "dt:task:task-1:events",
+        "dt:event-generation:task-1",
+    ]
+    assert calls[0][1][:2] == ["generation-a", 10_000]
+
+    def unavailable(**_kwargs):
+        raise RedisConnectionError("event storage unavailable")
+
+    store._read_event_at_cursor_script = unavailable
+    with pytest.raises(RedisConnectionError, match="event storage unavailable"):
+        store._event_at_cursor("task-1", "generation-b", 1)
+
+
+def test_redis_subscriber_rejects_malformed_event_like_history() -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    store = RedisLogStore(redis_connection, retention_seconds=60)
+    task_id = "malformed-events"
+    event_key = f"dt:task:{task_id}:events"
+    generation_key = f"dt:event-generation:{task_id}"
+    redis_connection.rpush(event_key, '{"not":"a log event"}')
+    redis_connection.set(generation_key, "generation-a")
+
+    with pytest.raises(ValueError) as history_error:
+        store.history(task_id)
+    subscriber = redis_tasks_module.RedisEventSubscriber(
+        store,
+        task_id,
+        "generation-a",
+        0,
+    )
+
+    with pytest.raises(type(history_error.value)):
+        subscriber.get(timeout=0.2)
+
+
 def test_real_redis_subscriber_recovers_after_event_log_expiry(
     real_redis_connection: Redis,
     tmp_path: Path,
@@ -1989,6 +2204,68 @@ def test_real_redis_subscriber_recovers_after_event_log_expiry(
     assert terminal.phase is LogPhase.FAILED
     assert terminal.message == "worker timed out"
     assert manager.get_task(task.task_id).status is TaskStatus.FAILED
+
+
+def test_real_redis_subscriber_adopts_missing_generation_and_resets_once(
+    real_redis_connection: Redis,
+) -> None:
+    store = RedisLogStore(real_redis_connection, retention_seconds=60)
+    task_id = "legacy-live-events"
+    store.append(
+        task_id=task_id,
+        level=LogLevel.INFO,
+        phase=LogPhase.CREATED,
+        message="queued",
+    )
+    history, subscriber = store.history_and_subscribe(task_id)
+    generation_key = f"dt:event-generation:{task_id}"
+    real_redis_connection.delete(generation_key)
+
+    assert [event.message for event in history] == ["queued"]
+    assert subscriber.get(timeout=0.2).message == "queued"
+    with pytest.raises(Empty):
+        subscriber.get(timeout=0.05)
+
+    event_ttl = real_redis_connection.pttl(f"dt:task:{task_id}:events")
+    generation_ttl = real_redis_connection.pttl(generation_key)
+    assert abs(event_ttl - generation_ttl) < 100
+    store.append(
+        task_id=task_id,
+        level=LogLevel.ERROR,
+        phase=LogPhase.FAILED,
+        message="worker failed",
+    )
+    assert subscriber.get(timeout=0.2).message == "worker failed"
+
+
+def test_real_redis_event_cursor_resets_to_new_generation(
+    real_redis_connection: Redis,
+) -> None:
+    store = RedisLogStore(real_redis_connection, retention_seconds=60)
+    task_id = "recreated-events"
+    store.append(
+        task_id=task_id,
+        level=LogLevel.INFO,
+        phase=LogPhase.CREATED,
+        message="old",
+    )
+    history, subscriber = store.history_and_subscribe(task_id)
+    assert [event.message for event in history] == ["old"]
+
+    real_redis_connection.delete(
+        f"dt:task:{task_id}:events",
+        f"dt:event-generation:{task_id}",
+    )
+    store.append(
+        task_id=task_id,
+        level=LogLevel.ERROR,
+        phase=LogPhase.FAILED,
+        message="new terminal",
+    )
+
+    assert subscriber.get(timeout=0.2).message == "new terminal"
+    with pytest.raises(Empty):
+        subscriber.get(timeout=0.05)
 
 
 def test_real_redis_subscriber_does_not_repeat_events_without_generation_change(
