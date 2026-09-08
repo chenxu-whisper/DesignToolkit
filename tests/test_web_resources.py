@@ -1337,8 +1337,19 @@ class DeterministicRedis(fakeredis.FakeRedis):
             return 2
         if self._text(self.hget(pin_key, "task_id")) != task_id:
             return 2
-        raw_asset_ids = self.hget(pin_key, "asset_ids")
-        asset_ids = json.loads(self._text(raw_asset_ids)) if raw_asset_ids else []
+        raw_identities = self.hget(pin_key, "asset_identities")
+        if raw_identities:
+            asset_ids = [
+                identity[0]
+                for identity in json.loads(self._text(raw_identities))
+            ]
+        else:
+            raw_asset_ids = self.hget(pin_key, "asset_ids")
+            asset_ids = (
+                json.loads(self._text(raw_asset_ids))
+                if raw_asset_ids
+                else []
+            )
         for asset_id in asset_ids:
             asset_tasks_key = f"{asset_task_prefix}{session_id}:{asset_id}"
             self.srem(asset_tasks_key, task_id)

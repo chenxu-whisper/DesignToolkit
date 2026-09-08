@@ -12,6 +12,7 @@ from random import Random
 from threading import Event
 from time import sleep
 from types import SimpleNamespace
+from urllib.parse import quote
 from zipfile import ZipFile
 
 import pytest
@@ -23,6 +24,7 @@ from designtoolkit.web.hosted import (
     UploadConflictError,
     UploadRejectedError,
     _CleanupClaimHeartbeat,
+    parse_asset_reference,
     prepare_download_artifact,
 )
 from designtoolkit.web.output_limits import OutputLimitExceeded
@@ -81,7 +83,7 @@ class RecordingReservation:
             self.visible_at_commit = [
                 path
                 for path in self.root.rglob("*")
-                if path.is_file() and path.name != ".uploading"
+                if path.is_file() and not path.name.startswith(".")
             ]
         if self.fail_commit:
             raise ResourceUnavailableError("Upload reservation expired")
@@ -1014,6 +1016,119 @@ async def test_published_asset_deletion_carries_manifest_generation(
 
     assert deletion is not None
     assert deletion.generation_id == registration.token
+
+
+def test_asset_reference_parser_decodes_generation_and_quoted_filename() -> None:
+    asset_id = "1" * 32
+    generation_id = "2" * 32
+    filename = "素材:100%.png"
+
+    parsed = parse_asset_reference(
+        f"asset:{asset_id}:{generation_id}:{quote(filename, safe='')}"
+    )
+
+    assert parsed.asset_id == asset_id
+    assert parsed.generation_id == generation_id
+    assert parsed.filename == filename
+
+
+@pytest.mark.parametrize(
+    "reference",
+    [
+        f"asset:{'1' * 32}:{'2' * 32}:bad%ZZname.png",
+        f"asset:{'1' * 32}:{'2' * 32}:..%2Fsecret.png",
+        f"asset:{'1' * 32}:{'2' * 32}:dir%5Csecret.png",
+        f"asset:{'1' * 32}:{'2' * 32}:bad:name.png",
+        f"asset:{'1' * 32}:{'G' * 32}:screen.png",
+    ],
+)
+def test_asset_reference_parser_rejects_invalid_or_injectable_filename(
+    reference: str,
+) -> None:
+    with pytest.raises(UploadRejectedError, match="not available"):
+        parse_asset_reference(reference)
+
+
+@pytest.mark.anyio
+async def test_reused_asset_id_cannot_resolve_previous_generation(
+    tmp_path: Path,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    session_id = "a" * 32
+    asset_id = "1" * 32
+    first_registration = RecordingUploadRegistration()
+    storage.claim_upload_generation(
+        session_id,
+        asset_id,
+        token=first_registration.token,
+    )
+    first = await storage.store_stream(
+        session_id,
+        asset_id=asset_id,
+        filename="first.png",
+        content_length=5,
+        chunks=_chunks(b"first"),
+        reservation=RecordingReservation(),
+        registration=first_registration,
+    )
+    deletion = storage.delete_asset(session_id, f"asset:{asset_id}")
+    assert deletion is not None
+    storage.finalize_asset_deletion(session_id, asset_id)
+
+    second_registration = RecordingUploadRegistration()
+    second_registration.token = "3" * 32
+    storage.claim_upload_generation(
+        session_id,
+        asset_id,
+        token=second_registration.token,
+    )
+    second = await storage.store_stream(
+        session_id,
+        asset_id=asset_id,
+        filename="second.png",
+        content_length=6,
+        chunks=_chunks(b"second"),
+        reservation=RecordingReservation(),
+        registration=second_registration,
+    )
+
+    assert first.reference == (
+        f"asset:{asset_id}:{first_registration.token}:first.png"
+    )
+    assert second.reference == (
+        f"asset:{asset_id}:{second_registration.token}:second.png"
+    )
+    with pytest.raises(UploadRejectedError, match="not available"):
+        storage.resolve(session_id, first.reference)
+    with pytest.raises(UploadRejectedError, match="not available"):
+        storage.resolve(session_id, f"asset:{asset_id}:first.png")
+    assert storage.resolve(session_id, second.reference).read_bytes() == b"second"
+
+
+@pytest.mark.anyio
+async def test_legacy_reference_only_resolves_manifest_without_generation(
+    tmp_path: Path,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    session_id = "a" * 32
+    asset_id = "1" * 32
+
+    asset = await storage.store_stream(
+        session_id,
+        asset_id=asset_id,
+        filename="legacy image.png",
+        content_length=6,
+        chunks=_chunks(b"legacy"),
+        reservation=RecordingReservation(),
+    )
+
+    assert asset.reference == f"asset:{asset_id}:legacy%20image.png"
+    assert storage.resolve(session_id, asset.reference).read_bytes() == b"legacy"
+    with pytest.raises(UploadRejectedError, match="not available"):
+        storage.resolve(
+            session_id,
+            f"asset:{asset_id}:{'2' * 32}:legacy%20image.png",
+        )
 
 
 @pytest.mark.parametrize(

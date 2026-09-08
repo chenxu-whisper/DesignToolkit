@@ -74,6 +74,7 @@ _ASSET_READ_PIN_PREFIX = "dt:resource:asset-read-pin:"
 _ASSET_READERS_PREFIX = "dt:resource:asset-readers:"
 _ASSET_READ_PIN_TTL_SECONDS = 60.0
 _ASSET_READ_PIN_HEARTBEAT_SECONDS = 10.0
+type AssetIdentity = tuple[str, str | None]
 _ALLOW_REQUEST_SCRIPT = """-- allow_request
 local count = redis.call("INCR", KEYS[1])
 if count == 1 then
@@ -201,7 +202,7 @@ local created_at = ARGV[5]
 local cleanup_prefix = ARGV[6]
 local owner_token = ARGV[7]
 local owner_ttl_ms = tonumber(ARGV[8])
-local asset_ids = cjson.decode(ARGV[9])
+local asset_identities = cjson.decode(ARGV[9])
 local asset_task_prefix = ARGV[10]
 local asset_delete_prefix = ARGV[11]
 local asset_read_pin_token = ARGV[12]
@@ -219,7 +220,8 @@ end
 if redis.call("LLEN", queue_key) >= max_queued_tasks then
     return 1
 end
-for _, asset_id in ipairs(asset_ids) do
+for _, identity in ipairs(asset_identities) do
+    local asset_id = identity[1]
     local delete_key = asset_delete_prefix .. owner_id .. ":" .. asset_id
     local redis_time = redis.call("TIME")
     local now_ms = redis_time[1] * 1000 + math.floor(redis_time[2] / 1000)
@@ -231,7 +233,7 @@ end
 if asset_read_pin_token ~= "" then
     if redis.call("HGET", KEYS[7], "token") ~= asset_read_pin_token
         or redis.call("HGET", KEYS[7], "session_id") ~= owner_id
-        or redis.call("HGET", KEYS[7], "asset_ids") ~= ARGV[9] then
+        or redis.call("HGET", KEYS[7], "asset_identities") ~= ARGV[9] then
         return 4
     end
 end
@@ -265,11 +267,12 @@ if owner_id ~= "" then
         task_id,
         "session_id",
         owner_id,
-        "asset_ids",
+        "asset_identities",
         ARGV[9]
     )
     redis.call("SADD", session_task_pins_key, task_id)
-    for _, asset_id in ipairs(asset_ids) do
+    for _, identity in ipairs(asset_identities) do
+        local asset_id = identity[1]
         redis.call(
             "SADD",
             asset_task_prefix .. owner_id .. ":" .. asset_id,
@@ -278,7 +281,8 @@ if owner_id ~= "" then
     end
 end
 if asset_read_pin_token ~= "" then
-    for _, asset_id in ipairs(asset_ids) do
+    for _, identity in ipairs(asset_identities) do
+        local asset_id = identity[1]
         local readers_key = asset_readers_prefix .. owner_id .. ":" .. asset_id
         redis.call("ZREM", readers_key, asset_read_pin_token)
         if redis.call("ZCARD", readers_key) == 0 then
@@ -311,10 +315,23 @@ if owner_id ~= "" then
     local pin_session = redis.call("HGET", KEYS[6], "session_id")
     local pin_task = redis.call("HGET", KEYS[6], "task_id")
     if pin_session == owner_id and pin_task == task_id then
-        local asset_ids_json = redis.call("HGET", KEYS[6], "asset_ids")
-        if asset_ids_json then
-            local asset_ids = cjson.decode(asset_ids_json)
-            for _, asset_id in ipairs(asset_ids) do
+        local identities_json = redis.call(
+            "HGET",
+            KEYS[6],
+            "asset_identities"
+        )
+        local legacy = false
+        if not identities_json then
+            identities_json = redis.call("HGET", KEYS[6], "asset_ids")
+            legacy = true
+        end
+        if identities_json then
+            local identities = cjson.decode(identities_json)
+            for _, identity in ipairs(identities) do
+                local asset_id = identity
+                if not legacy then
+                    asset_id = identity[1]
+                end
                 local asset_tasks_key = ARGV[4] .. owner_id .. ":" .. asset_id
                 redis.call("SREM", asset_tasks_key, task_id)
                 if redis.call("SCARD", asset_tasks_key) == 0 then
@@ -357,7 +374,7 @@ _ACQUIRE_ASSET_READ_PIN_SCRIPT = """-- acquire_asset_read_pin
 local token = ARGV[1]
 local session_id = ARGV[2]
 local ttl_ms = tonumber(ARGV[3])
-local asset_ids_json = ARGV[4]
+local asset_identities_json = ARGV[4]
 local asset_count = tonumber(ARGV[5])
 local redis_time = redis.call("TIME")
 local now_ms = redis_time[1] * 1000 + math.floor(redis_time[2] / 1000)
@@ -378,8 +395,8 @@ redis.call(
     token,
     "session_id",
     session_id,
-    "asset_ids",
-    asset_ids_json
+    "asset_identities",
+    asset_identities_json
 )
 redis.call("PEXPIRE", KEYS[1], ttl_ms)
 for index = 1, asset_count do
@@ -392,7 +409,7 @@ return 0
 _REFRESH_ASSET_READ_PIN_SCRIPT = """-- refresh_asset_read_pin
 if redis.call("HGET", KEYS[1], "token") ~= ARGV[1]
     or redis.call("HGET", KEYS[1], "session_id") ~= ARGV[2]
-    or redis.call("HGET", KEYS[1], "asset_ids") ~= ARGV[4] then
+    or redis.call("HGET", KEYS[1], "asset_identities") ~= ARGV[4] then
     return 0
 end
 local redis_time = redis.call("TIME")
@@ -411,7 +428,7 @@ if redis.call("EXISTS", KEYS[1]) == 0 then
 end
 if redis.call("HGET", KEYS[1], "token") ~= ARGV[1]
     or redis.call("HGET", KEYS[1], "session_id") ~= ARGV[2]
-    or redis.call("HGET", KEYS[1], "asset_ids") ~= ARGV[3] then
+    or redis.call("HGET", KEYS[1], "asset_identities") ~= ARGV[3] then
     return 2
 end
 for index = 2, #KEYS do
@@ -1079,18 +1096,22 @@ class RedisAssetReadPin:
         self,
         manager: RedisTaskManager,
         session_id: str,
-        asset_ids: tuple[str, ...],
+        asset_identities: tuple[AssetIdentity, ...],
         token: str,
     ) -> None:
         self._manager = manager
         self.session_id = session_id
-        self.asset_ids = asset_ids
+        self.asset_identities = asset_identities
         self.token = token
+
+    @property
+    def asset_ids(self) -> tuple[str, ...]:
+        return _asset_ids(self.asset_identities)
 
     def refresh(self) -> None:
         if not self._manager.refresh_asset_read_pin(
             self.session_id,
-            self.asset_ids,
+            self.asset_identities,
             self.token,
         ):
             raise TaskConflictError("Asset read pin expired")
@@ -1098,7 +1119,7 @@ class RedisAssetReadPin:
     def release(self) -> bool:
         return self._manager.release_asset_read_pin(
             self.session_id,
-            self.asset_ids,
+            self.asset_identities,
             self.token,
         )
 
@@ -1230,6 +1251,7 @@ class RedisTaskManager:
         owner_id: str | None = None,
         commit: Callable[[Callable[[], Job]], Job] | None = None,
         asset_ids: tuple[str, ...] = (),
+        asset_identities: tuple[AssetIdentity, ...] = (),
         asset_read_pin_token: str | None = None,
     ) -> TaskRecord:
         options = video_frame_options_list_from_request(request)
@@ -1241,6 +1263,7 @@ class RedisTaskManager:
             input_path=_joined_input_names(options),
             commit=commit,
             asset_ids=asset_ids,
+            asset_identities=asset_identities,
             asset_read_pin_token=asset_read_pin_token,
         )
 
@@ -1251,6 +1274,7 @@ class RedisTaskManager:
         owner_id: str | None = None,
         commit: Callable[[Callable[[], Job]], Job] | None = None,
         asset_ids: tuple[str, ...] = (),
+        asset_identities: tuple[AssetIdentity, ...] = (),
         asset_read_pin_token: str | None = None,
     ) -> TaskRecord:
         options = media_resize_options_list_from_request(request)
@@ -1262,6 +1286,7 @@ class RedisTaskManager:
             input_path="\n".join(option.input_path.name for option in options),
             commit=commit,
             asset_ids=asset_ids,
+            asset_identities=asset_identities,
             asset_read_pin_token=asset_read_pin_token,
         )
 
@@ -1272,6 +1297,7 @@ class RedisTaskManager:
         owner_id: str | None = None,
         commit: Callable[[Callable[[], Job]], Job] | None = None,
         asset_ids: tuple[str, ...] = (),
+        asset_identities: tuple[AssetIdentity, ...] = (),
         asset_read_pin_token: str | None = None,
     ) -> TaskRecord:
         options, _model, _params = chroma_keyer_options_from_request(request)
@@ -1285,6 +1311,7 @@ class RedisTaskManager:
             input_path=options.input_path.name,
             commit=commit,
             asset_ids=asset_ids,
+            asset_identities=asset_identities,
             asset_read_pin_token=asset_read_pin_token,
         )
 
@@ -1295,6 +1322,7 @@ class RedisTaskManager:
         owner_id: str | None = None,
         commit: Callable[[Callable[[], Job]], Job] | None = None,
         asset_ids: tuple[str, ...] = (),
+        asset_identities: tuple[AssetIdentity, ...] = (),
         asset_read_pin_token: str | None = None,
     ) -> TaskRecord:
         options, _model, _params = chroma_video_keyer_options_from_request(request)
@@ -1312,6 +1340,7 @@ class RedisTaskManager:
             input_path=options.input_path.name,
             commit=commit,
             asset_ids=asset_ids,
+            asset_identities=asset_identities,
             asset_read_pin_token=asset_read_pin_token,
         )
 
@@ -1558,16 +1587,15 @@ class RedisTaskManager:
     def acquire_asset_read_pin(
         self,
         session_id: str,
-        asset_ids: tuple[str, ...],
+        asset_identities: tuple[str | AssetIdentity, ...],
     ) -> RedisAssetReadPin:
         session_id = _validate_session_id(session_id)
-        asset_ids = tuple(dict.fromkeys(asset_ids))
-        if not asset_ids:
+        identities = _normalize_asset_identities(asset_identities)
+        if not identities:
             raise ValueError("Asset read pin requires at least one asset")
-        for asset_id in asset_ids:
-            _validate_asset_id(asset_id)
+        asset_ids = _asset_ids(identities)
         token = uuid4().hex
-        asset_ids_json = _asset_ids_json(asset_ids)
+        identities_json = _asset_identities_json(identities)
         keys = [
             _asset_read_pin_key(token),
             *(
@@ -1588,7 +1616,7 @@ class RedisTaskManager:
                             token,
                             session_id,
                             self._asset_read_pin_ttl_ms,
-                            asset_ids_json,
+                            identities_json,
                             len(asset_ids),
                         ],
                     )
@@ -1598,14 +1626,14 @@ class RedisTaskManager:
                     raise
                 result = self._acquire_asset_read_pin_without_lua(
                     session_id,
-                    asset_ids,
+                    identities,
                     token,
                 )
         except RedisError as acquire_error:
             try:
                 acquired = self._asset_read_pin_matches(
                     session_id,
-                    asset_ids,
+                    identities,
                     token,
                 )
             except RedisError as confirmation_error:
@@ -1615,19 +1643,18 @@ class RedisTaskManager:
             result = 0
         if result == 1:
             raise TaskConflictError("Asset deletion is already in progress")
-        return RedisAssetReadPin(self, session_id, asset_ids, token)
+        return RedisAssetReadPin(self, session_id, identities, token)
 
     def refresh_asset_read_pin(
         self,
         session_id: str,
-        asset_ids: tuple[str, ...],
+        asset_identities: tuple[str | AssetIdentity, ...],
         token: str,
     ) -> bool:
         session_id = _validate_session_id(session_id)
-        asset_ids = tuple(dict.fromkeys(asset_ids))
+        identities = _normalize_asset_identities(asset_identities)
         _validate_token(token)
-        for asset_id in asset_ids:
-            _validate_asset_id(asset_id)
+        asset_ids = _asset_ids(identities)
         keys = [
             _asset_read_pin_key(token),
             *(
@@ -1644,7 +1671,7 @@ class RedisTaskManager:
                             token,
                             session_id,
                             self._asset_read_pin_ttl_ms,
-                            _asset_ids_json(asset_ids),
+                            _asset_identities_json(identities),
                         ],
                     )
                 )
@@ -1653,14 +1680,14 @@ class RedisTaskManager:
                     raise
                 return self._refresh_asset_read_pin_without_lua(
                     session_id,
-                    asset_ids,
+                    identities,
                     token,
                 )
         except RedisError as refresh_error:
             try:
                 return self._asset_read_pin_matches(
                     session_id,
-                    asset_ids,
+                    identities,
                     token,
                 )
             except RedisError as confirmation_error:
@@ -1669,14 +1696,13 @@ class RedisTaskManager:
     def release_asset_read_pin(
         self,
         session_id: str,
-        asset_ids: tuple[str, ...],
+        asset_identities: tuple[str | AssetIdentity, ...],
         token: str,
     ) -> bool:
         session_id = _validate_session_id(session_id)
-        asset_ids = tuple(dict.fromkeys(asset_ids))
+        identities = _normalize_asset_identities(asset_identities)
         _validate_token(token)
-        for asset_id in asset_ids:
-            _validate_asset_id(asset_id)
+        asset_ids = _asset_ids(identities)
         keys = [
             _asset_read_pin_key(token),
             *(
@@ -1692,7 +1718,7 @@ class RedisTaskManager:
                         args=[
                             token,
                             session_id,
-                            _asset_ids_json(asset_ids),
+                            _asset_identities_json(identities),
                         ],
                     )
                 )
@@ -1701,14 +1727,14 @@ class RedisTaskManager:
                     raise
                 result = self._release_asset_read_pin_without_lua(
                     session_id,
-                    asset_ids,
+                    identities,
                     token,
                 )
         except RedisError as release_error:
             try:
                 if not self._asset_read_pin_matches(
                     session_id,
-                    asset_ids,
+                    identities,
                     token,
                 ):
                     return True
@@ -1722,9 +1748,10 @@ class RedisTaskManager:
     def _acquire_asset_read_pin_without_lua(
         self,
         session_id: str,
-        asset_ids: tuple[str, ...],
+        asset_identities: tuple[AssetIdentity, ...],
         token: str,
     ) -> int:
+        asset_ids = _asset_ids(asset_identities)
         claim_keys = [
             _asset_delete_key(session_id, asset_id) for asset_id in asset_ids
         ]
@@ -1752,7 +1779,9 @@ class RedisTaskManager:
                         mapping={
                             "token": token,
                             "session_id": session_id,
-                            "asset_ids": _asset_ids_json(asset_ids),
+                            "asset_identities": _asset_identities_json(
+                                asset_identities
+                            ),
                         },
                     )
                     pipeline.pexpire(pin_key, self._asset_read_pin_ttl_ms)
@@ -1767,9 +1796,10 @@ class RedisTaskManager:
     def _refresh_asset_read_pin_without_lua(
         self,
         session_id: str,
-        asset_ids: tuple[str, ...],
+        asset_identities: tuple[AssetIdentity, ...],
         token: str,
     ) -> bool:
+        asset_ids = _asset_ids(asset_identities)
         pin_key = _asset_read_pin_key(token)
         reader_keys = [
             _asset_readers_key(session_id, asset_id) for asset_id in asset_ids
@@ -1781,7 +1811,7 @@ class RedisTaskManager:
                     if not _asset_read_pin_metadata_matches(
                         pipeline.hgetall(pin_key),
                         session_id,
-                        asset_ids,
+                        asset_identities,
                         token,
                     ):
                         pipeline.unwatch()
@@ -1801,9 +1831,10 @@ class RedisTaskManager:
     def _release_asset_read_pin_without_lua(
         self,
         session_id: str,
-        asset_ids: tuple[str, ...],
+        asset_identities: tuple[AssetIdentity, ...],
         token: str,
     ) -> int:
+        asset_ids = _asset_ids(asset_identities)
         pin_key = _asset_read_pin_key(token)
         reader_keys = [
             _asset_readers_key(session_id, asset_id) for asset_id in asset_ids
@@ -1819,7 +1850,7 @@ class RedisTaskManager:
                     if not _asset_read_pin_metadata_matches(
                         metadata,
                         session_id,
-                        asset_ids,
+                        asset_identities,
                         token,
                     ):
                         pipeline.unwatch()
@@ -1836,13 +1867,13 @@ class RedisTaskManager:
     def _asset_read_pin_matches(
         self,
         session_id: str,
-        asset_ids: tuple[str, ...],
+        asset_identities: tuple[AssetIdentity, ...],
         token: str,
     ) -> bool:
         return _asset_read_pin_metadata_matches(
             self._redis.hgetall(_asset_read_pin_key(token)),
             session_id,
-            asset_ids,
+            asset_identities,
             token,
         )
 
@@ -1937,17 +1968,22 @@ class RedisTaskManager:
         input_path: str,
         commit: Callable[[Callable[[], Job]], Job] | None,
         asset_ids: tuple[str, ...],
+        asset_identities: tuple[AssetIdentity, ...],
         asset_read_pin_token: str | None,
     ) -> TaskRecord:
-        asset_ids = tuple(dict.fromkeys(asset_ids))
-        if asset_ids and owner_id is None:
+        if asset_ids and asset_identities:
+            raise ValueError(
+                "Use either asset_ids or asset_identities, not both"
+            )
+        identities = _normalize_asset_identities(
+            asset_identities or asset_ids
+        )
+        if identities and owner_id is None:
             raise ValueError("Hosted asset references require a task owner")
         if asset_read_pin_token is not None:
             _validate_token(asset_read_pin_token)
-            if not asset_ids:
+            if not identities:
                 raise ValueError("Asset read pin requires hosted asset references")
-        for asset_id in asset_ids:
-            _validate_asset_id(asset_id)
         task_id = str(uuid4())
         task = TaskRecord(
             task_id=task_id,
@@ -1965,7 +2001,7 @@ class RedisTaskManager:
         self._reserve_enqueue_intent(
             task,
             owner_token,
-            asset_ids,
+            identities,
             asset_read_pin_token,
         )
         heartbeat = _EnqueueIntentHeartbeat(
@@ -2080,7 +2116,7 @@ class RedisTaskManager:
         self,
         task: TaskRecord,
         owner_token: str,
-        asset_ids: tuple[str, ...],
+        asset_identities: tuple[AssetIdentity, ...],
         asset_read_pin_token: str | None,
     ) -> None:
         owner_id = task.owner_id or ""
@@ -2117,7 +2153,7 @@ class RedisTaskManager:
                         _CLEANUP_PREFIX,
                         owner_token,
                         self._enqueue_intent_ttl_ms,
-                        _asset_ids_json(asset_ids),
+                        _asset_identities_json(asset_identities),
                         _ASSET_TASK_PREFIX,
                         _ASSET_DELETE_PREFIX,
                         asset_read_pin_token or "",
@@ -2131,7 +2167,7 @@ class RedisTaskManager:
             result = self._reserve_enqueue_intent_without_lua(
                 task,
                 owner_token,
-                asset_ids,
+                asset_identities,
                 asset_read_pin_token,
             )
         if result == 1:
@@ -2147,10 +2183,11 @@ class RedisTaskManager:
         self,
         task: TaskRecord,
         owner_token: str,
-        asset_ids: tuple[str, ...],
+        asset_identities: tuple[AssetIdentity, ...],
         asset_read_pin_token: str | None,
     ) -> int:
         owner_id = task.owner_id or ""
+        asset_ids = _asset_ids(asset_identities)
         state_key = (
             _session_state_key(owner_id)
             if owner_id
@@ -2201,7 +2238,7 @@ class RedisTaskManager:
                         if not _asset_read_pin_metadata_matches(
                             read_pin_metadata,
                             owner_id,
-                            asset_ids,
+                            asset_identities,
                             asset_read_pin_token,
                         ):
                             pipeline.unwatch()
@@ -2234,7 +2271,9 @@ class RedisTaskManager:
                             mapping={
                                 "task_id": task.task_id,
                                 "session_id": owner_id,
-                                "asset_ids": _asset_ids_json(asset_ids),
+                                "asset_identities": _asset_identities_json(
+                                    asset_identities
+                                ),
                             },
                         )
                         pipeline.sadd(
@@ -3339,35 +3378,105 @@ def _asset_readers_key(session_id: str, asset_id: str) -> str:
     return f"{_ASSET_READERS_PREFIX}{session_id}:{asset_id}"
 
 
-def _asset_ids_json(asset_ids: tuple[str, ...]) -> str:
-    return json.dumps(asset_ids, separators=(",", ":"))
+def _normalize_asset_identities(
+    values: tuple[str | AssetIdentity, ...],
+) -> tuple[AssetIdentity, ...]:
+    identities: list[AssetIdentity] = []
+    generations_by_asset: dict[str, str | None] = {}
+    for value in values:
+        if isinstance(value, str):
+            asset_id, generation_id = value, None
+        elif (
+            isinstance(value, tuple)
+            and len(value) == 2
+            and isinstance(value[0], str)
+            and (value[1] is None or isinstance(value[1], str))
+        ):
+            asset_id, generation_id = value
+        else:
+            raise ValueError("Invalid hosted asset identity")
+        _validate_asset_id(asset_id)
+        if generation_id is not None:
+            _validate_token(generation_id)
+        previous = generations_by_asset.get(asset_id, generation_id)
+        if asset_id in generations_by_asset and previous != generation_id:
+            raise ValueError("Conflicting hosted asset generations")
+        if asset_id not in generations_by_asset:
+            generations_by_asset[asset_id] = generation_id
+            identities.append((asset_id, generation_id))
+    return tuple(identities)
+
+
+def _asset_ids(
+    asset_identities: tuple[AssetIdentity, ...],
+) -> tuple[str, ...]:
+    return tuple(identity[0] for identity in asset_identities)
+
+
+def _asset_identities_json(
+    asset_identities: tuple[AssetIdentity, ...],
+) -> str:
+    return json.dumps(asset_identities, separators=(",", ":"))
 
 
 def _asset_read_pin_metadata_matches(
     metadata: dict[bytes | str, bytes | str],
     session_id: str,
-    asset_ids: tuple[str, ...],
+    asset_identities: tuple[AssetIdentity, ...],
     token: str,
 ) -> bool:
     return (
         _redis_hash_text(metadata, "token") == token
         and _redis_hash_text(metadata, "session_id") == session_id
-        and _redis_hash_text(metadata, "asset_ids") == _asset_ids_json(asset_ids)
+        and _redis_hash_text(metadata, "asset_identities")
+        == _asset_identities_json(asset_identities)
     )
 
 
 def _asset_ids_from_pin_metadata(
     metadata: dict[bytes | str, bytes | str],
 ) -> tuple[str, ...]:
-    value = _redis_hash_text(metadata, "asset_ids")
-    if value is None:
+    identities_value = _redis_hash_text(metadata, "asset_identities")
+    if identities_value is not None:
+        try:
+            decoded = json.loads(identities_value)
+            if not isinstance(decoded, list):
+                raise ValueError
+            identities = tuple(
+                (identity[0], identity[1])
+                for identity in decoded
+                if (
+                    isinstance(identity, list)
+                    and len(identity) == 2
+                    and isinstance(identity[0], str)
+                    and (
+                        identity[1] is None
+                        or isinstance(identity[1], str)
+                    )
+                )
+            )
+            if len(identities) != len(decoded):
+                raise ValueError
+            return _asset_ids(_normalize_asset_identities(identities))
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise TaskConflictError(
+                "Task pin asset metadata is invalid"
+            ) from exc
+
+    legacy_value = _redis_hash_text(metadata, "asset_ids")
+    if legacy_value is None:
         return ()
-    decoded = json.loads(value)
-    if not isinstance(decoded, list) or not all(
-        isinstance(asset_id, str) for asset_id in decoded
-    ):
-        raise TaskConflictError("Task pin asset metadata is invalid")
-    return tuple(decoded)
+    try:
+        decoded = json.loads(legacy_value)
+        if not isinstance(decoded, list) or not all(
+            isinstance(asset_id, str) for asset_id in decoded
+        ):
+            raise ValueError
+        return _asset_ids(
+            _normalize_asset_identities(tuple(decoded))
+        )
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise TaskConflictError("Task pin asset metadata is invalid") from exc
 
 
 def _redis_hash_text(

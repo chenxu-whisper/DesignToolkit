@@ -59,8 +59,8 @@ from designtoolkit.web.hosted import (
     HostedStorage,
     UploadConflictError,
     UploadRejectedError,
-    _asset_id,
     _safe_filename,
+    parse_asset_reference,
 )
 from designtoolkit.web.local_paths import resolve_dropped_file_paths
 from designtoolkit.web.media_limits import (
@@ -270,7 +270,7 @@ class _HostedSessionOperation:
 
 @dataclass(frozen=True)
 class _HostedTaskAssets:
-    asset_ids: tuple[str, ...]
+    asset_identities: tuple[tuple[str, str | None], ...]
     pin: RedisAssetReadPin | None = None
     heartbeat: _AssetReadPinHeartbeat | None = None
 
@@ -1058,7 +1058,7 @@ def create_router(
                     payload,
                     owner_id=owner_id,
                     commit=operation.commit,
-                    asset_ids=task_assets.asset_ids,
+                    asset_identities=task_assets.asset_identities,
                     asset_read_pin_token=(
                         task_assets.pin.token
                         if task_assets.pin is not None
@@ -1072,7 +1072,9 @@ def create_router(
             lambda: create_task(payload, owner_id=owner_id)
         )
 
-    def hosted_task_asset_ids(payload: object) -> tuple[str, ...]:
+    def hosted_task_asset_ids(
+        payload: object,
+    ) -> tuple[tuple[str, str | None], ...]:
         if storage is None:
             return ()
         input_path = getattr(payload, "input_path", None)
@@ -1080,7 +1082,16 @@ def create_router(
         references = [input_path] if input_path is not None else list(input_paths or [])
         try:
             return tuple(
-                dict.fromkeys(_asset_id(reference) for reference in references)
+                dict.fromkeys(
+                    (
+                        parsed.asset_id,
+                        parsed.generation_id,
+                    )
+                    for parsed in (
+                        parse_asset_reference(reference)
+                        for reference in references
+                    )
+                )
             )
         except UploadRejectedError as exc:
             raise ApiError("asset_not_found", str(exc), 404) from exc
@@ -1090,18 +1101,18 @@ def create_router(
         http_request: Request,
         payload: object,
     ) -> Iterator[_HostedTaskAssets]:
-        asset_ids = hosted_task_asset_ids(payload)
+        asset_identities = hosted_task_asset_ids(payload)
         if (
             storage is None
-            or not asset_ids
+            or not asset_identities
             or not isinstance(task_manager, RedisTaskManager)
         ):
-            yield _HostedTaskAssets(asset_ids)
+            yield _HostedTaskAssets(asset_identities)
             return
         try:
             pin = task_manager.acquire_asset_read_pin(
                 http_request.state.session_id,
-                asset_ids,
+                asset_identities,
             )
         except TaskConflictError as exc:
             raise ApiError("task_conflict", str(exc), 409) from exc
@@ -1112,7 +1123,7 @@ def create_router(
         )
         heartbeat.start()
         task_assets = _HostedTaskAssets(
-            asset_ids=asset_ids,
+            asset_identities=asset_identities,
             pin=pin,
             heartbeat=heartbeat,
         )

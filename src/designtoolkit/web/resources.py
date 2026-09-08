@@ -1621,10 +1621,19 @@ end
 if redis.call("HGET", KEYS[1], "task_id") ~= ARGV[2] then
     return 2
 end
-local asset_ids_json = redis.call("HGET", KEYS[1], "asset_ids")
-if asset_ids_json then
-    local asset_ids = cjson.decode(asset_ids_json)
-    for _, asset_id in ipairs(asset_ids) do
+local identities_json = redis.call("HGET", KEYS[1], "asset_identities")
+local legacy = false
+if not identities_json then
+    identities_json = redis.call("HGET", KEYS[1], "asset_ids")
+    legacy = true
+end
+if identities_json then
+    local identities = cjson.decode(identities_json)
+    for _, identity in ipairs(identities) do
+        local asset_id = identity
+        if not legacy then
+            asset_id = identity[1]
+        end
         local asset_tasks_key = ARGV[3] .. ARGV[1] .. ":" .. asset_id
         redis.call("SREM", asset_tasks_key, ARGV[2])
         if redis.call("SCARD", asset_tasks_key) == 0 then

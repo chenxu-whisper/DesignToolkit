@@ -7,6 +7,7 @@ import re
 import shutil
 from collections.abc import AsyncIterable, Callable, Mapping, Sequence
 from dataclasses import dataclass
+from hmac import compare_digest
 from math import isfinite
 from pathlib import Path
 from stat import S_ISDIR, S_ISLNK, S_ISREG
@@ -14,7 +15,7 @@ from threading import Event, RLock, Thread
 from time import time
 from typing import BinaryIO
 from unicodedata import category
-from urllib.parse import quote
+from urllib.parse import quote, unquote_to_bytes
 from uuid import UUID, uuid4
 from zipfile import ZIP_DEFLATED, ZipFile
 
@@ -75,9 +76,6 @@ _ALLOWED_SUFFIXES = frozenset(
 _SESSION_PATTERN = re.compile(r"^[a-f0-9]{32}$")
 _QUARANTINE_PATTERN = re.compile(
     r"^(?P<session_id>[a-f0-9]{32})-(?P<token>[a-f0-9]{32})$"
-)
-_ASSET_REFERENCE_PATTERN = re.compile(
-    r"^asset:(?P<asset_id>[a-f0-9]{32})(?::[^:]*)?$"
 )
 _LOGGER = logging.getLogger(__name__)
 
@@ -503,6 +501,13 @@ class UploadedAsset:
 
 
 @dataclass(frozen=True)
+class ParsedAssetReference:
+    asset_id: str
+    generation_id: str | None
+    filename: str | None
+
+
+@dataclass(frozen=True)
 class AssetDeletion:
     asset_id: str
     reference: str
@@ -606,13 +611,12 @@ class HostedStorage:
                         raise UploadConflictError("Upload ID already exists") from exc
                     owns_asset_dir = True
                 with temporary_path.open("xb") as destination:
-                    if generation_id is not None:
-                        _write_asset_manifest(
-                            asset_dir,
-                            asset_id=asset_id,
-                            generation_id=generation_id,
-                            size=content_length,
-                        )
+                    _write_asset_manifest(
+                        asset_dir,
+                        asset_id=asset_id,
+                        generation_id=generation_id,
+                        size=content_length,
+                    )
                     async for chunk in chunks:
                         heartbeat.raise_if_failed()
                         self._raise_if_upload_cancelled(
@@ -681,8 +685,12 @@ class HostedStorage:
             raise
 
         await to_thread.run_sync(_finalize_best_effort, reservation)
+        reference_parts = ["asset", asset_id]
+        if generation_id is not None:
+            reference_parts.append(generation_id)
+        reference_parts.append(quote(filename, safe=""))
         return UploadedAsset(
-            reference=f"asset:{asset_id}:{quote(filename, safe='')}",
+            reference=":".join(reference_parts),
             filename=filename,
             size=size,
         )
@@ -721,8 +729,19 @@ class HostedStorage:
 
     def resolve(self, session_id: str, reference: str) -> Path:
         session_id = _validate_session_id(session_id)
-        asset_id = _asset_id(reference)
-        asset_dir = self._session_dir(session_id) / "assets" / asset_id
+        parsed = parse_asset_reference(reference)
+        asset_dir = self._session_dir(session_id) / "assets" / parsed.asset_id
+        try:
+            manifest = _read_asset_manifest(asset_dir, parsed.asset_id)
+        except AssetDeletionStateError as exc:
+            raise UploadRejectedError(
+                "Uploaded asset is not available"
+            ) from exc
+        if manifest is None or not _asset_generation_matches(
+            parsed.generation_id,
+            manifest.get("generation_id"),
+        ):
+            raise UploadRejectedError("Uploaded asset is not available")
         matches = [
             path
             for path in asset_dir.iterdir()
@@ -850,7 +869,7 @@ class HostedStorage:
                 reference=f"asset:{asset_id}",
                 size=_asset_payload_size(asset_dir),
                 generation_id=(
-                    manifest["generation_id"]
+                    manifest.get("generation_id")
                     if manifest is not None
                     else None
                 ),
@@ -1600,17 +1619,68 @@ def _validate_session_id(value: str) -> str:
 
 
 def _asset_id(reference: str) -> str:
-    match = _ASSET_REFERENCE_PATTERN.fullmatch(reference)
-    if match is None:
+    return parse_asset_reference(reference).asset_id
+
+
+def parse_asset_reference(reference: str) -> ParsedAssetReference:
+    if not isinstance(reference, str):
         raise UploadRejectedError("Uploaded asset is not available")
-    value = match.group("asset_id")
+    parts = reference.split(":")
+    if len(parts) not in {2, 3, 4} or parts[0] != "asset":
+        raise UploadRejectedError("Uploaded asset is not available")
+    value = parts[1]
     try:
         parsed = UUID(value)
     except ValueError as exc:
         raise UploadRejectedError("Uploaded asset is not available") from exc
     if parsed.hex != value:
         raise UploadRejectedError("Uploaded asset is not available")
-    return value
+    generation_id = None
+    encoded_filename = None
+    if len(parts) == 3:
+        encoded_filename = parts[2]
+    elif len(parts) == 4:
+        generation_id = parts[2]
+        encoded_filename = parts[3]
+        if not _SESSION_PATTERN.fullmatch(generation_id):
+            raise UploadRejectedError("Uploaded asset is not available")
+    filename = (
+        _decode_reference_filename(encoded_filename)
+        if encoded_filename is not None
+        else None
+    )
+    return ParsedAssetReference(
+        asset_id=value,
+        generation_id=generation_id,
+        filename=filename,
+    )
+
+
+def _decode_reference_filename(value: str) -> str:
+    if (
+        not value
+        or re.search(r"%(?![0-9A-Fa-f]{2})", value)
+    ):
+        raise UploadRejectedError("Uploaded asset is not available")
+    try:
+        filename = unquote_to_bytes(value).decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise UploadRejectedError("Uploaded asset is not available") from exc
+    if quote(filename, safe="") != value or _safe_filename(filename) != filename:
+        raise UploadRejectedError("Uploaded asset is not available")
+    return filename
+
+
+def _asset_generation_matches(
+    reference_generation: str | None,
+    manifest_generation: str | int | None,
+) -> bool:
+    if reference_generation is None or manifest_generation is None:
+        return reference_generation is None and manifest_generation is None
+    return isinstance(manifest_generation, str) and compare_digest(
+        reference_generation,
+        manifest_generation,
+    )
 
 
 def _asset_payload_size(asset_dir: Path) -> int:
@@ -1755,14 +1825,17 @@ def _write_asset_manifest(
     asset_dir: Path,
     *,
     asset_id: str,
-    generation_id: str,
+    generation_id: str | None,
     size: int,
 ) -> None:
     payload = {
         "asset_id": asset_id,
         "bytes": size,
-        "generation_id": generation_id,
     }
+    if generation_id is not None:
+        if not _SESSION_PATTERN.fullmatch(generation_id):
+            raise UploadRejectedError("Upload generation token is invalid")
+        payload["generation_id"] = generation_id
     manifest_path = asset_dir / _ASSET_MANIFEST_NAME
     temporary_path = asset_dir / f"{_ASSET_MANIFEST_NAME}.{uuid4().hex}.tmp"
     try:
@@ -1784,12 +1857,17 @@ def _read_asset_manifest(
         return None
     try:
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-        generation_id = payload["generation_id"]
+        generation_id = payload.get("generation_id")
         size = payload["bytes"]
         if (
             payload["asset_id"] != asset_id
-            or not isinstance(generation_id, str)
-            or not _SESSION_PATTERN.fullmatch(generation_id)
+            or (
+                generation_id is not None
+                and (
+                    not isinstance(generation_id, str)
+                    or not _SESSION_PATTERN.fullmatch(generation_id)
+                )
+            )
             or isinstance(size, bool)
             or not isinstance(size, int)
             or size <= 0
@@ -1797,11 +1875,13 @@ def _read_asset_manifest(
             raise ValueError
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise AssetDeletionStateError(asset_id) from exc
-    return {
+    result: dict[str, str | int] = {
         "asset_id": asset_id,
         "bytes": size,
-        "generation_id": generation_id,
     }
+    if generation_id is not None:
+        result["generation_id"] = generation_id
+    return result
 
 
 def _asset_manifest_generation(
@@ -1811,7 +1891,9 @@ def _asset_manifest_generation(
     manifest = _read_asset_manifest(asset_dir, asset_id)
     if manifest is None:
         return None
-    generation_id = manifest["generation_id"]
+    generation_id = manifest.get("generation_id")
+    if generation_id is None:
+        return None
     if not isinstance(generation_id, str):
         raise AssetDeletionStateError(asset_id)
     return generation_id

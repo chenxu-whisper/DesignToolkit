@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -599,6 +600,141 @@ def test_real_redis_asset_read_pin_handoff_is_multi_asset_and_generation_safe(
         manager.release_asset_deletion(session_id, asset_id, claim)
 
 
+@pytest.mark.parametrize("use_lua", [True, False], ids=["lua", "fallback"])
+def test_real_redis_asset_identity_handoff_validates_and_persists_generations(
+    real_redis_connection: Redis,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    use_lua: bool,
+) -> None:
+    manager = _manager(real_redis_connection, tmp_path)
+    session_id = "a" * 32
+    identities = (
+        ("1" * 32, "3" * 32),
+        ("2" * 32, "4" * 32),
+    )
+
+    if not use_lua:
+        def unknown_command(**_kwargs):
+            raise ResponseError("unknown command 'evalsha'")
+
+        monkeypatch.setattr(
+            manager,
+            "_acquire_asset_read_pin_script",
+            unknown_command,
+        )
+        monkeypatch.setattr(
+            manager,
+            "_reserve_enqueue_script",
+            unknown_command,
+        )
+        monkeypatch.setattr(
+            manager,
+            "_release_task_pin_script",
+            unknown_command,
+        )
+
+    stale_pin = manager.acquire_asset_read_pin(session_id, identities)
+    with pytest.raises(TaskConflictError, match="read pin expired"):
+        manager.create_video_frames_task(
+            VideoFramesTaskRequest(input_paths=[str(tmp_path / "clip.mp4")] * 2),
+            owner_id=session_id,
+            asset_identities=(
+                (identities[0][0], "5" * 32),
+                identities[1],
+            ),
+            asset_read_pin_token=stale_pin.token,
+        )
+    assert stale_pin.release()
+
+    pin = manager.acquire_asset_read_pin(session_id, identities)
+    pin_metadata = real_redis_connection.hgetall(
+        f"dt:resource:asset-read-pin:{pin.token}"
+    )
+    assert json.loads(pin_metadata[b"asset_identities"]) == [
+        list(identity) for identity in identities
+    ]
+    assert b"asset_ids" not in pin_metadata
+
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_paths=[str(tmp_path / "clip.mp4")] * 2),
+        owner_id=session_id,
+        asset_identities=identities,
+        asset_read_pin_token=pin.token,
+    )
+
+    task_pin = real_redis_connection.hgetall(
+        f"dt:resource:task-pin:{task.task_id}"
+    )
+    assert json.loads(task_pin[b"asset_identities"]) == [
+        list(identity) for identity in identities
+    ]
+    assert b"asset_ids" not in task_pin
+    for asset_id, _generation_id in identities:
+        with pytest.raises(TaskConflictError, match="active task"):
+            manager.claim_asset_deletion(session_id, asset_id)
+
+    manager.mark_finished(task.task_id, status=TaskStatus.SUCCEEDED)
+    for asset_id, _generation_id in identities:
+        claim = manager.claim_asset_deletion(session_id, asset_id)
+        manager.release_asset_deletion(session_id, asset_id, claim)
+
+
+def test_task_pin_release_conservatively_migrates_legacy_asset_id_metadata(
+    tmp_path: Path,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = _manager(redis_connection, tmp_path)
+    session_id = "a" * 32
+    asset_id = "1" * 32
+    task_id = "legacy-task"
+    redis_connection.hset(
+        f"dt:resource:task-pin:{task_id}",
+        mapping={
+            "task_id": task_id,
+            "session_id": session_id,
+            "asset_ids": json.dumps([asset_id]),
+        },
+    )
+    redis_connection.sadd(
+        f"dt:resource:session:{session_id}:task-pins",
+        task_id,
+    )
+    redis_connection.sadd(
+        f"dt:resource:asset-tasks:{session_id}:{asset_id}",
+        task_id,
+    )
+
+    assert manager.release_task_pin(task_id)
+    claim = manager.claim_asset_deletion(session_id, asset_id)
+    manager.release_asset_deletion(session_id, asset_id, claim)
+
+
+def test_asset_read_pin_rejects_generation_mismatch_during_handoff(
+    tmp_path: Path,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = _manager(redis_connection, tmp_path)
+    session_id = "a" * 32
+    asset_id = "1" * 32
+    pin = manager.acquire_asset_read_pin(
+        session_id,
+        ((asset_id, "2" * 32),),
+    )
+
+    with pytest.raises(TaskConflictError, match="read pin expired"):
+        manager.create_video_frames_task(
+            VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+            owner_id=session_id,
+            asset_identities=((asset_id, "3" * 32),),
+            asset_read_pin_token=pin.token,
+        )
+
+    assert pin.release()
+    claim = manager.claim_asset_deletion(session_id, asset_id)
+    manager.release_asset_deletion(session_id, asset_id, claim)
+
+
 def test_real_redis_multiple_asset_read_pins_handoff_independently(
     real_redis_connection: Redis,
     tmp_path: Path,
@@ -639,7 +775,8 @@ def test_real_redis_asset_read_pin_refresh_and_stale_reconcile(
     manager = _manager(real_redis_connection, tmp_path)
     session_id = "a" * 32
     asset_id = "1" * 32
-    pin = manager.acquire_asset_read_pin(session_id, (asset_id,))
+    identities = ((asset_id, "2" * 32),)
+    pin = manager.acquire_asset_read_pin(session_id, identities)
     pin_key = f"dt:resource:asset-read-pin:{pin.token}"
     readers_key = f"dt:resource:asset-readers:{session_id}:{asset_id}"
     real_redis_connection.pexpire(pin_key, 1_000)
@@ -690,7 +827,8 @@ def test_real_redis_asset_read_pin_handoff_ack_loss_is_reconciled(
     manager = _manager(real_redis_connection, tmp_path)
     session_id = "a" * 32
     asset_id = "1" * 32
-    pin = manager.acquire_asset_read_pin(session_id, (asset_id,))
+    identities = ((asset_id, "2" * 32),)
+    pin = manager.acquire_asset_read_pin(session_id, identities)
     reserve = manager._reserve_enqueue_script
 
     def reserve_then_lose_ack(*args, **kwargs):
@@ -703,7 +841,7 @@ def test_real_redis_asset_read_pin_handoff_ack_loss_is_reconciled(
         manager.create_video_frames_task(
             VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
             owner_id=session_id,
-            asset_ids=(asset_id,),
+            asset_identities=identities,
             asset_read_pin_token=pin.token,
         )
 

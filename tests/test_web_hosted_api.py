@@ -702,11 +702,19 @@ def test_hosted_upload_uses_validated_client_upload_id(tmp_path: Path) -> None:
         )
 
     assert upload.status_code == 201
-    assert upload.json()["reference"] == f"asset:{upload_id}:screen.png"
+    reference_parts = upload.json()["reference"].split(":")
+    assert reference_parts == [
+        "asset",
+        upload_id,
+        reference_parts[2],
+        "screen.png",
+    ]
+    assert len(reference_parts[2]) == 32
     session_id = client.cookies["dt_session"]
-    assert (
+    generation_marker = (
         tmp_path / "sessions" / session_id / ".upload-generations" / upload_id
-    ).is_file()
+    )
+    assert generation_marker.read_text(encoding="ascii") == reference_parts[2]
 
 
 @pytest.mark.parametrize(
@@ -2939,12 +2947,127 @@ def test_hosted_task_uses_uploaded_asset_and_is_session_isolated(
         own_status = owner.get(f"/api/tasks/{task_id}")
 
     with _client(tmp_path, task_manager=manager) as stranger:
+        foreign_submission = stranger.post(
+            "/api/tasks/video-frames",
+            json={"input_path": reference, "image_format": "png"},
+        )
         stranger_status = stranger.get(f"/api/tasks/{task_id}")
 
     assert created.status_code == 202
     assert own_status.status_code == 200
     assert own_status.json()["input_path"] == "clip.mp4"
+    assert foreign_submission.status_code == 404
+    assert foreign_submission.json()["error"]["code"] == "asset_not_found"
     assert stranger_status.status_code == 404
+
+
+def test_reused_upload_id_rejects_stale_generation_without_pin_or_task_leak(
+    tmp_path: Path,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = RedisTaskManager(
+        redis_connection=redis_connection,
+        queue=Queue("designtoolkit", connection=redis_connection),
+        data_dir=tmp_path,
+        max_queued_tasks=20,
+        retention_seconds=7200,
+    )
+    upload_id = "1" * 32
+    with _client(tmp_path, task_manager=manager) as client:
+        first_reference = _upload(
+            client,
+            "first.mp4",
+            b"first",
+            upload_id=upload_id,
+        ).json()["reference"]
+        assert client.delete(f"/api/uploads/{upload_id}").status_code == 204
+        second_reference = _upload(
+            client,
+            "second.mp4",
+            b"second",
+            upload_id=upload_id,
+        ).json()["reference"]
+
+        stale = client.post(
+            "/api/tasks/video-frames",
+            json={"input_path": first_reference, "image_format": "png"},
+        )
+        legacy = client.post(
+            "/api/tasks/video-frames",
+            json={
+                "input_path": f"asset:{upload_id}:first.mp4",
+                "image_format": "png",
+            },
+        )
+        current = client.post(
+            "/api/tasks/video-frames",
+            json={"input_path": second_reference, "image_format": "png"},
+        )
+
+    assert stale.status_code == 404
+    assert stale.json()["error"]["code"] == "asset_not_found"
+    assert legacy.status_code == 404
+    assert legacy.json()["error"]["code"] == "asset_not_found"
+    assert current.status_code == 202
+    assert manager.queue.count == 1
+    task_pin = redis_connection.hgetall(
+        f"dt:resource:task-pin:{current.json()['task_id']}"
+    )
+    assert json.loads(task_pin[b"asset_identities"]) == [
+        [upload_id, second_reference.split(":")[2]]
+    ]
+    assert list(
+        redis_connection.scan_iter(match="dt:resource:asset-read-pin:*")
+    ) == []
+    assert list(
+        redis_connection.scan_iter(match="dt:resource:asset-readers:*")
+    ) == []
+
+
+def test_hosted_batch_generation_mismatch_is_all_or_nothing(
+    tmp_path: Path,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = RedisTaskManager(
+        redis_connection=redis_connection,
+        queue=Queue("designtoolkit", connection=redis_connection),
+        data_dir=tmp_path,
+        max_queued_tasks=20,
+        retention_seconds=7200,
+    )
+    with _client(tmp_path, task_manager=manager) as client:
+        first = _upload(
+            client,
+            "first.mp4",
+            b"first",
+            upload_id="1" * 32,
+        ).json()["reference"]
+        second = _upload(
+            client,
+            "second.mp4",
+            b"second",
+            upload_id="2" * 32,
+        ).json()["reference"]
+        second_parts = second.split(":")
+        second_parts[2] = "f" * 32
+
+        response = client.post(
+            "/api/tasks/video-frames",
+            json={
+                "input_paths": [first, ":".join(second_parts)],
+                "image_format": "png",
+            },
+        )
+
+    assert response.status_code == 404
+    assert manager.queue.count == 0
+    assert list(redis_connection.scan_iter(match="dt:task:*")) == []
+    assert list(
+        redis_connection.scan_iter(match="dt:resource:asset-read-pin:*")
+    ) == []
+    assert list(
+        redis_connection.scan_iter(match="dt:resource:asset-readers:*")
+    ) == []
 
 
 def test_in_memory_hosted_task_retains_session_owner(tmp_path: Path) -> None:
