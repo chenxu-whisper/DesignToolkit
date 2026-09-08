@@ -1501,6 +1501,7 @@ def test_delete_does_not_reclaim_active_partial_upload(tmp_path: Path) -> None:
         min_free_bytes=0,
     )
     coordinator.inflight[(session_id, upload_id)] = False
+    coordinator.inflight_generations[(session_id, upload_id)] = "2" * 32
     asset_dir = tmp_path / "sessions" / session_id / "assets" / upload_id
     asset_dir.mkdir(parents=True)
     partial = asset_dir / ".uploading"
@@ -1640,6 +1641,7 @@ def test_active_upload_state_is_not_recovered_even_when_marker_is_old(
     generation.write_text("2" * 32, encoding="ascii")
     os.utime(generation, (1.0, 1.0))
     coordinator.inflight[(session_id, upload_id)] = False
+    coordinator.inflight_generations[(session_id, upload_id)] = "2" * 32
 
     with _client(tmp_path, resource_coordinator=coordinator) as client:
         client.cookies.set("dt_session", session_id)
@@ -1889,7 +1891,7 @@ def test_delete_upload_is_owner_scoped_idempotent_and_reclaims_quota(
     assert first_delete.status_code == 204
     assert second_delete.status_code == 404
     assert replacement.status_code == 201
-    assert coordinator.finalize_release_calls == 2
+    assert coordinator.finalize_release_calls == 1
     assert coordinator.finalized_assets == {
         (owner.cookies["dt_session"], asset_id)
     }
@@ -2015,7 +2017,7 @@ def test_delete_upload_has_no_periodic_refresh_during_slow_removal(
     assert coordinator.finalized_assets == {(session_id, asset_id)}
 
 
-def test_delete_absent_upload_best_effort_finalizes_known_release_marker(
+def test_delete_absent_upload_does_not_touch_known_release_marker(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2065,7 +2067,7 @@ def test_delete_absent_upload_best_effort_finalizes_known_release_marker(
         response = _delete_uploaded_asset(owner, reference)
 
     assert response.status_code == 404
-    assert finalize_attempts == 1
+    assert finalize_attempts == 0
     assert asset_id in coordinator.released_assets
 
 
@@ -2676,6 +2678,356 @@ def test_real_redis_random_delete_does_not_grow_upload_state(
         if resource_keys:
             redis_connection.delete(*resource_keys)
         redis_connection.close()
+
+
+def _real_redis_upload_resources(
+    tmp_path: Path,
+) -> tuple[Redis, RedisResourceCoordinator]:
+    url = os.environ.get(
+        "DESIGNTOOLKIT_TEST_REDIS_URL",
+        "redis://localhost:6379/15",
+    )
+    redis_connection = Redis.from_url(
+        url,
+        decode_responses=False,
+        socket_connect_timeout=0.2,
+        socket_timeout=0.2,
+    )
+    try:
+        redis_connection.ping()
+    except RedisError as error:
+        redis_connection.close()
+        pytest.skip(f"real Redis unavailable at {url}: {error}")
+    resource_keys = list(redis_connection.scan_iter(match="dt:resource:*"))
+    if resource_keys:
+        redis_connection.delete(*resource_keys)
+    return redis_connection, RedisResourceCoordinator(
+        redis_connection=redis_connection,
+        max_upload_concurrency=4,
+        max_session_bytes=2 * 1024 * 1024 * 1024,
+        min_free_bytes=0,
+        reservation_ttl=30,
+        lease_ttl=30,
+    )
+
+
+def _close_real_redis_upload_resources(redis_connection: Redis) -> None:
+    resource_keys = list(redis_connection.scan_iter(match="dt:resource:*"))
+    if resource_keys:
+        redis_connection.delete(*resource_keys)
+    redis_connection.close()
+
+
+class InspectBarrierStorage(HostedStorage):
+    def __init__(self, root: Path, *, max_upload_bytes: int) -> None:
+        super().__init__(root, max_upload_bytes=max_upload_bytes)
+        self.inspected = Event()
+        self.resume = Event()
+
+    def inspect_upload_for_deletion(
+        self,
+        session_id: str,
+        asset_id: str,
+    ):
+        inspection = super().inspect_upload_for_deletion(session_id, asset_id)
+        self.inspected.set()
+        assert self.resume.wait(timeout=5)
+        return inspection
+
+
+def test_real_redis_empty_delete_snapshot_does_not_cancel_new_registration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis_connection, resources = _real_redis_upload_resources(tmp_path)
+    storage = InspectBarrierStorage(tmp_path, max_upload_bytes=5)
+    session_id = "a" * 32
+    upload_id = "1" * 32
+    cancel_upload = Mock(wraps=resources.cancel_upload)
+    monkeypatch.setattr(resources, "cancel_upload", cancel_upload)
+    try:
+        with _client(
+            tmp_path,
+            resource_coordinator=resources,
+            hosted_storage=storage,
+        ) as client:
+            client.cookies.set("dt_session", session_id)
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                deletion = executor.submit(
+                    client.delete,
+                    f"/api/uploads/{upload_id}",
+                )
+                assert storage.inspected.wait(timeout=5)
+                registration = resources.register_upload(session_id, upload_id)
+                storage.claim_upload_generation(
+                    session_id,
+                    upload_id,
+                    token=registration.token,
+                )
+                storage.resume.set()
+                response = deletion.result(timeout=5)
+
+            assert response.status_code == 404
+            assert cancel_upload.call_count == 0
+            assert registration.refresh() is False
+            assert (
+                tmp_path
+                / "sessions"
+                / session_id
+                / ".upload-generations"
+                / upload_id
+            ).read_text(encoding="ascii") == registration.token
+            assert list(
+                redis_connection.scan_iter(
+                    match=f"dt:resource:upload-inflight:{session_id}:{upload_id}"
+                )
+            ) == [
+                f"dt:resource:upload-inflight:{session_id}:{upload_id}".encode()
+            ]
+    finally:
+        _close_real_redis_upload_resources(redis_connection)
+
+
+def test_real_redis_no_generation_delete_fences_replaced_upload_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis_connection, resources = _real_redis_upload_resources(tmp_path)
+    storage = InspectBarrierStorage(tmp_path, max_upload_bytes=5)
+    session_id = "a" * 32
+    upload_id = "1" * 32
+    old_generation = "2" * 32
+    cancel_upload = Mock(wraps=resources.cancel_upload)
+    monkeypatch.setattr(resources, "cancel_upload", cancel_upload)
+    storage.claim_upload_generation(
+        session_id,
+        upload_id,
+        token=old_generation,
+    )
+    try:
+        with _client(
+            tmp_path,
+            resource_coordinator=resources,
+            hosted_storage=storage,
+        ) as client:
+            client.cookies.set("dt_session", session_id)
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                deletion = executor.submit(
+                    client.delete,
+                    f"/api/uploads/{upload_id}",
+                )
+                assert storage.inspected.wait(timeout=5)
+                registration = resources.register_upload(session_id, upload_id)
+                storage.claim_upload_generation(
+                    session_id,
+                    upload_id,
+                    token=registration.token,
+                )
+                storage.resume.set()
+                response = deletion.result(timeout=5)
+
+            assert response.status_code == 404
+            assert cancel_upload.call_count == 1
+            assert cancel_upload.call_args.args == (
+                session_id,
+                upload_id,
+                old_generation,
+            )
+            assert registration.refresh() is False
+            assert (
+                tmp_path
+                / "sessions"
+                / session_id
+                / ".upload-generations"
+                / upload_id
+            ).read_text(encoding="ascii") == registration.token
+            assert not (
+                tmp_path
+                / "sessions"
+                / session_id
+                / ".upload-cancellations"
+                / upload_id
+            ).exists()
+    finally:
+        _close_real_redis_upload_resources(redis_connection)
+
+
+def test_real_redis_legacy_snapshot_cannot_delete_new_generation_marker(
+    tmp_path: Path,
+) -> None:
+    redis_connection, resources = _real_redis_upload_resources(tmp_path)
+    storage = InspectBarrierStorage(tmp_path, max_upload_bytes=5)
+    session_id = "a" * 32
+    upload_id = "1" * 32
+    asset_dir = tmp_path / "sessions" / session_id / "assets" / upload_id
+    asset_dir.mkdir(parents=True)
+    (asset_dir / "legacy.png").write_bytes(b"data")
+    (asset_dir / ".asset.json").write_text(
+        json.dumps({"asset_id": upload_id, "bytes": 4}),
+        encoding="utf-8",
+    )
+    try:
+        with _client(
+            tmp_path,
+            resource_coordinator=resources,
+            hosted_storage=storage,
+        ) as client:
+            client.cookies.set("dt_session", session_id)
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                deletion = executor.submit(
+                    client.delete,
+                    f"/api/uploads/{upload_id}",
+                )
+                assert storage.inspected.wait(timeout=5)
+                shutil.rmtree(asset_dir)
+                registration = resources.register_upload(session_id, upload_id)
+                storage.claim_upload_generation(
+                    session_id,
+                    upload_id,
+                    token=registration.token,
+                )
+                storage.resume.set()
+                response = deletion.result(timeout=5)
+
+            assert response.status_code == 404
+            assert registration.refresh() is False
+            assert (
+                tmp_path
+                / "sessions"
+                / session_id
+                / ".upload-generations"
+                / upload_id
+            ).read_text(encoding="ascii") == registration.token
+            assert not (
+                tmp_path
+                / "sessions"
+                / session_id
+                / ".upload-cancellations"
+                / upload_id
+            ).exists()
+    finally:
+        _close_real_redis_upload_resources(redis_connection)
+
+
+def test_real_redis_no_generation_delete_cancels_matching_active_upload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis_connection, resources = _real_redis_upload_resources(tmp_path)
+    storage = HostedStorage(tmp_path, max_upload_bytes=5)
+    session_id = "a" * 32
+    upload_id = "1" * 32
+    try:
+        registration = resources.register_upload(session_id, upload_id)
+        cancel_upload = Mock(wraps=resources.cancel_upload)
+        monkeypatch.setattr(resources, "cancel_upload", cancel_upload)
+        storage.claim_upload_generation(
+            session_id,
+            upload_id,
+            token=registration.token,
+        )
+        with _client(
+            tmp_path,
+            resource_coordinator=resources,
+            hosted_storage=storage,
+        ) as client:
+            client.cookies.set("dt_session", session_id)
+            response = client.delete(f"/api/uploads/{upload_id}")
+
+        assert response.status_code == 409
+        assert cancel_upload.call_count == 1
+        assert cancel_upload.call_args.args == (
+            session_id,
+            upload_id,
+            registration.token,
+        )
+        assert registration.refresh() is True
+        assert (
+            tmp_path
+            / "sessions"
+            / session_id
+            / ".upload-cancellations"
+            / upload_id
+        ).is_file()
+    finally:
+        _close_real_redis_upload_resources(redis_connection)
+
+
+def test_real_redis_legacy_delete_does_not_cancel_arbitrary_inflight_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis_connection, resources = _real_redis_upload_resources(tmp_path)
+    storage = HostedStorage(tmp_path, max_upload_bytes=5)
+    session_id = "a" * 32
+    upload_id = "1" * 32
+    asset_dir = tmp_path / "sessions" / session_id / "assets" / upload_id
+    asset_dir.mkdir(parents=True)
+    (asset_dir / "legacy.png").write_bytes(b"data")
+    (asset_dir / ".asset.json").write_text(
+        json.dumps({"asset_id": upload_id, "bytes": 4}),
+        encoding="utf-8",
+    )
+    try:
+        reservation = resources.reserve_upload(
+            session_id,
+            4,
+            free_bytes=10**12,
+        )
+        reservation.commit()
+        reservation.finalize()
+        registration = resources.register_upload(session_id, upload_id)
+        cancel_upload = Mock(wraps=resources.cancel_upload)
+        monkeypatch.setattr(resources, "cancel_upload", cancel_upload)
+        with _client(
+            tmp_path,
+            resource_coordinator=resources,
+            hosted_storage=storage,
+        ) as client:
+            client.cookies.set("dt_session", session_id)
+            response = client.delete(f"/api/uploads/{upload_id}")
+
+        assert response.status_code == 204
+        assert cancel_upload.call_count == 0
+        assert registration.refresh() is False
+        assert not asset_dir.exists()
+    finally:
+        _close_real_redis_upload_resources(redis_connection)
+
+
+def test_real_redis_published_generation_requires_explicit_delete_identity(
+    tmp_path: Path,
+) -> None:
+    redis_connection, resources = _real_redis_upload_resources(tmp_path)
+    storage = HostedStorage(tmp_path, max_upload_bytes=5)
+    session_id = "a" * 32
+    try:
+        with _client(
+            tmp_path,
+            max_session_bytes=5,
+            resource_coordinator=resources,
+            hosted_storage=storage,
+        ) as client:
+            client.cookies.set("dt_session", session_id)
+            uploaded = _upload(client, "screen.png", b"image")
+            reference = uploaded.json()["reference"]
+            _scheme, upload_id, generation_id, _filename = reference.split(
+                ":",
+                3,
+            )
+
+            missing = client.delete(f"/api/uploads/{upload_id}")
+            contents = storage.resolve(session_id, reference).read_bytes()
+            matching = client.delete(
+                f"/api/uploads/{upload_id}?generation={generation_id}"
+            )
+
+        assert uploaded.status_code == 201
+        assert missing.status_code == 404
+        assert contents == b"image"
+        assert matching.status_code == 204
+    finally:
+        _close_real_redis_upload_resources(redis_connection)
 
 
 def test_hosted_upload_also_consumes_api_rate_limit(tmp_path: Path) -> None:

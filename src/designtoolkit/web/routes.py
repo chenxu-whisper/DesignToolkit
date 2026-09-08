@@ -1414,73 +1414,28 @@ def create_router(
         deletion_claim: str | None = None
         release_generation: str | None = None
         try:
-            has_local_state = storage.has_upload_state(
+            deletion_identity = storage.inspect_upload_for_deletion(
                 session_id,
                 asset_id,
             )
-            if (
-                has_local_state
-                and not storage.asset_generation_matches_deletion(
-                    session_id,
-                    asset_id,
-                    expected_generation,
-                )
-            ):
+            if not deletion_identity.has_local_state:
                 return Response(status_code=404)
-            inflight = operation.commit(
-                lambda: resources.cancel_upload(
-                    session_id,
-                    asset_id,
-                    expected_generation,
-                )
+            if not deletion_identity.accepts_generation(expected_generation):
+                return Response(status_code=404)
+            effective_generation = (
+                expected_generation
+                if expected_generation is not None
+                else deletion_identity.inflight_generation
             )
-            if not inflight and not has_local_state:
-                if expected_generation is not None:
-                    release_generation = expected_generation
-                    already_released = operation.commit(
-                        lambda: resources.is_committed_asset_released(
-                            session_id,
-                            asset_id,
-                            expected_generation,
-                        )
+            inflight = False
+            if effective_generation is not None:
+                inflight = operation.commit(
+                    lambda: resources.cancel_upload(
+                        session_id,
+                        asset_id,
+                        effective_generation,
                     )
-                else:
-                    already_released = operation.commit(
-                        lambda: resources.is_committed_asset_released(
-                            session_id,
-                            asset_id,
-                        )
-                    )
-                if already_released:
-                    operation.commit(
-                        lambda: storage.finalize_asset_deletion(
-                            session_id,
-                            asset_id,
-                            expected_generation,
-                        )
-                    )
-                    try:
-                        if release_generation is None:
-                            operation.commit(
-                                lambda: resources.finalize_asset_release(
-                                    session_id,
-                                    asset_id,
-                                )
-                            )
-                        else:
-                            operation.commit(
-                                lambda: resources.finalize_asset_release(
-                                    session_id,
-                                    asset_id,
-                                    release_generation,
-                                )
-                            )
-                    except RedisError:
-                        _LOGGER.warning(
-                            "Failed to finalize release marker for absent asset",
-                            exc_info=True,
-                        )
-                return Response(status_code=404)
+                )
             if isinstance(task_manager, RedisTaskManager):
                 deletion_claim = operation.commit(
                     lambda: task_manager.claim_asset_deletion(
@@ -1494,7 +1449,8 @@ def create_router(
                     lambda: storage.delete_asset(
                         session_id,
                         f"asset:{asset_id}",
-                        expected_generation=expected_generation,
+                        expected_generation=effective_generation,
+                        expected_identity=deletion_identity,
                         cancel_inflight=inflight,
                         orphan_stale_after_seconds=(
                             resources.upload_registration_ttl_seconds
@@ -1503,13 +1459,13 @@ def create_router(
                 )
             except AssetDeletionStateError as exc:
                 invalid_asset_id = exc.asset_id
-                if expected_generation is not None:
-                    release_generation = expected_generation
+                if effective_generation is not None:
+                    release_generation = effective_generation
                     already_released = operation.commit(
                         lambda: resources.is_committed_asset_released(
                             session_id,
                             invalid_asset_id,
-                            expected_generation,
+                            effective_generation,
                         )
                     )
                 else:
@@ -1565,7 +1521,7 @@ def create_router(
                 lambda: storage.finalize_asset_deletion(
                     session_id,
                     asset_id,
-                    expected_generation,
+                    effective_generation,
                 )
             )
             if release_generation is None:

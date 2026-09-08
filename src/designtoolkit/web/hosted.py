@@ -7,6 +7,7 @@ import re
 import shutil
 from collections.abc import AsyncIterable, Callable, Mapping, Sequence
 from dataclasses import dataclass
+from enum import StrEnum
 from hmac import compare_digest
 from math import isfinite
 from pathlib import Path
@@ -518,6 +519,44 @@ class AssetDeletion:
     generation_required: bool = False
 
 
+class UploadDeletionState(StrEnum):
+    ABSENT = "absent"
+    ACTIVE = "active"
+    CANCELLED = "cancelled"
+    PUBLISHED = "published"
+    DELETING = "deleting"
+
+
+@dataclass(frozen=True)
+class UploadDeletionInspection:
+    asset_id: str
+    state: UploadDeletionState
+    generation_id: str | None
+    legacy: bool
+    storage_identity: tuple[int, int] | None
+
+    @property
+    def has_local_state(self) -> bool:
+        return self.state is not UploadDeletionState.ABSENT
+
+    @property
+    def inflight_generation(self) -> str | None:
+        if self.state not in {
+            UploadDeletionState.ACTIVE,
+            UploadDeletionState.CANCELLED,
+        }:
+            return None
+        return self.generation_id
+
+    def accepts_generation(self, expected_generation: str | None) -> bool:
+        if expected_generation is None:
+            return self.legacy or self.inflight_generation is not None
+        return (
+            self.generation_id is not None
+            and compare_digest(expected_generation, self.generation_id)
+        )
+
+
 class HostedStorage:
     def __init__(
         self,
@@ -760,6 +799,7 @@ class HostedStorage:
         reference: str,
         *,
         expected_generation: str | None = None,
+        expected_identity: UploadDeletionInspection | None = None,
         cancel_inflight: bool = False,
         orphan_stale_after_seconds: float | None = None,
     ) -> AssetDeletion | None:
@@ -777,6 +817,15 @@ class HostedStorage:
         generation = session_dir / _UPLOAD_GENERATIONS_NAME / asset_id
         cancellation = session_dir / _UPLOAD_CANCELLATIONS_NAME / asset_id
         with self._deletion_lock:
+            current_identity = self._inspect_upload_for_deletion(
+                session_dir,
+                asset_id,
+            )
+            if (
+                expected_identity is not None
+                and current_identity != expected_identity
+            ):
+                return None
             if not self._asset_generation_matches_deletion(
                 session_dir,
                 asset_id,
@@ -904,6 +953,128 @@ class HostedStorage:
         os.utime(session_dir, None)
         return deletion
 
+    def inspect_upload_for_deletion(
+        self,
+        session_id: str,
+        asset_id: str,
+    ) -> UploadDeletionInspection:
+        session_id = _validate_session_id(session_id)
+        asset_id = _asset_id(f"asset:{asset_id}")
+        with self._deletion_lock:
+            return self._inspect_upload_for_deletion(
+                self._session_dir(session_id),
+                asset_id,
+            )
+
+    def _inspect_upload_for_deletion(
+        self,
+        session_dir: Path,
+        asset_id: str,
+    ) -> UploadDeletionInspection:
+        asset_dir = session_dir / "assets" / asset_id
+        tombstone = session_dir / ".trash" / asset_id
+        generation_marker = (
+            session_dir / _UPLOAD_GENERATIONS_NAME / asset_id
+        )
+        cancellation = session_dir / _UPLOAD_CANCELLATIONS_NAME / asset_id
+        marker_generation = _read_upload_generation_marker(
+            generation_marker,
+            asset_id,
+        )
+        if tombstone.is_dir():
+            try:
+                deletion = _read_asset_deletion(tombstone, asset_id)
+            except AssetDeletionStateError:
+                return UploadDeletionInspection(
+                    asset_id=asset_id,
+                    state=UploadDeletionState.DELETING,
+                    generation_id=marker_generation,
+                    legacy=marker_generation is None,
+                    storage_identity=_deletion_storage_identity(tombstone),
+                )
+            return UploadDeletionInspection(
+                asset_id=asset_id,
+                state=UploadDeletionState.DELETING,
+                generation_id=deletion.generation_id,
+                legacy=not deletion.generation_required,
+                storage_identity=_deletion_storage_identity(tombstone),
+            )
+        if asset_dir.is_dir():
+            manifest = _read_asset_manifest(asset_dir, asset_id)
+            active = (asset_dir / ".uploading").is_file()
+            manifest_generation_value = (
+                manifest.get("generation_id")
+                if manifest is not None
+                else None
+            )
+            manifest_generation = (
+                manifest_generation_value
+                if isinstance(manifest_generation_value, str)
+                else None
+            )
+            if (
+                marker_generation is not None
+                and manifest is not None
+                and (
+                    manifest_generation is None
+                    or not compare_digest(
+                        marker_generation,
+                        manifest_generation,
+                    )
+                )
+            ):
+                raise AssetDeletionStateError(asset_id)
+            if marker_generation is not None and manifest is None and not active:
+                raise AssetDeletionStateError(asset_id)
+            state = (
+                UploadDeletionState.ACTIVE
+                if active
+                else UploadDeletionState.PUBLISHED
+            )
+            legacy = (
+                manifest_generation is None
+                if active
+                else (
+                    manifest is None
+                    or manifest["reference_version"] == 1
+                )
+            )
+            return UploadDeletionInspection(
+                asset_id=asset_id,
+                state=state,
+                generation_id=marker_generation or manifest_generation,
+                legacy=legacy,
+                storage_identity=_deletion_storage_identity(asset_dir),
+            )
+        if marker_generation is not None:
+            state = (
+                UploadDeletionState.CANCELLED
+                if cancellation.is_file()
+                else UploadDeletionState.ACTIVE
+            )
+            return UploadDeletionInspection(
+                asset_id=asset_id,
+                state=state,
+                generation_id=marker_generation,
+                legacy=False,
+                storage_identity=_deletion_storage_identity(generation_marker),
+            )
+        if cancellation.is_file():
+            return UploadDeletionInspection(
+                asset_id=asset_id,
+                state=UploadDeletionState.CANCELLED,
+                generation_id=None,
+                legacy=True,
+                storage_identity=_deletion_storage_identity(cancellation),
+            )
+        return UploadDeletionInspection(
+            asset_id=asset_id,
+            state=UploadDeletionState.ABSENT,
+            generation_id=None,
+            legacy=False,
+            storage_identity=None,
+        )
+
     def asset_generation_matches_deletion(
         self,
         session_id: str,
@@ -930,89 +1101,16 @@ class HostedStorage:
         asset_id: str,
         expected_generation: str | None,
     ) -> bool:
-        asset_dir = session_dir / "assets" / asset_id
-        tombstone = session_dir / ".trash" / asset_id
-        generation_marker = (
-            session_dir / _UPLOAD_GENERATIONS_NAME / asset_id
-        )
-        cancellation = session_dir / _UPLOAD_CANCELLATIONS_NAME / asset_id
-        marker_generation = _read_upload_generation_marker(
-            generation_marker,
+        return self._inspect_upload_for_deletion(
+            session_dir,
             asset_id,
-        )
-        if tombstone.is_dir():
-            try:
-                deletion = _read_asset_deletion(tombstone, asset_id)
-            except AssetDeletionStateError:
-                if marker_generation is not None:
-                    return _generation_matches(
-                        expected_generation,
-                        marker_generation,
-                    )
-                return expected_generation is None
-            if not deletion.generation_required and expected_generation is None:
-                return True
-            return _generation_matches(
-                expected_generation,
-                deletion.generation_id,
-            )
-        if asset_dir.is_dir():
-            manifest = _read_asset_manifest(asset_dir, asset_id)
-            manifest_generation_value = (
-                manifest.get("generation_id")
-                if manifest is not None
-                else None
-            )
-            manifest_generation = (
-                manifest_generation_value
-                if isinstance(manifest_generation_value, str)
-                else None
-            )
-            if (
-                marker_generation is not None
-                and manifest_generation is not None
-                and not compare_digest(
-                    marker_generation,
-                    manifest_generation,
-                )
-            ):
-                raise AssetDeletionStateError(asset_id)
-            if (asset_dir / ".uploading").is_file():
-                if expected_generation is None:
-                    return True
-                return _generation_matches(
-                    expected_generation,
-                    marker_generation or manifest_generation,
-                )
-            if manifest is None:
-                return expected_generation is None
-            return _asset_generation_matches(
-                expected_generation,
-                manifest_generation,
-                manifest["reference_version"],
-            )
-        if marker_generation is not None:
-            return (
-                expected_generation is None
-                or compare_digest(expected_generation, marker_generation)
-            )
-        return cancellation.is_file() and expected_generation is None
+        ).accepts_generation(expected_generation)
 
     def has_upload_state(self, session_id: str, asset_id: str) -> bool:
-        session_id = _validate_session_id(session_id)
-        asset_id = _asset_id(f"asset:{asset_id}")
-        session_dir = self._session_dir(session_id)
-        with self._deletion_lock:
-            return any(
-                (
-                    (session_dir / "assets" / asset_id).is_dir(),
-                    (session_dir / ".trash" / asset_id).is_dir(),
-                    (
-                        session_dir / _UPLOAD_CANCELLATIONS_NAME / asset_id
-                    ).is_file(),
-                    (session_dir / _UPLOAD_GENERATIONS_NAME / asset_id).is_file(),
-                )
-            )
+        return self.inspect_upload_for_deletion(
+            session_id,
+            asset_id,
+        ).has_local_state
 
     def finalize_asset_deletion(
         self,
@@ -1825,15 +1923,9 @@ def _read_upload_generation_marker(
     return generation_id
 
 
-def _generation_matches(
-    expected_generation: str | None,
-    current_generation: str | None,
-) -> bool:
-    return (
-        expected_generation is not None
-        and current_generation is not None
-        and compare_digest(expected_generation, current_generation)
-    )
+def _deletion_storage_identity(path: Path) -> tuple[int, int]:
+    metadata = path.stat()
+    return metadata.st_dev, metadata.st_ino
 
 
 def _asset_payload_size(asset_dir: Path) -> int:
