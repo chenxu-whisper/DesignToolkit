@@ -404,6 +404,12 @@ def _windows_startup_error(
     return error if str(error) == message else OSError(message)
 
 
+class _WindowsContainmentError(Exception):
+    def __init__(self, original_error: OSError | RuntimeError) -> None:
+        super().__init__(str(original_error))
+        self.original_error = original_error
+
+
 class _WindowsLaunchGate:
     def __init__(
         self,
@@ -549,12 +555,21 @@ class _WindowsLaunchGate:
         process_handle = getattr(process, "_handle", None)
         if process_handle is None:
             raise RuntimeError("Windows launcher process handle is unavailable")
-        job_handle = self._api.create_job()
+        job_handle = self._call_containment_api(self._api.create_job)
         self._job_handle = job_handle
-        self._api.set_job_kill_on_close(job_handle)
-        self._api.assign_process(job_handle, process_handle)
-        self._api.set_event(self._event_handle)
+        self._call_containment_api(lambda: self._api.set_job_kill_on_close(job_handle))
+        self._call_containment_api(
+            lambda: self._api.assign_process(job_handle, process_handle)
+        )
+        self._call_containment_api(lambda: self._api.set_event(self._event_handle))
         self._released = True
+
+    @staticmethod
+    def _call_containment_api(operation: Callable[[], object]) -> object:
+        try:
+            return operation()
+        except (OSError, RuntimeError) as exc:
+            raise _WindowsContainmentError(exc) from exc
 
     @property
     def has_job(self) -> bool:
@@ -721,11 +736,13 @@ class FfmpegBackend:
                 raise
             try:
                 process_tree_owner.claim_and_release(process)
-            except Exception as exc:
+            except BaseException as exc:
                 self._abort_windows_launch(process, process_tree_owner)
-                raise BackendUnavailableError(
-                    "Windows FFmpeg launch containment could not be established."
-                ) from exc
+                if isinstance(exc, _WindowsContainmentError):
+                    raise BackendUnavailableError(
+                        "Windows FFmpeg launch containment could not be established."
+                    ) from exc.original_error
+                raise
         else:
             process = self._popen(gated_command, **popen_kwargs)
         try:

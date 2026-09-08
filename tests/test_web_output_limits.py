@@ -502,6 +502,90 @@ def test_windows_gate_create_job_failure_reaps_launcher_when_terminate_is_denied
     assert "wait for Windows FFmpeg launcher" in caplog.text
 
 
+@pytest.mark.parametrize(
+    ("failure", "expected_closed", "terminates_launcher"),
+    [
+        ("create_job", ["event"], True),
+        ("set_info", ["event", "job"], False),
+        ("assign", ["event", "job"], False),
+        ("set_event", ["event", "job"], False),
+    ],
+)
+@pytest.mark.parametrize(
+    "base_exception_only",
+    [False, True],
+    ids=["rq-timeout", "base-exception"],
+)
+def test_windows_gate_binding_interrupt_preserves_original_after_cleanup_errors(
+    failure: str,
+    expected_closed: list[str],
+    terminates_launcher: bool,
+    base_exception_only: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class CleanupFailure(BaseException):
+        pass
+
+    class TaskInterruption(BaseException):
+        pass
+
+    interruption = (
+        TaskInterruption("task interrupted during Windows binding")
+        if base_exception_only
+        else JobTimeoutException("worker timed out during Windows binding")
+    )
+
+    class InterruptingKernelApi(FakeWindowsKernelApi):
+        def _fail(self, operation: str) -> None:
+            if operation == failure:
+                raise interruption
+
+        def close_handle(self, handle: object) -> None:
+            super().close_handle(handle)
+            raise CleanupFailure(f"close {handle} failed")
+
+    class CleanupFailingPopen(FakePopen):
+        def terminate(self) -> None:
+            super().terminate()
+            raise CleanupFailure("terminate failed")
+
+        def kill(self) -> None:
+            super().kill()
+            raise CleanupFailure("kill failed")
+
+    process = CleanupFailingPopen([], wait_times_out=True)
+    process._handle = 456  # type: ignore[attr-defined]
+    api = InterruptingKernelApi("")
+    gates: list[ffmpeg_backend._WindowsLaunchGate] = []
+
+    def create_gate(command: list[str]) -> ffmpeg_backend._WindowsLaunchGate:
+        gate = ffmpeg_backend._WindowsLaunchGate.create(command, api=api)
+        gates.append(gate)
+        return gate
+
+    monkeypatch.setattr(ffmpeg_backend, "os_name", "nt")
+    backend = FfmpegBackend(
+        popen=_popen_factory(process, []),
+        windows_launch_gate_factory=create_gate,
+    )
+
+    with pytest.raises(type(interruption)) as exc_info:
+        backend.run(["ffmpeg", "out.mp4"])
+
+    assert exc_info.value is interruption
+    assert process.terminate_called is terminates_launcher
+    assert process.kill_called
+    assert process.wait_calls == [
+        ffmpeg_backend._PROCESS_CLEANUP_TIMEOUT_SECONDS,
+        ffmpeg_backend._PROCESS_CLEANUP_TIMEOUT_SECONDS,
+    ]
+    assert sorted(api.closed) == sorted(expected_closed)
+    assert gates[0]._job_handle is None
+    assert gates[0]._event_handle is None
+    assert gates[0]._status_read_fd is None
+    assert gates[0]._status_write_fd is None
+
+
 def test_windows_launcher_popen_failure_preserves_original_when_cleanup_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -550,7 +634,7 @@ def test_windows_gate_setup_failure_closes_job_before_kill_even_if_close_fails(
 
         def claim_and_release(self, process: FakePopen) -> None:
             del process
-            raise OSError("assign failed")
+            raise ffmpeg_backend._WindowsContainmentError(OSError("assign failed"))
 
         def close(self) -> None:
             operations.append("close")
