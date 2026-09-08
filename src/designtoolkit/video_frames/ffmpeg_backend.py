@@ -28,6 +28,7 @@ _POSIX_SIGKILL = getattr(signal, "SIGKILL", 9)
 _WINDOWS_NEW_PROCESS_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200)
 _PROCESS_CLEANUP_TIMEOUT_SECONDS = 5.0
 _WINDOWS_LAUNCH_CLEANUP_TIMEOUT_SECONDS = 5.0
+_WINDOWS_LAUNCH_WAIT_POLL_SECONDS = 0.01
 _WINDOWS_STARTUP_ERROR_RETURN_CODE = 126
 _WINDOWS_STARTUP_ERROR_MAX_BYTES = 4096
 _WINDOWS_HANDLE_INHERITANCE_LOCK = RLock()
@@ -657,7 +658,8 @@ class _WindowsLaunchTransaction:
         self._thread.start()
 
     def wait(self) -> _WindowsLaunchResult:
-        self._ready.wait()
+        while not self._ready.wait(timeout=_WINDOWS_LAUNCH_WAIT_POLL_SECONDS):
+            pass
         result = self._result
         if result is None:
             raise RuntimeError("Windows FFmpeg launch produced no result")

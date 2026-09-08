@@ -9,7 +9,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from threading import Event
+from threading import Event, Timer
 from typing import Any
 
 import pytest
@@ -691,6 +691,150 @@ def test_windows_launch_transaction_preserves_gate_factory_timeout(
         backend.run(["ffmpeg", "out.mp4"])
 
     assert exc_info.value is interruption
+
+
+def test_windows_launch_wait_delivers_timer_timeout_before_prepare_commits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ProbeTimeout(JobTimeoutException):
+        pass
+
+    marker = tmp_path / "target-started.txt"
+    prepare_started = Event()
+    cleanup_finished = Event()
+    transactions: list[Any] = []
+
+    class DelayedGate(FakeWindowsLaunchGate):
+        def prepare(self, process: FakePopen) -> None:
+            del process
+            self.has_job = True
+            prepare_started.set()
+            time.sleep(0.2)
+
+        def release(self) -> None:
+            marker.touch()
+
+        def close(self) -> None:
+            super().close()
+            cleanup_finished.set()
+
+    gate = DelayedGate()
+    process = FakePopen([], wait_times_out=True)
+    real_transaction = ffmpeg_backend._WindowsLaunchTransaction
+
+    def create_transaction(*args: object, **kwargs: object) -> Any:
+        transaction = real_transaction(*args, **kwargs)
+        transactions.append(transaction)
+        return transaction
+
+    monkeypatch.setattr(ffmpeg_backend, "os_name", "nt")
+    monkeypatch.setattr(
+        ffmpeg_backend,
+        "_WINDOWS_LAUNCH_CLEANUP_TIMEOUT_SECONDS",
+        0.01,
+    )
+    monkeypatch.setattr(
+        ffmpeg_backend,
+        "_WindowsLaunchTransaction",
+        create_transaction,
+    )
+    backend = FfmpegBackend(
+        popen=_popen_factory(process, []),
+        windows_launch_gate_factory=lambda _command: gate,
+    )
+
+    started_at = time.monotonic()
+    with pytest.raises(ProbeTimeout):
+        with TimerDeathPenalty(0.05, exception=ProbeTimeout):
+            backend.run(["ffmpeg", "out.mp4"])
+    elapsed = time.monotonic() - started_at
+
+    transaction = transactions[0]
+    assert prepare_started.is_set()
+    assert elapsed < 0.15
+    assert not marker.exists()
+    assert transaction._thread.daemon
+    assert transaction._thread.is_alive()
+
+    assert cleanup_finished.wait(1)
+    transaction._thread.join(timeout=1)
+    assert not transaction._thread.is_alive()
+    assert gate.closed
+    assert process.kill_called
+    assert not marker.exists()
+
+
+def test_windows_launch_wait_delivers_timer_timeout_when_worker_never_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ProbeTimeout(JobTimeoutException):
+        pass
+
+    prepare_started = Event()
+    release_prepare = Event()
+    cleanup_finished = Event()
+    transactions: list[Any] = []
+
+    class BlockingGate(FakeWindowsLaunchGate):
+        def prepare(self, process: FakePopen) -> None:
+            del process
+            self.has_job = True
+            prepare_started.set()
+            assert release_prepare.wait(2)
+
+        def close(self) -> None:
+            super().close()
+            cleanup_finished.set()
+
+    gate = BlockingGate()
+    process = FakePopen([], wait_times_out=True)
+    real_transaction = ffmpeg_backend._WindowsLaunchTransaction
+
+    def create_transaction(*args: object, **kwargs: object) -> Any:
+        transaction = real_transaction(*args, **kwargs)
+        transactions.append(transaction)
+        return transaction
+
+    monkeypatch.setattr(ffmpeg_backend, "os_name", "nt")
+    monkeypatch.setattr(
+        ffmpeg_backend,
+        "_WINDOWS_LAUNCH_CLEANUP_TIMEOUT_SECONDS",
+        0.01,
+    )
+    monkeypatch.setattr(
+        ffmpeg_backend,
+        "_WindowsLaunchTransaction",
+        create_transaction,
+    )
+    backend = FfmpegBackend(
+        popen=_popen_factory(process, []),
+        windows_launch_gate_factory=lambda _command: gate,
+    )
+
+    deadlock_guard = Timer(0.3, release_prepare.set)
+    deadlock_guard.start()
+    started_at = time.monotonic()
+    try:
+        with pytest.raises(ProbeTimeout):
+            with TimerDeathPenalty(0.05, exception=ProbeTimeout):
+                backend.run(["ffmpeg", "out.mp4"])
+        elapsed = time.monotonic() - started_at
+
+        transaction = transactions[0]
+        assert prepare_started.is_set()
+        assert elapsed < 0.15
+        assert transaction._thread.daemon
+        assert transaction._thread.is_alive()
+    finally:
+        deadlock_guard.cancel()
+        release_prepare.set()
+
+    assert cleanup_finished.wait(1)
+    transaction._thread.join(timeout=1)
+    assert not transaction._thread.is_alive()
+    assert gate.closed
+    assert process.kill_called
 
 
 def test_windows_launch_transaction_cancel_wins_before_commit(tmp_path: Path) -> None:
