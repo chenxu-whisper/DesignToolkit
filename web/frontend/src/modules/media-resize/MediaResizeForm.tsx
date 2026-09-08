@@ -27,12 +27,16 @@ export function MediaResizeForm({ disabled, onSubmit }: MediaResizeFormProps) {
   const [values, setValues] = useState<MediaResizeValues>(() => createMediaResizeDefaultValues())
   const [errors, setErrors] = useState<MediaResizeErrors>({})
   const [isSubmitting, setIsSubmitting] = useState(false)
+  const [isUploadPending, setIsUploadPending] = useState(false)
   const mountedRef = useRef(true)
   const submittingRef = useRef(false)
+  const uploadPendingRef = useRef(false)
   const formDisabled = disabled || isSubmitting
+  const submitDisabled = formDisabled || isUploadPending
   const isBatchInput = normalizeMediaResizeInputPaths(values.inputPath).length > 1
 
   useEffect(() => {
+    mountedRef.current = true
     return () => {
       mountedRef.current = false
     }
@@ -53,10 +57,17 @@ export function MediaResizeForm({ disabled, onSubmit }: MediaResizeFormProps) {
     setErrors((current) => ({ ...current, inputPath: undefined, outputPath: undefined }))
   }
 
+  const handleUploadPendingChange = (pending: boolean) => {
+    uploadPendingRef.current = pending
+    if (mountedRef.current) {
+      setIsUploadPending(pending)
+    }
+  }
+
   const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
 
-    if (disabled || submittingRef.current) {
+    if (disabled || submittingRef.current || uploadPendingRef.current) {
       return
     }
 
@@ -88,6 +99,7 @@ export function MediaResizeForm({ disabled, onSubmit }: MediaResizeFormProps) {
         label={hostedMode ? '输入媒体' : '输入媒体路径'}
         multiline
         onChange={updateInputPath}
+        onUploadPendingChange={handleUploadPendingChange}
         pickPaths={async () => {
           const response = await pickLocalFiles({
             fileKind: 'media',
@@ -134,7 +146,7 @@ export function MediaResizeForm({ disabled, onSubmit }: MediaResizeFormProps) {
         required
         value={values.size}
       />
-      <SubmitButton disabled={formDisabled}>开始调整</SubmitButton>
+      <SubmitButton disabled={submitDisabled}>开始调整</SubmitButton>
     </form>
   )
 }

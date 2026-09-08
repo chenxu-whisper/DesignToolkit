@@ -73,21 +73,29 @@ function ControlledBatchPathInputWithPicker({
 }
 
 function ControlledUploadPathInput({
+  disabled = false,
+  initialValue = '',
+  onUploadPendingChange,
   uploadFiles,
 }: {
+  disabled?: boolean
+  initialValue?: string
+  onUploadPendingChange?: (pending: boolean) => void
   uploadFiles: (
     files: readonly File[],
     onProgress: (percentage: number) => void,
     signal?: AbortSignal,
   ) => Promise<readonly string[]>
 }) {
-  const [value, setValue] = useState('')
+  const [value, setValue] = useState(initialValue)
 
   return (
     <PathInput
+      disabled={disabled}
       label="输入媒体路径"
       multiline
       onChange={setValue}
+      onUploadPendingChange={onUploadPendingChange}
       uploadFiles={uploadFiles}
       value={value}
     />
@@ -984,6 +992,113 @@ describe('PathInput', () => {
     expect(uploadFiles).toHaveBeenCalledOnce()
   })
 
+  it('reports upload pending until a replacement upload resolves', async () => {
+    const uploadRequest = deferred<readonly string[]>()
+    const uploadFiles = vi.fn(() => uploadRequest.promise)
+    const onUploadPendingChange = vi.fn()
+    const { container } = render(
+      <ControlledUploadPathInput
+        initialValue="asset:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:old.png"
+        onUploadPendingChange={onUploadPendingChange}
+        uploadFiles={uploadFiles}
+      />,
+    )
+    const fileInput = container.querySelector<HTMLInputElement>('input[type="file"]')
+    if (!fileInput) {
+      throw new Error('upload input missing')
+    }
+
+    fireEvent.change(fileInput, {
+      target: { files: [new File(['new'], 'new.png', { type: 'image/png' })] },
+    })
+
+    expect(onUploadPendingChange).toHaveBeenCalledTimes(1)
+    expect(onUploadPendingChange).toHaveBeenLastCalledWith(true)
+    expect(screen.getByLabelText('输入媒体路径')).toHaveValue('old.png')
+
+    await act(async () => {
+      uploadRequest.resolve(['asset:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:new.png'])
+      await uploadRequest.promise
+    })
+
+    expect(screen.getByLabelText('输入媒体路径')).toHaveValue('new.png')
+    expect(onUploadPendingChange.mock.calls).toEqual([[true], [false]])
+  })
+
+  it('reports upload completion after rejection while preserving the previous value', async () => {
+    const uploadFiles = vi.fn().mockRejectedValue(new Error('上传失败'))
+    const onUploadPendingChange = vi.fn()
+    const { container } = render(
+      <ControlledUploadPathInput
+        initialValue="asset:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:old.png"
+        onUploadPendingChange={onUploadPendingChange}
+        uploadFiles={uploadFiles}
+      />,
+    )
+    const fileInput = container.querySelector<HTMLInputElement>('input[type="file"]')
+    if (!fileInput) {
+      throw new Error('upload input missing')
+    }
+
+    fireEvent.change(fileInput, {
+      target: { files: [new File(['new'], 'new.png', { type: 'image/png' })] },
+    })
+
+    expect(onUploadPendingChange).toHaveBeenCalledWith(true)
+    expect(await screen.findByText('上传失败')).toBeInTheDocument()
+    expect(screen.getByLabelText('输入媒体路径')).toHaveValue('old.png')
+    expect(onUploadPendingChange.mock.calls).toEqual([[true], [false]])
+  })
+
+  it('keeps a newer upload pending when a stale aborted upload settles', async () => {
+    const firstRequest = deferred<readonly string[]>()
+    const secondRequest = deferred<readonly string[]>()
+    const uploadFiles = vi
+      .fn()
+      .mockReturnValueOnce(firstRequest.promise)
+      .mockReturnValueOnce(secondRequest.promise)
+    const onUploadPendingChange = vi.fn()
+    const renderInput = (disabled: boolean) => (
+      <ControlledUploadPathInput
+        disabled={disabled}
+        initialValue="asset:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:old.png"
+        onUploadPendingChange={onUploadPendingChange}
+        uploadFiles={uploadFiles}
+      />
+    )
+    const { container, rerender } = render(renderInput(false))
+    const fileInput = container.querySelector<HTMLInputElement>('input[type="file"]')
+    if (!fileInput) {
+      throw new Error('upload input missing')
+    }
+
+    fireEvent.change(fileInput, {
+      target: { files: [new File(['first'], 'first.png', { type: 'image/png' })] },
+    })
+    rerender(renderInput(true))
+    expect(onUploadPendingChange.mock.calls).toEqual([[true], [false]])
+
+    rerender(renderInput(false))
+    fireEvent.change(fileInput, {
+      target: { files: [new File(['second'], 'second.png', { type: 'image/png' })] },
+    })
+    expect(onUploadPendingChange.mock.calls).toEqual([[true], [false], [true]])
+
+    await act(async () => {
+      firstRequest.resolve(['asset:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:first.png'])
+      await firstRequest.promise
+    })
+    expect(onUploadPendingChange.mock.calls).toEqual([[true], [false], [true]])
+    expect(screen.getByLabelText('输入媒体路径')).toHaveValue('old.png')
+
+    await act(async () => {
+      secondRequest.resolve(['asset:cccccccccccccccccccccccccccccccc:second.png'])
+      await secondRequest.promise
+    })
+    expect(onUploadPendingChange.mock.calls).toEqual([[true], [false], [true], [false]])
+    expect(screen.getByLabelText('输入媒体路径')).toHaveValue('second.png')
+  })
+
   it('keeps the active upload intent when another file is dropped', async () => {
     const user = userEvent.setup()
     const uploadRequest = deferred<readonly string[]>()
@@ -1068,6 +1183,7 @@ describe('PathInput', () => {
   it('aborts an in-flight browser upload when unmounted', async () => {
     let uploadSignal: AbortSignal | undefined
     const uploadRequest = deferred<readonly string[]>()
+    const onUploadPendingChange = vi.fn()
     const uploadFiles = vi.fn(
       (
         _files: readonly File[],
@@ -1079,7 +1195,10 @@ describe('PathInput', () => {
       },
     )
     const { container, unmount } = render(
-      <ControlledUploadPathInput uploadFiles={uploadFiles} />,
+      <ControlledUploadPathInput
+        onUploadPendingChange={onUploadPendingChange}
+        uploadFiles={uploadFiles}
+      />,
     )
     const fileInput = container.querySelector<HTMLInputElement>(
       'input[type="file"]',
@@ -1092,14 +1211,17 @@ describe('PathInput', () => {
       target: { files: [new File(['image'], 'screen.png', { type: 'image/png' })] },
     })
     expect(uploadSignal?.aborted).toBe(false)
+    expect(onUploadPendingChange).toHaveBeenLastCalledWith(true)
 
     unmount()
 
     expect(uploadSignal?.aborted).toBe(true)
+    expect(onUploadPendingChange.mock.calls).toEqual([[true], [false]])
     await act(async () => {
       uploadRequest.resolve([])
       await uploadRequest.promise
     })
+    expect(onUploadPendingChange.mock.calls).toEqual([[true], [false]])
   })
 
   it('ignores stale upload progress after its intent is invalidated', async () => {

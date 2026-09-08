@@ -27,11 +27,15 @@ export function VideoFramesForm({ disabled, onSubmit }: VideoFramesFormProps) {
   const [values, setValues] = useState<VideoFramesValues>(() => createVideoFramesDefaultValues())
   const [errors, setErrors] = useState<VideoFramesErrors>({})
   const [isSubmitting, setIsSubmitting] = useState(false)
+  const [isUploadPending, setIsUploadPending] = useState(false)
   const mountedRef = useRef(true)
   const submittingRef = useRef(false)
+  const uploadPendingRef = useRef(false)
   const formDisabled = disabled || isSubmitting
+  const submitDisabled = formDisabled || isUploadPending
 
   useEffect(() => {
+    mountedRef.current = true
     return () => {
       mountedRef.current = false
     }
@@ -42,10 +46,17 @@ export function VideoFramesForm({ disabled, onSubmit }: VideoFramesFormProps) {
     setErrors((current) => ({ ...current, [key]: undefined }))
   }
 
+  const handleUploadPendingChange = (pending: boolean) => {
+    uploadPendingRef.current = pending
+    if (mountedRef.current) {
+      setIsUploadPending(pending)
+    }
+  }
+
   const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
 
-    if (disabled || submittingRef.current) {
+    if (disabled || submittingRef.current || uploadPendingRef.current) {
       return
     }
 
@@ -77,6 +88,7 @@ export function VideoFramesForm({ disabled, onSubmit }: VideoFramesFormProps) {
         label={hostedMode ? '输入视频' : '输入视频路径'}
         multiline
         onChange={(value) => updateValue('inputPath', value)}
+        onUploadPendingChange={handleUploadPendingChange}
         pickPaths={async () => {
           const response = await pickLocalFiles({
             fileKind: 'video',
@@ -224,7 +236,7 @@ export function VideoFramesForm({ disabled, onSubmit }: VideoFramesFormProps) {
         覆盖已有文件
       </label>
 
-      <SubmitButton disabled={formDisabled}>开始导出</SubmitButton>
+      <SubmitButton disabled={submitDisabled}>开始导出</SubmitButton>
     </form>
   )
 }

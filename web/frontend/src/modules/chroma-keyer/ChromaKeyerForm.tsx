@@ -15,9 +15,11 @@ import type { ChromaKeyerErrors, ChromaKeyerValues } from './chromaKeyerValidati
 type ChromaKeyerFormProps = {
   disabled: boolean
   errors: ChromaKeyerErrors
+  isUploadPending?: boolean
   onChange: (values: ChromaKeyerValues) => void
   onInputPathCommit: (path: string) => void
   onSubmit: () => void
+  onUploadPendingChange?: (pending: boolean) => void
   values: ChromaKeyerValues
 }
 
@@ -50,9 +52,11 @@ function getSliderValue(value: number, min: number, max: number, fallback: numbe
 export function ChromaKeyerForm({
   disabled,
   errors,
+  isUploadPending = false,
   onChange,
   onInputPathCommit,
   onSubmit,
+  onUploadPendingChange,
   values,
 }: ChromaKeyerFormProps) {
   const updateValue = <Key extends keyof ChromaKeyerValues>(key: Key, value: ChromaKeyerValues[Key]) => {
@@ -61,6 +65,9 @@ export function ChromaKeyerForm({
 
   const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
+    if (disabled || isUploadPending) {
+      return
+    }
     onSubmit()
   }
 
@@ -78,6 +85,7 @@ export function ChromaKeyerForm({
           label={hostedMode ? '输入图片或视频' : '输入图片或视频路径'}
           onChange={(value) => updateValue('inputPath', value)}
           onCommit={onInputPathCommit}
+          onUploadPendingChange={onUploadPendingChange}
           pickPaths={async () => {
             const response = await pickLocalFiles({
               allowedSuffixes: chromaInputAllowedSuffixes,
@@ -211,7 +219,11 @@ export function ChromaKeyerForm({
           value={values.outputPath}
         />
       )}
-      <button className="submit-button" disabled={disabled || values.samples.length === 0} type="submit">
+      <button
+        className="submit-button"
+        disabled={disabled || isUploadPending || values.samples.length === 0}
+        type="submit"
+      >
         {values.mediaKind === 'video' ? '导出 PNG 序列' : '导出 PNG'}
       </button>
     </form>

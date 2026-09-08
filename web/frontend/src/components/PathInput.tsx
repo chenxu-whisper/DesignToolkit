@@ -13,6 +13,7 @@ type PathInputProps = {
   multiline?: boolean
   onChange: (value: string) => void
   onCommit?: (value: string) => void
+  onUploadPendingChange?: (pending: boolean) => void
   pickPaths?: () => Promise<readonly string[]>
   placeholder?: string
   required?: boolean
@@ -35,6 +36,7 @@ export function PathInput({
   multiline = false,
   onChange,
   onCommit,
+  onUploadPendingChange,
   pickPaths,
   placeholder,
   required = false,
@@ -64,7 +66,9 @@ export function PathInput({
   const skipNextBlurRef = useRef(false)
   const uploadControllerRef = useRef<AbortController | null>(null)
   const uploadInputRef = useRef<HTMLInputElement>(null)
+  const uploadPendingChangeRef = useRef(onUploadPendingChange)
   currentValueRef.current = value
+  uploadPendingChangeRef.current = onUploadPendingChange
 
   useEffect(() => {
     if (isEditorOpen) {
@@ -75,18 +79,29 @@ export function PathInput({
   useEffect(() => {
     if (disabled) {
       latestIntentRef.current += 1
-      uploadControllerRef.current?.abort()
-      uploadControllerRef.current = null
+      const controller = uploadControllerRef.current
+      if (controller) {
+        uploadControllerRef.current = null
+        controller.abort()
+        uploadPendingChangeRef.current?.(false)
+      }
       setIsPicking(false)
       setUploadProgress(null)
+      if (uploadInputRef.current) {
+        uploadInputRef.current.value = ''
+      }
     }
   }, [disabled])
 
   useEffect(() => {
     return () => {
       latestIntentRef.current += 1
-      uploadControllerRef.current?.abort()
-      uploadControllerRef.current = null
+      const controller = uploadControllerRef.current
+      if (controller) {
+        uploadControllerRef.current = null
+        controller.abort()
+        uploadPendingChangeRef.current?.(false)
+      }
     }
   }, [])
 
@@ -198,6 +213,7 @@ export function PathInput({
     const intent = beginIntent()
     const controller = new AbortController()
     uploadControllerRef.current = controller
+    uploadPendingChangeRef.current?.(true)
     setPickerError(null)
     setDropError(null)
     setIsPicking(true)
@@ -214,7 +230,7 @@ export function PathInput({
       )
       if (isLatestIntent(intent) && references.length > 0) {
         commitValue(
-          valueWithDroppedPaths(currentValueRef.current, references, multiline),
+          valueWithDroppedPaths('', references, multiline),
         )
       }
     } catch (error) {
@@ -228,6 +244,7 @@ export function PathInput({
     } finally {
       if (uploadControllerRef.current === controller) {
         uploadControllerRef.current = null
+        uploadPendingChangeRef.current?.(false)
         setIsPicking(false)
         setUploadProgress(null)
         if (uploadInputRef.current) {

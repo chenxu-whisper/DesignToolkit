@@ -118,9 +118,11 @@ export function ChromaKeyerPage() {
   const [sampleDetails, setSampleDetails] = useState<ChromaCanvasSample[]>([])
   const [exportError, setExportError] = useState<string | null>(null)
   const [isRequestPending, setIsRequestPending] = useState(false)
+  const [isUploadPending, setIsUploadPending] = useState(false)
   const [renderedTimestampSeconds, setRenderedTimestampSeconds] = useState<number | null>(null)
   const mountedRef = useRef(true)
   const inspectingPathRef = useRef<string | null>(null)
+  const uploadPendingRef = useRef(false)
   const requestSequenceRef = useRef(0)
   const previewSequenceRef = useRef(0)
   const renderedTimestampRef = useRef<number | null>(null)
@@ -163,6 +165,13 @@ export function ChromaKeyerPage() {
   const invalidateRequests = () => {
     requestSequenceRef.current += 1
     previewSequenceRef.current += 1
+  }
+
+  const handleUploadPendingChange = (pending: boolean) => {
+    uploadPendingRef.current = pending
+    if (mountedRef.current) {
+      setIsUploadPending(pending)
+    }
   }
 
   const updateValues = (nextValues: ChromaKeyerValues) => {
@@ -679,7 +688,7 @@ export function ChromaKeyerPage() {
   }
 
   const handleSample = async (point: { x: number; y: number; previewWidth: number; previewHeight: number }) => {
-    if (!media || disabled) {
+    if (!media || disabled || uploadPendingRef.current) {
       return
     }
     stopVideoPlayback()
@@ -808,7 +817,7 @@ export function ChromaKeyerPage() {
   const removeSample = clearSamples
 
   const handleSubmit = async () => {
-    if (disabled) {
+    if (disabled || uploadPendingRef.current) {
       return
     }
 
@@ -886,7 +895,12 @@ export function ChromaKeyerPage() {
         <div className="chroma-editor-main">
           {media && previewUrl ? (
             <ChromaKeyerCanvas
-              disabled={disabledByTask || playback.isPlaying || videoPreviewOutOfDate}
+              disabled={
+                disabledByTask
+                || isUploadPending
+                || playback.isPlaying
+                || videoPreviewOutOfDate
+              }
               onSample={handleSample}
               originalHeight={media.height}
               originalWidth={media.width}
@@ -964,9 +978,11 @@ export function ChromaKeyerPage() {
         <ChromaKeyerForm
           disabled={disabled}
           errors={errors}
+          isUploadPending={isUploadPending}
           onChange={updateValues}
           onInputPathCommit={(path) => void handleInspect(path)}
           onSubmit={() => void handleSubmit()}
+          onUploadPendingChange={handleUploadPendingChange}
           values={values}
         />
       </div>
