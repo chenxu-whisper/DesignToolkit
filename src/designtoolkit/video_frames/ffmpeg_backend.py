@@ -430,7 +430,10 @@ class _WindowsLaunchGate:
         self._job_handle: object | None = None
         self._status_read_fd: int | None = status_read_fd
         self._status_write_fd: int | None = status_write_fd
-        self._status_write_handle = status_write_handle
+        self._status_write_handle: int | None = status_write_handle
+        self._lock = RLock()
+        self._closed = False
+        self._release_started = False
         self._released = False
         self.event_name = event_name
         self.launcher_command = launcher_command
@@ -486,45 +489,60 @@ class _WindowsLaunchGate:
         popen: PopenFactory,
         popen_kwargs: dict[str, object],
     ) -> subprocess.Popen[str]:
+        with self._lock:
+            status_write_fd = self._status_write_fd
+            status_write_handle = self._status_write_handle
+            if (
+                self._closed
+                or status_write_fd is None
+                or status_write_handle is None
+            ):
+                raise _WindowsContainmentError(
+                    RuntimeError("Windows launcher status writer is unavailable")
+                )
         startupinfo = subprocess.STARTUPINFO()
-        startupinfo.lpAttributeList = {"handle_list": [self._status_write_handle]}
+        startupinfo.lpAttributeList = {"handle_list": [status_write_handle]}
         kwargs = {
             **popen_kwargs,
             "startupinfo": startupinfo,
             "close_fds": True,
         }
-        status_write_fd = self._status_write_fd
-        if status_write_fd is None:
-            raise RuntimeError("Windows launcher status writer is unavailable")
         with _WINDOWS_HANDLE_INHERITANCE_LOCK:
             try:
-                os.set_handle_inheritable(self._status_write_handle, True)
+                os.set_handle_inheritable(status_write_handle, True)
                 process = popen(self.launcher_command, **kwargs)
             finally:
-                self._status_write_fd = None
-                try:
-                    os.set_handle_inheritable(self._status_write_handle, False)
-                except BaseException:
+                with self._lock:
+                    owns_status_writer = self._status_write_fd == status_write_fd
+                    if owns_status_writer:
+                        self._status_write_fd = None
+                        self._status_write_handle = None
+                if owns_status_writer:
                     try:
-                        _LOGGER.exception(
-                            "Failed to reset parent FFmpeg status writer inheritance"
-                        )
+                        os.set_handle_inheritable(status_write_handle, False)
                     except BaseException:
-                        pass
-                try:
-                    os.close(status_write_fd)
-                except BaseException:
+                        try:
+                            _LOGGER.exception(
+                                "Failed to reset parent FFmpeg status writer "
+                                "inheritance"
+                            )
+                        except BaseException:
+                            pass
                     try:
-                        _LOGGER.exception(
-                            "Failed to close parent FFmpeg startup status writer"
-                        )
+                        os.close(status_write_fd)
                     except BaseException:
-                        pass
+                        try:
+                            _LOGGER.exception(
+                                "Failed to close parent FFmpeg startup status writer"
+                            )
+                        except BaseException:
+                            pass
         return process
 
     def read_startup_error(self, returncode: int | None) -> OSError | None:
-        status_read_fd = self._status_read_fd
-        self._status_read_fd = None
+        with self._lock:
+            status_read_fd = self._status_read_fd
+            self._status_read_fd = None
         if status_read_fd is None:
             return None
         payload = bytearray()
@@ -555,23 +573,64 @@ class _WindowsLaunchGate:
         return _windows_startup_error(bytes(payload))
 
     def prepare(self, process: subprocess.Popen[str]) -> None:
-        if self._released:
-            raise RuntimeError("Windows FFmpeg launch gate was already released")
+        with self._lock:
+            if self._closed:
+                raise _WindowsContainmentError(
+                    RuntimeError("Windows FFmpeg launch gate was closed")
+                )
+            if self._release_started:
+                raise RuntimeError("Windows FFmpeg launch gate was already released")
         process_handle = getattr(process, "_handle", None)
         if process_handle is None:
             raise RuntimeError("Windows launcher process handle is unavailable")
         job_handle = self._call_containment_api(self._api.create_job)
-        self._job_handle = job_handle
+        with self._lock:
+            if self._closed:
+                owns_job = False
+            else:
+                self._job_handle = job_handle
+                owns_job = True
+        if not owns_job:
+            try:
+                self._api.close_handle(job_handle)
+            except BaseException:
+                pass
+            raise _WindowsContainmentError(
+                RuntimeError("Windows FFmpeg launch gate was closed")
+            )
         self._call_containment_api(lambda: self._api.set_job_kill_on_close(job_handle))
+        self._require_owned_handle(
+            "_job_handle",
+            job_handle,
+            "Windows FFmpeg Job handle was closed during preparation",
+        )
         self._call_containment_api(
             lambda: self._api.assign_process(job_handle, process_handle)
         )
+        self._require_owned_handle(
+            "_job_handle",
+            job_handle,
+            "Windows FFmpeg Job handle was closed during assignment",
+        )
 
     def release(self) -> None:
-        if self._released:
-            raise RuntimeError("Windows FFmpeg launch gate was already released")
-        self._call_containment_api(lambda: self._api.set_event(self._event_handle))
-        self._released = True
+        with self._lock:
+            if self._release_started:
+                raise RuntimeError("Windows FFmpeg launch gate was already released")
+            event_handle = self._event_handle
+            if self._closed or event_handle is None:
+                raise _WindowsContainmentError(
+                    RuntimeError("Windows FFmpeg launch event was closed")
+                )
+            self._release_started = True
+        self._call_containment_api(lambda: self._api.set_event(event_handle))
+        self._require_owned_handle(
+            "_event_handle",
+            event_handle,
+            "Windows FFmpeg launch event was closed during release",
+        )
+        with self._lock:
+            self._released = True
 
     @staticmethod
     def _call_containment_api(operation: Callable[[], object]) -> object:
@@ -580,19 +639,34 @@ class _WindowsLaunchGate:
         except (OSError, RuntimeError) as exc:
             raise _WindowsContainmentError(exc) from exc
 
+    def _require_owned_handle(
+        self,
+        attribute: str,
+        expected: object,
+        message: str,
+    ) -> None:
+        with self._lock:
+            if getattr(self, attribute) is expected:
+                return
+        raise _WindowsContainmentError(RuntimeError(message))
+
     @property
     def has_job(self) -> bool:
-        return self._job_handle is not None
+        with self._lock:
+            return self._job_handle is not None
 
     def close(self) -> None:
-        job_handle = self._job_handle
-        event_handle = self._event_handle
-        status_write_fd = self._status_write_fd
-        status_read_fd = self._status_read_fd
-        self._job_handle = None
-        self._event_handle = None
-        self._status_write_fd = None
-        self._status_read_fd = None
+        with self._lock:
+            job_handle = self._job_handle
+            event_handle = self._event_handle
+            status_write_fd = self._status_write_fd
+            status_read_fd = self._status_read_fd
+            self._job_handle = None
+            self._event_handle = None
+            self._status_write_fd = None
+            self._status_write_handle = None
+            self._status_read_fd = None
+            self._closed = True
         errors: list[BaseException] = []
         if job_handle is not None:
             try:
@@ -640,10 +714,9 @@ class _WindowsLaunchTransaction:
         self._decision = Event()
         self._done = Event()
         self._state_lock = Lock()
-        self._commit_lock = RLock()
         self._abort_lock = Lock()
+        self._state = "STARTING"
         self._accepted = False
-        self._committed = False
         self._aborted = False
         self._process: subprocess.Popen[str] | None = None
         self._gate: _WindowsLaunchGate | None = None
@@ -670,21 +743,17 @@ class _WindowsLaunchTransaction:
         return result
 
     def accept(self) -> None:
-        with self._commit_lock, self._state_lock:
+        with self._state_lock:
             if self._cancel.is_set():
                 raise RuntimeError("Windows FFmpeg launch was already cancelled")
             self._accepted = True
-            self._decision.set()
+            self._state = "ACCEPTED"
+        self._decision.set()
 
     def cancel(self) -> None:
-        abort_committed = False
-        with self._commit_lock:
-            self._cancel.set()
-            with self._state_lock:
-                abort_committed = self._committed and not self._accepted
-            self._decision.set()
-        if abort_committed:
-            self._abort_owned_launch()
+        self._cancel.set()
+        self._contain_owned_launch()
+        self._decision.set()
 
     @property
     def was_accepted(self) -> bool:
@@ -700,31 +769,46 @@ class _WindowsLaunchTransaction:
         process: subprocess.Popen[str] | None = None
         try:
             gate = self._gate_factory(self._command)
-            self._gate = gate
+            with self._state_lock:
+                self._gate = gate
             if self._cancel.is_set():
-                self._close_gate(gate)
+                self._close_owned_gate(gate)
                 return
 
             process = gate.start_launcher(self._popen, self._popen_kwargs)
-            self._process = process
+            with self._state_lock:
+                self._process = process
             if self._cancel.is_set():
                 self._abort_launch(process, gate)
                 return
 
             gate.prepare(process)
-            cancelled_before_commit = False
-            with self._commit_lock:
+            with self._state_lock:
+                self._state = "PREPARED"
                 if self._cancel.is_set():
                     cancelled_before_commit = True
                 else:
-                    gate.release()
-                    self._committed = True
+                    self._state = "COMMITTING"
+                    cancelled_before_commit = False
             if cancelled_before_commit:
                 self._abort_launch(process, gate)
                 return
+            gate.release()
+            with self._state_lock:
+                if self._cancel.is_set():
+                    cancelled_during_commit = True
+                else:
+                    cancelled_during_commit = False
+                    self._state = "COMMITTED"
+                    self._result = _WindowsLaunchResult(
+                        process=process,
+                        gate=gate,
+                    )
+                    self._ready.set()
+            if cancelled_during_commit:
+                self._abort_launch(process, gate)
+                return
 
-            self._result = _WindowsLaunchResult(process=process, gate=gate)
-            self._ready.set()
             self._decision.wait()
             with self._state_lock:
                 cancelled_before_accept = (
@@ -736,7 +820,7 @@ class _WindowsLaunchTransaction:
             if process is not None and gate is not None:
                 self._abort_launch(process, gate)
             elif gate is not None:
-                self._close_gate(gate)
+                self._close_owned_gate(gate)
             self._result = _WindowsLaunchResult(exception=exc)
             self._ready.set()
         finally:
@@ -747,11 +831,33 @@ class _WindowsLaunchTransaction:
                 self._ready.set()
             self._done.set()
 
-    def _abort_owned_launch(self) -> None:
-        process = self._process
-        gate = self._gate
-        if process is not None and gate is not None:
-            self._abort_launch(process, gate)
+    def _contain_owned_launch(self) -> None:
+        with self._abort_lock:
+            if self._aborted:
+                return
+        with self._state_lock:
+            process = self._process
+            gate = self._gate
+            self._gate = None
+        if gate is not None:
+            self._close_gate(gate)
+        if process is not None:
+            try:
+                process.kill()
+            except BaseException:
+                try:
+                    _LOGGER.exception(
+                        "Failed to kill cancelled FFmpeg Windows launcher"
+                    )
+                except BaseException:
+                    pass
+
+    def _close_owned_gate(self, gate: _WindowsLaunchGate) -> None:
+        with self._state_lock:
+            if self._gate is not gate:
+                return
+            self._gate = None
+        self._close_gate(gate)
 
     def _abort_launch(
         self,
@@ -948,7 +1054,6 @@ class FfmpegBackend:
         except BaseException:
             if launch_transaction is not None:
                 launch_transaction.cancel()
-                launch_transaction.wait_for_cleanup()
             if (
                 process is not None
                 and (

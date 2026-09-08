@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import gc
 import json
 import os
 import signal
@@ -9,7 +10,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from threading import Event, Timer
+from threading import Event, Thread, Timer
 from typing import Any
 
 import pytest
@@ -610,6 +611,9 @@ def test_windows_launch_transaction_cancels_each_blocked_startup_stage(
         backend.run(["ffmpeg", "out.mp4"])
 
     assert exc_info.value is interruption
+    transaction = transactions[0]
+    assert transaction._done.wait(2)
+    transaction._thread.join(timeout=2)
     assert gate.closed
     assert not gate.target_alive
     assert gate.target_was_released is (interrupted_stage == "set_event")
@@ -618,7 +622,7 @@ def test_windows_launch_transaction_cancels_each_blocked_startup_stage(
     else:
         assert process.kill_called
         assert process.returncode is not None
-    assert not transactions[0]._thread.is_alive()
+    assert not transaction._thread.is_alive()
 
 
 def test_windows_launch_transaction_eventually_cleans_up_after_bounded_wait(
@@ -835,6 +839,86 @@ def test_windows_launch_wait_delivers_timer_timeout_when_worker_never_ready(
     assert not transaction._thread.is_alive()
     assert gate.closed
     assert process.kill_called
+
+
+def test_windows_launch_timeout_does_not_wait_for_blocked_release(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ProbeTimeout(JobTimeoutException):
+        pass
+
+    marker = tmp_path / "target-started.txt"
+    release_started = Event()
+    release_block = Event()
+    run_finished = Event()
+    outcome: dict[str, object] = {}
+    transactions: list[Any] = []
+
+    class BlockingReleaseGate(FakeWindowsLaunchGate):
+        def prepare(self, process: FakePopen) -> None:
+            del process
+            self.claim_calls += 1
+            self.has_job = True
+
+        def release(self) -> None:
+            release_started.set()
+            assert release_block.wait(2)
+            if self.closed:
+                raise ffmpeg_backend._WindowsContainmentError(
+                    RuntimeError("event handle was closed")
+                )
+            marker.touch()
+
+    gate = BlockingReleaseGate()
+    process = FakePopen([], wait_times_out=True)
+    real_transaction = ffmpeg_backend._WindowsLaunchTransaction
+
+    def create_transaction(*args: object, **kwargs: object) -> Any:
+        transaction = real_transaction(*args, **kwargs)
+        transactions.append(transaction)
+        return transaction
+
+    def invoke_backend() -> None:
+        started_at = time.monotonic()
+        try:
+            with TimerDeathPenalty(0.05, exception=ProbeTimeout):
+                FfmpegBackend(
+                    popen=_popen_factory(process, []),
+                    windows_launch_gate_factory=lambda _command: gate,
+                ).run(["ffmpeg", "out.mp4"])
+        except BaseException as exc:
+            outcome["exception"] = exc
+        finally:
+            outcome["elapsed"] = time.monotonic() - started_at
+            run_finished.set()
+
+    monkeypatch.setattr(ffmpeg_backend, "os_name", "nt")
+    monkeypatch.setattr(
+        ffmpeg_backend,
+        "_WindowsLaunchTransaction",
+        create_transaction,
+    )
+    runner = Thread(target=invoke_backend, daemon=True)
+    runner.start()
+    assert release_started.wait(1)
+
+    try:
+        assert run_finished.wait(0.2)
+        assert type(outcome["exception"]) is ProbeTimeout
+        assert float(outcome["elapsed"]) < 0.2
+        assert gate.close_calls == 1
+        assert process.kill_called
+        assert not marker.exists()
+    finally:
+        release_block.set()
+        runner.join(timeout=2)
+
+    assert not runner.is_alive()
+    assert transactions[0]._done.wait(1)
+    transactions[0]._thread.join(timeout=1)
+    assert not transactions[0]._thread.is_alive()
+    assert not marker.exists()
 
 
 def test_windows_launch_transaction_cancel_wins_before_commit(tmp_path: Path) -> None:
@@ -1950,6 +2034,9 @@ def test_windows_status_pipe_file_descriptors_do_not_leak(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    import ctypes
+    from ctypes import wintypes
+
     def open_file_descriptors() -> set[int]:
         descriptors: set[int] = set()
         for descriptor in range(2048):
@@ -1960,16 +2047,44 @@ def test_windows_status_pipe_file_descriptors_do_not_leak(
             descriptors.add(descriptor)
         return descriptors
 
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetCurrentProcess.argtypes = []
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.GetProcessHandleCount.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    kernel32.GetProcessHandleCount.restype = wintypes.BOOL
+
+    def process_handle_count() -> int:
+        count = wintypes.DWORD()
+        assert kernel32.GetProcessHandleCount(
+            kernel32.GetCurrentProcess(),
+            ctypes.byref(count),
+        )
+        return int(count.value)
+
     missing_executable = tmp_path / "does-not-exist.exe"
     monkeypatch.setattr(ffmpeg_backend, "os_name", "nt")
     backend = FfmpegBackend()
-    before = open_file_descriptors()
+    before_descriptors = open_file_descriptors()
+
+    for _ in range(10):
+        with pytest.raises(FileNotFoundError):
+            backend.run([str(missing_executable)])
+
+    gc.collect()
+    before_handles = process_handle_count()
 
     for _ in range(20):
         with pytest.raises(FileNotFoundError):
             backend.run([str(missing_executable)])
 
-    assert open_file_descriptors() == before
+    gc.collect()
+    after_descriptors = open_file_descriptors()
+    after_handles = process_handle_count()
+    assert not after_descriptors - before_descriptors
+    assert after_handles - before_handles <= 2
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires Windows Job Objects")
@@ -1995,6 +2110,7 @@ def test_windows_timer_death_penalty_during_popen_is_fail_closed(
     monkeypatch.setattr(ffmpeg_backend, "os_name", "nt")
     backend = FfmpegBackend(popen=popen)
 
+    started_at = time.monotonic()
     with pytest.raises(ProbeTimeout):
         with TimerDeathPenalty(0.05, exception=ProbeTimeout):
             backend.run(
@@ -2005,9 +2121,14 @@ def test_windows_timer_death_penalty_during_popen_is_fail_closed(
                     str(marker),
                 ]
             )
+    elapsed = time.monotonic() - started_at
 
     assert launcher_created.is_set()
     assert launchers
+    assert elapsed < 0.2
+    deadline = time.monotonic() + 2
+    while launchers[0].poll() is None and time.monotonic() < deadline:
+        time.sleep(0.01)
     assert launchers[0].returncode is not None
     assert not _windows_process_is_active(launchers[0].pid)
     assert not marker.exists()
