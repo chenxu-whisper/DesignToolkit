@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import json
 import os
 import signal
 import subprocess
@@ -14,12 +16,20 @@ import pytest
 from rq.timeouts import JobTimeoutException
 
 from designtoolkit.video_frames import ffmpeg_backend
-from designtoolkit.video_frames.ffmpeg_backend import FfmpegBackend
+from designtoolkit.video_frames.ffmpeg_backend import (
+    BackendUnavailableError,
+    FfmpegBackend,
+)
 from designtoolkit.web.output_limits import (
     OutputBudgetGuard,
     OutputLimitExceeded,
     OutputTargetMonitor,
 )
+
+
+@pytest.fixture(autouse=True)
+def _default_ffmpeg_tests_to_posix(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(ffmpeg_backend, "os_name", "posix")
 
 
 def test_budget_rejects_aggregate_files_at_safety_boundary(tmp_path: Path) -> None:
@@ -327,10 +337,16 @@ def _popen_factory(
     return create
 
 
-class FakeProcessTreeOwner:
+class FakeWindowsLaunchGate:
     def __init__(self) -> None:
+        self.launcher_command = [sys.executable, "-c", "raise SystemExit(0)"]
+        self.claim_calls = 0
         self.close_calls = 0
         self.closed = False
+
+    def claim_and_release(self, process: FakePopen) -> None:
+        del process
+        self.claim_calls += 1
 
     def close(self) -> None:
         if self.closed:
@@ -339,43 +355,77 @@ class FakeProcessTreeOwner:
         self.close_calls += 1
 
 
-def test_windows_job_assignment_failure_closes_handle(
+class FakeWindowsKernelApi:
+    def __init__(self, failure: str) -> None:
+        self.failure = failure
+        self.closed: list[str] = []
+
+    def _fail(self, operation: str) -> None:
+        if self.failure == operation:
+            raise OSError(f"{operation} failed")
+
+    def create_event(self, name: str) -> str:
+        assert name.startswith("Local\\DesignToolkit.FFmpeg.")
+        self._fail("create_event")
+        return "event"
+
+    def create_job(self) -> str:
+        self._fail("create_job")
+        return "job"
+
+    def set_job_kill_on_close(self, job_handle: object) -> None:
+        assert job_handle == "job"
+        self._fail("set_info")
+
+    def assign_process(self, job_handle: object, process_handle: object) -> None:
+        assert (job_handle, process_handle) == ("job", 456)
+        self._fail("assign")
+
+    def set_event(self, event_handle: object) -> None:
+        assert event_handle == "event"
+        self._fail("set_event")
+
+    def close_handle(self, handle: object) -> None:
+        self.closed.append(str(handle))
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_closed", "starts_launcher"),
+    [
+        ("create_event", [], False),
+        ("create_job", ["event"], True),
+        ("set_info", ["event", "job"], True),
+        ("assign", ["event", "job"], True),
+        ("set_event", ["event", "job"], True),
+    ],
+)
+def test_windows_gate_setup_failure_is_fail_closed_without_handle_leaks(
+    failure: str,
+    expected_closed: list[str],
+    starts_launcher: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import ctypes
-
-    class FakeFunction:
-        def __init__(self, result: int) -> None:
-            self.result = result
-            self.calls: list[tuple[object, ...]] = []
-
-        def __call__(self, *args: object) -> int:
-            self.calls.append(args)
-            return self.result
-
-    class FakeKernel32:
-        CreateJobObjectW = FakeFunction(123)
-        SetInformationJobObject = FakeFunction(1)
-        AssignProcessToJobObject = FakeFunction(0)
-        CloseHandle = FakeFunction(1)
-
     process = FakePopen([])
     process._handle = 456  # type: ignore[attr-defined]
-    kernel32 = FakeKernel32()
+    calls: list[tuple[list[str], dict[str, Any]]] = []
+    api = FakeWindowsKernelApi(failure)
     monkeypatch.setattr(ffmpeg_backend, "os_name", "nt")
-    monkeypatch.setattr(ctypes, "WinDLL", lambda *_args, **_kwargs: kernel32)
-    monkeypatch.setattr(ctypes, "get_last_error", lambda: 5)
-    monkeypatch.setattr(
-        ctypes,
-        "WinError",
-        lambda _error: PermissionError("access denied"),
+    backend = FfmpegBackend(
+        popen=_popen_factory(process, calls),
+        windows_launch_gate_factory=lambda command: (
+            ffmpeg_backend._WindowsLaunchGate.create(command, api=api)
+        ),
     )
 
-    owner = ffmpeg_backend._create_windows_job(process)  # type: ignore[arg-type]
+    with pytest.raises(
+        BackendUnavailableError,
+        match="Windows FFmpeg launch containment",
+    ):
+        backend.run(["ffmpeg", "out.mp4"])
 
-    assert owner is None
-    assert kernel32.AssignProcessToJobObject.calls == [(123, 456)]
-    assert kernel32.CloseHandle.calls == [(123,)]
+    assert bool(calls) is starts_launcher
+    assert process.terminate_called is starts_launcher
+    assert sorted(api.closed) == sorted(expected_closed)
 
 
 def test_ffmpeg_backend_stops_when_active_sequence_tail_grows(
@@ -433,50 +483,61 @@ def test_ffmpeg_backend_preserves_captured_stderr_on_success() -> None:
     assert not process.kill_called
 
 
-def test_ffmpeg_backend_closes_windows_job_after_success(
+def test_ffmpeg_backend_releases_windows_gate_once_and_preserves_result(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    process = FakePopen([("", "")])
-    owner = FakeProcessTreeOwner()
+    process = FakePopen([("ignored stdout", "diagnostic")], returncode=23)
+    calls: list[tuple[list[str], dict[str, Any]]] = []
+    gate = FakeWindowsLaunchGate()
+    gated_commands: list[list[str]] = []
     monkeypatch.setattr(ffmpeg_backend, "os_name", "nt")
-    monkeypatch.setattr(
-        ffmpeg_backend,
-        "_create_windows_job",
-        lambda _process: owner,
-        raising=False,
+
+    def create_gate(command: list[str]) -> FakeWindowsLaunchGate:
+        gated_commands.append(command)
+        return gate
+
+    backend = FfmpegBackend(
+        popen=_popen_factory(process, calls),
+        windows_launch_gate_factory=create_gate,
     )
-    backend = FfmpegBackend(popen=_popen_factory(process, []))
 
     result = backend.run(["ffmpeg", "out.mp4"])
 
-    assert result.returncode == 0
-    assert owner.close_calls == 1
+    assert result.returncode == 23
+    assert result.stderr == "diagnostic"
+    assert gated_commands == [["ffmpeg", "out.mp4"]]
+    assert calls[0][0] == gate.launcher_command
+    assert gate.claim_calls == 1
+    assert gate.close_calls == 1
 
 
-def test_ffmpeg_backend_closes_windows_job_when_root_waits_immediately(
+def test_ffmpeg_backend_closes_windows_job_before_reaping_on_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     timeout = JobTimeoutException("worker timed out")
     process = FakePopen([timeout])
-    owner = FakeProcessTreeOwner()
+    gate = FakeWindowsLaunchGate()
+    close_before_wait: list[bool] = []
+    original_wait = process.wait
+
+    def wait(timeout: float | None = None) -> int:
+        close_before_wait.append(gate.closed)
+        return original_wait(timeout)
+
+    process.wait = wait  # type: ignore[method-assign]
     monkeypatch.setattr(ffmpeg_backend, "os_name", "nt")
-    monkeypatch.setattr(
-        ffmpeg_backend,
-        "_create_windows_job",
-        lambda _process: owner,
-        raising=False,
+    backend = FfmpegBackend(
+        popen=_popen_factory(process, []),
+        windows_launch_gate_factory=lambda _command: gate,
     )
-    backend = FfmpegBackend(popen=_popen_factory(process, []))
 
     with pytest.raises(JobTimeoutException) as exc_info:
         backend.run(["ffmpeg", "out.mp4"])
 
     assert exc_info.value is timeout
-    assert process.wait_calls == [
-        ffmpeg_backend._PROCESS_CLEANUP_TIMEOUT_SECONDS,
-        ffmpeg_backend._PROCESS_CLEANUP_TIMEOUT_SECONDS,
-    ]
-    assert owner.close_calls == 1
+    assert process.wait_calls == [ffmpeg_backend._PROCESS_CLEANUP_TIMEOUT_SECONDS]
+    assert close_before_wait == [True]
+    assert gate.close_calls == 1
 
 
 def test_ffmpeg_backend_stops_process_and_preserves_rq_timeout() -> None:
@@ -771,259 +832,6 @@ def test_ffmpeg_backend_kills_posix_group_when_root_waits_immediately(
     ]
 
 
-def test_ffmpeg_backend_uses_taskkill_when_job_assignment_fails_and_root_exits(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    timeout = JobTimeoutException("worker timed out")
-
-    class GroupedPopen(FakePopen):
-        pid = 4321
-
-        def __init__(self) -> None:
-            super().__init__([timeout])
-            self.signals: list[int] = []
-
-        def send_signal(self, sent_signal: int) -> None:
-            self.signals.append(sent_signal)
-
-    process = GroupedPopen()
-    taskkill_calls: list[tuple[int, float]] = []
-    ctrl_break = 1
-    monkeypatch.setattr(ffmpeg_backend, "os_name", "nt")
-    monkeypatch.setattr(signal, "CTRL_BREAK_EVENT", ctrl_break, raising=False)
-    monkeypatch.setattr(
-        ffmpeg_backend,
-        "_create_windows_job",
-        lambda _process: None,
-        raising=False,
-    )
-    monkeypatch.setattr(
-        ffmpeg_backend,
-        "_run_windows_taskkill",
-        lambda pid, timeout_seconds: taskkill_calls.append((pid, timeout_seconds)) or 0,
-    )
-    backend = FfmpegBackend(popen=_popen_factory(process, []))
-
-    with pytest.raises(JobTimeoutException) as exc_info:
-        backend.run(["ffmpeg", "out.mp4"])
-
-    assert exc_info.value is timeout
-    assert process.signals == [ctrl_break]
-    assert taskkill_calls == [(process.pid, 5.0)]
-    assert process.wait_calls == [
-        ffmpeg_backend._PROCESS_CLEANUP_TIMEOUT_SECONDS,
-        ffmpeg_backend._PROCESS_CLEANUP_TIMEOUT_SECONDS,
-    ]
-
-
-def test_ffmpeg_backend_falls_back_when_windows_taskkill_times_out(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    timeout = JobTimeoutException("worker timed out")
-
-    class GroupedPopen(FakePopen):
-        pid = 4321
-
-        def __init__(self) -> None:
-            super().__init__([timeout], wait_times_out=True)
-            self.signals: list[int] = []
-
-        def send_signal(self, sent_signal: int) -> None:
-            self.signals.append(sent_signal)
-
-    process = GroupedPopen()
-    taskkill_calls: list[tuple[int, float]] = []
-    ctrl_break = 1
-
-    def taskkill(pid: int, timeout_seconds: float) -> int:
-        taskkill_calls.append((pid, timeout_seconds))
-        raise subprocess.TimeoutExpired("taskkill", timeout_seconds)
-
-    monkeypatch.setattr(ffmpeg_backend, "os_name", "nt")
-    monkeypatch.setattr(signal, "CTRL_BREAK_EVENT", ctrl_break, raising=False)
-    monkeypatch.setattr(ffmpeg_backend, "_run_windows_taskkill", taskkill)
-    backend = FfmpegBackend(
-        poll_interval=0.01,
-        popen=_popen_factory(process, []),
-    )
-
-    with pytest.raises(JobTimeoutException) as exc_info:
-        backend.run(["ffmpeg", "out.mp4"])
-
-    assert exc_info.value is timeout
-    assert process.signals == [ctrl_break]
-    assert taskkill_calls == [(process.pid, 5.0), (process.pid, 10.0)]
-    cleanup_timeout = ffmpeg_backend._PROCESS_CLEANUP_TIMEOUT_SECONDS
-    assert cleanup_timeout > backend._poll_interval
-    assert process.kill_called
-    assert process.wait_calls == [cleanup_timeout, cleanup_timeout]
-
-
-def test_windows_tree_terminates_captured_descendant_after_root_exits(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class Identity:
-        def __init__(
-            self,
-            pid: int,
-            parent_pid: int,
-            creation_time: int,
-        ) -> None:
-            self.pid = pid
-            self.parent_pid = parent_pid
-            self.creation_time = creation_time
-            self.handle = f"handle-{pid}"
-
-    class FakeWindowsProcessApi:
-        def __init__(self) -> None:
-            self.identities = {
-                4321: Identity(4321, 1, 100),
-                5432: Identity(5432, 4321, 200),
-                6543: Identity(6543, 5432, 225),
-            }
-            self.active = {4321, 5432, 6543}
-            self.terminated: list[int] = []
-            self.closed: list[str] = []
-
-        def snapshot(self) -> list[Identity]:
-            return list(self.identities.values())
-
-        def open_process(self, pid: int) -> Identity | None:
-            return self.identities.get(pid)
-
-        def exit_time(self, identity: Identity) -> int | None:
-            if identity.pid == 4321 and identity.pid not in self.active:
-                return 250
-            return None
-
-        def is_active(self, identity: Identity) -> bool:
-            return identity.pid in self.active
-
-        def terminate(self, identity: Identity) -> None:
-            self.terminated.append(identity.pid)
-            self.active.discard(identity.pid)
-
-        def wait(self, identity: Identity, timeout_seconds: float) -> None:
-            del identity, timeout_seconds
-
-        def close(self, identity: Identity) -> None:
-            self.closed.append(identity.handle)
-
-    api = FakeWindowsProcessApi()
-    taskkill_timeouts: list[float] = []
-
-    def time_out_taskkill(pid: int, timeout_seconds: float) -> int:
-        assert pid == 4321
-        taskkill_timeouts.append(timeout_seconds)
-        api.active.discard(pid)
-        api.identities[7654] = Identity(7654, 4321, 300)
-        api.active.add(7654)
-        raise subprocess.TimeoutExpired("taskkill", timeout_seconds)
-
-    monkeypatch.setattr(
-        ffmpeg_backend,
-        "_run_windows_taskkill",
-        time_out_taskkill,
-        raising=False,
-    )
-    tree = ffmpeg_backend._WindowsProcessTree(  # type: ignore[attr-defined]
-        4321,
-        api=api,
-        poll_interval=60,
-    )
-
-    tree.terminate()
-    tree.close()
-
-    assert taskkill_timeouts == [5.0, 10.0]
-    assert api.terminated == [6543, 5432]
-    assert sorted(set(api.closed)) == [
-        "handle-4321",
-        "handle-5432",
-        "handle-6543",
-        "handle-7654",
-    ]
-    assert api.closed.count("handle-7654") == 2
-
-
-def test_windows_taskkill_timeout_kills_and_reaps_taskkill(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class HungTaskkill:
-        returncode = 1
-
-        def __init__(self) -> None:
-            self.kill_called = False
-            self.wait_calls: list[float] = []
-
-        def wait(self, timeout: float) -> int:
-            self.wait_calls.append(timeout)
-            if not self.kill_called:
-                raise subprocess.TimeoutExpired("taskkill", timeout)
-            return self.returncode
-
-        def kill(self) -> None:
-            self.kill_called = True
-
-    taskkill = HungTaskkill()
-    popen_calls: list[tuple[list[str], dict[str, Any]]] = []
-
-    def create(command: list[str], **kwargs: Any) -> HungTaskkill:
-        popen_calls.append((command, kwargs))
-        return taskkill
-
-    monkeypatch.setattr(subprocess, "Popen", create)
-
-    with pytest.raises(subprocess.TimeoutExpired):
-        ffmpeg_backend._run_windows_taskkill(4321, 5.0)  # type: ignore[attr-defined]
-
-    assert taskkill.kill_called
-    assert taskkill.wait_calls == [5.0, 5.0]
-    assert popen_calls[0][0] == ["taskkill", "/PID", "4321", "/T", "/F"]
-    assert popen_calls[0][1]["stdout"] is subprocess.DEVNULL
-    assert popen_calls[0][1]["stderr"] is subprocess.DEVNULL
-
-
-def test_windows_tree_closes_candidate_handle_when_capture_fails() -> None:
-    class Identity:
-        def __init__(self, pid: int, parent_pid: int) -> None:
-            self.pid = pid
-            self.parent_pid = parent_pid
-            self.creation_time = pid
-            self.handle = f"handle-{pid}"
-
-    class FailingWindowsProcessApi:
-        def __init__(self) -> None:
-            self.identities = {
-                100: Identity(100, 1),
-                200: Identity(200, 100),
-            }
-            self.closed: list[str] = []
-
-        def snapshot(self) -> list[Identity]:
-            return list(self.identities.values())
-
-        def open_process(self, pid: int) -> Identity:
-            return self.identities[pid]
-
-        def exit_time(self, identity: Identity) -> int | None:
-            del identity
-            raise OSError("GetProcessTimes failed")
-
-        def close(self, identity: Identity) -> None:
-            self.closed.append(identity.handle)
-
-    api = FailingWindowsProcessApi()
-
-    with pytest.raises(OSError, match="GetProcessTimes failed"):
-        ffmpeg_backend._WindowsProcessTree(  # type: ignore[attr-defined]
-            100,
-            api=api,
-        )
-
-    assert sorted(api.closed) == ["handle-100", "handle-200"]
-
-
 def _windows_process_is_active(pid: int) -> bool:
     import ctypes
     from ctypes import wintypes
@@ -1053,10 +861,122 @@ def _windows_process_is_active(pid: int) -> bool:
         close_handle(handle)
 
 
+def _terminate_windows_process(pid: int) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    open_process = kernel32.OpenProcess
+    open_process.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    open_process.restype = wintypes.HANDLE
+    terminate_process = kernel32.TerminateProcess
+    terminate_process.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    terminate_process.restype = wintypes.BOOL
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+    handle = open_process(0x0001, False, pid)
+    if not handle:
+        return
+    try:
+        terminate_process(handle, 1)
+    finally:
+        close_handle(handle)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows named events")
+def test_windows_launcher_open_event_failure_never_spawns_command(
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / "must-not-exist.txt"
+    command = [
+        sys.executable,
+        "-c",
+        "from pathlib import Path; import sys; Path(sys.argv[1]).touch()",
+        str(marker),
+    ]
+
+    result = subprocess.run(
+        ffmpeg_backend._windows_launcher_command(
+            f"Local\\DesignToolkit.FFmpeg.missing-{time.monotonic_ns()}",
+            command,
+        ),
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+
+    assert result.returncode != 0
+    assert not marker.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows Job Objects")
+@pytest.mark.parametrize(
+    "failing_method",
+    ["set_job_kill_on_close", "assign_process", "set_event"],
+    ids=["set-info", "assignment", "set-event"],
+)
+def test_windows_job_setup_failure_never_releases_marker_command(
+    failing_method: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = tmp_path / f"{failing_method}.txt"
+    api = ffmpeg_backend._WindowsKernelApi()
+
+    def fail(*_args: object) -> None:
+        raise OSError(f"{failing_method} failed")
+
+    monkeypatch.setattr(ffmpeg_backend, "os_name", "nt")
+    monkeypatch.setattr(api, failing_method, fail)
+    backend = FfmpegBackend(
+        windows_launch_gate_factory=lambda command: (
+            ffmpeg_backend._WindowsLaunchGate.create(command, api=api)
+        ),
+    )
+
+    with pytest.raises(
+        BackendUnavailableError,
+        match="Windows FFmpeg launch containment",
+    ):
+        backend.run(
+            [
+                sys.executable,
+                "-c",
+                "from pathlib import Path; import sys; Path(sys.argv[1]).touch()",
+                str(marker),
+            ]
+        )
+
+    assert not marker.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows Job Objects")
+def test_windows_launcher_preserves_stderr_and_returncode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(ffmpeg_backend, "os_name", "nt")
+    backend = FfmpegBackend()
+
+    result = backend.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.stderr.write('diagnostic'); raise SystemExit(23)",
+        ]
+    )
+
+    assert result.returncode == 23
+    assert result.stderr == "diagnostic"
+
+
 @pytest.mark.skipif(os.name != "nt", reason="requires Windows Job Objects")
 def test_ffmpeg_backend_job_kills_descendant_that_ignores_break(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(ffmpeg_backend, "os_name", "nt")
     child_pid_path = tmp_path / "child.pid"
     child_script = (
         "import os, signal, sys, time; "
@@ -1090,20 +1010,15 @@ def test_ffmpeg_backend_job_kills_descendant_that_ignores_break(
         assert not _windows_process_is_active(child_pid)
     finally:
         if child_pid is not None and _windows_process_is_active(child_pid):
-            subprocess.run(
-                ["taskkill", "/PID", str(child_pid), "/T", "/F"],
-                check=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+            _terminate_windows_process(child_pid)
 
 
-@pytest.mark.skipif(os.name != "nt", reason="requires Windows process handles")
-def test_ffmpeg_backend_fallback_kills_child_after_root_exits_during_taskkill(
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows Job Objects")
+def test_windows_timeout_closes_job_after_launcher_and_root_exit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    child_pid_path = tmp_path / "fallback-child.pid"
+    child_pid_path = tmp_path / "detached-child.pid"
     child_script = (
         "import os, signal, sys, time; "
         "signal.signal(signal.SIGBREAK, signal.SIG_IGN); "
@@ -1111,64 +1026,47 @@ def test_ffmpeg_backend_fallback_kills_child_after_root_exits_during_taskkill(
         "time.sleep(60)"
     )
     parent_script = (
-        "import os, signal, subprocess, sys, time; "
-        "signal.signal(signal.SIGBREAK, lambda *_args: os._exit(0)); "
-        f"subprocess.Popen([sys.executable, '-c', {child_script!r}, sys.argv[1]]); "
-        "time.sleep(60)"
+        "import pathlib, subprocess, sys, time; "
+        f"subprocess.Popen([sys.executable, '-c', {child_script!r}, sys.argv[1]], "
+        "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
+        "stderr=subprocess.DEVNULL); "
+        "path = pathlib.Path(sys.argv[1]); "
+        "deadline = time.monotonic() + 5; "
+        "\nwhile not path.exists() and time.monotonic() < deadline: time.sleep(0.01)"
     )
-    taskkill_calls: list[tuple[int, float]] = []
 
-    def timeout_after_break(pid: int, timeout_seconds: float) -> int:
-        taskkill_calls.append((pid, timeout_seconds))
-        if len(taskkill_calls) == 1:
-            subprocess.run(
-                ["taskkill", "/PID", str(pid), "/F"],
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            deadline = time.monotonic() + 2
-            while _windows_process_is_active(pid) and time.monotonic() < deadline:
-                time.sleep(0.01)
-            assert not _windows_process_is_active(pid)
-        raise subprocess.TimeoutExpired("taskkill", timeout_seconds)
+    class TimeoutAfterLauncherExit:
+        def __init__(self, process: subprocess.Popen[str]) -> None:
+            self._process = process
 
-    def reject_when_child_is_ready() -> None:
-        if child_pid_path.exists():
-            raise OutputLimitExceeded("fallback must retain child ownership")
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._process, name)
 
-    monkeypatch.setattr(ffmpeg_backend, "_create_windows_job", lambda _process: None)
-    monkeypatch.setattr(
-        ffmpeg_backend,
-        "_run_windows_taskkill",
-        timeout_after_break,
-    )
+        def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+            self._process.communicate(timeout=timeout)
+            assert self._process.returncode == 0
+            raise JobTimeoutException("worker timed out after launcher exit")
+
+    def popen(command: list[str], **kwargs: Any) -> TimeoutAfterLauncherExit:
+        return TimeoutAfterLauncherExit(subprocess.Popen(command, **kwargs))
+
+    monkeypatch.setattr(ffmpeg_backend, "os_name", "nt")
     backend = FfmpegBackend(
-        output_guard=reject_when_child_is_ready,
         poll_interval=0.05,
+        popen=popen,
     )
     child_pid: int | None = None
     try:
-        with pytest.raises(
-            OutputLimitExceeded,
-            match="fallback must retain child ownership",
-        ):
+        with pytest.raises(JobTimeoutException, match="after launcher exit"):
             backend.run([sys.executable, "-c", parent_script, str(child_pid_path)])
         child_pid = int(child_pid_path.read_text(encoding="ascii"))
         deadline = time.monotonic() + 2
         while _windows_process_is_active(child_pid) and time.monotonic() < deadline:
             time.sleep(0.05)
         assert not _windows_process_is_active(child_pid)
-        root_pid = taskkill_calls[0][0]
-        assert taskkill_calls == [(root_pid, 5.0), (root_pid, 10.0)]
     finally:
         if child_pid is not None and _windows_process_is_active(child_pid):
-            subprocess.run(
-                ["taskkill", "/PID", str(child_pid), "/T", "/F"],
-                check=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+            _terminate_windows_process(child_pid)
 
 
 def test_ffmpeg_backend_falls_back_to_monitor_when_prlimit_is_missing(
@@ -1202,27 +1100,20 @@ def test_ffmpeg_backend_falls_back_to_monitor_when_prlimit_is_missing(
     assert process.terminate_called
 
 
-def test_ffmpeg_backend_keeps_windows_command_unchanged(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    process = FakePopen([("", "")])
-    calls: list[tuple[list[str], dict[str, Any]]] = []
-    monkeypatch.setattr(ffmpeg_backend, "os_name", "nt")
-    monkeypatch.setattr(
-        ffmpeg_backend,
-        "which",
-        lambda _executable: (_ for _ in ()).throw(
-            AssertionError("Windows must not search for prlimit")
-        ),
-    )
-    backend = FfmpegBackend(
-        popen=_popen_factory(process, calls),
-        max_file_bytes=123_456,
+def test_windows_launcher_passes_command_as_base64_json_arguments() -> None:
+    command = [
+        "ffmpeg",
+        "-metadata",
+        "comment='; raise RuntimeError(\"not code\")",
+        "out.mp4",
+    ]
+
+    launcher_command = ffmpeg_backend._windows_launcher_command(
+        "Local\\DesignToolkit.FFmpeg.test",
+        command,
     )
 
-    result = backend.run(["ffmpeg", "out.mp4"])
-
-    assert calls[0][0] == ["ffmpeg", "out.mp4"]
-    assert "preexec_fn" not in calls[0][1]
-    assert calls[0][1]["creationflags"] == subprocess.CREATE_NEW_PROCESS_GROUP
-    assert result.returncode == 0
+    assert launcher_command[:2] == [sys.executable, "-c"]
+    assert command[2] not in launcher_command[2]
+    assert launcher_command[3] == "Local\\DesignToolkit.FFmpeg.test"
+    assert json.loads(base64.b64decode(launcher_command[4]).decode("utf-8")) == command

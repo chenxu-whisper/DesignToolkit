@@ -1,16 +1,18 @@
 from __future__ import annotations
 
+import base64
+import json
 import logging
 import os
 import signal
 import subprocess
+import sys
+import uuid
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
 from importlib import resources
 from os import name as os_name
 from pathlib import Path
 from shutil import which
-from threading import Event, RLock, Thread
 from typing import Protocol
 
 import imageio_ffmpeg
@@ -23,482 +25,237 @@ _LOGGER = logging.getLogger(__name__)
 _POSIX_SIGKILL = getattr(signal, "SIGKILL", 9)
 _WINDOWS_NEW_PROCESS_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200)
 _PROCESS_CLEANUP_TIMEOUT_SECONDS = 5.0
-_WINDOWS_TREE_POLL_SECONDS = 0.01
-_WINDOWS_TASKKILL_TIMEOUTS_SECONDS = (5.0, 10.0)
+_WINDOWS_LAUNCHER_CODE = """\
+import base64
+import ctypes
+import json
+import subprocess
+import sys
+from ctypes import wintypes
+
+kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+open_event = kernel32.OpenEventW
+open_event.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+open_event.restype = wintypes.HANDLE
+wait_for_single_object = kernel32.WaitForSingleObject
+wait_for_single_object.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+wait_for_single_object.restype = wintypes.DWORD
+close_handle = kernel32.CloseHandle
+close_handle.argtypes = [wintypes.HANDLE]
+close_handle.restype = wintypes.BOOL
+
+event_handle = open_event(0x00100000, False, sys.argv[1])
+if not event_handle:
+    raise SystemExit(125)
+try:
+    if wait_for_single_object(event_handle, 0xFFFFFFFF) != 0:
+        raise SystemExit(125)
+finally:
+    close_handle(event_handle)
+
+command = json.loads(base64.b64decode(sys.argv[2]).decode("utf-8"))
+raise SystemExit(subprocess.Popen(command, shell=False).wait())
+"""
 
 
-class _WindowsJob:
-    def __init__(
+class _WindowsKernelApiProtocol(Protocol):
+    def create_event(self, name: str) -> object: ...
+
+    def create_job(self) -> object: ...
+
+    def set_job_kill_on_close(self, job_handle: object) -> None: ...
+
+    def assign_process(
         self,
-        handle: object,
-        close_handle: Callable[[object], int],
-    ) -> None:
-        self._handle = handle
-        self._close_handle = close_handle
-
-    def close(self) -> None:
-        handle = self._handle
-        if handle is None:
-            return
-        self._handle = None
-        self._close_handle(handle)
-
-
-@dataclass
-class _WindowsProcessIdentity:
-    pid: int
-    parent_pid: int
-    creation_time: int
-    handle: object
-
-
-@dataclass(frozen=True)
-class _WindowsProcessEntry:
-    pid: int
-    parent_pid: int
-
-
-class _WindowsProcessApi(Protocol):
-    def snapshot(self) -> list[_WindowsProcessEntry]: ...
-
-    def open_process(self, pid: int) -> _WindowsProcessIdentity | None: ...
-
-    def exit_time(self, identity: _WindowsProcessIdentity) -> int | None: ...
-
-    def is_active(self, identity: _WindowsProcessIdentity) -> bool: ...
-
-    def terminate(self, identity: _WindowsProcessIdentity) -> None: ...
-
-    def wait(
-        self,
-        identity: _WindowsProcessIdentity,
-        timeout_seconds: float,
+        job_handle: object,
+        process_handle: object,
     ) -> None: ...
 
-    def close(self, identity: _WindowsProcessIdentity) -> None: ...
+    def set_event(self, event_handle: object) -> None: ...
+
+    def close_handle(self, handle: object) -> None: ...
 
 
-class _WindowsProcessApiImpl:
+class _WindowsKernelApi:
     def __init__(self) -> None:
         import ctypes
         from ctypes import wintypes
 
-        process_query_limited_information = 0x1000
-        process_terminate = 0x0001
-        synchronize = 0x00100000
-
         self._ctypes = ctypes
-        self._wintypes = wintypes
         self._kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        self._process_access = (
-            process_query_limited_information | process_terminate | synchronize
-        )
 
-        class ProcessEntry32(ctypes.Structure):
+        class IoCounters(ctypes.Structure):
             _fields_ = [
-                ("dwSize", wintypes.DWORD),
-                ("cntUsage", wintypes.DWORD),
-                ("th32ProcessID", wintypes.DWORD),
-                ("th32DefaultHeapID", ctypes.c_size_t),
-                ("th32ModuleID", wintypes.DWORD),
-                ("cntThreads", wintypes.DWORD),
-                ("th32ParentProcessID", wintypes.DWORD),
-                ("pcPriClassBase", wintypes.LONG),
-                ("dwFlags", wintypes.DWORD),
-                ("szExeFile", wintypes.WCHAR * 260),
+                ("read_operation_count", ctypes.c_ulonglong),
+                ("write_operation_count", ctypes.c_ulonglong),
+                ("other_operation_count", ctypes.c_ulonglong),
+                ("read_transfer_count", ctypes.c_ulonglong),
+                ("write_transfer_count", ctypes.c_ulonglong),
+                ("other_transfer_count", ctypes.c_ulonglong),
             ]
 
-        self._process_entry_type = ProcessEntry32
-        self._configure_functions()
+        class BasicLimitInformation(ctypes.Structure):
+            _fields_ = [
+                ("per_process_user_time_limit", ctypes.c_longlong),
+                ("per_job_user_time_limit", ctypes.c_longlong),
+                ("limit_flags", wintypes.DWORD),
+                ("minimum_working_set_size", ctypes.c_size_t),
+                ("maximum_working_set_size", ctypes.c_size_t),
+                ("active_process_limit", wintypes.DWORD),
+                ("affinity", ctypes.c_size_t),
+                ("priority_class", wintypes.DWORD),
+                ("scheduling_class", wintypes.DWORD),
+            ]
 
-    def _configure_functions(self) -> None:
+        class ExtendedLimitInformation(ctypes.Structure):
+            _fields_ = [
+                ("basic_limit_information", BasicLimitInformation),
+                ("io_info", IoCounters),
+                ("process_memory_limit", ctypes.c_size_t),
+                ("job_memory_limit", ctypes.c_size_t),
+                ("peak_process_memory_used", ctypes.c_size_t),
+                ("peak_job_memory_used", ctypes.c_size_t),
+            ]
+
+        self._extended_limit_information = ExtendedLimitInformation
+        self._configure_functions(wintypes)
+
+    def _configure_functions(self, wintypes: object) -> None:
         ctypes = self._ctypes
-        wintypes = self._wintypes
         kernel32 = self._kernel32
-
-        kernel32.CreateToolhelp32Snapshot.argtypes = [
-            wintypes.DWORD,
-            wintypes.DWORD,
-        ]
-        kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
-        kernel32.Process32FirstW.argtypes = [
-            wintypes.HANDLE,
-            ctypes.POINTER(self._process_entry_type),
-        ]
-        kernel32.Process32FirstW.restype = wintypes.BOOL
-        kernel32.Process32NextW.argtypes = [
-            wintypes.HANDLE,
-            ctypes.POINTER(self._process_entry_type),
-        ]
-        kernel32.Process32NextW.restype = wintypes.BOOL
-        kernel32.OpenProcess.argtypes = [
-            wintypes.DWORD,
+        kernel32.CreateEventW.argtypes = [
+            ctypes.c_void_p,
             wintypes.BOOL,
+            wintypes.BOOL,
+            wintypes.LPCWSTR,
+        ]
+        kernel32.CreateEventW.restype = wintypes.HANDLE
+        kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+        kernel32.SetInformationJobObject.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            ctypes.c_void_p,
             wintypes.DWORD,
         ]
-        kernel32.OpenProcess.restype = wintypes.HANDLE
-        kernel32.GetProcessTimes.argtypes = [
+        kernel32.SetInformationJobObject.restype = wintypes.BOOL
+        kernel32.AssignProcessToJobObject.argtypes = [
             wintypes.HANDLE,
-            ctypes.POINTER(wintypes.FILETIME),
-            ctypes.POINTER(wintypes.FILETIME),
-            ctypes.POINTER(wintypes.FILETIME),
-            ctypes.POINTER(wintypes.FILETIME),
-        ]
-        kernel32.GetProcessTimes.restype = wintypes.BOOL
-        kernel32.GetExitCodeProcess.argtypes = [
             wintypes.HANDLE,
-            ctypes.POINTER(wintypes.DWORD),
         ]
-        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
-        kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
-        kernel32.TerminateProcess.restype = wintypes.BOOL
-        kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
-        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+        kernel32.SetEvent.argtypes = [wintypes.HANDLE]
+        kernel32.SetEvent.restype = wintypes.BOOL
         kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
         kernel32.CloseHandle.restype = wintypes.BOOL
 
-    @staticmethod
-    def _filetime_value(filetime: object) -> int:
-        return (filetime.dwHighDateTime << 32) | filetime.dwLowDateTime
+    def _raise_last_error(self) -> None:
+        raise self._ctypes.WinError(self._ctypes.get_last_error())
 
-    def _process_times(self, handle: object) -> tuple[int, int | None]:
-        ctypes = self._ctypes
-        wintypes = self._wintypes
-        creation = wintypes.FILETIME()
-        exit_time = wintypes.FILETIME()
-        kernel = wintypes.FILETIME()
-        user = wintypes.FILETIME()
-        if not self._kernel32.GetProcessTimes(
-            handle,
-            ctypes.byref(creation),
-            ctypes.byref(exit_time),
-            ctypes.byref(kernel),
-            ctypes.byref(user),
-        ):
-            raise ctypes.WinError(ctypes.get_last_error())
-        exit_value = self._filetime_value(exit_time)
-        return self._filetime_value(creation), exit_value or None
-
-    def snapshot(self) -> list[_WindowsProcessEntry]:
-        ctypes = self._ctypes
-        snapshot = self._kernel32.CreateToolhelp32Snapshot(0x00000002, 0)
-        if snapshot == ctypes.c_void_p(-1).value:
-            raise ctypes.WinError(ctypes.get_last_error())
-        entries: list[_WindowsProcessEntry] = []
-        try:
-            entry = self._process_entry_type()
-            entry.dwSize = ctypes.sizeof(entry)
-            more = self._kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
-            while more:
-                entries.append(
-                    _WindowsProcessEntry(
-                        pid=int(entry.th32ProcessID),
-                        parent_pid=int(entry.th32ParentProcessID),
-                    )
-                )
-                more = self._kernel32.Process32NextW(snapshot, ctypes.byref(entry))
-        finally:
-            self._kernel32.CloseHandle(snapshot)
-        return entries
-
-    def open_process(self, pid: int) -> _WindowsProcessIdentity | None:
-        handle = self._kernel32.OpenProcess(self._process_access, False, pid)
+    def create_event(self, name: str) -> object:
+        handle = self._kernel32.CreateEventW(None, False, False, name)
         if not handle:
-            return None
-        try:
-            creation_time, _exit_time = self._process_times(handle)
-        except OSError:
-            self._kernel32.CloseHandle(handle)
-            return None
-        return _WindowsProcessIdentity(pid, 0, creation_time, handle)
+            self._raise_last_error()
+        return handle
 
-    def exit_time(self, identity: _WindowsProcessIdentity) -> int | None:
-        _creation_time, exit_time = self._process_times(identity.handle)
-        return exit_time
+    def create_job(self) -> object:
+        handle = self._kernel32.CreateJobObjectW(None, None)
+        if not handle:
+            self._raise_last_error()
+        return handle
 
-    def is_active(self, identity: _WindowsProcessIdentity) -> bool:
-        exit_code = self._wintypes.DWORD()
-        if not self._kernel32.GetExitCodeProcess(
-            identity.handle,
-            self._ctypes.byref(exit_code),
+    def set_job_kill_on_close(self, job_handle: object) -> None:
+        limits = self._extended_limit_information()
+        limits.basic_limit_information.limit_flags = 0x00002000
+        if not self._kernel32.SetInformationJobObject(
+            job_handle,
+            9,
+            self._ctypes.byref(limits),
+            self._ctypes.sizeof(limits),
         ):
-            return False
-        return exit_code.value == 259
+            self._raise_last_error()
 
-    def terminate(self, identity: _WindowsProcessIdentity) -> None:
-        if self.is_active(identity) and not self._kernel32.TerminateProcess(
-            identity.handle,
-            1,
-        ):
-            raise self._ctypes.WinError(self._ctypes.get_last_error())
-
-    def wait(
+    def assign_process(
         self,
-        identity: _WindowsProcessIdentity,
-        timeout_seconds: float,
+        job_handle: object,
+        process_handle: object,
     ) -> None:
-        timeout_ms = min(round(timeout_seconds * 1000), 0xFFFFFFFE)
-        self._kernel32.WaitForSingleObject(identity.handle, timeout_ms)
+        if not self._kernel32.AssignProcessToJobObject(
+            job_handle,
+            process_handle,
+        ):
+            self._raise_last_error()
 
-    def close(self, identity: _WindowsProcessIdentity) -> None:
-        self._kernel32.CloseHandle(identity.handle)
+    def set_event(self, event_handle: object) -> None:
+        if not self._kernel32.SetEvent(event_handle):
+            self._raise_last_error()
 
-
-def _run_windows_taskkill(pid: int, timeout_seconds: float) -> int:
-    taskkill = subprocess.Popen(
-        ["taskkill", "/PID", str(pid), "/T", "/F"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    try:
-        return taskkill.wait(timeout=timeout_seconds)
-    except subprocess.TimeoutExpired:
-        taskkill.kill()
-        try:
-            taskkill.wait(timeout=timeout_seconds)
-        except (ProcessLookupError, subprocess.TimeoutExpired):
-            pass
-        raise
+    def close_handle(self, handle: object) -> None:
+        self._kernel32.CloseHandle(handle)
 
 
-class _WindowsProcessTree:
+def _windows_launcher_command(
+    event_name: str,
+    command: Sequence[str],
+) -> list[str]:
+    payload = base64.b64encode(
+        json.dumps(list(command), ensure_ascii=False).encode("utf-8")
+    ).decode("ascii")
+    return [sys.executable, "-c", _WINDOWS_LAUNCHER_CODE, event_name, payload]
+
+
+class _WindowsLaunchGate:
     def __init__(
         self,
-        root_pid: int,
         *,
-        api: _WindowsProcessApi | None = None,
-        poll_interval: float = _WINDOWS_TREE_POLL_SECONDS,
+        api: _WindowsKernelApiProtocol,
+        event_handle: object,
+        launcher_command: list[str],
     ) -> None:
-        self._root_pid = root_pid
-        self._api = api or _WindowsProcessApiImpl()
-        self._poll_interval = poll_interval
-        self._identities: dict[int, _WindowsProcessIdentity] = {}
-        self._lock = RLock()
-        self._stop = Event()
-        self._closed = False
-        root = self._api.open_process(root_pid)
-        if root is None:
-            raise ProcessLookupError(root_pid)
-        self._identities[root_pid] = root
-        try:
-            self._refresh()
-        except BaseException:
-            self._api.close(root)
-            raise
-        self._thread = Thread(
-            target=self._watch,
-            name=f"ffmpeg-tree-{root_pid}",
-            daemon=True,
+        self._api = api
+        self._event_handle = event_handle
+        self._job_handle: object | None = None
+        self._released = False
+        self.launcher_command = launcher_command
+
+    @classmethod
+    def create(
+        cls,
+        command: Sequence[str],
+        *,
+        api: _WindowsKernelApiProtocol | None = None,
+    ) -> _WindowsLaunchGate:
+        kernel_api = api or _WindowsKernelApi()
+        event_name = f"Local\\DesignToolkit.FFmpeg.{uuid.uuid4().hex}"
+        event_handle = kernel_api.create_event(event_name)
+        return cls(
+            api=kernel_api,
+            event_handle=event_handle,
+            launcher_command=_windows_launcher_command(event_name, command),
         )
-        self._thread.start()
 
-    def _watch(self) -> None:
-        while not self._stop.wait(self._poll_interval):
-            try:
-                self._refresh()
-            except OSError:
-                continue
-
-    def _refresh(self) -> None:
-        entries = self._api.snapshot()
-        with self._lock:
-            pending = {
-                entry.pid: entry
-                for entry in entries
-                if entry.pid not in self._identities
-            }
-            captured = True
-            while captured:
-                captured = False
-                for pid, entry in list(pending.items()):
-                    parent = self._identities.get(entry.parent_pid)
-                    if parent is None:
-                        continue
-                    identity = self._api.open_process(pid)
-                    del pending[pid]
-                    if identity is None:
-                        continue
-                    try:
-                        parent_exit_time = self._api.exit_time(parent)
-                    except BaseException:
-                        self._api.close(identity)
-                        raise
-                    if identity.creation_time < parent.creation_time or (
-                        parent_exit_time is not None
-                        and identity.creation_time > parent_exit_time
-                    ):
-                        self._api.close(identity)
-                        continue
-                    identity.parent_pid = entry.parent_pid
-                    self._identities[pid] = identity
-                    captured = True
-
-    def _shutdown_watcher(self) -> None:
-        self._stop.set()
-        self._thread.join(timeout=_PROCESS_CLEANUP_TIMEOUT_SECONDS)
-
-    def _leaf_first(self) -> list[_WindowsProcessIdentity]:
-        with self._lock:
-            identities = list(self._identities.values())
-            by_pid = dict(self._identities)
-
-        def depth(identity: _WindowsProcessIdentity) -> int:
-            result = 0
-            parent_pid = identity.parent_pid
-            visited = {identity.pid}
-            while parent_pid in by_pid and parent_pid not in visited:
-                visited.add(parent_pid)
-                result += 1
-                parent_pid = by_pid[parent_pid].parent_pid
-            return result
-
-        return sorted(identities, key=depth, reverse=True)
-
-    def _terminate_captured(self) -> None:
-        for identity in self._leaf_first():
-            if not self._api.is_active(identity):
-                continue
-            try:
-                self._api.terminate(identity)
-            except OSError:
-                continue
-            self._api.wait(identity, _PROCESS_CLEANUP_TIMEOUT_SECONDS)
-
-    def terminate(self) -> None:
-        for timeout_seconds in _WINDOWS_TASKKILL_TIMEOUTS_SECONDS:
-            try:
-                if _run_windows_taskkill(self._root_pid, timeout_seconds) == 0:
-                    break
-            except (OSError, subprocess.TimeoutExpired):
-                continue
-        self._shutdown_watcher()
-        try:
-            self._refresh()
-        except OSError:
-            pass
-        self._terminate_captured()
+    def claim_and_release(self, process: subprocess.Popen[str]) -> None:
+        if self._released:
+            raise RuntimeError("Windows FFmpeg launch gate was already released")
+        process_handle = getattr(process, "_handle", None)
+        if process_handle is None:
+            raise RuntimeError("Windows launcher process handle is unavailable")
+        job_handle = self._api.create_job()
+        self._job_handle = job_handle
+        self._api.set_job_kill_on_close(job_handle)
+        self._api.assign_process(job_handle, process_handle)
+        self._api.set_event(self._event_handle)
+        self._released = True
 
     def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        self._shutdown_watcher()
-        try:
-            self._refresh()
-        except OSError:
-            pass
-        self._terminate_captured()
-        with self._lock:
-            identities = list(self._identities.values())
-            self._identities.clear()
-        for identity in identities:
-            self._api.close(identity)
-
-
-def _create_windows_job(
-    process: subprocess.Popen[str],
-) -> _WindowsJob | None:
-    if os_name != "nt":
-        return None
-    process_handle = getattr(process, "_handle", None)
-    if process_handle is None:
-        return None
-
-    import ctypes
-    from ctypes import wintypes
-
-    job_object_extended_limit_information = 9
-    job_object_limit_kill_on_job_close = 0x00002000
-
-    class IoCounters(ctypes.Structure):
-        _fields_ = [
-            ("read_operation_count", ctypes.c_ulonglong),
-            ("write_operation_count", ctypes.c_ulonglong),
-            ("other_operation_count", ctypes.c_ulonglong),
-            ("read_transfer_count", ctypes.c_ulonglong),
-            ("write_transfer_count", ctypes.c_ulonglong),
-            ("other_transfer_count", ctypes.c_ulonglong),
-        ]
-
-    class BasicLimitInformation(ctypes.Structure):
-        _fields_ = [
-            ("per_process_user_time_limit", ctypes.c_longlong),
-            ("per_job_user_time_limit", ctypes.c_longlong),
-            ("limit_flags", wintypes.DWORD),
-            ("minimum_working_set_size", ctypes.c_size_t),
-            ("maximum_working_set_size", ctypes.c_size_t),
-            ("active_process_limit", wintypes.DWORD),
-            ("affinity", ctypes.c_size_t),
-            ("priority_class", wintypes.DWORD),
-            ("scheduling_class", wintypes.DWORD),
-        ]
-
-    class ExtendedLimitInformation(ctypes.Structure):
-        _fields_ = [
-            ("basic_limit_information", BasicLimitInformation),
-            ("io_info", IoCounters),
-            ("process_memory_limit", ctypes.c_size_t),
-            ("job_memory_limit", ctypes.c_size_t),
-            ("peak_process_memory_used", ctypes.c_size_t),
-            ("peak_job_memory_used", ctypes.c_size_t),
-        ]
-
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    create_job = kernel32.CreateJobObjectW
-    create_job.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
-    create_job.restype = wintypes.HANDLE
-    set_job_information = kernel32.SetInformationJobObject
-    set_job_information.argtypes = [
-        wintypes.HANDLE,
-        ctypes.c_int,
-        ctypes.c_void_p,
-        wintypes.DWORD,
-    ]
-    set_job_information.restype = wintypes.BOOL
-    assign_process = kernel32.AssignProcessToJobObject
-    assign_process.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
-    assign_process.restype = wintypes.BOOL
-    close_handle = kernel32.CloseHandle
-    close_handle.argtypes = [wintypes.HANDLE]
-    close_handle.restype = wintypes.BOOL
-
-    job_handle = create_job(None, None)
-    if not job_handle:
-        return None
-    owner = _WindowsJob(job_handle, close_handle)
-    try:
-        limits = ExtendedLimitInformation()
-        limits.basic_limit_information.limit_flags = (
-            job_object_limit_kill_on_job_close
-        )
-        if not set_job_information(
-            job_handle,
-            job_object_extended_limit_information,
-            ctypes.byref(limits),
-            ctypes.sizeof(limits),
-        ):
-            raise ctypes.WinError(ctypes.get_last_error())
-
-        if not assign_process(job_handle, process_handle):
-            raise ctypes.WinError(ctypes.get_last_error())
-    except OSError:
-        owner.close()
-        return None
-    return owner
-
-
-def _create_windows_process_tree(
-    process: subprocess.Popen[str],
-) -> _WindowsProcessTree | None:
-    if os_name != "nt":
-        return None
-    pid = getattr(process, "pid", None)
-    if pid is None:
-        return None
-    try:
-        return _WindowsProcessTree(pid)
-    except OSError:
-        return None
+        job_handle = self._job_handle
+        if job_handle is not None:
+            self._job_handle = None
+            self._api.close_handle(job_handle)
+        event_handle = self._event_handle
+        if event_handle is not None:
+            self._event_handle = None
+            self._api.close_handle(event_handle)
 
 
 def _bundled_binary_dir() -> Path:
@@ -533,11 +290,17 @@ class FfmpegBackend:
         poll_interval: float = 0.25,
         popen: PopenFactory = subprocess.Popen,
         max_file_bytes: int | None = None,
+        windows_launch_gate_factory: (
+            Callable[[Sequence[str]], _WindowsLaunchGate] | None
+        ) = None,
     ) -> None:
         self._output_guard = output_guard
         self._poll_interval = poll_interval
         self._popen = popen
         self._max_file_bytes = max_file_bytes
+        self._windows_launch_gate_factory = (
+            windows_launch_gate_factory or _WindowsLaunchGate.create
+        )
 
     def get_ffmpeg_exe(self) -> str:
         try:
@@ -601,14 +364,32 @@ class FfmpegBackend:
             popen_kwargs["start_new_session"] = True
         elif os_name == "nt":
             popen_kwargs["creationflags"] = _WINDOWS_NEW_PROCESS_GROUP
-        process = self._popen(
-            _file_size_limited_command(command, self._max_file_bytes),
-            **popen_kwargs,
-        )
-        process_tree_owner: _WindowsJob | _WindowsProcessTree | None
-        process_tree_owner = _create_windows_job(process)
-        if os_name == "nt" and process_tree_owner is None:
-            process_tree_owner = _create_windows_process_tree(process)
+        gated_command = _file_size_limited_command(command, self._max_file_bytes)
+        process_tree_owner: _WindowsLaunchGate | None = None
+        if os_name == "nt":
+            try:
+                process_tree_owner = self._windows_launch_gate_factory(gated_command)
+            except Exception as exc:
+                raise BackendUnavailableError(
+                    "Windows FFmpeg launch containment could not be established."
+                ) from exc
+            try:
+                process = self._popen(
+                    process_tree_owner.launcher_command,
+                    **popen_kwargs,
+                )
+            except BaseException:
+                process_tree_owner.close()
+                raise
+            try:
+                process_tree_owner.claim_and_release(process)
+            except Exception as exc:
+                self._abort_windows_launch(process, process_tree_owner)
+                raise BackendUnavailableError(
+                    "Windows FFmpeg launch containment could not be established."
+                ) from exc
+        else:
+            process = self._popen(gated_command, **popen_kwargs)
         try:
             while True:
                 try:
@@ -665,15 +446,6 @@ class FfmpegBackend:
         if os_name == "posix" and pid is not None:
             os.killpg(pid, signal.SIGTERM)
             return
-        if os_name == "nt" and pid is not None:
-            send_signal = getattr(process, "send_signal", None)
-            ctrl_break = getattr(signal, "CTRL_BREAK_EVENT", None)
-            if send_signal is not None and ctrl_break is not None:
-                try:
-                    send_signal(ctrl_break)
-                    return
-                except OSError:
-                    pass
         process.terminate()
 
     def _kill_process_tree(self, process: subprocess.Popen[str]) -> None:
@@ -681,13 +453,6 @@ class FfmpegBackend:
         if os_name == "posix" and pid is not None:
             os.killpg(pid, _POSIX_SIGKILL)
             return
-        if os_name == "nt" and pid is not None:
-            for timeout_seconds in _WINDOWS_TASKKILL_TIMEOUTS_SECONDS:
-                try:
-                    if _run_windows_taskkill(pid, timeout_seconds) == 0:
-                        break
-                except (OSError, subprocess.TimeoutExpired):
-                    continue
         process.kill()
 
     @staticmethod
@@ -703,7 +468,7 @@ class FfmpegBackend:
     def _stop_process(
         self,
         process: subprocess.Popen[str],
-        process_tree_owner: _WindowsJob | _WindowsProcessTree | None = None,
+        process_tree_owner: _WindowsLaunchGate | None = None,
     ) -> None:
         pid = getattr(process, "pid", None)
         if os_name == "posix" and pid is not None:
@@ -720,24 +485,14 @@ class FfmpegBackend:
             return
 
         if os_name == "nt":
-            if isinstance(process_tree_owner, _WindowsProcessTree):
-                process_tree_owner.terminate()
-                self._wait_for_process(process)
-                return
-            if self._process_is_running(process):
-                try:
-                    self._terminate_process_tree(process)
-                except ProcessLookupError:
-                    pass
-            self._wait_for_process(process)
             if process_tree_owner is not None:
                 process_tree_owner.close()
-            elif pid is not None or self._process_is_running(process):
+            if not self._wait_for_process(process):
                 try:
-                    self._kill_process_tree(process)
+                    process.kill()
                 except ProcessLookupError:
                     pass
-            self._wait_for_process(process)
+                self._wait_for_process(process)
             return
 
         if not self._process_is_running(process):
@@ -752,3 +507,23 @@ class FfmpegBackend:
             except ProcessLookupError:
                 return
             self._wait_for_process(process)
+
+    @classmethod
+    def _abort_windows_launch(
+        cls,
+        process: subprocess.Popen[str],
+        process_tree_owner: _WindowsLaunchGate,
+    ) -> None:
+        try:
+            process.terminate()
+        except ProcessLookupError:
+            pass
+        finally:
+            process_tree_owner.close()
+        if cls._wait_for_process(process):
+            return
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        cls._wait_for_process(process)
