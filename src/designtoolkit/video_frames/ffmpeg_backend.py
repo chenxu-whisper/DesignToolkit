@@ -4,6 +4,7 @@ import base64
 import json
 import logging
 import os
+import secrets
 import signal
 import subprocess
 import sys
@@ -25,6 +26,8 @@ _LOGGER = logging.getLogger(__name__)
 _POSIX_SIGKILL = getattr(signal, "SIGKILL", 9)
 _WINDOWS_NEW_PROCESS_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200)
 _PROCESS_CLEANUP_TIMEOUT_SECONDS = 5.0
+_WINDOWS_STARTUP_ERROR_RETURN_CODE = 126
+_WINDOWS_STARTUP_ERROR_PREFIX = "DESIGNTOOLKIT_FFMPEG_STARTUP_ERROR:"
 _WINDOWS_LAUNCHER_CODE = """\
 import base64
 import ctypes
@@ -53,8 +56,26 @@ try:
 finally:
     close_handle(event_handle)
 
-command = json.loads(base64.b64decode(sys.argv[2]).decode("utf-8"))
-raise SystemExit(subprocess.Popen(command, shell=False).wait())
+command = json.loads(base64.b64decode(sys.argv[3]).decode("utf-8"))
+try:
+    process = subprocess.Popen(command, shell=False)
+except OSError as exc:
+    payload = {
+        "event": sys.argv[1],
+        "token": sys.argv[2],
+        "type": type(exc).__name__,
+        "errno": exc.errno,
+        "winerror": getattr(exc, "winerror", None),
+        "filename": exc.filename,
+        "strerror": exc.strerror,
+        "message": str(exc),
+    }
+    encoded = base64.b64encode(
+        json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    ).decode("ascii")
+    sys.stderr.write("DESIGNTOOLKIT_FFMPEG_STARTUP_ERROR:" + encoded + "\\n")
+    raise SystemExit(126)
+raise SystemExit(process.wait())
 """
 
 
@@ -196,12 +217,74 @@ class _WindowsKernelApi:
 
 def _windows_launcher_command(
     event_name: str,
+    startup_error_token: str,
     command: Sequence[str],
 ) -> list[str]:
     payload = base64.b64encode(
         json.dumps(list(command), ensure_ascii=False).encode("utf-8")
     ).decode("ascii")
-    return [sys.executable, "-c", _WINDOWS_LAUNCHER_CODE, event_name, payload]
+    return [
+        sys.executable,
+        "-c",
+        _WINDOWS_LAUNCHER_CODE,
+        event_name,
+        startup_error_token,
+        payload,
+    ]
+
+
+def _windows_startup_error(
+    *,
+    returncode: int | None,
+    stderr: str,
+    event_name: str,
+    startup_error_token: str,
+) -> OSError | None:
+    if returncode != _WINDOWS_STARTUP_ERROR_RETURN_CODE:
+        return None
+    line = stderr.removesuffix("\n").removesuffix("\r")
+    if "\n" in line or "\r" in line or not line.startswith(
+        _WINDOWS_STARTUP_ERROR_PREFIX
+    ):
+        return None
+    encoded = line.removeprefix(_WINDOWS_STARTUP_ERROR_PREFIX)
+    try:
+        payload = json.loads(
+            base64.b64decode(encoded, validate=True).decode("utf-8")
+        )
+    except (ValueError, UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if (
+        payload.get("event") != event_name
+        or payload.get("token") != startup_error_token
+    ):
+        return None
+    error_types: dict[str, type[OSError]] = {
+        "FileNotFoundError": FileNotFoundError,
+        "PermissionError": PermissionError,
+        "OSError": OSError,
+    }
+    error_type = error_types.get(payload.get("type"))
+    errno = payload.get("errno")
+    winerror = payload.get("winerror")
+    filename = payload.get("filename")
+    strerror = payload.get("strerror")
+    message = payload.get("message")
+    if (
+        error_type is None
+        or not isinstance(errno, int)
+        or (winerror is not None and not isinstance(winerror, int))
+        or (filename is not None and not isinstance(filename, str))
+        or not isinstance(strerror, str)
+        or not isinstance(message, str)
+    ):
+        return None
+    error = error_type(errno, strerror, filename, winerror)
+    if str(error) != message:
+        return None
+    return error
 
 
 class _WindowsLaunchGate:
@@ -210,12 +293,16 @@ class _WindowsLaunchGate:
         *,
         api: _WindowsKernelApiProtocol,
         event_handle: object,
+        event_name: str,
+        startup_error_token: str,
         launcher_command: list[str],
     ) -> None:
         self._api = api
         self._event_handle = event_handle
         self._job_handle: object | None = None
         self._released = False
+        self.event_name = event_name
+        self.startup_error_token = startup_error_token
         self.launcher_command = launcher_command
 
     @classmethod
@@ -227,11 +314,18 @@ class _WindowsLaunchGate:
     ) -> _WindowsLaunchGate:
         kernel_api = api or _WindowsKernelApi()
         event_name = f"Local\\DesignToolkit.FFmpeg.{uuid.uuid4().hex}"
+        startup_error_token = secrets.token_urlsafe(32)
         event_handle = kernel_api.create_event(event_name)
         return cls(
             api=kernel_api,
             event_handle=event_handle,
-            launcher_command=_windows_launcher_command(event_name, command),
+            event_name=event_name,
+            startup_error_token=startup_error_token,
+            launcher_command=_windows_launcher_command(
+                event_name,
+                startup_error_token,
+                command,
+            ),
         )
 
     def claim_and_release(self, process: subprocess.Popen[str]) -> None:
@@ -247,15 +341,28 @@ class _WindowsLaunchGate:
         self._api.set_event(self._event_handle)
         self._released = True
 
+    @property
+    def has_job(self) -> bool:
+        return self._job_handle is not None
+
     def close(self) -> None:
         job_handle = self._job_handle
-        if job_handle is not None:
-            self._job_handle = None
-            self._api.close_handle(job_handle)
         event_handle = self._event_handle
+        self._job_handle = None
+        self._event_handle = None
+        errors: list[BaseException] = []
+        if job_handle is not None:
+            try:
+                self._api.close_handle(job_handle)
+            except BaseException as exc:
+                errors.append(exc)
         if event_handle is not None:
-            self._event_handle = None
-            self._api.close_handle(event_handle)
+            try:
+                self._api.close_handle(event_handle)
+            except BaseException as exc:
+                errors.append(exc)
+        if errors:
+            raise errors[0]
 
 
 def _bundled_binary_dir() -> Path:
@@ -404,6 +511,17 @@ class FfmpegBackend:
                     else:
                         self._output_guard()
                     continue
+                if process_tree_owner is not None:
+                    startup_error = _windows_startup_error(
+                        returncode=process.returncode,
+                        stderr=stderr or "",
+                        event_name=process_tree_owner.event_name,
+                        startup_error_token=(
+                            process_tree_owner.startup_error_token
+                        ),
+                    )
+                    if startup_error is not None:
+                        raise startup_error
                 if monitor is not None:
                     monitor.finish()
                 return BackendResult(
@@ -514,16 +632,24 @@ class FfmpegBackend:
         process: subprocess.Popen[str],
         process_tree_owner: _WindowsLaunchGate,
     ) -> None:
-        try:
-            process.terminate()
-        except ProcessLookupError:
-            pass
-        finally:
-            process_tree_owner.close()
-        if cls._wait_for_process(process):
-            return
-        try:
-            process.kill()
-        except ProcessLookupError:
-            pass
-        cls._wait_for_process(process)
+        def attempt(description: str, cleanup: Callable[[], object]) -> None:
+            try:
+                cleanup()
+            except BaseException:
+                try:
+                    _LOGGER.exception("Failed to %s", description)
+                except BaseException:
+                    pass
+
+        if not process_tree_owner.has_job:
+            attempt("terminate Windows FFmpeg launcher", process.terminate)
+        attempt("close Windows FFmpeg launch gate", process_tree_owner.close)
+        attempt(
+            "wait for Windows FFmpeg launcher",
+            lambda: process.wait(timeout=_PROCESS_CLEANUP_TIMEOUT_SECONDS),
+        )
+        attempt("kill Windows FFmpeg launcher", process.kill)
+        attempt(
+            "reap Windows FFmpeg launcher",
+            lambda: process.wait(timeout=_PROCESS_CLEANUP_TIMEOUT_SECONDS),
+        )

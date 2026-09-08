@@ -340,6 +340,8 @@ def _popen_factory(
 class FakeWindowsLaunchGate:
     def __init__(self) -> None:
         self.launcher_command = [sys.executable, "-c", "raise SystemExit(0)"]
+        self.event_name = "Local\\DesignToolkit.FFmpeg.test"
+        self.startup_error_token = "trusted-startup-error-token"
         self.claim_calls = 0
         self.close_calls = 0
         self.closed = False
@@ -353,6 +355,27 @@ class FakeWindowsLaunchGate:
             return
         self.closed = True
         self.close_calls += 1
+
+
+def _windows_startup_error_sentinel(
+    event_name: str,
+    token: str,
+    error: OSError,
+) -> str:
+    payload = {
+        "event": event_name,
+        "token": token,
+        "type": type(error).__name__,
+        "errno": error.errno,
+        "winerror": getattr(error, "winerror", None),
+        "filename": error.filename,
+        "strerror": error.strerror,
+        "message": str(error),
+    }
+    encoded = base64.b64encode(
+        json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    ).decode("ascii")
+    return f"DESIGNTOOLKIT_FFMPEG_STARTUP_ERROR:{encoded}\n"
 
 
 class FakeWindowsKernelApi:
@@ -390,19 +413,20 @@ class FakeWindowsKernelApi:
 
 
 @pytest.mark.parametrize(
-    ("failure", "expected_closed", "starts_launcher"),
+    ("failure", "expected_closed", "starts_launcher", "terminates_launcher"),
     [
-        ("create_event", [], False),
-        ("create_job", ["event"], True),
-        ("set_info", ["event", "job"], True),
-        ("assign", ["event", "job"], True),
-        ("set_event", ["event", "job"], True),
+        ("create_event", [], False, False),
+        ("create_job", ["event"], True, True),
+        ("set_info", ["event", "job"], True, False),
+        ("assign", ["event", "job"], True, False),
+        ("set_event", ["event", "job"], True, False),
     ],
 )
 def test_windows_gate_setup_failure_is_fail_closed_without_handle_leaks(
     failure: str,
     expected_closed: list[str],
     starts_launcher: bool,
+    terminates_launcher: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     process = FakePopen([])
@@ -424,8 +448,182 @@ def test_windows_gate_setup_failure_is_fail_closed_without_handle_leaks(
         backend.run(["ffmpeg", "out.mp4"])
 
     assert bool(calls) is starts_launcher
-    assert process.terminate_called is starts_launcher
+    assert process.terminate_called is terminates_launcher
     assert sorted(api.closed) == sorted(expected_closed)
+
+
+def test_windows_gate_create_job_failure_reaps_launcher_when_terminate_is_denied(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class TerminateDeniedPopen(FakePopen):
+        def terminate(self) -> None:
+            super().terminate()
+            raise PermissionError("terminate denied")
+
+    process = TerminateDeniedPopen([], wait_times_out=True)
+    process._handle = 456  # type: ignore[attr-defined]
+    api = FakeWindowsKernelApi("create_job")
+    monkeypatch.setattr(ffmpeg_backend, "os_name", "nt")
+    backend = FfmpegBackend(
+        popen=_popen_factory(process, []),
+        windows_launch_gate_factory=lambda command: (
+            ffmpeg_backend._WindowsLaunchGate.create(command, api=api)
+        ),
+    )
+    caplog.set_level("ERROR", logger="designtoolkit.video_frames.ffmpeg_backend")
+
+    with pytest.raises(BackendUnavailableError) as exc_info:
+        backend.run(["ffmpeg", "out.mp4"])
+
+    assert isinstance(exc_info.value.__cause__, OSError)
+    assert str(exc_info.value.__cause__) == "create_job failed"
+    assert process.terminate_called
+    assert process.kill_called
+    assert process.wait_calls == [
+        ffmpeg_backend._PROCESS_CLEANUP_TIMEOUT_SECONDS,
+        ffmpeg_backend._PROCESS_CLEANUP_TIMEOUT_SECONDS,
+    ]
+    assert api.closed == ["event"]
+    assert "terminate Windows FFmpeg launcher" in caplog.text
+    assert "wait for Windows FFmpeg launcher" in caplog.text
+
+
+def test_windows_gate_setup_failure_closes_job_before_kill_even_if_close_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    operations: list[str] = []
+
+    class JobOwningGate(FakeWindowsLaunchGate):
+        has_job = True
+
+        def claim_and_release(self, process: FakePopen) -> None:
+            del process
+            raise OSError("assign failed")
+
+        def close(self) -> None:
+            operations.append("close")
+            raise OSError("close failed")
+
+    class ReapTrackingPopen(FakePopen):
+        def terminate(self) -> None:
+            operations.append("terminate")
+            super().terminate()
+
+        def kill(self) -> None:
+            operations.append("kill")
+            super().kill()
+
+        def wait(self, timeout: float | None = None) -> int:
+            operations.append("wait")
+            self.wait_calls.append(timeout)
+            if len(self.wait_calls) == 1:
+                raise subprocess.TimeoutExpired("ffmpeg", timeout)
+            self.returncode = 1
+            return 1
+
+    process = ReapTrackingPopen([])
+    monkeypatch.setattr(ffmpeg_backend, "os_name", "nt")
+    backend = FfmpegBackend(
+        popen=_popen_factory(process, []),
+        windows_launch_gate_factory=lambda _command: JobOwningGate(),
+    )
+    caplog.set_level("ERROR", logger="designtoolkit.video_frames.ffmpeg_backend")
+
+    with pytest.raises(BackendUnavailableError) as exc_info:
+        backend.run(["ffmpeg", "out.mp4"])
+
+    assert isinstance(exc_info.value.__cause__, OSError)
+    assert str(exc_info.value.__cause__) == "assign failed"
+    assert operations == ["close", "wait", "kill", "wait"]
+    assert process.wait_calls == [
+        ffmpeg_backend._PROCESS_CLEANUP_TIMEOUT_SECONDS,
+        ffmpeg_backend._PROCESS_CLEANUP_TIMEOUT_SECONDS,
+    ]
+    assert "close Windows FFmpeg launch gate" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "startup_error",
+    [
+        FileNotFoundError(2, "missing executable", "missing.exe", 2),
+        PermissionError(13, "permission denied", "denied.exe", 5),
+        OSError(123, "operating system failure", "broken.exe", 456),
+    ],
+    ids=["file-not-found", "permission", "os-error"],
+)
+def test_windows_launcher_rebuilds_matching_gated_startup_error(
+    startup_error: OSError,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gate = FakeWindowsLaunchGate()
+    stderr = _windows_startup_error_sentinel(
+        gate.event_name,
+        gate.startup_error_token,
+        startup_error,
+    )
+    process = FakePopen([("", stderr)], returncode=126)
+    monkeypatch.setattr(ffmpeg_backend, "os_name", "nt")
+    backend = FfmpegBackend(
+        popen=_popen_factory(process, []),
+        windows_launch_gate_factory=lambda _command: gate,
+    )
+
+    with pytest.raises(type(startup_error)) as exc_info:
+        backend.run(["missing.exe"])
+
+    rebuilt = exc_info.value
+    assert rebuilt.errno == startup_error.errno
+    assert getattr(rebuilt, "winerror", None) == getattr(
+        startup_error,
+        "winerror",
+        None,
+    )
+    assert rebuilt.filename == startup_error.filename
+    assert rebuilt.strerror == startup_error.strerror
+    assert str(rebuilt) == str(startup_error)
+
+
+def test_windows_launcher_ignores_spoofed_startup_error_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gate = FakeWindowsLaunchGate()
+    stderr = _windows_startup_error_sentinel(
+        gate.event_name,
+        "attacker-controlled-token",
+        FileNotFoundError(2, "spoofed missing executable", "spoof.exe", 2),
+    )
+    process = FakePopen([("", stderr)], returncode=126)
+    monkeypatch.setattr(ffmpeg_backend, "os_name", "nt")
+    backend = FfmpegBackend(
+        popen=_popen_factory(process, []),
+        windows_launch_gate_factory=lambda _command: gate,
+    )
+
+    result = backend.run(["real-target.exe"])
+
+    assert result.returncode == 126
+    assert result.stderr == stderr
+
+
+def test_windows_gate_close_attempts_event_after_job_close_failure() -> None:
+    class CloseFailingKernelApi(FakeWindowsKernelApi):
+        def close_handle(self, handle: object) -> None:
+            super().close_handle(handle)
+            if handle == "job":
+                raise PermissionError("job close denied")
+
+    api = CloseFailingKernelApi("")
+    gate = ffmpeg_backend._WindowsLaunchGate.create(["ffmpeg"], api=api)
+    process = FakePopen([])
+    process._handle = 456  # type: ignore[attr-defined]
+    gate.claim_and_release(process)  # type: ignore[arg-type]
+
+    with pytest.raises(PermissionError, match="job close denied"):
+        gate.close()
+
+    assert api.closed == ["job", "event"]
 
 
 def test_ffmpeg_backend_stops_when_active_sequence_tail_grows(
@@ -899,6 +1097,7 @@ def test_windows_launcher_open_event_failure_never_spawns_command(
     result = subprocess.run(
         ffmpeg_backend._windows_launcher_command(
             f"Local\\DesignToolkit.FFmpeg.missing-{time.monotonic_ns()}",
+            "standalone-launcher-secret",
             command,
         ),
         check=False,
@@ -969,6 +1168,25 @@ def test_windows_launcher_preserves_stderr_and_returncode(
 
     assert result.returncode == 23
     assert result.stderr == "diagnostic"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows Job Objects")
+def test_windows_launcher_preserves_missing_executable_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    missing_executable = tmp_path / "does-not-exist.exe"
+    monkeypatch.setattr(ffmpeg_backend, "os_name", "nt")
+
+    with pytest.raises(FileNotFoundError) as exc_info:
+        FfmpegBackend().run([str(missing_executable)])
+
+    error = exc_info.value
+    assert error.errno == 2
+    assert error.winerror == 2
+    assert error.filename is None
+    assert error.strerror
+    assert str(error)
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires Windows Job Objects")
@@ -1110,10 +1328,14 @@ def test_windows_launcher_passes_command_as_base64_json_arguments() -> None:
 
     launcher_command = ffmpeg_backend._windows_launcher_command(
         "Local\\DesignToolkit.FFmpeg.test",
+        "independent-secret",
         command,
     )
 
     assert launcher_command[:2] == [sys.executable, "-c"]
     assert command[2] not in launcher_command[2]
     assert launcher_command[3] == "Local\\DesignToolkit.FFmpeg.test"
-    assert json.loads(base64.b64decode(launcher_command[4]).decode("utf-8")) == command
+    assert launcher_command[4] == "independent-secret"
+    assert launcher_command[4] != launcher_command[3]
+    assert json.loads(base64.b64decode(launcher_command[5]).decode("utf-8")) == command
+    assert "independent-secret" not in launcher_command[5]
