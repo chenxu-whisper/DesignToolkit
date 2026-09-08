@@ -39,6 +39,7 @@ from designtoolkit.web.resources import (
     _ASSET_TASK_PREFIX,
     _CLEANUP_PREFIX,
     _RELEASE_TASK_PIN_SCRIPT,
+    _TASK_PIN_PREFIX,
     CorruptTaskPinError,
     SessionDeletingError,
     _asset_tasks_key,
@@ -76,6 +77,7 @@ _ASSET_READERS_PREFIX = "dt:resource:asset-readers:"
 _ASSET_READ_PIN_TTL_SECONDS = 60.0
 _ASSET_READ_PIN_HEARTBEAT_SECONDS = 10.0
 _CORRUPT_PIN_SCAN_COUNT = 100
+_MAX_REVERSE_TASK_ID_BYTES = 128
 _SESSION_TASK_PINS_PREFIX = "dt:resource:session:"
 _SESSION_TASK_PINS_SUFFIX = ":task-pins"
 type AssetIdentity = tuple[str, str | None]
@@ -303,6 +305,8 @@ _ROLLBACK_ENQUEUE_SCRIPT = """-- rollback_enqueue_intent
 local task_id = ARGV[1]
 local owner_id = ARGV[2]
 local owner_token = ARGV[3]
+local expected_identities_json = ARGV[5]
+local expected_asset_ids_json = ARGV[6]
 if redis.call("HGET", KEYS[5], "owner_token") ~= owner_token then
     return 0
 end
@@ -316,7 +320,16 @@ if owner_id ~= "" then
     release_pin = true
     local pin_session = redis.call("HGET", KEYS[6], "session_id")
     local pin_task = redis.call("HGET", KEYS[6], "task_id")
-    if pin_session ~= owner_id or pin_task ~= task_id then
+    if pin_session ~= owner_id
+        or pin_task ~= task_id
+        or expected_identities_json == ""
+        or redis.call(
+            "HGET",
+            KEYS[6],
+            "asset_identities"
+        ) ~= expected_identities_json
+        or redis.call("HGET", KEYS[6], "asset_ids") ~= expected_asset_ids_json
+    then
         repair_pin = true
     else
         local identities_json = redis.call(
@@ -2095,6 +2108,8 @@ class RedisTaskManager:
             output_path=None,
             error=None,
             owner_id=owner_id,
+            asset_identities=identities,
+            has_canonical_asset_identities=True,
         )
         owner_token = uuid4().hex
         self._reserve_enqueue_intent(
@@ -2144,6 +2159,7 @@ class RedisTaskManager:
                 task.task_id,
                 owner_id=owner_id,
                 owner_token=owner_token,
+                asset_identities=task.asset_identities,
             )
             raise
         except BaseException:
@@ -2172,6 +2188,7 @@ class RedisTaskManager:
                 task.task_id,
                 owner_id=owner_id,
                 owner_token=owner_token,
+                asset_identities=task.asset_identities,
             )
             raise
         except Exception as enqueue_error:
@@ -2202,6 +2219,7 @@ class RedisTaskManager:
                 task.task_id,
                 owner_id=owner_id,
                 owner_token=owner_token,
+                asset_identities=task.asset_identities,
             )
             raise
         except BaseException:
@@ -2421,8 +2439,29 @@ class RedisTaskManager:
         *,
         owner_id: str | None,
         owner_token: str,
+        asset_identities: tuple[AssetIdentity, ...] | None = None,
     ) -> bool:
         owner = owner_id or ""
+        if asset_identities is None:
+            task = self.get_task(task_id)
+            asset_identities = (
+                task.asset_identities
+                if (
+                    task is not None
+                    and task.has_canonical_asset_identities
+                )
+                else None
+            )
+        identities_json = (
+            _asset_identities_json(asset_identities)
+            if asset_identities is not None
+            else ""
+        )
+        asset_ids_json = (
+            _asset_ids_json(asset_identities)
+            if asset_identities is not None
+            else ""
+        )
         session_task_pins_key = (
             _session_task_pins_key(owner)
             if owner
@@ -2443,7 +2482,14 @@ class RedisTaskManager:
                         _event_generation_key(task_id),
                         _event_index_key(task_id),
                     ],
-                    args=[task_id, owner, owner_token, _ASSET_TASK_PREFIX],
+                    args=[
+                        task_id,
+                        owner,
+                        owner_token,
+                        _ASSET_TASK_PREFIX,
+                        identities_json,
+                        asset_ids_json,
+                    ],
                 )
             )
             if result in {0, 4} and self._repair_rolled_back_enqueue_indexes(
@@ -2496,7 +2542,12 @@ class RedisTaskManager:
                         bool(owner)
                         and (
                             not release_pin
-                            or _task_pin_asset_metadata_corrupt(pin_metadata)
+                            or not _task_pin_metadata_matches(
+                                pin_metadata,
+                                task_id=task_id,
+                                session_id=owner,
+                                asset_identities=asset_identities,
+                            )
                         )
                     )
                     asset_ids = (
@@ -2988,9 +3039,27 @@ class RedisTaskManager:
     def _reconcile_stale_task_pins(self, started_ids: set[str]) -> int:
         coordinator = self.resource_coordinator
         reconciled = 0
-        for key in self._redis.scan_iter(match="dt:resource:task-pin:*"):
-            key_text = key.decode() if isinstance(key, bytes) else key
-            task_id = key_text.removeprefix("dt:resource:task-pin:")
+        pin_keys: list[tuple[bytes | str, str]] = []
+        reverse_index_keys: list[bytes | str] = []
+        repair_members: set[bytes] = set()
+        for key in self._redis.scan_iter(
+            match="dt:resource:*",
+            count=_CORRUPT_PIN_SCAN_COUNT,
+        ):
+            pin_suffix = _task_pin_key_suffix(key)
+            if pin_suffix is not None:
+                task_id = _valid_task_id_from_index_member(pin_suffix)
+                if task_id is None:
+                    reconciled += int(bool(self._redis.delete(key)))
+                    if len(pin_suffix) <= _MAX_REVERSE_TASK_ID_BYTES:
+                        repair_members.add(pin_suffix)
+                    continue
+                pin_keys.append((key, task_id))
+                continue
+            if _is_asset_tasks_key(key) or _is_session_task_pins_key(key):
+                reverse_index_keys.append(key)
+
+        for key, task_id in pin_keys:
             if self._enqueue_intent_exists(task_id):
                 continue
             task = self.get_task(task_id)
@@ -3006,6 +3075,7 @@ class RedisTaskManager:
                     continue
                 if task_id in started_ids:
                     continue
+            repair_pin = task is None
             if coordinator is not None:
                 try:
                     coordinator.release_task_resources(
@@ -3013,17 +3083,66 @@ class RedisTaskManager:
                         expected_session_id=(
                             task.owner_id if task is not None else None
                         ),
+                        expected_asset_identities=(
+                            task.asset_identities
+                            if (
+                                task is not None
+                                and task.has_canonical_asset_identities
+                            )
+                            else None
+                        ),
                     )
                 except CorruptTaskPinError:
-                    self._repair_task_reverse_indexes(task_id)
-                else:
-                    if task is None:
-                        self._repair_task_reverse_indexes(task_id)
+                    repair_pin = True
             else:
-                self.release_task_pin(task_id)
+                metadata = self._redis.hgetall(key)
+                if (
+                    task is None
+                    or task.owner_id is None
+                    or not _task_pin_metadata_matches(
+                        metadata,
+                        task_id=task_id,
+                        session_id=task.owner_id,
+                        asset_identities=(
+                            task.asset_identities
+                            if task.has_canonical_asset_identities
+                            else None
+                        ),
+                    )
+                ):
+                    repair_pin = True
+                else:
+                    self.release_task_pin(task_id)
+            if repair_pin:
+                repair_members.add(task_id.encode("ascii"))
+                self._redis.delete(key)
             if not self._redis.exists(key):
                 reconciled += 1
+        self._reconcile_reverse_indexes(
+            reverse_index_keys,
+            repair_members,
+        )
         return reconciled
+
+    def _reconcile_reverse_indexes(
+        self,
+        keys: list[bytes | str],
+        repair_members: set[bytes],
+    ) -> None:
+        for key in keys:
+            for member in self._redis.smembers(key):
+                raw_member = (
+                    member.encode("utf-8")
+                    if isinstance(member, str)
+                    else member
+                )
+                task_id = _valid_task_id_from_index_member(raw_member)
+                if (
+                    raw_member in repair_members
+                    or task_id is None
+                    or not self._redis.exists(_task_pin_key(task_id))
+                ):
+                    self._remove_task_from_index(raw_member, key)
 
     def release_task_pin(self, task_id: str) -> bool:
         task = self.get_task(task_id)
@@ -3036,10 +3155,15 @@ class RedisTaskManager:
                 return False
             return self._repair_task_reverse_indexes(task_id)
         session_id = _redis_hash_text(metadata, "session_id")
-        if (
-            _redis_hash_text(metadata, "task_id") != task_id
-            or session_id is None
-            or _task_pin_asset_metadata_corrupt(metadata)
+        if session_id is None or not _task_pin_metadata_matches(
+            metadata,
+            task_id=task_id,
+            session_id=session_id,
+            asset_identities=(
+                task.asset_identities
+                if task.has_canonical_asset_identities
+                else None
+            ),
         ):
             return self._repair_task_reverse_indexes(task_id)
         try:
@@ -3061,6 +3185,8 @@ class RedisTaskManager:
                         session_id,
                         task_id,
                         _ASSET_TASK_PREFIX,
+                        _asset_identities_json(task.asset_identities),
+                        _asset_ids_json(task.asset_identities),
                     ],
                 )
             )
@@ -3077,9 +3203,16 @@ class RedisTaskManager:
                             result = 4
                             break
                         if (
-                            _redis_hash_text(metadata, "session_id") != session_id
-                            or _redis_hash_text(metadata, "task_id") != task_id
-                            or _task_pin_asset_metadata_corrupt(metadata)
+                            not _task_pin_metadata_matches(
+                                metadata,
+                                task_id=task_id,
+                                session_id=session_id,
+                                asset_identities=(
+                                    task.asset_identities
+                                    if task.has_canonical_asset_identities
+                                    else None
+                                ),
+                            )
                         ):
                             pipeline.unwatch()
                             result = 4
@@ -3141,7 +3274,7 @@ class RedisTaskManager:
 
     def _remove_task_from_index(
         self,
-        task_id: str,
+        task_id: bytes | str,
         key: bytes | str,
     ) -> None:
         while True:
@@ -3475,6 +3608,14 @@ class RedisTaskManager:
                     expected_session_id=(
                         task.owner_id if task is not None else None
                     ),
+                    expected_asset_identities=(
+                        task.asset_identities
+                        if (
+                            task is not None
+                            and task.has_canonical_asset_identities
+                        )
+                        else None
+                    ),
                 )
         self._redis.set(cleanup_key, "1", ex=self.retention_seconds)
         return True
@@ -3686,6 +3827,25 @@ def _asset_ids_json(
     return json.dumps(_asset_ids(asset_identities), separators=(",", ":"))
 
 
+def _task_pin_metadata_matches(
+    metadata: dict[bytes | str, bytes | str],
+    *,
+    task_id: str,
+    session_id: str,
+    asset_identities: tuple[AssetIdentity, ...] | None,
+) -> bool:
+    if asset_identities is None:
+        return False
+    return (
+        _redis_hash_text(metadata, "task_id") == task_id
+        and _redis_hash_text(metadata, "session_id") == session_id
+        and _redis_hash_text(metadata, "asset_identities")
+        == _asset_identities_json(asset_identities)
+        and _redis_hash_text(metadata, "asset_ids")
+        == _asset_ids_json(asset_identities)
+    )
+
+
 def _asset_read_pin_metadata_matches(
     metadata: dict[bytes | str, bytes | str],
     session_id: str,
@@ -3779,6 +3939,25 @@ def _validated_index_key_batches(
             batch = []
     if batch:
         yield batch
+
+
+def _task_pin_key_suffix(key: bytes | str) -> bytes | None:
+    raw_key = key.encode("utf-8") if isinstance(key, str) else key
+    prefix = _TASK_PIN_PREFIX.encode("ascii")
+    if not raw_key.startswith(prefix):
+        return None
+    return raw_key[len(prefix) :]
+
+
+def _valid_task_id_from_index_member(member: bytes | str) -> str | None:
+    raw_member = member.encode("utf-8") if isinstance(member, str) else member
+    if not raw_member or len(raw_member) > _MAX_REVERSE_TASK_ID_BYTES:
+        return None
+    try:
+        task_id = raw_member.decode("ascii")
+        return _validate_task_id(task_id)
+    except (UnicodeDecodeError, ValueError):
+        return None
 
 
 def _is_asset_tasks_key(key: bytes | str) -> bool:
@@ -3920,11 +4099,14 @@ def _encode_task(task: TaskRecord) -> str:
         "owner_id": task.owner_id,
         "result_path": task.result_path,
     }
+    if task.has_canonical_asset_identities:
+        data["asset_identities"] = task.asset_identities
     return json.dumps(data, separators=(",", ":"))
 
 
 def _decode_task(value: bytes | str) -> TaskRecord:
     data = json.loads(value)
+    has_canonical_asset_identities = "asset_identities" in data
     return TaskRecord(
         task_id=data["task_id"],
         kind=TaskKind(data["kind"]),
@@ -3945,4 +4127,9 @@ def _decode_task(value: bytes | str) -> TaskRecord:
         error=data["error"],
         owner_id=data["owner_id"],
         result_path=data["result_path"],
+        asset_identities=tuple(
+            (identity[0], identity[1])
+            for identity in data.get("asset_identities", ())
+        ),
+        has_canonical_asset_identities=has_canonical_asset_identities,
     )

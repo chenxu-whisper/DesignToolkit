@@ -517,6 +517,11 @@ def run_task(task_id: str, job_kind: str, payload: dict[str, object]) -> None:
         resources.release_task_pin(
             task_id,
             expected_session_id=task.owner_id,
+            expected_asset_identities=(
+                task.asset_identities
+                if task.has_canonical_asset_identities
+                else None
+            ),
         )
 
 

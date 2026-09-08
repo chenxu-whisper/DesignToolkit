@@ -6,6 +6,7 @@ Cluster support is intentionally out of scope.
 
 from __future__ import annotations
 
+import json
 import math
 import re
 from collections.abc import Callable
@@ -1623,6 +1624,10 @@ if redis.call("HGET", KEYS[1], "task_id") ~= ARGV[2] then
 end
 local identities_json = redis.call("HGET", KEYS[1], "asset_identities")
 local asset_ids_json = redis.call("HGET", KEYS[1], "asset_ids")
+if identities_json ~= ARGV[4]
+    or asset_ids_json ~= ARGV[5] then
+    return 4
+end
 if not identities_json and not asset_ids_json then
     return 4
 end
@@ -3085,6 +3090,9 @@ class RedisResourceCoordinator:
         task_id: str,
         *,
         expected_session_id: str | None = None,
+        expected_asset_identities: (
+            tuple[tuple[str, str | None], ...] | None
+        ) = None,
     ) -> None:
         metadata = self._redis.hgetall(_task_resource_key(task_id))
         session_id = _decoded_hash_value(metadata, "session_id")
@@ -3103,6 +3111,7 @@ class RedisResourceCoordinator:
         self.release_task_pin(
             task_id,
             expected_session_id=expected_session_id,
+            expected_asset_identities=expected_asset_identities,
         )
 
     def release_task_pin(
@@ -3110,6 +3119,9 @@ class RedisResourceCoordinator:
         task_id: str,
         *,
         expected_session_id: str | None = None,
+        expected_asset_identities: (
+            tuple[tuple[str, str | None], ...] | None
+        ) = None,
     ) -> bool:
         pin_key = _task_pin_key(task_id)
         metadata = self._redis.hgetall(pin_key)
@@ -3118,6 +3130,25 @@ class RedisResourceCoordinator:
         session_id = _decoded_hash_value(metadata, "session_id")
         if session_id is None or session_id != expected_session_id:
             raise CorruptTaskPinError("Task pin ownership is invalid")
+        if expected_asset_identities is None:
+            raise CorruptTaskPinError("Task pin asset metadata is invalid")
+        identities_json = json.dumps(
+            expected_asset_identities,
+            separators=(",", ":"),
+        )
+        asset_ids_json = json.dumps(
+            tuple(
+                asset_id
+                for asset_id, _generation_id in expected_asset_identities
+            ),
+            separators=(",", ":"),
+        )
+        if (
+            _decoded_hash_value(metadata, "asset_identities")
+            != identities_json
+            or _decoded_hash_value(metadata, "asset_ids") != asset_ids_json
+        ):
+            raise CorruptTaskPinError("Task pin asset metadata is invalid")
         result = int(
             self._release_task_pin_script(
                 keys=[
@@ -3128,6 +3159,8 @@ class RedisResourceCoordinator:
                     session_id,
                     task_id,
                     _ASSET_TASK_PREFIX,
+                    identities_json,
+                    asset_ids_json,
                 ],
             )
         )

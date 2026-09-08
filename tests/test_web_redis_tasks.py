@@ -103,8 +103,12 @@ class StubTaskResources:
         task_id: str,
         *,
         expected_session_id: str | None = None,
+        expected_asset_identities: (
+            tuple[tuple[str, str | None], ...] | None
+        ) = None,
     ) -> None:
         assert expected_session_id is not None
+        assert expected_asset_identities is not None
         self.released.append(task_id)
 
 
@@ -152,8 +156,12 @@ class TrackingTaskResources:
         task_id: str,
         *,
         expected_session_id: str | None = None,
+        expected_asset_identities: (
+            tuple[tuple[str, str | None], ...] | None
+        ) = None,
     ) -> None:
         assert expected_session_id is not None
+        assert expected_asset_identities is not None
         self.events.append(f"release-task:{task_id}")
 
     def release_task_pin(
@@ -161,8 +169,12 @@ class TrackingTaskResources:
         _task_id: str,
         *,
         expected_session_id: str | None = None,
+        expected_asset_identities: (
+            tuple[tuple[str, str | None], ...] | None
+        ) = None,
     ) -> None:
         assert expected_session_id is not None
+        assert expected_asset_identities is not None
 
 
 def _manager(
@@ -286,6 +298,31 @@ def test_redis_manager_enqueues_and_isolates_task_records(tmp_path: Path) -> Non
     job = manager.queue.fetch_job(task.task_id)
     assert job is not None
     assert job.func_name == "designtoolkit.web.worker.run_task"
+
+
+def test_real_redis_task_record_persists_internal_asset_identities(
+    real_redis_connection: Redis,
+    tmp_path: Path,
+) -> None:
+    manager = _manager(real_redis_connection, tmp_path)
+    identities = (("1" * 32, "2" * 32),)
+
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+        owner_id="a" * 32,
+        asset_identities=identities,
+    )
+
+    stored = json.loads(
+        real_redis_connection.get(f"dt:task:{task.task_id}")
+    )
+    assert task.asset_identities == identities
+    assert stored["asset_identities"] == [
+        list(identity) for identity in identities
+    ]
+    response = task.to_response().model_dump()
+    assert "asset_identities" not in response
+    assert "has_canonical_asset_identities" not in response
 
 
 def test_rq_job_timeout_is_independent_from_artifact_retention(
@@ -849,6 +886,85 @@ def test_real_redis_task_pin_release_repairs_untrusted_metadata(
     )
 
 
+@pytest.mark.parametrize(
+    "corruption",
+    ["self-consistent-empty", "self-consistent-wrong"],
+)
+@pytest.mark.parametrize(
+    "release_via_reconcile",
+    [False, True],
+    ids=["release", "reconcile"],
+)
+def test_real_redis_task_pin_uses_canonical_asset_identities(
+    real_redis_connection: Redis,
+    tmp_path: Path,
+    corruption: str,
+    release_via_reconcile: bool,
+) -> None:
+    manager = _manager(
+        real_redis_connection,
+        tmp_path,
+        resource_coordinator=_resources(real_redis_connection),
+    )
+    session_id = "a" * 32
+    shared_asset_id = "1" * 32
+    exclusive_asset_id = "2" * 32
+    wrong_asset_id = "3" * 32
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_paths=[str(tmp_path / "clip.mp4")] * 2),
+        owner_id=session_id,
+        asset_identities=(
+            (shared_asset_id, "4" * 32),
+            (exclusive_asset_id, "5" * 32),
+        ),
+    )
+    other_task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "other.mp4")),
+        owner_id=session_id,
+        asset_identities=((shared_asset_id, "6" * 32),),
+    )
+    pin_key = f"dt:resource:task-pin:{task.task_id}"
+    corrupted_identities = (
+        []
+        if corruption == "self-consistent-empty"
+        else [[wrong_asset_id, "7" * 32]]
+    )
+    real_redis_connection.hset(
+        pin_key,
+        mapping={
+            "asset_ids": json.dumps(
+                [identity[0] for identity in corrupted_identities]
+            ),
+            "asset_identities": json.dumps(corrupted_identities),
+        },
+    )
+    if corrupted_identities:
+        real_redis_connection.sadd(
+            f"dt:resource:asset-tasks:{session_id}:{wrong_asset_id}",
+            task.task_id,
+        )
+    if release_via_reconcile:
+        task.status = TaskStatus.SUCCEEDED
+        manager._save_task(task)
+        assert manager.reconcile_tasks(grace_seconds=60) >= 1
+    else:
+        assert manager.release_task_pin(task.task_id)
+
+    assert not real_redis_connection.exists(pin_key)
+    assert real_redis_connection.smembers(
+        f"dt:resource:session:{session_id}:task-pins"
+    ) == {other_task.task_id.encode()}
+    assert real_redis_connection.smembers(
+        f"dt:resource:asset-tasks:{session_id}:{shared_asset_id}"
+    ) == {other_task.task_id.encode()}
+    assert not real_redis_connection.exists(
+        f"dt:resource:asset-tasks:{session_id}:{exclusive_asset_id}"
+    )
+    assert not real_redis_connection.exists(
+        f"dt:resource:asset-tasks:{session_id}:{wrong_asset_id}"
+    )
+
+
 def test_real_redis_coordinator_rejects_task_pin_from_unexpected_session(
     real_redis_connection: Redis,
     tmp_path: Path,
@@ -868,6 +984,7 @@ def test_real_redis_coordinator_rejects_task_pin_from_unexpected_session(
         resources.release_task_pin(
             task.task_id,
             expected_session_id=session_id,
+            expected_asset_identities=task.asset_identities,
         )
 
     assert real_redis_connection.exists(pin_key)
@@ -1129,19 +1246,24 @@ def test_real_redis_corrupt_task_pin_repair_is_idempotent_after_ack_loss(
 
 
 @pytest.mark.parametrize("use_lua", [True, False], ids=["lua", "fallback"])
+@pytest.mark.parametrize(
+    "asset_identities",
+    [(), (("1" * 32, "2" * 32),)],
+    ids=["empty", "with-asset"],
+)
 def test_real_redis_task_pin_normal_release_does_not_scan(
     real_redis_connection: Redis,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     use_lua: bool,
+    asset_identities: tuple[tuple[str, str], ...],
 ) -> None:
     manager = _manager(real_redis_connection, tmp_path)
     session_id = "a" * 32
-    asset_id = "1" * 32
     task = manager.create_video_frames_task(
         VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
         owner_id=session_id,
-        asset_identities=((asset_id, "2" * 32),),
+        asset_identities=asset_identities,
     )
     if not use_lua:
         monkeypatch.setattr(
@@ -1167,6 +1289,8 @@ def test_real_redis_task_pin_normal_release_does_not_scan(
         "asset-missing",
         "asset-divergent",
         "asset-malformed",
+        "asset-self-consistent-empty",
+        "asset-self-consistent-wrong",
         "pin-missing",
         "task-mismatch",
         "session-mismatch",
@@ -1236,6 +1360,24 @@ def test_real_redis_enqueue_rollback_repairs_corrupt_task_pin_indexes(
             )
         elif corruption == "asset-malformed":
             real_redis_connection.hset(pin_key, "asset_identities", "{")
+        elif corruption == "asset-self-consistent-empty":
+            real_redis_connection.hset(
+                pin_key,
+                mapping={
+                    "asset_ids": "[]",
+                    "asset_identities": "[]",
+                },
+            )
+        elif corruption == "asset-self-consistent-wrong":
+            real_redis_connection.hset(
+                pin_key,
+                mapping={
+                    "asset_ids": json.dumps([orphan_asset_id]),
+                    "asset_identities": json.dumps(
+                        [[orphan_asset_id, "7" * 32]]
+                    ),
+                },
+            )
         elif corruption == "pin-missing":
             real_redis_connection.delete(pin_key)
         elif corruption == "task-mismatch":
@@ -1466,7 +1608,7 @@ def test_real_redis_enqueue_rollback_repairs_corrupt_pin_after_ack_loss(
     manager.release_asset_deletion(session_id, asset_id, claim)
 
 
-def test_task_pin_release_conservatively_migrates_legacy_asset_id_metadata(
+def test_task_pin_release_repairs_legacy_task_without_canonical_identities(
     tmp_path: Path,
 ) -> None:
     redis_connection = fakeredis.FakeRedis(decode_responses=False)
@@ -1478,12 +1620,22 @@ def test_task_pin_release_conservatively_migrates_legacy_asset_id_metadata(
         owner_id=session_id,
         asset_ids=(asset_id,),
     )
-    redis_connection.hdel(
-        f"dt:resource:task-pin:{task.task_id}",
-        "asset_identities",
+    task_data = json.loads(redis_connection.get(f"dt:task:{task.task_id}"))
+    task_data.pop("asset_identities", None)
+    redis_connection.set(
+        f"dt:task:{task.task_id}",
+        json.dumps(task_data),
+    )
+    orphan_asset_id = "2" * 32
+    redis_connection.sadd(
+        f"dt:resource:asset-tasks:{session_id}:{orphan_asset_id}",
+        task.task_id,
     )
 
     assert manager.release_task_pin(task.task_id)
+    assert not redis_connection.exists(
+        f"dt:resource:asset-tasks:{session_id}:{orphan_asset_id}"
+    )
     claim = manager.claim_asset_deletion(session_id, asset_id)
     manager.release_asset_deletion(session_id, asset_id, claim)
 
@@ -1805,6 +1957,107 @@ def test_real_redis_reconcile_repairs_valid_pin_with_wrong_owner_identity(
     }
 
 
+def test_real_redis_reconcile_removes_malformed_pins_and_reverse_orphans(
+    real_redis_connection: Redis,
+    tmp_path: Path,
+) -> None:
+    manager = _manager(real_redis_connection, tmp_path)
+    session_id = "a" * 32
+    asset_id = "1" * 32
+    active = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "active.mp4")),
+        owner_id=session_id,
+        asset_identities=((asset_id, "2" * 32),),
+    )
+    terminal = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "terminal.mp4")),
+        owner_id=session_id,
+        asset_identities=((asset_id, "3" * 32),),
+    )
+    terminal.status = TaskStatus.SUCCEEDED
+    manager._save_task(terminal)
+    no_pin_terminal = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "no-pin.mp4")),
+        owner_id=session_id,
+        asset_identities=((asset_id, "4" * 32),),
+    )
+    no_pin_terminal.status = TaskStatus.SUCCEEDED
+    manager._save_task(no_pin_terminal)
+    real_redis_connection.delete(
+        f"dt:resource:task-pin:{no_pin_terminal.task_id}"
+    )
+    malformed_task_id = "not-a-task"
+    missing_task_id = "ffffffff-ffff-4fff-bfff-ffffffffffff"
+    oversized_task_id = "x" * 129
+    binary_task_id = b"\xff"
+    malformed_pin_key = f"dt:resource:task-pin:{malformed_task_id}"
+    oversized_pin_key = f"dt:resource:task-pin:{oversized_task_id}"
+    binary_pin_key = b"dt:resource:task-pin:" + binary_task_id
+    unrelated_key = f"dt:resource:not-task-pin:{malformed_task_id}"
+    session_pins_key = f"dt:resource:session:{session_id}:task-pins"
+    asset_tasks_key = f"dt:resource:asset-tasks:{session_id}:{asset_id}"
+    real_redis_connection.hset(
+        malformed_pin_key,
+        mapping={"task_id": malformed_task_id, "session_id": session_id},
+    )
+    real_redis_connection.hset(oversized_pin_key, "task_id", oversized_task_id)
+    real_redis_connection.hset(binary_pin_key, b"task_id", binary_task_id)
+    real_redis_connection.set(unrelated_key, "preserve")
+    real_redis_connection.sadd(
+        session_pins_key,
+        malformed_task_id,
+        missing_task_id,
+        oversized_task_id,
+        binary_task_id,
+    )
+    real_redis_connection.sadd(
+        asset_tasks_key,
+        malformed_task_id,
+        missing_task_id,
+        oversized_task_id,
+        binary_task_id,
+    )
+
+    assert manager.reconcile_tasks(grace_seconds=60) >= 4
+    assert manager.reconcile_tasks(grace_seconds=60) == 0
+
+    assert not real_redis_connection.exists(malformed_pin_key)
+    assert not real_redis_connection.exists(oversized_pin_key)
+    assert not real_redis_connection.exists(binary_pin_key)
+    assert real_redis_connection.get(unrelated_key) == b"preserve"
+    assert not real_redis_connection.exists(
+        f"dt:resource:task-pin:{terminal.task_id}"
+    )
+    assert real_redis_connection.smembers(session_pins_key) == {
+        active.task_id.encode()
+    }
+    assert real_redis_connection.smembers(asset_tasks_key) == {
+        active.task_id.encode()
+    }
+
+
+def test_real_redis_reconcile_propagates_reverse_scan_transport_errors(
+    real_redis_connection: Redis,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(real_redis_connection, tmp_path)
+    scan_iter = real_redis_connection.scan_iter
+
+    def fail_resource_scan(*, match=None, **kwargs):
+        if match == "dt:resource:*":
+            raise RedisConnectionError("reverse index scan disconnected")
+        return scan_iter(match=match, **kwargs)
+
+    monkeypatch.setattr(real_redis_connection, "scan_iter", fail_resource_scan)
+
+    with pytest.raises(
+        RedisConnectionError,
+        match="reverse index scan disconnected",
+    ):
+        manager.reconcile_tasks(grace_seconds=60)
+
+
 def test_real_redis_reconcile_normal_coordinator_release_does_not_repair_scan(
     real_redis_connection: Redis,
     tmp_path: Path,
@@ -1864,8 +2117,12 @@ def test_real_redis_reconcile_does_not_treat_availability_errors_as_corruption(
         _task_id: str,
         *,
         expected_session_id: str | None = None,
+        expected_asset_identities: (
+            tuple[tuple[str, str | None], ...] | None
+        ) = None,
     ) -> None:
         assert expected_session_id == "a" * 32
+        assert expected_asset_identities == (("1" * 32, "2" * 32),)
         raise error
 
     monkeypatch.setattr(resources, "release_task_resources", fail_release)
@@ -4464,8 +4721,12 @@ def test_external_failure_discards_output_before_releasing_task_lease(
             _task_id: str,
             *,
             expected_session_id: str | None = None,
+            expected_asset_identities: (
+                tuple[tuple[str, str | None], ...] | None
+            ) = None,
         ) -> None:
             assert expected_session_id is not None
+            assert expected_asset_identities is not None
             events.append("release")
 
     manager = _manager(

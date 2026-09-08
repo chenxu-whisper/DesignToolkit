@@ -95,6 +95,8 @@ class TaskRecord:
     error: str | None
     owner_id: str | None = None
     result_path: str | None = None
+    asset_identities: tuple[tuple[str, str | None], ...] = ()
+    has_canonical_asset_identities: bool = False
 
     def to_response(self) -> TaskResponse:
         return TaskResponse(
