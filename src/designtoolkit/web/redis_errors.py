@@ -6,6 +6,11 @@ STORAGE_UNAVAILABLE_CODE = "storage_unavailable"
 STORAGE_UNAVAILABLE_MESSAGE = "Redis storage is temporarily unavailable"
 STORAGE_UNAVAILABLE_STATUS = 503
 
+
+class EventCursorUnavailable(redis_exceptions.RedisError):
+    """Raised when an event cursor cannot be read from consistent metadata."""
+
+
 _UNAVAILABLE_ERROR_NAMES = (
     "BusyLoadingError",
     "ClusterDownError",
@@ -39,6 +44,8 @@ _UNAVAILABLE_RESPONSE_PREFIXES = (
 
 
 def is_redis_unavailable(exc: BaseException) -> bool:
+    if isinstance(exc, EventCursorUnavailable):
+        return True
     if isinstance(exc, _UNAVAILABLE_ERROR_TYPES):
         return True
     if not isinstance(exc, redis_exceptions.ResponseError):

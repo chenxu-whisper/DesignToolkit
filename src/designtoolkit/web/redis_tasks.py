@@ -34,6 +34,7 @@ from designtoolkit.web.heartbeat import (
     HeartbeatStopTimeoutError,
     stop_heartbeat_thread,
 )
+from designtoolkit.web.redis_errors import EventCursorUnavailable
 from designtoolkit.web.resources import (
     _ASSET_TASK_PREFIX,
     _CLEANUP_PREFIX,
@@ -151,63 +152,39 @@ end
 return {generation, history, tostring(event_count + 1)}
 """
 _READ_EVENT_AT_CURSOR_SCRIPT = """-- read_task_event_at_cursor
-if redis.call("EXISTS", KEYS[1]) == 0 then
-    return {"", false, ARGV[2]}
-end
-
 local expected_generation = ARGV[1]
 local expected_sequence = tonumber(ARGV[2])
 local generation = redis.call("GET", KEYS[2])
-local repair_ttl = false
+local indexed_sequence_value = redis.call("HGET", KEYS[3], "next_sequence")
+local indexed_sequence = tonumber(indexed_sequence_value)
+
 if not generation then
-    generation = ARGV[3]
-    redis.call("SET", KEYS[2], generation)
-    repair_ttl = true
+    if expected_generation ~= "" or indexed_sequence_value then
+        return {"unavailable", "", false, ARGV[2]}
+    end
+    return {"empty", "", false, ARGV[2]}
 end
-if generation ~= expected_generation then
-    expected_sequence = 1
+if expected_generation ~= "" and generation ~= expected_generation then
+    return {"unavailable", generation, false, ARGV[2]}
+end
+if not indexed_sequence or not expected_sequence
+    or indexed_sequence < 0 or expected_sequence < 1
+    or expected_sequence > indexed_sequence + 1 then
+    return {"unavailable", generation, false, ARGV[2]}
 end
 
-local event_count = redis.call("LLEN", KEYS[1])
-local indexed_sequence = tonumber(
-    redis.call("HGET", KEYS[3], "next_sequence")
-)
 local event = false
-local index_consistent = indexed_sequence == event_count
-    and redis.call("HLEN", KEYS[3]) == event_count + 1
-if index_consistent then
+if expected_sequence <= indexed_sequence then
     event = redis.call("HGET", KEYS[3], tostring(expected_sequence))
-    if not event and expected_sequence <= event_count then
-        index_consistent = false
-    end
-end
-if not index_consistent then
-    local history = redis.call("LRANGE", KEYS[1], 0, -1)
-    redis.call("DEL", KEYS[3])
-    redis.call("HSET", KEYS[3], "next_sequence", event_count)
-    for sequence, event in ipairs(history) do
-        redis.call("HSET", KEYS[3], tostring(sequence), event)
-    end
-    repair_ttl = true
-    event = redis.call("HGET", KEYS[3], tostring(expected_sequence))
-end
-if repair_ttl then
-    local ttl_ms = redis.call("PTTL", KEYS[1])
-    if ttl_ms > 0 then
-        redis.call("PEXPIRE", KEYS[1], ttl_ms)
-        redis.call("PEXPIRE", KEYS[2], ttl_ms)
-        redis.call("PEXPIRE", KEYS[3], ttl_ms)
-    else
-        redis.call("EXPIRE", KEYS[1], ARGV[4])
-        redis.call("EXPIRE", KEYS[2], ARGV[4])
-        redis.call("EXPIRE", KEYS[3], ARGV[4])
+    if not event then
+        return {"unavailable", generation, false, ARGV[2]}
     end
 end
 
 if not event then
-    return {generation, false, tostring(expected_sequence)}
+    return {"ok", generation, false, tostring(expected_sequence)}
 end
-return {generation, event, tostring(expected_sequence + 1)}
+return {"ok", generation, event, tostring(expected_sequence + 1)}
 """
 _RESERVE_ENQUEUE_SCRIPT = """-- reserve_enqueue_intent
 local queue_key = KEYS[1]
@@ -825,7 +802,7 @@ class RedisLogStore:
         expected_sequence: int,
     ) -> tuple[str | None, LogEventResponse | None, int]:
         try:
-            generation, value, next_sequence = (
+            status, generation, value, next_sequence = (
                 self._read_event_at_cursor_script(
                     keys=[
                         _event_key(task_id),
@@ -835,20 +812,22 @@ class RedisLogStore:
                     args=[
                         expected_generation or "",
                         expected_sequence,
-                        uuid4().hex,
-                        self._retention_seconds,
                     ],
                 )
             )
         except ResponseError as error_response:
             if "unknown command" not in str(error_response).lower():
                 raise
-            generation, value, next_sequence = (
+            status, generation, value, next_sequence = (
                 self._event_at_cursor_without_lua(
                     task_id,
                     expected_generation,
                     expected_sequence,
                 )
+            )
+        if _redis_text(status) == "unavailable":
+            raise EventCursorUnavailable(
+                "Task event cursor state is unavailable"
             )
         generation_text = _redis_text(generation) or None
         event = (
@@ -921,11 +900,10 @@ class RedisLogStore:
         task_id: str,
         expected_generation: str | None,
         expected_sequence: int,
-    ) -> tuple[bytes | str | None, bytes | str | None, int]:
+    ) -> tuple[str, bytes | str | None, bytes | str | None, int]:
         event_key = _event_key(task_id)
         generation_key = _event_generation_key(task_id)
         event_index_key = _event_index_key(task_id)
-        candidate = uuid4().hex
         while True:
             with self._redis.pipeline() as pipeline:
                 try:
@@ -934,90 +912,76 @@ class RedisLogStore:
                         generation_key,
                         event_index_key,
                     )
-                    if not pipeline.exists(event_key):
-                        pipeline.unwatch()
-                        return None, None, expected_sequence
                     generation = pipeline.get(generation_key)
-                    generation_was_missing = generation is None
-                    event_count = int(pipeline.llen(event_key))
-                    indexed_sequence = pipeline.hget(
+                    indexed_sequence_value = pipeline.hget(
                         event_index_key,
                         "next_sequence",
                     )
-                    index_is_consistent = _event_index_is_consistent(
-                        indexed_sequence,
-                        int(pipeline.hlen(event_index_key)),
-                        event_count,
-                    )
                     if generation is None:
-                        generation = candidate
+                        pipeline.unwatch()
+                        status = (
+                            "unavailable"
+                            if expected_generation is not None
+                            or indexed_sequence_value is not None
+                            else "empty"
+                        )
+                        return status, None, None, expected_sequence
                     generation_text = _redis_text(generation)
-                    read_sequence = (
-                        1
-                        if generation_text != (expected_generation or "")
-                        else expected_sequence
-                    )
+                    if (
+                        expected_generation is not None
+                        and generation_text != expected_generation
+                    ):
+                        pipeline.unwatch()
+                        return (
+                            "unavailable",
+                            generation,
+                            None,
+                            expected_sequence,
+                        )
+                    try:
+                        indexed_sequence = int(indexed_sequence_value)
+                    except (TypeError, ValueError):
+                        pipeline.unwatch()
+                        return (
+                            "unavailable",
+                            generation,
+                            None,
+                            expected_sequence,
+                        )
+                    if (
+                        indexed_sequence < 0
+                        or expected_sequence < 1
+                        or expected_sequence > indexed_sequence + 1
+                    ):
+                        pipeline.unwatch()
+                        return (
+                            "unavailable",
+                            generation,
+                            None,
+                            expected_sequence,
+                        )
                     indexed_event = (
-                        pipeline.hget(event_index_key, str(read_sequence))
-                        if index_is_consistent
+                        pipeline.hget(event_index_key, str(expected_sequence))
+                        if expected_sequence <= indexed_sequence
                         else None
                     )
                     if (
                         indexed_event is None
-                        and read_sequence <= event_count
+                        and expected_sequence <= indexed_sequence
                     ):
-                        index_is_consistent = False
-                    history = (
-                        pipeline.lrange(event_key, 0, -1)
-                        if not index_is_consistent
-                        else None
-                    )
-                    ttl_ms = pipeline.pttl(event_key)
-                    pipeline.multi()
-                    if generation_was_missing:
-                        pipeline.set(generation_key, generation)
-                    if history is not None:
-                        pipeline.delete(event_index_key)
-                        pipeline.hset(
-                            event_index_key,
-                            mapping={
-                                "next_sequence": event_count,
-                                **{
-                                    str(sequence): value
-                                    for sequence, value in enumerate(
-                                        history,
-                                        start=1,
-                                    )
-                                },
-                            },
+                        pipeline.unwatch()
+                        return (
+                            "unavailable",
+                            generation,
+                            None,
+                            expected_sequence,
                         )
-                    if history is not None or generation_was_missing:
-                        if ttl_ms > 0:
-                            for key in (
-                                event_key,
-                                generation_key,
-                                event_index_key,
-                            ):
-                                pipeline.pexpire(key, ttl_ms)
-                        else:
-                            for key in (
-                                event_key,
-                                generation_key,
-                                event_index_key,
-                            ):
-                                pipeline.expire(
-                                    key,
-                                    self._retention_seconds,
-                                )
-                    if history is None:
-                        pipeline.exists(event_key)
-                        pipeline.execute()
-                        value = indexed_event
-                    else:
-                        pipeline.hget(event_index_key, str(read_sequence))
-                        value = pipeline.execute()[-1]
-                    next_sequence = read_sequence + (value is not None)
-                    return generation, value, next_sequence
+                    pipeline.multi()
+                    pipeline.execute()
+                    next_sequence = expected_sequence + (
+                        indexed_event is not None
+                    )
+                    return "ok", generation, indexed_event, next_sequence
                 except WatchError:
                     continue
 

@@ -2838,6 +2838,51 @@ def test_hosted_event_stream_emits_error_and_closes_on_midstream_redis_outage(
     unsubscribe.assert_called_once()
 
 
+def test_hosted_event_stream_reports_unavailable_cursor_without_hanging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = RedisTaskManager(
+        redis_connection=redis_connection,
+        queue=Queue("designtoolkit", connection=redis_connection),
+        data_dir=tmp_path,
+        max_queued_tasks=20,
+        retention_seconds=7200,
+    )
+    original_subscribe = manager.log_store.history_and_subscribe
+
+    def subscribe_then_drop_index(task_id: str):
+        history, subscriber = original_subscribe(task_id)
+        redis_connection.delete(f"dt:task:{task_id}:event-index")
+        return history, subscriber
+
+    monkeypatch.setattr(
+        manager.log_store,
+        "history_and_subscribe",
+        subscribe_then_drop_index,
+    )
+    with _client(
+        tmp_path,
+        task_manager=manager,
+        raise_server_exceptions=False,
+    ) as client:
+        reference = _upload(client, "clip.mp4", b"video").json()["reference"]
+        task_id = client.post(
+            "/api/tasks/video-frames",
+            json={"input_path": reference, "image_format": "png"},
+        ).json()["task_id"]
+
+        response = client.get(f"/api/tasks/{task_id}/events")
+
+    assert response.status_code == 200
+    assert response.text.endswith(
+        "event: error\n"
+        'data: {"error":{"code":"storage_unavailable",'
+        '"message":"Task event storage is temporarily unavailable"}}\n\n'
+    )
+
+
 def test_rate_limit_unknown_failure_is_not_suppressed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

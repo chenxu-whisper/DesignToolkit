@@ -27,6 +27,7 @@ from designtoolkit.media_resize import (
 )
 from designtoolkit.video_frames import ExportResult
 from designtoolkit.web import cleanup as cleanup_module
+from designtoolkit.web import redis_errors as redis_errors_module
 from designtoolkit.web import redis_tasks as redis_tasks_module
 from designtoolkit.web import worker as worker_module
 from designtoolkit.web.adapters import (
@@ -2142,7 +2143,7 @@ def test_redis_fallback_resets_inconsistent_event_index_counter(
     assert store.history(task_id) == [first, second]
 
 
-def test_redis_subscriber_fallback_adopts_generation_and_resets_once() -> None:
+def test_redis_subscriber_rejects_missing_generation() -> None:
     redis_connection = fakeredis.FakeRedis(decode_responses=False)
     store = RedisLogStore(redis_connection, retention_seconds=60)
     task_id = "legacy-live-events"
@@ -2157,15 +2158,14 @@ def test_redis_subscriber_fallback_adopts_generation_and_resets_once() -> None:
     redis_connection.delete(generation_key)
 
     assert [event.message for event in history] == ["queued"]
-    assert subscriber.get(timeout=0.2).message == "queued"
-    with pytest.raises(Empty):
-        subscriber.get(timeout=0.05)
-    event_ttl = redis_connection.pttl(f"dt:task:{task_id}:events")
-    generation_ttl = redis_connection.pttl(generation_key)
-    assert abs(event_ttl - generation_ttl) < 100
+    with pytest.raises(RedisError, match="cursor state") as error:
+        subscriber.get(timeout=0.2)
+    assert type(error.value).__name__ == "EventCursorUnavailable"
+    assert redis_errors_module.is_redis_unavailable(error.value)
+    assert not redis_connection.exists(generation_key)
 
 
-def test_redis_subscriber_fallback_resets_cursor_after_log_recreation() -> None:
+def test_redis_subscriber_rejects_event_log_recreation() -> None:
     redis_connection = fakeredis.FakeRedis(decode_responses=False)
     store = RedisLogStore(redis_connection, retention_seconds=60)
     task_id = "recreated-events"
@@ -2187,9 +2187,9 @@ def test_redis_subscriber_fallback_resets_cursor_after_log_recreation() -> None:
         message="new terminal",
     )
 
-    assert subscriber.get(timeout=0.2).message == "new terminal"
-    with pytest.raises(Empty):
-        subscriber.get(timeout=0.05)
+    with pytest.raises(RedisError, match="cursor state") as error:
+        subscriber.get(timeout=0.2)
+    assert type(error.value).__name__ == "EventCursorUnavailable"
 
 
 def test_redis_event_cursor_uses_lua_result_and_propagates_redis_errors() -> None:
@@ -2207,7 +2207,7 @@ def test_redis_event_cursor_uses_lua_result_and_propagates_redis_errors() -> Non
 
     def read_script(*, keys: list[str], args: list[object]):
         calls.append((keys, args))
-        return ["generation-b", event.model_dump_json(), "1"]
+        return ["ok", "generation-b", event.model_dump_json(), "1"]
 
     store._read_event_at_cursor_script = read_script
 
@@ -2253,7 +2253,7 @@ def test_redis_subscriber_rejects_malformed_event_like_history() -> None:
         subscriber.get(timeout=0.2)
 
 
-def test_real_redis_subscriber_recovers_after_event_log_expiry(
+def test_real_redis_subscriber_rejects_event_log_generation_after_expiry(
     real_redis_connection: Redis,
     tmp_path: Path,
 ) -> None:
@@ -2313,13 +2313,13 @@ def test_real_redis_subscriber_recovers_after_event_log_expiry(
         terminal_event=terminal_event,
     )
 
-    terminal = subscriber.get(timeout=0.5)
-    assert terminal.phase is LogPhase.FAILED
-    assert terminal.message == "worker timed out"
+    with pytest.raises(RedisError, match="cursor state") as error:
+        subscriber.get(timeout=0.5)
+    assert type(error.value).__name__ == "EventCursorUnavailable"
     assert manager.get_task(task.task_id).status is TaskStatus.FAILED
 
 
-def test_real_redis_subscriber_adopts_missing_generation_and_resets_once(
+def test_real_redis_subscriber_rejects_missing_generation(
     real_redis_connection: Redis,
 ) -> None:
     store = RedisLogStore(real_redis_connection, retention_seconds=60)
@@ -2335,23 +2335,13 @@ def test_real_redis_subscriber_adopts_missing_generation_and_resets_once(
     real_redis_connection.delete(generation_key)
 
     assert [event.message for event in history] == ["queued"]
-    assert subscriber.get(timeout=0.2).message == "queued"
-    with pytest.raises(Empty):
-        subscriber.get(timeout=0.05)
-
-    event_ttl = real_redis_connection.pttl(f"dt:task:{task_id}:events")
-    generation_ttl = real_redis_connection.pttl(generation_key)
-    assert abs(event_ttl - generation_ttl) < 100
-    store.append(
-        task_id=task_id,
-        level=LogLevel.ERROR,
-        phase=LogPhase.FAILED,
-        message="worker failed",
-    )
-    assert subscriber.get(timeout=0.2).message == "worker failed"
+    with pytest.raises(RedisError, match="cursor state") as error:
+        subscriber.get(timeout=0.2)
+    assert type(error.value).__name__ == "EventCursorUnavailable"
+    assert not real_redis_connection.exists(generation_key)
 
 
-def test_real_redis_event_cursor_resets_to_new_generation(
+def test_real_redis_event_cursor_rejects_new_generation(
     real_redis_connection: Redis,
 ) -> None:
     store = RedisLogStore(real_redis_connection, retention_seconds=60)
@@ -2377,9 +2367,9 @@ def test_real_redis_event_cursor_resets_to_new_generation(
         message="new terminal",
     )
 
-    assert subscriber.get(timeout=0.2).message == "new terminal"
-    with pytest.raises(Empty):
-        subscriber.get(timeout=0.05)
+    with pytest.raises(RedisError, match="cursor state") as error:
+        subscriber.get(timeout=0.2)
+    assert type(error.value).__name__ == "EventCursorUnavailable"
 
 
 def test_real_redis_subscriber_does_not_repeat_events_without_generation_change(
@@ -2470,8 +2460,21 @@ def test_real_redis_history_backfills_legacy_event_index(
     real_redis_connection.set(generation_key, "legacy-generation")
     real_redis_connection.expire(event_key, 60)
     real_redis_connection.expire(generation_key, 60)
+    commandstats_before = real_redis_connection.info("commandstats")
 
-    assert store.history(task_id) == events
+    history, subscriber = store.history_and_subscribe(task_id)
+    assert history == events
+    commandstats_after_snapshot = real_redis_connection.info("commandstats")
+    lrange_before = commandstats_before.get("cmdstat_lrange", {})
+    lrange_after_snapshot = commandstats_after_snapshot.get(
+        "cmdstat_lrange",
+        {},
+    )
+    assert isinstance(lrange_before, dict)
+    assert isinstance(lrange_after_snapshot, dict)
+    assert int(lrange_after_snapshot.get("calls", 0)) == (
+        int(lrange_before.get("calls", 0)) + 1
+    )
 
     assert real_redis_connection.hgetall(event_index_key) == {
         b"next_sequence": b"2",
@@ -2483,10 +2486,25 @@ def test_real_redis_history_backfills_legacy_event_index(
     generation_ttl = real_redis_connection.pttl(generation_key)
     assert abs(event_ttl - event_index_ttl) < 100
     assert abs(event_ttl - generation_ttl) < 100
+    commandstats_before_poll = real_redis_connection.info("commandstats")
+
+    with pytest.raises(Empty):
+        subscriber.get(timeout=0.05)
+
+    commandstats_after = real_redis_connection.info("commandstats")
+    for command in ("lindex", "lrange"):
+        before = commandstats_before_poll.get(f"cmdstat_{command}", {})
+        after = commandstats_after.get(f"cmdstat_{command}", {})
+        assert isinstance(before, dict)
+        assert isinstance(after, dict)
+        assert int(after.get("calls", 0)) == int(before.get("calls", 0))
 
 
-def test_real_redis_poll_backfills_legacy_event_index(
+@pytest.mark.parametrize("use_lua", [True, False])
+def test_real_redis_poll_rejects_missing_index_without_list_reads(
     real_redis_connection: Redis,
+    monkeypatch: pytest.MonkeyPatch,
+    use_lua: bool,
 ) -> None:
     store = RedisLogStore(real_redis_connection, retention_seconds=60)
     task_id = "legacy-poll-events"
@@ -2511,12 +2529,37 @@ def test_real_redis_poll_backfills_legacy_event_index(
         "legacy-generation",
         1,
     )
+    if not use_lua:
+        def unknown_command(**_kwargs):
+            raise ResponseError("unknown command 'evalsha'")
 
-    assert subscriber.get(timeout=0.2) == event
-    assert real_redis_connection.hgetall(event_index_key) == {
-        b"next_sequence": b"1",
-        b"1": event.model_dump_json().encode(),
-    }
+        monkeypatch.setattr(
+            store,
+            "_read_event_at_cursor_script",
+            unknown_command,
+        )
+    commandstats_before = real_redis_connection.info("commandstats")
+
+    with pytest.raises(RedisError, match="cursor state") as error:
+        subscriber.get(timeout=0.2)
+
+    commandstats_after = real_redis_connection.info("commandstats")
+    assert type(error.value).__name__ == "EventCursorUnavailable"
+    assert not real_redis_connection.exists(event_index_key)
+    for command, expected_calls in (("get", 1), ("hget", 1)):
+        before = commandstats_before.get(f"cmdstat_{command}", {})
+        after = commandstats_after.get(f"cmdstat_{command}", {})
+        assert isinstance(before, dict)
+        assert isinstance(after, dict)
+        assert int(after.get("calls", 0)) == (
+            int(before.get("calls", 0)) + expected_calls
+        )
+    for command in ("lindex", "lrange"):
+        before = commandstats_before.get(f"cmdstat_{command}", {})
+        after = commandstats_after.get(f"cmdstat_{command}", {})
+        assert isinstance(before, dict)
+        assert isinstance(after, dict)
+        assert int(after.get("calls", 0)) == int(before.get("calls", 0))
 
 
 def test_real_redis_history_repairs_incorrect_index_payload(
@@ -2539,12 +2582,12 @@ def test_real_redis_history_repairs_incorrect_index_payload(
     )
 
 
-def test_real_redis_poll_repairs_missing_expected_sequence(
+def test_real_redis_poll_rejects_missing_expected_sequence(
     real_redis_connection: Redis,
 ) -> None:
     store = RedisLogStore(real_redis_connection, retention_seconds=60)
     task_id = "missing-poll-sequence"
-    expected = store.append(
+    store.append(
         task_id=task_id,
         level=LogLevel.INFO,
         phase=LogPhase.CREATED,
@@ -2563,10 +2606,12 @@ def test_real_redis_poll_repairs_missing_expected_sequence(
         1,
     )
 
-    assert subscriber.get(timeout=0.2) == expected
+    with pytest.raises(RedisError, match="cursor state") as error:
+        subscriber.get(timeout=0.2)
+    assert type(error.value).__name__ == "EventCursorUnavailable"
     assert real_redis_connection.hgetall(event_index_key) == {
         b"next_sequence": b"1",
-        b"1": expected.model_dump_json().encode(),
+        b"unexpected": b"value",
     }
 
 
@@ -2630,7 +2675,7 @@ def test_real_redis_append_resets_inconsistent_event_index_counter(
     assert store.history(task_id) == [first, second]
 
 
-def test_real_redis_slow_cursor_reads_hash_index(
+def test_real_redis_commandstats_spy_proves_large_cursor_read_is_constant(
     real_redis_connection: Redis,
 ) -> None:
     store = RedisLogStore(real_redis_connection, retention_seconds=60)
@@ -2674,14 +2719,15 @@ def test_real_redis_slow_cursor_reads_hash_index(
         commandstats_before,
         "hget",
     ) == 2
-    assert calls(commandstats_after, "lindex") == calls(
+    assert calls(commandstats_after, "get") - calls(
         commandstats_before,
-        "lindex",
-    )
-    assert calls(commandstats_after, "lrange") == calls(
-        commandstats_before,
-        "lrange",
-    )
+        "get",
+    ) == 1
+    for command in ("hlen", "lindex", "llen", "lrange"):
+        assert calls(commandstats_after, command) == calls(
+            commandstats_before,
+            command,
+        )
 
 
 def test_real_redis_concurrent_event_read_has_no_gaps_or_duplicates(
