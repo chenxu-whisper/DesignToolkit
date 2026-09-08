@@ -3007,6 +3007,57 @@ def test_hosted_task_accepts_previous_generation_manifest_legacy_reference(
     assert json.loads(task_pin[b"asset_identities"]) == [[asset_id, None]]
 
 
+@pytest.mark.parametrize("include_generation", [False, True])
+def test_hosted_task_rejects_explicit_v1_manifest_references(
+    tmp_path: Path,
+    include_generation: bool,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = RedisTaskManager(
+        redis_connection=redis_connection,
+        queue=Queue("designtoolkit", connection=redis_connection),
+        data_dir=tmp_path,
+        max_queued_tasks=20,
+        retention_seconds=7200,
+    )
+    asset_id = "1" * 32
+    generation_id = "2" * 32
+    with _client(tmp_path, task_manager=manager) as client:
+        assert client.get("/api/config").status_code == 200
+        session_id = client.cookies["dt_session"]
+        asset_dir = tmp_path / "sessions" / session_id / "assets" / asset_id
+        asset_dir.mkdir(parents=True)
+        (asset_dir / "previous.mp4").write_bytes(b"video")
+        (asset_dir / ".asset.json").write_text(
+            json.dumps(
+                {
+                    "asset_id": asset_id,
+                    "generation_id": generation_id,
+                    "bytes": 5,
+                    "reference_version": 1,
+                }
+            ),
+            encoding="utf-8",
+        )
+        reference = (
+            f"asset:{asset_id}:{generation_id}:previous.mp4"
+            if include_generation
+            else f"asset:{asset_id}:previous.mp4"
+        )
+
+        response = client.post(
+            "/api/tasks/video-frames",
+            json={"input_path": reference, "image_format": "png"},
+        )
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "asset_not_found"
+    assert manager.queue.count == 0
+    assert list(
+        redis_connection.scan_iter(match="dt:resource:task-pin:*")
+    ) == []
+
+
 def test_reused_upload_id_rejects_stale_generation_without_pin_or_task_leak(
     tmp_path: Path,
 ) -> None:

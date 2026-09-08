@@ -798,6 +798,233 @@ def test_real_redis_task_pin_release_preserves_divergent_metadata(
 
 
 @pytest.mark.parametrize("use_lua", [True, False], ids=["lua", "fallback"])
+@pytest.mark.parametrize(
+    "release_via_reconcile",
+    [False, True],
+    ids=["release", "reconcile"],
+)
+def test_real_redis_corrupt_task_pin_repairs_all_reverse_indexes(
+    real_redis_connection: Redis,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    use_lua: bool,
+    release_via_reconcile: bool,
+) -> None:
+    manager = _manager(
+        real_redis_connection,
+        tmp_path,
+        resource_coordinator=_resources(real_redis_connection),
+    )
+    session_id = "a" * 32
+    shared_asset_id = "1" * 32
+    exclusive_asset_id = "2" * 32
+    orphan_asset_id = "3" * 32
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_paths=[str(tmp_path / "clip.mp4")] * 2),
+        owner_id=session_id,
+        asset_identities=(
+            (shared_asset_id, "4" * 32),
+            (exclusive_asset_id, "5" * 32),
+        ),
+    )
+    other_task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "other.mp4")),
+        owner_id=session_id,
+        asset_identities=((shared_asset_id, "6" * 32),),
+    )
+    pin_key = f"dt:resource:task-pin:{task.task_id}"
+    session_pins_key = f"dt:resource:session:{session_id}:task-pins"
+    orphan_asset_tasks_key = (
+        f"dt:resource:asset-tasks:{session_id}:{orphan_asset_id}"
+    )
+    malformed_asset_tasks_key = (
+        f"dt:resource:asset-tasks:{session_id}:not-an-asset"
+    )
+    real_redis_connection.sadd(orphan_asset_tasks_key, task.task_id)
+    real_redis_connection.sadd(malformed_asset_tasks_key, task.task_id)
+    real_redis_connection.hdel(pin_key, "asset_ids", "asset_identities")
+    if not use_lua:
+        monkeypatch.setattr(
+            manager,
+            "_release_task_pin_script",
+            lambda **_kwargs: (_ for _ in ()).throw(
+                ResponseError("unknown command 'evalsha'")
+            ),
+        )
+    if release_via_reconcile:
+        task.status = TaskStatus.SUCCEEDED
+        manager._save_task(task)
+        assert manager._reconcile_stale_task_pins(set()) == 1
+    else:
+        assert manager.release_task_pin(task.task_id)
+
+    assert not real_redis_connection.exists(pin_key)
+    assert real_redis_connection.smembers(session_pins_key) == {
+        other_task.task_id.encode()
+    }
+    assert real_redis_connection.smembers(
+        f"dt:resource:asset-tasks:{session_id}:{shared_asset_id}"
+    ) == {other_task.task_id.encode()}
+    assert not real_redis_connection.exists(
+        f"dt:resource:asset-tasks:{session_id}:{exclusive_asset_id}"
+    )
+    assert not real_redis_connection.exists(orphan_asset_tasks_key)
+    assert real_redis_connection.smembers(malformed_asset_tasks_key) == {
+        task.task_id.encode()
+    }
+    for asset_id in (exclusive_asset_id, orphan_asset_id):
+        claim = manager.claim_asset_deletion(session_id, asset_id)
+        manager.release_asset_deletion(session_id, asset_id, claim)
+
+
+@pytest.mark.parametrize("use_lua", [True, False], ids=["lua", "fallback"])
+def test_real_redis_corrupt_task_pin_uses_task_owner_when_session_is_missing(
+    real_redis_connection: Redis,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    use_lua: bool,
+) -> None:
+    manager = _manager(real_redis_connection, tmp_path)
+    session_id = "a" * 32
+    asset_id = "1" * 32
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+        owner_id=session_id,
+        asset_identities=((asset_id, "2" * 32),),
+    )
+    pin_key = f"dt:resource:task-pin:{task.task_id}"
+    real_redis_connection.hdel(
+        pin_key,
+        "session_id",
+        "asset_ids",
+        "asset_identities",
+    )
+    if not use_lua:
+        monkeypatch.setattr(
+            manager,
+            "_release_task_pin_script",
+            lambda **_kwargs: (_ for _ in ()).throw(
+                ResponseError("unknown command 'evalsha'")
+            ),
+        )
+
+    assert manager.release_task_pin(task.task_id)
+
+    assert not real_redis_connection.exists(pin_key)
+    assert not real_redis_connection.exists(
+        f"dt:resource:session:{session_id}:task-pins"
+    )
+    assert not real_redis_connection.exists(
+        f"dt:resource:asset-tasks:{session_id}:{asset_id}"
+    )
+    claim = manager.claim_asset_deletion(session_id, asset_id)
+    manager.release_asset_deletion(session_id, asset_id, claim)
+
+
+def test_real_redis_corrupt_task_pin_scans_session_indexes_without_owner(
+    real_redis_connection: Redis,
+    tmp_path: Path,
+) -> None:
+    manager = _manager(real_redis_connection, tmp_path)
+    session_id = "a" * 32
+    task_id = "orphaned-task"
+    asset_id = "1" * 32
+    pin_key = f"dt:resource:task-pin:{task_id}"
+    session_pins_key = f"dt:resource:session:{session_id}:task-pins"
+    asset_tasks_key = f"dt:resource:asset-tasks:{session_id}:{asset_id}"
+    malformed_session_pins_key = "dt:resource:session:not-a-session:task-pins"
+    real_redis_connection.hset(pin_key, mapping={"task_id": task_id})
+    real_redis_connection.sadd(session_pins_key, task_id)
+    real_redis_connection.sadd(malformed_session_pins_key, task_id)
+    real_redis_connection.sadd(asset_tasks_key, task_id)
+
+    assert manager.release_task_pin(task_id)
+
+    assert not real_redis_connection.exists(pin_key)
+    assert not real_redis_connection.exists(session_pins_key)
+    assert not real_redis_connection.exists(asset_tasks_key)
+    assert real_redis_connection.smembers(malformed_session_pins_key) == {
+        task_id.encode()
+    }
+    claim = manager.claim_asset_deletion(session_id, asset_id)
+    manager.release_asset_deletion(session_id, asset_id, claim)
+
+
+def test_real_redis_corrupt_task_pin_repair_is_idempotent_after_ack_loss(
+    real_redis_connection: Redis,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(real_redis_connection, tmp_path)
+    session_id = "a" * 32
+    asset_id = "1" * 32
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+        owner_id=session_id,
+        asset_identities=((asset_id, "2" * 32),),
+    )
+    pin_key = f"dt:resource:task-pin:{task.task_id}"
+    real_redis_connection.hdel(pin_key, "asset_ids", "asset_identities")
+    repair = manager._repair_corrupt_task_pin_indexes
+
+    def repair_then_lose_ack(*args, **kwargs):
+        repair(*args, **kwargs)
+        raise RedisConnectionError("corrupt pin repair acknowledgement lost")
+
+    monkeypatch.setattr(
+        manager,
+        "_repair_corrupt_task_pin_indexes",
+        repair_then_lose_ack,
+    )
+    with pytest.raises(RedisConnectionError, match="acknowledgement lost"):
+        manager.release_task_pin(task.task_id)
+
+    monkeypatch.setattr(manager, "_repair_corrupt_task_pin_indexes", repair)
+    assert not manager.release_task_pin(task.task_id)
+    assert not real_redis_connection.exists(pin_key)
+    assert not real_redis_connection.exists(
+        f"dt:resource:session:{session_id}:task-pins"
+    )
+    assert not real_redis_connection.exists(
+        f"dt:resource:asset-tasks:{session_id}:{asset_id}"
+    )
+    claim = manager.claim_asset_deletion(session_id, asset_id)
+    manager.release_asset_deletion(session_id, asset_id, claim)
+
+
+@pytest.mark.parametrize("use_lua", [True, False], ids=["lua", "fallback"])
+def test_real_redis_task_pin_normal_release_does_not_scan(
+    real_redis_connection: Redis,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    use_lua: bool,
+) -> None:
+    manager = _manager(real_redis_connection, tmp_path)
+    session_id = "a" * 32
+    asset_id = "1" * 32
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+        owner_id=session_id,
+        asset_identities=((asset_id, "2" * 32),),
+    )
+    if not use_lua:
+        monkeypatch.setattr(
+            manager,
+            "_release_task_pin_script",
+            lambda **_kwargs: (_ for _ in ()).throw(
+                ResponseError("unknown command 'evalsha'")
+            ),
+        )
+    monkeypatch.setattr(
+        real_redis_connection,
+        "scan_iter",
+        lambda **_kwargs: pytest.fail("normal task pin release must not scan"),
+    )
+
+    assert manager.release_task_pin(task.task_id)
+
+
+@pytest.mark.parametrize("use_lua", [True, False], ids=["lua", "fallback"])
 def test_real_redis_enqueue_rollback_preserves_divergent_task_pin(
     real_redis_connection: Redis,
     tmp_path: Path,

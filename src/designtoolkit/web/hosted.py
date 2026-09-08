@@ -1832,14 +1832,14 @@ def _write_asset_manifest(
     generation_id: str | None,
     size: int,
 ) -> None:
-    payload = {
+    payload: dict[str, str | int] = {
         "asset_id": asset_id,
         "bytes": size,
-        "reference_version": 2 if generation_id is not None else 1,
     }
     if generation_id is not None:
         if not _SESSION_PATTERN.fullmatch(generation_id):
             raise UploadRejectedError("Upload generation token is invalid")
+        payload["reference_version"] = 2
         payload["generation_id"] = generation_id
     manifest_path = asset_dir / _ASSET_MANIFEST_NAME
     temporary_path = asset_dir / f"{_ASSET_MANIFEST_NAME}.{uuid4().hex}.tmp"
@@ -1862,15 +1862,25 @@ def _read_asset_manifest(
         return None
     try:
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError
         generation_id = payload.get("generation_id")
-        reference_version = payload.get("reference_version", 1)
+        has_reference_version = "reference_version" in payload
+        reference_version = (
+            payload["reference_version"] if has_reference_version else 1
+        )
         size = payload["bytes"]
         if (
             payload["asset_id"] != asset_id
-            or isinstance(reference_version, bool)
-            or not isinstance(reference_version, int)
-            or reference_version not in {1, 2}
-            or (reference_version == 2 and generation_id is None)
+            or (
+                has_reference_version
+                and (
+                    isinstance(reference_version, bool)
+                    or not isinstance(reference_version, int)
+                    or reference_version != 2
+                    or generation_id is None
+                )
+            )
             or (
                 generation_id is not None
                 and (

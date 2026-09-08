@@ -1338,13 +1338,15 @@ class DeterministicRedis(fakeredis.FakeRedis):
         if self._text(self.hget(pin_key, "task_id")) != task_id:
             return 2
         raw_identities = self.hget(pin_key, "asset_identities")
+        raw_asset_ids = self.hget(pin_key, "asset_ids")
+        if raw_identities is None and raw_asset_ids is None:
+            return 4
         if raw_identities:
             asset_ids = [
                 identity[0]
                 for identity in json.loads(self._text(raw_identities))
             ]
         else:
-            raw_asset_ids = self.hget(pin_key, "asset_ids")
             asset_ids = (
                 json.loads(self._text(raw_asset_ids))
                 if raw_asset_ids

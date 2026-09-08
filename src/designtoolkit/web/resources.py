@@ -1623,6 +1623,9 @@ if redis.call("HGET", KEYS[1], "task_id") ~= ARGV[2] then
 end
 local identities_json = redis.call("HGET", KEYS[1], "asset_identities")
 local asset_ids_json = redis.call("HGET", KEYS[1], "asset_ids")
+if not identities_json and not asset_ids_json then
+    return 4
+end
 local asset_ids = {}
 if identities_json then
     if string.sub(identities_json, 1, 1) ~= "[" then

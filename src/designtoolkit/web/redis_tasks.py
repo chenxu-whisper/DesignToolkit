@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Iterator
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
@@ -74,6 +74,9 @@ _ASSET_READ_PIN_PREFIX = "dt:resource:asset-read-pin:"
 _ASSET_READERS_PREFIX = "dt:resource:asset-readers:"
 _ASSET_READ_PIN_TTL_SECONDS = 60.0
 _ASSET_READ_PIN_HEARTBEAT_SECONDS = 10.0
+_CORRUPT_PIN_SCAN_COUNT = 100
+_SESSION_TASK_PINS_PREFIX = "dt:resource:session:"
+_SESSION_TASK_PINS_SUFFIX = ":task-pins"
 type AssetIdentity = tuple[str, str | None]
 _ALLOW_REQUEST_SCRIPT = """-- allow_request
 local count = redis.call("INCR", KEYS[1])
@@ -2942,8 +2945,15 @@ class RedisTaskManager:
     def release_task_pin(self, task_id: str) -> bool:
         pin_key = _task_pin_key(task_id)
         metadata = self._redis.hgetall(pin_key)
+        if not metadata:
+            return False
         session_id = _redis_hash_text(metadata, "session_id")
         if session_id is None:
+            if _task_pin_asset_metadata_missing(metadata):
+                return self._repair_corrupt_task_pin_indexes(
+                    task_id,
+                    metadata,
+                )
             return False
         session_task_pins_key = _session_task_pins_key(session_id)
         try:
@@ -2978,6 +2988,10 @@ class RedisTaskManager:
                             pipeline.unwatch()
                             result = 2
                             break
+                        if _task_pin_asset_metadata_missing(metadata):
+                            pipeline.unwatch()
+                            result = 4
+                            break
                         asset_task_keys = [
                             _asset_tasks_key(session_id, asset_id)
                             for asset_id in _asset_ids_from_pin_metadata(metadata)
@@ -2998,7 +3012,93 @@ class RedisTaskManager:
             raise TaskConflictError("Task pin ownership is invalid")
         if result == 3:
             raise TaskConflictError("Task pin asset metadata is invalid")
+        if result == 4:
+            return self._repair_corrupt_task_pin_indexes(task_id, metadata)
         return result == 1
+
+    def _repair_corrupt_task_pin_indexes(
+        self,
+        task_id: str,
+        metadata: dict[bytes | str, bytes | str],
+    ) -> bool:
+        if _redis_hash_text(metadata, "task_id") != task_id:
+            raise TaskConflictError("Task pin ownership is invalid")
+        if not _task_pin_asset_metadata_missing(metadata):
+            raise TaskConflictError("Task pin asset metadata is invalid")
+
+        session_id = _redis_hash_text(metadata, "session_id")
+        if session_id is None:
+            task = self.get_task(task_id)
+            session_id = task.owner_id if task is not None else None
+        if session_id is not None:
+            try:
+                session_keys: list[bytes | str] = [
+                    _session_task_pins_key(_validate_session_id(session_id))
+                ]
+            except ValueError as exc:
+                raise TaskConflictError("Task pin ownership is invalid") from exc
+        else:
+            session_keys = []
+
+        self._remove_task_from_index_scan(
+            task_id,
+            match=f"{_ASSET_TASK_PREFIX}*",
+            validator=_is_asset_tasks_key,
+        )
+        if session_id is None:
+            self._remove_task_from_index_scan(
+                task_id,
+                match=(
+                    f"{_SESSION_TASK_PINS_PREFIX}*"
+                    f"{_SESSION_TASK_PINS_SUFFIX}"
+                ),
+                validator=_is_session_task_pins_key,
+            )
+
+        pin_key = _task_pin_key(task_id)
+        while True:
+            with self._redis.pipeline() as pipeline:
+                try:
+                    pipeline.watch(pin_key)
+                    current = pipeline.hgetall(pin_key)
+                    if not current:
+                        pipeline.unwatch()
+                        return False
+                    if _redis_hash_text(current, "task_id") != task_id:
+                        pipeline.unwatch()
+                        raise TaskConflictError("Task pin ownership is invalid")
+                    if not _task_pin_asset_metadata_missing(current):
+                        pipeline.unwatch()
+                        raise TaskConflictError(
+                            "Task pin asset metadata is invalid"
+                        )
+                    pipeline.multi()
+                    for key in session_keys:
+                        pipeline.srem(key, task_id)
+                    pipeline.delete(pin_key)
+                    pipeline.execute()
+                    return True
+                except WatchError:
+                    continue
+
+    def _remove_task_from_index_scan(
+        self,
+        task_id: str,
+        *,
+        match: str,
+        validator: Callable[[bytes | str], bool],
+    ) -> None:
+        for keys in _validated_index_key_batches(
+            self._redis.scan_iter(
+                match=match,
+                count=_CORRUPT_PIN_SCAN_COUNT,
+            ),
+            validator,
+        ):
+            with self._redis.pipeline() as pipeline:
+                for key in keys:
+                    pipeline.srem(key, task_id)
+                pipeline.execute()
 
     def _release_queue_slot(self, task_id: str) -> None:
         self._redis.lrem(_queue_reservations_key(), 0, task_id)
@@ -3565,6 +3665,73 @@ def _asset_ids_from_pin_metadata(
         return _decode_legacy_asset_ids(legacy_value)
     except (TypeError, ValueError, json.JSONDecodeError) as exc:
         raise TaskConflictError("Task pin asset metadata is invalid") from exc
+
+
+def _task_pin_asset_metadata_missing(
+    metadata: dict[bytes | str, bytes | str],
+) -> bool:
+    return (
+        _redis_hash_text(metadata, "asset_identities") is None
+        and _redis_hash_text(metadata, "asset_ids") is None
+    )
+
+
+def _validated_index_key_batches(
+    keys: Iterable[bytes | str],
+    validator: Callable[[bytes | str], bool],
+) -> Iterator[list[bytes | str]]:
+    batch: list[bytes | str] = []
+    for key in keys:
+        if not validator(key):
+            continue
+        batch.append(key)
+        if len(batch) == _CORRUPT_PIN_SCAN_COUNT:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
+
+
+def _is_asset_tasks_key(key: bytes | str) -> bool:
+    key_text = _decode_redis_key(key)
+    if key_text is None or not key_text.startswith(_ASSET_TASK_PREFIX):
+        return False
+    parts = key_text.removeprefix(_ASSET_TASK_PREFIX).split(":")
+    if len(parts) != 2:
+        return False
+    try:
+        _validate_session_id(parts[0])
+        _validate_asset_id(parts[1])
+    except ValueError:
+        return False
+    return True
+
+
+def _is_session_task_pins_key(key: bytes | str) -> bool:
+    key_text = _decode_redis_key(key)
+    if (
+        key_text is None
+        or not key_text.startswith(_SESSION_TASK_PINS_PREFIX)
+        or not key_text.endswith(_SESSION_TASK_PINS_SUFFIX)
+    ):
+        return False
+    session_id = key_text[
+        len(_SESSION_TASK_PINS_PREFIX) : -len(_SESSION_TASK_PINS_SUFFIX)
+    ]
+    try:
+        _validate_session_id(session_id)
+    except ValueError:
+        return False
+    return True
+
+
+def _decode_redis_key(key: bytes | str) -> str | None:
+    if isinstance(key, str):
+        return key
+    try:
+        return key.decode("ascii")
+    except UnicodeDecodeError:
+        return None
 
 
 def _decode_legacy_asset_ids(value: str) -> tuple[str, ...]:
