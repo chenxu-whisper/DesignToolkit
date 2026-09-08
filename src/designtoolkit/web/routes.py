@@ -1081,18 +1081,24 @@ def create_router(
         input_paths = getattr(payload, "input_paths", None)
         references = [input_path] if input_path is not None else list(input_paths or [])
         try:
-            return tuple(
-                dict.fromkeys(
-                    (
-                        parsed.asset_id,
-                        parsed.generation_id,
+            identities: list[tuple[str, str | None]] = []
+            generations_by_asset: dict[str, str | None] = {}
+            for reference in references:
+                parsed = parse_asset_reference(reference)
+                if (
+                    parsed.asset_id in generations_by_asset
+                    and generations_by_asset[parsed.asset_id]
+                    != parsed.generation_id
+                ):
+                    raise ApiError(
+                        "asset_not_found",
+                        "Uploaded asset is not available",
+                        404,
                     )
-                    for parsed in (
-                        parse_asset_reference(reference)
-                        for reference in references
-                    )
-                )
-            )
+                if parsed.asset_id not in generations_by_asset:
+                    generations_by_asset[parsed.asset_id] = parsed.generation_id
+                    identities.append((parsed.asset_id, parsed.generation_id))
+            return tuple(identities)
         except UploadRejectedError as exc:
             raise ApiError("asset_not_found", str(exc), 404) from exc
 

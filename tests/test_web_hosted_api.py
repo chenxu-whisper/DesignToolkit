@@ -3070,6 +3070,158 @@ def test_hosted_batch_generation_mismatch_is_all_or_nothing(
     ) == []
 
 
+@pytest.mark.parametrize(
+    ("route", "extra_payload", "filename", "content"),
+    [
+        (
+            "/api/tasks/video-frames",
+            {"image_format": "png"},
+            "clip.mp4",
+            b"video",
+        ),
+        (
+            "/api/tasks/media-resize",
+            {"size": "100x100"},
+            "image.png",
+            _png_bytes(),
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "use_legacy_reference",
+    [False, True],
+    ids=["stale-generation", "legacy-generation"],
+)
+@pytest.mark.parametrize(
+    "current_first",
+    [True, False],
+    ids=["current-first", "stale-first"],
+)
+def test_hosted_batch_rejects_conflicting_asset_generations_without_state(
+    tmp_path: Path,
+    route: str,
+    extra_payload: dict[str, object],
+    filename: str,
+    content: bytes,
+    use_legacy_reference: bool,
+    current_first: bool,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = RedisTaskManager(
+        redis_connection=redis_connection,
+        queue=Queue("designtoolkit", connection=redis_connection),
+        data_dir=tmp_path,
+        max_queued_tasks=20,
+        retention_seconds=7200,
+    )
+    upload_id = "1" * 32
+    with _client(
+        tmp_path,
+        task_manager=manager,
+        raise_server_exceptions=False,
+    ) as client:
+        stale_reference = _upload(
+            client,
+            filename,
+            content,
+            upload_id=upload_id,
+        ).json()["reference"]
+        assert client.delete(f"/api/uploads/{upload_id}").status_code == 204
+        current_reference = _upload(
+            client,
+            filename,
+            content,
+            upload_id=upload_id,
+        ).json()["reference"]
+        if use_legacy_reference:
+            stale_reference = f"asset:{upload_id}:{filename}"
+        input_paths = [current_reference, stale_reference]
+        if not current_first:
+            input_paths.reverse()
+
+        response = client.post(
+            route,
+            json={"input_paths": input_paths, **extra_payload},
+        )
+
+    current_generation = current_reference.split(":")[2]
+    stale_generation = stale_reference.split(":")[2]
+    assert response.status_code == 404
+    assert response.json() == {
+        "error": {
+            "code": "asset_not_found",
+            "message": "Uploaded asset is not available",
+        }
+    }
+    assert current_generation not in response.text
+    if not use_legacy_reference:
+        assert stale_generation not in response.text
+    assert manager.queue.count == 0
+    for pattern in (
+        "dt:task:*",
+        "dt:task-work:*",
+        "dt:resource:task:*",
+        "dt:resource:task-pin:*",
+        "dt:resource:asset-read-pin:*",
+        "dt:resource:asset-readers:*",
+    ):
+        assert list(redis_connection.scan_iter(match=pattern)) == []
+    assert list(tmp_path.glob("sessions/*/tasks/*")) == []
+
+
+@pytest.mark.parametrize(
+    ("route", "extra_payload", "filename", "content"),
+    [
+        (
+            "/api/tasks/video-frames",
+            {"image_format": "png"},
+            "clip.mp4",
+            b"video",
+        ),
+        (
+            "/api/tasks/media-resize",
+            {"size": "100x100"},
+            "image.png",
+            _png_bytes(),
+        ),
+    ],
+)
+def test_hosted_batch_deduplicates_identical_asset_identity_only_for_pinning(
+    tmp_path: Path,
+    route: str,
+    extra_payload: dict[str, object],
+    filename: str,
+    content: bytes,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = RedisTaskManager(
+        redis_connection=redis_connection,
+        queue=Queue("designtoolkit", connection=redis_connection),
+        data_dir=tmp_path,
+        max_queued_tasks=20,
+        retention_seconds=7200,
+    )
+    with _client(tmp_path, task_manager=manager) as client:
+        reference = _upload(client, filename, content).json()["reference"]
+        response = client.post(
+            route,
+            json={"input_paths": [reference, reference], **extra_payload},
+        )
+
+    assert response.status_code == 202
+    task_id = response.json()["task_id"]
+    task_pin = redis_connection.hgetall(f"dt:resource:task-pin:{task_id}")
+    reference_parts = reference.split(":")
+    assert json.loads(task_pin[b"asset_identities"]) == [
+        [reference_parts[1], reference_parts[2]]
+    ]
+    job = manager.queue.fetch_job(task_id)
+    assert job is not None
+    input_paths = job.args[2]["input_paths"]
+    assert len(input_paths) == 2
+    assert input_paths[0] == input_paths[1]
+
+
 def test_in_memory_hosted_task_retains_session_owner(tmp_path: Path) -> None:
     manager = TaskManager(
         log_store=LogStore(),
