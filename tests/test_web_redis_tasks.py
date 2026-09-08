@@ -304,6 +304,7 @@ def test_real_redis_terminal_keys_use_configured_retention(
         f"dt:task:{task.task_id}",
         f"dt:task-work:{task.task_id}",
         f"dt:task:{task.task_id}:events",
+        f"dt:task:{task.task_id}:event-index",
         f"dt:event-generation:{task.task_id}",
         f"dt:failure-cleanup:{task.task_id}",
     ):
@@ -351,6 +352,7 @@ def test_real_redis_callback_uses_configured_retention(
         f"dt:task:{task.task_id}",
         f"dt:task-work:{task.task_id}",
         f"dt:task:{task.task_id}:events",
+        f"dt:task:{task.task_id}:event-index",
         f"dt:event-generation:{task.task_id}",
         f"dt:failure-cleanup:{task.task_id}",
     ):
@@ -381,6 +383,11 @@ def test_real_redis_terminal_transition_refreshes_existing_event_retention(
     _assert_ttl_matches(
         real_redis_connection,
         f"dt:event-generation:{task.task_id}",
+        retention_seconds,
+    )
+    _assert_ttl_matches(
+        real_redis_connection,
+        f"dt:task:{task.task_id}:event-index",
         retention_seconds,
     )
 
@@ -419,10 +426,15 @@ def test_real_redis_terminal_event_is_idempotent_after_acknowledgement_loss(
     ]
     assert len(terminal_events) == 1
     event_key = f"dt:task:{task.task_id}:events"
+    event_index_key = f"dt:task:{task.task_id}:event-index"
     generation_key = f"dt:event-generation:{task.task_id}"
     assert abs(
         real_redis_connection.pttl(event_key)
         - real_redis_connection.pttl(generation_key)
+    ) < 100
+    assert abs(
+        real_redis_connection.pttl(event_key)
+        - real_redis_connection.pttl(event_index_key)
     ) < 100
 
 
@@ -763,6 +775,7 @@ def test_real_redis_repeated_terminal_does_not_shorten_ttl_or_resurrect(
         f"dt:task:{task.task_id}",
         f"dt:task-work:{task.task_id}",
         f"dt:task:{task.task_id}:events",
+        f"dt:task:{task.task_id}:event-index",
         f"dt:event-generation:{task.task_id}",
         f"dt:failure-cleanup:{task.task_id}",
     )
@@ -1977,9 +1990,9 @@ def test_redis_subscriber_polls_only_the_event_at_its_cursor() -> None:
             self,
             task_id: str,
             generation: str | None,
-            offset: int,
+            next_sequence: int,
         ):
-            self.calls.append((task_id, generation, offset))
+            self.calls.append((task_id, generation, next_sequence))
             return self.responses.pop(0)
 
         def _snapshot(self, task_id: str):
@@ -2015,6 +2028,7 @@ def test_redis_subscriber_fallback_reads_constant_data_after_large_history(
         details={},
     )
     event_key = f"dt:task:{task_id}:events"
+    event_index_key = f"dt:task:{task_id}:event-index"
     generation_key = f"dt:event-generation:{task_id}"
     with redis_connection.pipeline() as pipeline:
         for _ in range(10_000):
@@ -2032,20 +2046,19 @@ def test_redis_subscriber_fallback_reads_constant_data_after_large_history(
 
     store._read_event_at_cursor_script = unknown_command
     pipeline_type = type(redis_connection.pipeline())
-    original_lindex = pipeline_type.lindex
-    original_lrange = pipeline_type.lrange
-    reads: list[tuple[str, int, int | None]] = []
+    original_hget = pipeline_type.hget
+    reads: list[tuple[str, str]] = []
 
-    def tracked_lindex(self, name: str, index: int):
-        reads.append((name, index, None))
-        return original_lindex(self, name, index)
+    def tracked_hget(self, name: str, key: str):
+        reads.append((name, key))
+        return original_hget(self, name, key)
 
-    def tracked_lrange(self, name: str, start: int, end: int):
-        reads.append((name, start, end))
-        return original_lrange(self, name, start, end)
+    def forbidden_list_read(*_args, **_kwargs):
+        raise AssertionError("steady-state polling read the event list")
 
-    monkeypatch.setattr(pipeline_type, "lindex", tracked_lindex)
-    monkeypatch.setattr(pipeline_type, "lrange", tracked_lrange)
+    monkeypatch.setattr(pipeline_type, "hget", tracked_hget)
+    monkeypatch.setattr(pipeline_type, "lindex", forbidden_list_read)
+    monkeypatch.setattr(pipeline_type, "lrange", forbidden_list_read)
     store.append(
         task_id=task_id,
         level=LogLevel.SUCCESS,
@@ -2056,8 +2069,77 @@ def test_redis_subscriber_fallback_reads_constant_data_after_large_history(
     assert subscriber.get(timeout=0.2).message == "completed"
     with pytest.raises(Empty):
         subscriber.get(timeout=0.05)
-    assert reads[0] == (event_key, 10_000, None)
-    assert all(read == (event_key, 10_001, None) for read in reads[1:])
+    assert (event_index_key, "10001") in reads
+    assert all(name != event_key for name, _field in reads)
+
+
+def test_redis_unknown_command_fallback_builds_and_reads_event_index(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    store = RedisLogStore(redis_connection, retention_seconds=60)
+    task_id = "fallback-events"
+
+    def unknown_command(**_kwargs):
+        raise ResponseError("unknown command 'evalsha'")
+
+    monkeypatch.setattr(store, "_append_event_script", unknown_command)
+    monkeypatch.setattr(store, "_read_event_log_script", unknown_command)
+    monkeypatch.setattr(store, "_read_event_at_cursor_script", unknown_command)
+    first = store.append(
+        task_id=task_id,
+        level=LogLevel.INFO,
+        phase=LogPhase.CREATED,
+        message="first",
+    )
+    history, subscriber = store.history_and_subscribe(task_id)
+    second = store.append(
+        task_id=task_id,
+        level=LogLevel.SUCCESS,
+        phase=LogPhase.COMPLETED,
+        message="second",
+    )
+
+    assert history == [first]
+    assert subscriber.get(timeout=0.2) == second
+    event_index_key = f"dt:task:{task_id}:event-index"
+    assert redis_connection.hget(event_index_key, "next_sequence") == b"2"
+    assert redis_connection.hget(event_index_key, "1") == (
+        first.model_dump_json().encode()
+    )
+    assert redis_connection.hget(event_index_key, "2") == (
+        second.model_dump_json().encode()
+    )
+
+
+def test_redis_fallback_resets_inconsistent_event_index_counter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    store = RedisLogStore(redis_connection, retention_seconds=60)
+    task_id = "inconsistent-fallback-index"
+    first = store.append(
+        task_id=task_id,
+        level=LogLevel.INFO,
+        phase=LogPhase.CREATED,
+        message="first",
+    )
+    event_index_key = f"dt:task:{task_id}:event-index"
+    redis_connection.hset(event_index_key, "next_sequence", 99)
+
+    def unknown_command(**_kwargs):
+        raise ResponseError("unknown command 'evalsha'")
+
+    monkeypatch.setattr(store, "_append_event_script", unknown_command)
+    second = store.append(
+        task_id=task_id,
+        level=LogLevel.SUCCESS,
+        phase=LogPhase.COMPLETED,
+        message="second",
+    )
+
+    assert redis_connection.hget(event_index_key, "next_sequence") == b"2"
+    assert store.history(task_id) == [first, second]
 
 
 def test_redis_subscriber_fallback_adopts_generation_and_resets_once() -> None:
@@ -2137,6 +2219,7 @@ def test_redis_event_cursor_uses_lua_result_and_propagates_redis_errors() -> Non
     assert calls[0][0] == [
         "dt:task:task-1:events",
         "dt:event-generation:task-1",
+        "dt:task:task-1:event-index",
     ]
     assert calls[0][1][:2] == ["generation-a", 10_000]
 
@@ -2163,7 +2246,7 @@ def test_redis_subscriber_rejects_malformed_event_like_history() -> None:
         store,
         task_id,
         "generation-a",
-        0,
+        1,
     )
 
     with pytest.raises(type(history_error.value)):
@@ -2182,23 +2265,53 @@ def test_real_redis_subscriber_recovers_after_event_log_expiry(
         retention_seconds=1,
         task_timeout_seconds=60,
     )
-    task = manager.create_video_frames_task(
-        VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
-        owner_id="a" * 32,
+    task = TaskRecord(
+        task_id="expiring-event-log",
+        kind=TaskKind.VIDEO_FRAMES,
+        status=TaskStatus.RUNNING,
+        created_at=datetime.now(UTC),
+        started_at=datetime.now(UTC),
+        finished_at=None,
+        input_path=str(tmp_path / "clip.mp4"),
+        output_path=None,
+        error=None,
+        owner_id=None,
+    )
+    manager._save_task(task)
+    manager.log_store.append(
+        task_id=task.task_id,
+        level=LogLevel.INFO,
+        phase=LogPhase.CREATED,
+        message="created",
     )
     history, subscriber = manager.log_store.history_and_subscribe(task.task_id)
     assert len(history) == 1
 
     event_key = f"dt:task:{task.task_id}:events"
+    event_index_key = f"dt:task:{task.task_id}:event-index"
     generation_key = f"dt:event-generation:{task.task_id}"
     real_redis_connection.pexpire(event_key, 1)
+    real_redis_connection.pexpire(event_index_key, 1)
     real_redis_connection.pexpire(generation_key, 1)
     deadline = time.monotonic() + 1
     while real_redis_connection.exists(event_key) and time.monotonic() < deadline:
         time.sleep(0.01)
     assert not real_redis_connection.exists(event_key)
 
-    assert manager._finalize_external_failure(task.task_id, "worker timed out")
+    terminal_event = redis_tasks_module.LogEventResponse(
+        task_id=task.task_id,
+        timestamp=datetime.now(UTC),
+        level=LogLevel.ERROR,
+        phase=LogPhase.FAILED,
+        message="worker timed out",
+        details={},
+    )
+    manager._transition_finished(
+        task.task_id,
+        status=TaskStatus.FAILED,
+        error="worker timed out",
+        terminal_event=terminal_event,
+    )
 
     terminal = subscriber.get(timeout=0.5)
     assert terminal.phase is LogPhase.FAILED
@@ -2254,6 +2367,7 @@ def test_real_redis_event_cursor_resets_to_new_generation(
 
     real_redis_connection.delete(
         f"dt:task:{task_id}:events",
+        f"dt:task:{task_id}:event-index",
         f"dt:event-generation:{task_id}",
     )
     store.append(
@@ -2313,33 +2427,286 @@ def test_real_redis_event_generation_ttl_matches_event_list(
         message="queued",
     )
 
-    event_ttl = real_redis_connection.pttl(f"dt:task:{task_id}:events")
-    generation_ttl = real_redis_connection.pttl(
-        f"dt:event-generation:{task_id}"
+    event_ttl, generation_ttl, event_index_ttl = real_redis_connection.eval(
+        """
+        return {
+            redis.call("PTTL", KEYS[1]),
+            redis.call("PTTL", KEYS[2]),
+            redis.call("PTTL", KEYS[3])
+        }
+        """,
+        3,
+        f"dt:task:{task_id}:events",
+        f"dt:event-generation:{task_id}",
+        f"dt:task:{task_id}:event-index",
     )
-    assert abs(event_ttl - generation_ttl) < 100
+    assert event_ttl == generation_ttl == event_index_ttl
     assert generation_ttl > 0
 
 
-def test_real_redis_history_adopts_legacy_event_list_generation(
+def test_real_redis_history_backfills_legacy_event_index(
     real_redis_connection: Redis,
 ) -> None:
     store = RedisLogStore(real_redis_connection, retention_seconds=60)
     task_id = "legacy-events"
+    events = [
+        redis_tasks_module.LogEventResponse(
+            task_id=task_id,
+            timestamp=datetime.now(UTC),
+            level=LogLevel.INFO,
+            phase=LogPhase.CREATED,
+            message=f"legacy event {sequence}",
+            details={},
+        )
+        for sequence in range(2)
+    ]
+    event_key = f"dt:task:{task_id}:events"
+    event_index_key = f"dt:task:{task_id}:event-index"
+    generation_key = f"dt:event-generation:{task_id}"
+    real_redis_connection.rpush(
+        event_key,
+        *(event.model_dump_json() for event in events),
+    )
+    real_redis_connection.set(generation_key, "legacy-generation")
+    real_redis_connection.expire(event_key, 60)
+    real_redis_connection.expire(generation_key, 60)
+
+    assert store.history(task_id) == events
+
+    assert real_redis_connection.hgetall(event_index_key) == {
+        b"next_sequence": b"2",
+        b"1": events[0].model_dump_json().encode(),
+        b"2": events[1].model_dump_json().encode(),
+    }
+    event_ttl = real_redis_connection.pttl(event_key)
+    event_index_ttl = real_redis_connection.pttl(event_index_key)
+    generation_ttl = real_redis_connection.pttl(generation_key)
+    assert abs(event_ttl - event_index_ttl) < 100
+    assert abs(event_ttl - generation_ttl) < 100
+
+
+def test_real_redis_poll_backfills_legacy_event_index(
+    real_redis_connection: Redis,
+) -> None:
+    store = RedisLogStore(real_redis_connection, retention_seconds=60)
+    task_id = "legacy-poll-events"
+    event = redis_tasks_module.LogEventResponse(
+        task_id=task_id,
+        timestamp=datetime.now(UTC),
+        level=LogLevel.INFO,
+        phase=LogPhase.CREATED,
+        message="legacy event",
+        details={},
+    )
+    event_key = f"dt:task:{task_id}:events"
+    event_index_key = f"dt:task:{task_id}:event-index"
+    generation_key = f"dt:event-generation:{task_id}"
+    real_redis_connection.rpush(event_key, event.model_dump_json())
+    real_redis_connection.set(generation_key, "legacy-generation")
+    real_redis_connection.expire(event_key, 60)
+    real_redis_connection.expire(generation_key, 60)
+    subscriber = redis_tasks_module.RedisEventSubscriber(
+        store,
+        task_id,
+        "legacy-generation",
+        1,
+    )
+
+    assert subscriber.get(timeout=0.2) == event
+    assert real_redis_connection.hgetall(event_index_key) == {
+        b"next_sequence": b"1",
+        b"1": event.model_dump_json().encode(),
+    }
+
+
+def test_real_redis_history_repairs_incorrect_index_payload(
+    real_redis_connection: Redis,
+) -> None:
+    store = RedisLogStore(real_redis_connection, retention_seconds=60)
+    task_id = "incorrect-history-index"
     expected = store.append(
         task_id=task_id,
         level=LogLevel.INFO,
         phase=LogPhase.CREATED,
-        message="legacy event",
+        message="expected",
     )
-    generation_key = f"dt:event-generation:{task_id}"
-    real_redis_connection.delete(generation_key)
+    event_index_key = f"dt:task:{task_id}:event-index"
+    real_redis_connection.hset(event_index_key, "1", '{"message":"wrong"}')
 
     assert store.history(task_id) == [expected]
+    assert real_redis_connection.hget(event_index_key, "1") == (
+        expected.model_dump_json().encode()
+    )
 
-    event_ttl = real_redis_connection.pttl(f"dt:task:{task_id}:events")
-    generation_ttl = real_redis_connection.pttl(generation_key)
-    assert abs(event_ttl - generation_ttl) < 100
+
+def test_real_redis_poll_repairs_missing_expected_sequence(
+    real_redis_connection: Redis,
+) -> None:
+    store = RedisLogStore(real_redis_connection, retention_seconds=60)
+    task_id = "missing-poll-sequence"
+    expected = store.append(
+        task_id=task_id,
+        level=LogLevel.INFO,
+        phase=LogPhase.CREATED,
+        message="expected",
+    )
+    generation = real_redis_connection.get(
+        f"dt:event-generation:{task_id}"
+    ).decode()
+    event_index_key = f"dt:task:{task_id}:event-index"
+    real_redis_connection.hdel(event_index_key, "1")
+    real_redis_connection.hset(event_index_key, "unexpected", "value")
+    subscriber = redis_tasks_module.RedisEventSubscriber(
+        store,
+        task_id,
+        generation,
+        1,
+    )
+
+    assert subscriber.get(timeout=0.2) == expected
+    assert real_redis_connection.hgetall(event_index_key) == {
+        b"next_sequence": b"1",
+        b"1": expected.model_dump_json().encode(),
+    }
+
+
+def test_real_redis_append_resets_stale_index_for_new_generation(
+    real_redis_connection: Redis,
+) -> None:
+    store = RedisLogStore(real_redis_connection, retention_seconds=60)
+    task_id = "expired-events"
+    old = store.append(
+        task_id=task_id,
+        level=LogLevel.INFO,
+        phase=LogPhase.CREATED,
+        message="old",
+    )
+    event_key = f"dt:task:{task_id}:events"
+    event_index_key = f"dt:task:{task_id}:event-index"
+    generation_key = f"dt:event-generation:{task_id}"
+    old_generation = real_redis_connection.get(generation_key)
+    assert real_redis_connection.hget(event_index_key, "1") == (
+        old.model_dump_json().encode()
+    )
+    real_redis_connection.delete(event_key, generation_key)
+
+    new = store.append(
+        task_id=task_id,
+        level=LogLevel.ERROR,
+        phase=LogPhase.FAILED,
+        message="new",
+    )
+
+    assert real_redis_connection.get(generation_key) != old_generation
+    assert real_redis_connection.hgetall(event_index_key) == {
+        b"next_sequence": b"1",
+        b"1": new.model_dump_json().encode(),
+    }
+    assert store.history(task_id) == [new]
+
+
+def test_real_redis_append_resets_inconsistent_event_index_counter(
+    real_redis_connection: Redis,
+) -> None:
+    store = RedisLogStore(real_redis_connection, retention_seconds=60)
+    task_id = "inconsistent-lua-index"
+    first = store.append(
+        task_id=task_id,
+        level=LogLevel.INFO,
+        phase=LogPhase.CREATED,
+        message="first",
+    )
+    event_index_key = f"dt:task:{task_id}:event-index"
+    real_redis_connection.hset(event_index_key, "next_sequence", 99)
+
+    second = store.append(
+        task_id=task_id,
+        level=LogLevel.SUCCESS,
+        phase=LogPhase.COMPLETED,
+        message="second",
+    )
+
+    assert real_redis_connection.hget(event_index_key, "next_sequence") == b"2"
+    assert store.history(task_id) == [first, second]
+
+
+def test_real_redis_slow_cursor_reads_hash_index(
+    real_redis_connection: Redis,
+) -> None:
+    store = RedisLogStore(real_redis_connection, retention_seconds=60)
+    task_id = "slow-cursor"
+    event = redis_tasks_module.LogEventResponse(
+        task_id=task_id,
+        timestamp=datetime.now(UTC),
+        level=LogLevel.INFO,
+        phase=LogPhase.CREATED,
+        message="historical",
+        details={},
+    )
+    event_key = f"dt:task:{task_id}:events"
+    generation_key = f"dt:event-generation:{task_id}"
+    with real_redis_connection.pipeline() as pipeline:
+        for _ in range(10_000):
+            pipeline.rpush(event_key, event.model_dump_json())
+        pipeline.set(generation_key, "generation-a")
+        pipeline.expire(event_key, 60)
+        pipeline.expire(generation_key, 60)
+        pipeline.execute()
+    history, subscriber = store.history_and_subscribe(task_id)
+    appended = store.append(
+        task_id=task_id,
+        level=LogLevel.SUCCESS,
+        phase=LogPhase.COMPLETED,
+        message="completed",
+    )
+    commandstats_before = real_redis_connection.info("commandstats")
+
+    assert len(history) == 10_000
+    assert subscriber.get(timeout=0.2) == appended
+    commandstats_after = real_redis_connection.info("commandstats")
+
+    def calls(stats: dict[str, object], command: str) -> int:
+        command_stats = stats.get(f"cmdstat_{command}", {})
+        assert isinstance(command_stats, dict)
+        return int(command_stats.get("calls", 0))
+
+    assert calls(commandstats_after, "hget") - calls(
+        commandstats_before,
+        "hget",
+    ) == 2
+    assert calls(commandstats_after, "lindex") == calls(
+        commandstats_before,
+        "lindex",
+    )
+    assert calls(commandstats_after, "lrange") == calls(
+        commandstats_before,
+        "lrange",
+    )
+
+
+def test_real_redis_concurrent_event_read_has_no_gaps_or_duplicates(
+    real_redis_connection: Redis,
+) -> None:
+    store = RedisLogStore(real_redis_connection, retention_seconds=60)
+    task_id = "concurrent-event-reader"
+    _history, subscriber = store.history_and_subscribe(task_id)
+    expected = [f"event-{sequence}" for sequence in range(100)]
+
+    def append_all() -> None:
+        for message in expected:
+            store.append(
+                task_id=task_id,
+                level=LogLevel.PROGRESS,
+                phase=LogPhase.RUNNING,
+                message=message,
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        writer = executor.submit(append_all)
+        actual = [subscriber.get(timeout=2).message for _ in expected]
+        writer.result(timeout=5)
+
+    assert actual == expected
 
 
 def test_real_redis_concurrent_event_appends_preserve_each_writer_order(
@@ -2369,6 +2736,85 @@ def test_real_redis_concurrent_event_appends_preserve_each_writer_order(
     for worker in range(8):
         assert messages.index(f"{worker}:0") < messages.index(f"{worker}:1")
     assert real_redis_connection.exists(f"dt:event-generation:{task_id}")
+
+
+def test_real_redis_all_transition_producers_update_event_index(
+    real_redis_connection: Redis,
+    tmp_path: Path,
+) -> None:
+    manager = _manager(real_redis_connection, tmp_path, retention_seconds=60)
+    task = TaskRecord(
+        task_id="transition-producers",
+        kind=TaskKind.VIDEO_FRAMES,
+        status=TaskStatus.QUEUED,
+        created_at=datetime.now(UTC),
+        started_at=None,
+        finished_at=None,
+        input_path=str(tmp_path / "clip.mp4"),
+        output_path=None,
+        error=None,
+        owner_id=None,
+    )
+    manager._save_task(task)
+    manager.log_store.append(
+        task_id=task.task_id,
+        level=LogLevel.INFO,
+        phase=LogPhase.CREATED,
+        message="created",
+    )
+    manager.mark_running(task.task_id)
+    terminal_event = redis_tasks_module.LogEventResponse(
+        task_id=task.task_id,
+        timestamp=datetime.now(UTC),
+        level=LogLevel.ERROR,
+        phase=LogPhase.FAILED,
+        message="worker failed",
+        details={},
+    )
+    manager._transition_finished(
+        task.task_id,
+        status=TaskStatus.FAILED,
+        error="worker failed",
+        terminal_event=terminal_event,
+    )
+
+    event_key = f"dt:task:{task.task_id}:events"
+    event_index_key = f"dt:task:{task.task_id}:event-index"
+    events = real_redis_connection.lrange(event_key, 0, -1)
+    assert real_redis_connection.hget(event_index_key, "next_sequence") == b"3"
+    assert real_redis_connection.hlen(event_index_key) == len(events) + 1
+    assert [
+        real_redis_connection.hget(event_index_key, str(sequence))
+        for sequence in range(1, 4)
+    ] == events
+
+
+def test_terminal_transition_without_events_leaves_no_event_metadata(
+    tmp_path: Path,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = _manager(redis_connection, tmp_path)
+    task = TaskRecord(
+        task_id="task-without-events",
+        kind=TaskKind.VIDEO_FRAMES,
+        status=TaskStatus.RUNNING,
+        created_at=datetime.now(UTC),
+        started_at=datetime.now(UTC),
+        finished_at=None,
+        input_path="clip.mp4",
+        output_path=None,
+        error=None,
+        owner_id=None,
+    )
+    manager._save_task(task)
+
+    manager.mark_finished(task.task_id, status=TaskStatus.SUCCEEDED)
+
+    assert not redis_connection.exists(f"dt:task:{task.task_id}:events")
+    assert not redis_connection.exists(
+        f"dt:task:{task.task_id}:event-index"
+    )
+    assert not redis_connection.exists(f"dt:event-generation:{task.task_id}")
 
 
 def test_worker_status_updates_are_visible_to_api_manager(tmp_path: Path) -> None:
@@ -2911,6 +3357,7 @@ def test_real_redis_reconcile_uses_configured_retention(
         f"dt:task:{task.task_id}",
         f"dt:task-work:{task.task_id}",
         f"dt:task:{task.task_id}:events",
+        f"dt:task:{task.task_id}:event-index",
         f"dt:event-generation:{task.task_id}",
         f"dt:failure-cleanup:{task.task_id}",
     ):
@@ -3240,10 +3687,20 @@ def test_real_redis_reconcile_fails_uncommitted_ambiguous_enqueue(
         f"dt:task:{task.task_id}",
         f"dt:task-work:{task.task_id}",
         f"dt:task:{task.task_id}:events",
+        f"dt:task:{task.task_id}:event-index",
         f"dt:event-generation:{task.task_id}",
         f"dt:failure-cleanup:{task.task_id}",
     ):
         _assert_ttl_matches(real_redis_connection, key, retention_seconds)
+    event_key = f"dt:task:{task.task_id}:events"
+    event_index_key = f"dt:task:{task.task_id}:event-index"
+    assert real_redis_connection.hget(
+        event_index_key,
+        "next_sequence",
+    ) == str(real_redis_connection.llen(event_key)).encode()
+    assert real_redis_connection.hlen(event_index_key) == (
+        real_redis_connection.llen(event_key) + 1
+    )
     claim = resources.claim_session_cleanup("a" * 32)
     assert claim is not None
     resources.release_cleanup_claim("a" * 32, claim)

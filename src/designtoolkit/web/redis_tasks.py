@@ -81,34 +81,74 @@ end
 return count
 """
 _APPEND_EVENT_SCRIPT = """-- append_task_event
+local event_exists = redis.call("EXISTS", KEYS[1]) == 1
 local generation = redis.call("GET", KEYS[2])
-if redis.call("EXISTS", KEYS[1]) == 0 or not generation then
+local event_count = redis.call("LLEN", KEYS[1])
+local indexed_sequence = tonumber(
+    redis.call("HGET", KEYS[3], "next_sequence")
+)
+local index_consistent = indexed_sequence == event_count
+    and redis.call("HLEN", KEYS[3]) == event_count + 1
+if not event_exists or not generation then
     generation = ARGV[3]
     redis.call("SET", KEYS[2], generation)
+    redis.call("DEL", KEYS[3])
+    redis.call("HSET", KEYS[3], "next_sequence", event_count)
+elseif not index_consistent then
+    redis.call("DEL", KEYS[3])
+    redis.call("HSET", KEYS[3], "next_sequence", event_count)
 end
+local sequence = redis.call("HINCRBY", KEYS[3], "next_sequence", 1)
+redis.call("HSET", KEYS[3], tostring(sequence), ARGV[1])
 redis.call("RPUSH", KEYS[1], ARGV[1])
 redis.call("EXPIRE", KEYS[1], ARGV[2])
 redis.call("EXPIRE", KEYS[2], ARGV[2])
-return generation
+redis.call("EXPIRE", KEYS[3], ARGV[2])
+return {generation, tostring(sequence)}
 """
 _READ_EVENT_LOG_SCRIPT = """-- read_task_event_log
 if redis.call("EXISTS", KEYS[1]) == 0 then
-    return {"", {}}
+    return {"", {}, "1"}
 end
 
 local generation = redis.call("GET", KEYS[2])
 if not generation then
     generation = ARGV[1]
-    local ttl_ms = redis.call("PTTL", KEYS[1])
     redis.call("SET", KEYS[2], generation)
-    if ttl_ms > 0 then
-        redis.call("PEXPIRE", KEYS[2], ttl_ms)
-    else
-        redis.call("EXPIRE", KEYS[1], ARGV[2])
-        redis.call("EXPIRE", KEYS[2], ARGV[2])
+end
+local history = redis.call("LRANGE", KEYS[1], 0, -1)
+local event_count = #history
+local indexed_sequence = tonumber(
+    redis.call("HGET", KEYS[3], "next_sequence")
+)
+local index_consistent = indexed_sequence == event_count
+    and redis.call("HLEN", KEYS[3]) == event_count + 1
+if index_consistent then
+    for sequence, event in ipairs(history) do
+        if redis.call("HGET", KEYS[3], tostring(sequence)) ~= event then
+            index_consistent = false
+            break
+        end
     end
 end
-return {generation, redis.call("LRANGE", KEYS[1], 0, -1)}
+if not index_consistent then
+    redis.call("DEL", KEYS[3])
+    redis.call("HSET", KEYS[3], "next_sequence", event_count)
+    for sequence, event in ipairs(history) do
+        redis.call("HSET", KEYS[3], tostring(sequence), event)
+    end
+end
+local ttl_ms = redis.call("PTTL", KEYS[1])
+if ttl_ms > 0 then
+    redis.call("PEXPIRE", KEYS[1], ttl_ms)
+    redis.call("PEXPIRE", KEYS[2], ttl_ms)
+    redis.call("PEXPIRE", KEYS[3], ttl_ms)
+else
+    redis.call("EXPIRE", KEYS[1], ARGV[2])
+    redis.call("EXPIRE", KEYS[2], ARGV[2])
+    redis.call("EXPIRE", KEYS[3], ARGV[2])
+end
+return {generation, history, tostring(event_count + 1)}
 """
 _READ_EVENT_AT_CURSOR_SCRIPT = """-- read_task_event_at_cursor
 if redis.call("EXISTS", KEYS[1]) == 0 then
@@ -116,28 +156,58 @@ if redis.call("EXISTS", KEYS[1]) == 0 then
 end
 
 local expected_generation = ARGV[1]
-local offset = tonumber(ARGV[2])
+local expected_sequence = tonumber(ARGV[2])
 local generation = redis.call("GET", KEYS[2])
+local repair_ttl = false
 if not generation then
     generation = ARGV[3]
-    local ttl_ms = redis.call("PTTL", KEYS[1])
     redis.call("SET", KEYS[2], generation)
+    repair_ttl = true
+end
+if generation ~= expected_generation then
+    expected_sequence = 1
+end
+
+local event_count = redis.call("LLEN", KEYS[1])
+local indexed_sequence = tonumber(
+    redis.call("HGET", KEYS[3], "next_sequence")
+)
+local event = false
+local index_consistent = indexed_sequence == event_count
+    and redis.call("HLEN", KEYS[3]) == event_count + 1
+if index_consistent then
+    event = redis.call("HGET", KEYS[3], tostring(expected_sequence))
+    if not event and expected_sequence <= event_count then
+        index_consistent = false
+    end
+end
+if not index_consistent then
+    local history = redis.call("LRANGE", KEYS[1], 0, -1)
+    redis.call("DEL", KEYS[3])
+    redis.call("HSET", KEYS[3], "next_sequence", event_count)
+    for sequence, event in ipairs(history) do
+        redis.call("HSET", KEYS[3], tostring(sequence), event)
+    end
+    repair_ttl = true
+    event = redis.call("HGET", KEYS[3], tostring(expected_sequence))
+end
+if repair_ttl then
+    local ttl_ms = redis.call("PTTL", KEYS[1])
     if ttl_ms > 0 then
+        redis.call("PEXPIRE", KEYS[1], ttl_ms)
         redis.call("PEXPIRE", KEYS[2], ttl_ms)
+        redis.call("PEXPIRE", KEYS[3], ttl_ms)
     else
         redis.call("EXPIRE", KEYS[1], ARGV[4])
         redis.call("EXPIRE", KEYS[2], ARGV[4])
+        redis.call("EXPIRE", KEYS[3], ARGV[4])
     end
 end
 
-if generation ~= expected_generation then
-    offset = 0
-end
-local event = redis.call("LINDEX", KEYS[1], offset)
 if not event then
-    return {generation, false, tostring(offset)}
+    return {generation, false, tostring(expected_sequence)}
 end
-return {generation, event, tostring(offset + 1)}
+return {generation, event, tostring(expected_sequence + 1)}
 """
 _RESERVE_ENQUEUE_SCRIPT = """-- reserve_enqueue_intent
 local queue_key = KEYS[1]
@@ -257,7 +327,8 @@ redis.call(
     KEYS[4],
     KEYS[5],
     KEYS[8],
-    KEYS[9]
+    KEYS[9],
+    KEYS[10]
 )
 if owner_id ~= "" then
     local pin_session = redis.call("HGET", KEYS[6], "session_id")
@@ -440,13 +511,28 @@ task.started_at = ARGV[2]
 local encoded = cjson.encode(task)
 redis.call("SET", KEYS[1], encoded, "EX", ARGV[3])
 redis.call("LREM", KEYS[2], 0, ARGV[1])
+local event_exists = redis.call("EXISTS", KEYS[3]) == 1
 local generation = redis.call("GET", KEYS[4])
-if redis.call("EXISTS", KEYS[3]) == 0 or not generation then
+local event_count = redis.call("LLEN", KEYS[3])
+local indexed_sequence = tonumber(
+    redis.call("HGET", KEYS[5], "next_sequence")
+)
+local index_consistent = indexed_sequence == event_count
+    and redis.call("HLEN", KEYS[5]) == event_count + 1
+if not event_exists or not generation then
     redis.call("SET", KEYS[4], ARGV[5])
+    redis.call("DEL", KEYS[5])
+    redis.call("HSET", KEYS[5], "next_sequence", event_count)
+elseif not index_consistent then
+    redis.call("DEL", KEYS[5])
+    redis.call("HSET", KEYS[5], "next_sequence", event_count)
 end
+local sequence = redis.call("HINCRBY", KEYS[5], "next_sequence", 1)
+redis.call("HSET", KEYS[5], tostring(sequence), ARGV[4])
 redis.call("RPUSH", KEYS[3], ARGV[4])
 redis.call("EXPIRE", KEYS[3], ARGV[3])
 redis.call("EXPIRE", KEYS[4], ARGV[3])
+redis.call("EXPIRE", KEYS[5], ARGV[3])
 return {1, encoded}
 """
 _TERMINAL_TRANSITION_SCRIPT = """-- transition_task_terminal
@@ -480,20 +566,62 @@ if redis.call("EXISTS", KEYS[2]) == 1 then
     redis.call("EXPIRE", KEYS[2], ARGV[9])
 end
 if ARGV[10] == "1" then
+    local event_exists = redis.call("EXISTS", KEYS[3]) == 1
     local generation = redis.call("GET", KEYS[4])
-    if redis.call("EXISTS", KEYS[3]) == 0 or not generation then
+    local event_count = redis.call("LLEN", KEYS[3])
+    local indexed_sequence = tonumber(
+        redis.call("HGET", KEYS[5], "next_sequence")
+    )
+    local index_consistent = indexed_sequence == event_count
+        and redis.call("HLEN", KEYS[5]) == event_count + 1
+    if not event_exists or not generation then
         redis.call("SET", KEYS[4], ARGV[12])
+        redis.call("DEL", KEYS[5])
+        redis.call(
+            "HSET",
+            KEYS[5],
+            "next_sequence",
+            event_count
+        )
+    elseif not index_consistent then
+        redis.call("DEL", KEYS[5])
+        redis.call(
+            "HSET",
+            KEYS[5],
+            "next_sequence",
+            event_count
+        )
     end
+    local sequence = redis.call("HINCRBY", KEYS[5], "next_sequence", 1)
+    redis.call("HSET", KEYS[5], tostring(sequence), ARGV[11])
     redis.call("RPUSH", KEYS[3], ARGV[11])
 end
 if redis.call("EXISTS", KEYS[3]) == 1 then
     if redis.call("EXISTS", KEYS[4]) == 0 then
         redis.call("SET", KEYS[4], ARGV[12])
     end
+    if ARGV[10] ~= "1" then
+        local event_count = redis.call("LLEN", KEYS[3])
+        local indexed_sequence = tonumber(
+            redis.call("HGET", KEYS[5], "next_sequence")
+        )
+        if indexed_sequence ~= event_count
+            or redis.call("HLEN", KEYS[5]) ~= event_count + 1 then
+            redis.call("DEL", KEYS[5])
+            redis.call(
+                "HSET",
+                KEYS[5],
+                "next_sequence",
+                event_count
+            )
+        end
+    end
     redis.call("EXPIRE", KEYS[3], ARGV[9])
     redis.call("EXPIRE", KEYS[4], ARGV[9])
+    redis.call("EXPIRE", KEYS[5], ARGV[9])
 else
     redis.call("DEL", KEYS[4])
+    redis.call("DEL", KEYS[5])
 end
 return {1, encoded}
 """
@@ -563,23 +691,23 @@ class RedisEventSubscriber:
         store: RedisLogStore,
         task_id: str,
         generation: str | None,
-        offset: int,
+        next_sequence: int,
     ) -> None:
         self._store = store
         self._task_id = task_id
         self._generation = generation
-        self._offset = offset
+        self._next_sequence = next_sequence
 
     def get(self, timeout: float) -> LogEventResponse:
         deadline = monotonic() + timeout
         while monotonic() < deadline:
-            generation, event, next_offset = self._store._event_at_cursor(
+            generation, event, next_sequence = self._store._event_at_cursor(
                 self._task_id,
                 self._generation,
-                self._offset,
+                self._next_sequence,
             )
             self._generation = generation
-            self._offset = next_offset
+            self._next_sequence = next_sequence
             if event is not None:
                 return event
             sleep(min(0.05, max(0.0, deadline - monotonic())))
@@ -628,6 +756,7 @@ class RedisLogStore:
                 keys=[
                     _event_key(task_id),
                     _event_generation_key(task_id),
+                    _event_index_key(task_id),
                 ],
                 args=[
                     event_json,
@@ -642,19 +771,19 @@ class RedisLogStore:
         return event
 
     def history(self, task_id: str) -> list[LogEventResponse]:
-        _generation, events = self._snapshot(task_id)
+        _generation, events, _next_sequence = self._snapshot(task_id)
         return events
 
     def history_and_subscribe(
         self,
         task_id: str,
     ) -> tuple[list[LogEventResponse], RedisEventSubscriber]:
-        generation, history = self._snapshot(task_id)
+        generation, history, next_sequence = self._snapshot(task_id)
         return history, RedisEventSubscriber(
             self,
             task_id,
             generation,
-            len(history),
+            next_sequence,
         )
 
     def unsubscribe(
@@ -667,41 +796,45 @@ class RedisLogStore:
     def _snapshot(
         self,
         task_id: str,
-    ) -> tuple[str | None, list[LogEventResponse]]:
+    ) -> tuple[str | None, list[LogEventResponse], int]:
         try:
-            generation, values = self._read_event_log_script(
+            generation, values, next_sequence = self._read_event_log_script(
                 keys=[
                     _event_key(task_id),
                     _event_generation_key(task_id),
+                    _event_index_key(task_id),
                 ],
                 args=[uuid4().hex, self._retention_seconds],
             )
         except ResponseError as error_response:
             if "unknown command" not in str(error_response).lower():
                 raise
-            generation, values = self._snapshot_without_lua(task_id)
+            generation, values, next_sequence = self._snapshot_without_lua(
+                task_id
+            )
         generation_text = _redis_text(generation) or None
         events = [
             LogEventResponse.model_validate_json(value) for value in values
         ]
-        return generation_text, events
+        return generation_text, events, int(next_sequence)
 
     def _event_at_cursor(
         self,
         task_id: str,
         expected_generation: str | None,
-        offset: int,
+        expected_sequence: int,
     ) -> tuple[str | None, LogEventResponse | None, int]:
         try:
-            generation, value, next_offset = (
+            generation, value, next_sequence = (
                 self._read_event_at_cursor_script(
                     keys=[
                         _event_key(task_id),
                         _event_generation_key(task_id),
+                        _event_index_key(task_id),
                     ],
                     args=[
                         expected_generation or "",
-                        offset,
+                        expected_sequence,
                         uuid4().hex,
                         self._retention_seconds,
                     ],
@@ -710,11 +843,11 @@ class RedisLogStore:
         except ResponseError as error_response:
             if "unknown command" not in str(error_response).lower():
                 raise
-            generation, value, next_offset = (
+            generation, value, next_sequence = (
                 self._event_at_cursor_without_lua(
                     task_id,
                     expected_generation,
-                    offset,
+                    expected_sequence,
                 )
             )
         generation_text = _redis_text(generation) or None
@@ -723,24 +856,61 @@ class RedisLogStore:
             if value is not None
             else None
         )
-        return generation_text, event, int(next_offset)
+        return generation_text, event, int(next_sequence)
 
     def _append_without_lua(self, task_id: str, event_json: str) -> None:
         event_key = _event_key(task_id)
         generation_key = _event_generation_key(task_id)
+        event_index_key = _event_index_key(task_id)
         candidate = uuid4().hex
         while True:
             with self._redis.pipeline() as pipeline:
                 try:
-                    pipeline.watch(event_key, generation_key)
+                    pipeline.watch(
+                        event_key,
+                        generation_key,
+                        event_index_key,
+                    )
                     generation = pipeline.get(generation_key)
                     event_log_exists = bool(pipeline.exists(event_key))
+                    event_count = int(pipeline.llen(event_key))
+                    indexed_sequence = pipeline.hget(
+                        event_index_key,
+                        "next_sequence",
+                    )
+                    reset_index = (
+                        not event_log_exists
+                        or generation is None
+                        or not _event_index_is_consistent(
+                            indexed_sequence,
+                            int(pipeline.hlen(event_index_key)),
+                            event_count,
+                        )
+                    )
+                    sequence = event_count + 1
                     pipeline.multi()
                     if not event_log_exists or generation is None:
                         pipeline.set(generation_key, candidate)
+                    if reset_index:
+                        pipeline.delete(event_index_key)
+                        pipeline.hset(
+                            event_index_key,
+                            "next_sequence",
+                            event_count,
+                        )
+                    pipeline.hincrby(
+                        event_index_key,
+                        "next_sequence",
+                        1,
+                    )
+                    pipeline.hset(event_index_key, str(sequence), event_json)
                     pipeline.rpush(event_key, event_json)
                     pipeline.expire(event_key, self._retention_seconds)
                     pipeline.expire(generation_key, self._retention_seconds)
+                    pipeline.expire(
+                        event_index_key,
+                        self._retention_seconds,
+                    )
                     pipeline.execute()
                     return
                 except WatchError:
@@ -750,91 +920,186 @@ class RedisLogStore:
         self,
         task_id: str,
         expected_generation: str | None,
-        offset: int,
+        expected_sequence: int,
     ) -> tuple[bytes | str | None, bytes | str | None, int]:
         event_key = _event_key(task_id)
         generation_key = _event_generation_key(task_id)
+        event_index_key = _event_index_key(task_id)
         candidate = uuid4().hex
         while True:
             with self._redis.pipeline() as pipeline:
                 try:
-                    pipeline.watch(event_key, generation_key)
+                    pipeline.watch(
+                        event_key,
+                        generation_key,
+                        event_index_key,
+                    )
                     if not pipeline.exists(event_key):
                         pipeline.unwatch()
-                        return None, None, offset
+                        return None, None, expected_sequence
                     generation = pipeline.get(generation_key)
-                    ttl_ms = (
-                        pipeline.pttl(event_key)
-                        if generation is None
-                        else None
+                    generation_was_missing = generation is None
+                    event_count = int(pipeline.llen(event_key))
+                    indexed_sequence = pipeline.hget(
+                        event_index_key,
+                        "next_sequence",
+                    )
+                    index_is_consistent = _event_index_is_consistent(
+                        indexed_sequence,
+                        int(pipeline.hlen(event_index_key)),
+                        event_count,
                     )
                     if generation is None:
                         generation = candidate
                     generation_text = _redis_text(generation)
-                    read_offset = (
-                        0
+                    read_sequence = (
+                        1
                         if generation_text != (expected_generation or "")
-                        else offset
+                        else expected_sequence
                     )
+                    indexed_event = (
+                        pipeline.hget(event_index_key, str(read_sequence))
+                        if index_is_consistent
+                        else None
+                    )
+                    if (
+                        indexed_event is None
+                        and read_sequence <= event_count
+                    ):
+                        index_is_consistent = False
+                    history = (
+                        pipeline.lrange(event_key, 0, -1)
+                        if not index_is_consistent
+                        else None
+                    )
+                    ttl_ms = pipeline.pttl(event_key)
                     pipeline.multi()
-                    if ttl_ms is not None:
+                    if generation_was_missing:
                         pipeline.set(generation_key, generation)
+                    if history is not None:
+                        pipeline.delete(event_index_key)
+                        pipeline.hset(
+                            event_index_key,
+                            mapping={
+                                "next_sequence": event_count,
+                                **{
+                                    str(sequence): value
+                                    for sequence, value in enumerate(
+                                        history,
+                                        start=1,
+                                    )
+                                },
+                            },
+                        )
+                    if history is not None or generation_was_missing:
                         if ttl_ms > 0:
-                            pipeline.pexpire(generation_key, ttl_ms)
-                        else:
-                            pipeline.expire(
+                            for key in (
                                 event_key,
-                                self._retention_seconds,
-                            )
-                            pipeline.expire(
                                 generation_key,
-                                self._retention_seconds,
-                            )
-                    pipeline.lindex(event_key, read_offset)
-                    value = pipeline.execute()[-1]
-                    next_offset = read_offset + (value is not None)
-                    return generation, value, next_offset
+                                event_index_key,
+                            ):
+                                pipeline.pexpire(key, ttl_ms)
+                        else:
+                            for key in (
+                                event_key,
+                                generation_key,
+                                event_index_key,
+                            ):
+                                pipeline.expire(
+                                    key,
+                                    self._retention_seconds,
+                                )
+                    if history is None:
+                        pipeline.exists(event_key)
+                        pipeline.execute()
+                        value = indexed_event
+                    else:
+                        pipeline.hget(event_index_key, str(read_sequence))
+                        value = pipeline.execute()[-1]
+                    next_sequence = read_sequence + (value is not None)
+                    return generation, value, next_sequence
                 except WatchError:
                     continue
 
     def _snapshot_without_lua(
         self,
         task_id: str,
-    ) -> tuple[bytes | str | None, list[bytes | str]]:
+    ) -> tuple[bytes | str | None, list[bytes | str], int]:
         event_key = _event_key(task_id)
         generation_key = _event_generation_key(task_id)
+        event_index_key = _event_index_key(task_id)
         candidate = uuid4().hex
         while True:
             with self._redis.pipeline() as pipeline:
                 try:
-                    pipeline.watch(event_key, generation_key)
+                    pipeline.watch(
+                        event_key,
+                        generation_key,
+                        event_index_key,
+                    )
                     if not pipeline.exists(event_key):
                         pipeline.unwatch()
-                        return None, []
+                        return None, [], 1
                     generation = pipeline.get(generation_key)
-                    ttl_ms = (
-                        pipeline.pttl(event_key)
-                        if generation is None
-                        else None
+                    values = pipeline.lrange(event_key, 0, -1)
+                    event_count = len(values)
+                    indexed_sequence = pipeline.hget(
+                        event_index_key,
+                        "next_sequence",
                     )
+                    index_is_consistent = _event_index_is_consistent(
+                        indexed_sequence,
+                        int(pipeline.hlen(event_index_key)),
+                        event_count,
+                    )
+                    if index_is_consistent:
+                        indexed_values = pipeline.hmget(
+                            event_index_key,
+                            [
+                                str(sequence)
+                                for sequence in range(1, event_count + 1)
+                            ],
+                        )
+                        index_is_consistent = indexed_values == values
+                    ttl_ms = pipeline.pttl(event_key)
                     pipeline.multi()
                     if generation is None:
                         generation = candidate
                         pipeline.set(generation_key, generation)
-                        if ttl_ms is not None and ttl_ms > 0:
-                            pipeline.pexpire(generation_key, ttl_ms)
-                        else:
+                    if not index_is_consistent:
+                        pipeline.delete(event_index_key)
+                        pipeline.hset(
+                            event_index_key,
+                            mapping={
+                                "next_sequence": event_count,
+                                **{
+                                    str(sequence): value
+                                    for sequence, value in enumerate(
+                                        values,
+                                        start=1,
+                                    )
+                                },
+                            },
+                        )
+                    if ttl_ms > 0:
+                        for key in (
+                            event_key,
+                            generation_key,
+                            event_index_key,
+                        ):
+                            pipeline.pexpire(key, ttl_ms)
+                    else:
+                        for key in (
+                            event_key,
+                            generation_key,
+                            event_index_key,
+                        ):
                             pipeline.expire(
-                                event_key,
+                                key,
                                 self._retention_seconds,
                             )
-                            pipeline.expire(
-                                generation_key,
-                                self._retention_seconds,
-                            )
-                    pipeline.lrange(event_key, 0, -1)
-                    values = pipeline.execute()[-1]
-                    return generation, values
+                    pipeline.execute()
+                    return generation, values, event_count + 1
                 except WatchError:
                     continue
 
@@ -1114,6 +1379,7 @@ class RedisTaskManager:
                     _queue_reservations_key(),
                     _event_key(task_id),
                     _event_generation_key(task_id),
+                    _event_index_key(task_id),
                 ],
                 args=[
                     task_id,
@@ -1248,7 +1514,7 @@ class RedisTaskManager:
         owners: set[str] = set()
         for key in self._redis.scan_iter(match="dt:task:*"):
             key_text = key.decode() if isinstance(key, bytes) else key
-            if key_text.endswith(":events"):
+            if _is_task_event_key(key_text):
                 continue
             value = self._redis.get(key)
             if value is None:
@@ -2063,6 +2329,7 @@ class RedisTaskManager:
                         session_task_pins_key,
                         _enqueue_owner_key(task_id),
                         _event_generation_key(task_id),
+                        _event_index_key(task_id),
                     ],
                     args=[task_id, owner, owner_token, _ASSET_TASK_PREFIX],
                 )
@@ -2073,7 +2340,12 @@ class RedisTaskManager:
         while True:
             with self._redis.pipeline() as pipeline:
                 try:
-                    pipeline.watch(_enqueue_intent_key(task_id))
+                    pipeline.watch(
+                        _enqueue_intent_key(task_id),
+                        _event_key(task_id),
+                        _event_generation_key(task_id),
+                        _event_index_key(task_id),
+                    )
                     token = pipeline.hget(
                         _enqueue_intent_key(task_id),
                         "owner_token",
@@ -2094,6 +2366,7 @@ class RedisTaskManager:
                     pipeline.delete(
                         _task_key(task_id),
                         _event_key(task_id),
+                        _event_index_key(task_id),
                         _event_generation_key(task_id),
                         _task_work_key(task_id),
                         _enqueue_intent_key(task_id),
@@ -2402,6 +2675,7 @@ class RedisTaskManager:
                 try:
                     event_key = _event_key(task_id)
                     generation_key = _event_generation_key(task_id)
+                    event_index_key = _event_index_key(task_id)
                     pipeline.watch(
                         task_key,
                         intent_key,
@@ -2409,6 +2683,7 @@ class RedisTaskManager:
                         job_key,
                         event_key,
                         generation_key,
+                        event_index_key,
                     )
                     metadata = pipeline.hgetall(intent_key)
                     if not metadata:
@@ -2472,6 +2747,21 @@ class RedisTaskManager:
                     task.finished_at = event.timestamp
                     event_log_exists = bool(pipeline.exists(event_key))
                     generation = pipeline.get(generation_key)
+                    event_count = int(pipeline.llen(event_key))
+                    indexed_sequence = pipeline.hget(
+                        event_index_key,
+                        "next_sequence",
+                    )
+                    reset_index = (
+                        not event_log_exists
+                        or generation is None
+                        or not _event_index_is_consistent(
+                            indexed_sequence,
+                            int(pipeline.hlen(event_index_key)),
+                            event_count,
+                        )
+                    )
+                    sequence = event_count + 1
                     pipeline.multi()
                     pipeline.set(
                         task_key,
@@ -2484,9 +2774,30 @@ class RedisTaskManager:
                     )
                     if not event_log_exists or generation is None:
                         pipeline.set(generation_key, uuid4().hex)
+                    if reset_index:
+                        pipeline.delete(event_index_key)
+                        pipeline.hset(
+                            event_index_key,
+                            "next_sequence",
+                            event_count,
+                        )
+                    pipeline.hincrby(
+                        event_index_key,
+                        "next_sequence",
+                        1,
+                    )
+                    pipeline.hset(
+                        event_index_key,
+                        str(sequence),
+                        event.model_dump_json(),
+                    )
                     pipeline.rpush(event_key, event.model_dump_json())
                     pipeline.expire(event_key, self.retention_seconds)
                     pipeline.expire(generation_key, self.retention_seconds)
+                    pipeline.expire(
+                        event_index_key,
+                        self.retention_seconds,
+                    )
                     pipeline.lrem(_queue_reservations_key(), 0, task_id)
                     pipeline.delete(intent_key, owner_key)
                     pipeline.execute()
@@ -2618,7 +2929,13 @@ class RedisTaskManager:
                 try:
                     event_key = _event_key(task_id)
                     generation_key = _event_generation_key(task_id)
-                    pipeline.watch(key, event_key, generation_key)
+                    event_index_key = _event_index_key(task_id)
+                    pipeline.watch(
+                        key,
+                        event_key,
+                        generation_key,
+                        event_index_key,
+                    )
                     value = pipeline.get(key)
                     if value is None:
                         raise KeyError(task_id)
@@ -2630,6 +2947,21 @@ class RedisTaskManager:
                     task.started_at = started_at
                     event_log_exists = bool(pipeline.exists(event_key))
                     generation = pipeline.get(generation_key)
+                    event_count = int(pipeline.llen(event_key))
+                    indexed_sequence = pipeline.hget(
+                        event_index_key,
+                        "next_sequence",
+                    )
+                    reset_index = (
+                        not event_log_exists
+                        or generation is None
+                        or not _event_index_is_consistent(
+                            indexed_sequence,
+                            int(pipeline.hlen(event_index_key)),
+                            event_count,
+                        )
+                    )
+                    sequence = event_count + 1
                     pipeline.multi()
                     pipeline.set(
                         key,
@@ -2639,9 +2971,27 @@ class RedisTaskManager:
                     pipeline.lrem(_queue_reservations_key(), 0, task_id)
                     if not event_log_exists or generation is None:
                         pipeline.set(generation_key, uuid4().hex)
+                    if reset_index:
+                        pipeline.delete(event_index_key)
+                        pipeline.hset(
+                            event_index_key,
+                            "next_sequence",
+                            event_count,
+                        )
+                    pipeline.hincrby(
+                        event_index_key,
+                        "next_sequence",
+                        1,
+                    )
+                    pipeline.hset(
+                        event_index_key,
+                        str(sequence),
+                        event.model_dump_json(),
+                    )
                     pipeline.rpush(event_key, event.model_dump_json())
                     pipeline.expire(event_key, self.live_task_ttl)
                     pipeline.expire(generation_key, self.live_task_ttl)
+                    pipeline.expire(event_index_key, self.live_task_ttl)
                     pipeline.execute()
                     return task, RunningTransitionResult.APPLIED
                 except WatchError:
@@ -2668,6 +3018,7 @@ class RedisTaskManager:
                     _task_work_key(task_id),
                     _event_key(task_id),
                     _event_generation_key(task_id),
+                    _event_index_key(task_id),
                 ],
                 args=[
                     status.value,
@@ -2725,7 +3076,13 @@ class RedisTaskManager:
                 try:
                     event_key = _event_key(task_id)
                     generation_key = _event_generation_key(task_id)
-                    pipeline.watch(key, event_key, generation_key)
+                    event_index_key = _event_index_key(task_id)
+                    pipeline.watch(
+                        key,
+                        event_key,
+                        generation_key,
+                        event_index_key,
+                    )
                     value = pipeline.get(key)
                     if value is None:
                         raise KeyError(task_id)
@@ -2743,6 +3100,16 @@ class RedisTaskManager:
                     task.finished_at = finished_at
                     event_log_exists = bool(pipeline.exists(event_key))
                     generation = pipeline.get(generation_key)
+                    event_count = int(pipeline.llen(event_key))
+                    indexed_sequence = pipeline.hget(
+                        event_index_key,
+                        "next_sequence",
+                    )
+                    index_is_consistent = _event_index_is_consistent(
+                        indexed_sequence,
+                        int(pipeline.hlen(event_index_key)),
+                        event_count,
+                    )
                     pipeline.multi()
                     pipeline.set(
                         key,
@@ -2754,8 +3121,31 @@ class RedisTaskManager:
                         self.retention_seconds,
                     )
                     if terminal_event is not None:
+                        reset_index = (
+                            not event_log_exists
+                            or generation is None
+                            or not index_is_consistent
+                        )
+                        sequence = event_count + 1
                         if not event_log_exists or generation is None:
                             pipeline.set(generation_key, uuid4().hex)
+                        if reset_index:
+                            pipeline.delete(event_index_key)
+                            pipeline.hset(
+                                event_index_key,
+                                "next_sequence",
+                                event_count,
+                            )
+                        pipeline.hincrby(
+                            event_index_key,
+                            "next_sequence",
+                            1,
+                        )
+                        pipeline.hset(
+                            event_index_key,
+                            str(sequence),
+                            terminal_event.model_dump_json(),
+                        )
                         pipeline.rpush(
                             event_key,
                             terminal_event.model_dump_json(),
@@ -2764,13 +3154,27 @@ class RedisTaskManager:
                     if event_log_exists:
                         if generation is None and terminal_event is None:
                             pipeline.set(generation_key, uuid4().hex)
+                        if (
+                            not index_is_consistent
+                            and terminal_event is None
+                        ):
+                            pipeline.delete(event_index_key)
+                            pipeline.hset(
+                                event_index_key,
+                                "next_sequence",
+                                event_count,
+                            )
                         pipeline.expire(event_key, self.retention_seconds)
                         pipeline.expire(
                             generation_key,
                             self.retention_seconds,
                         )
+                        pipeline.expire(
+                            event_index_key,
+                            self.retention_seconds,
+                        )
                     else:
-                        pipeline.delete(generation_key)
+                        pipeline.delete(generation_key, event_index_key)
                     pipeline.execute()
                     self.release_task_pin(task_id)
                     return task, TerminalTransitionResult.APPLIED
@@ -2819,7 +3223,7 @@ class RedisTaskManager:
         tasks: list[TaskRecord] = []
         for key in self._redis.scan_iter(match="dt:task:*"):
             key_text = key.decode() if isinstance(key, bytes) else key
-            if key_text.endswith(":events"):
+            if _is_task_event_key(key_text):
                 continue
             value = self._redis.get(key)
             if value is None:
@@ -2836,7 +3240,7 @@ class RedisTaskManager:
         tasks: list[TaskRecord] = []
         for key in self._redis.scan_iter(match="dt:task:*"):
             key_text = key.decode() if isinstance(key, bytes) else key
-            if key_text.endswith(":events"):
+            if _is_task_event_key(key_text):
                 continue
             value = self._redis.get(key)
             if value is None:
@@ -2904,6 +3308,29 @@ def _task_key(task_id: str) -> str:
 
 def _event_key(task_id: str) -> str:
     return f"dt:task:{task_id}:events"
+
+
+def _event_index_key(task_id: str) -> str:
+    return f"dt:task:{task_id}:event-index"
+
+
+def _is_task_event_key(key: str) -> bool:
+    return key.endswith((":events", ":event-index"))
+
+
+def _event_index_is_consistent(
+    indexed_sequence: bytes | str | None,
+    index_size: int,
+    event_count: int,
+) -> bool:
+    try:
+        return (
+            indexed_sequence is not None
+            and int(indexed_sequence) == event_count
+            and index_size == event_count + 1
+        )
+    except ValueError:
+        return False
 
 
 def _event_generation_key(task_id: str) -> str:
