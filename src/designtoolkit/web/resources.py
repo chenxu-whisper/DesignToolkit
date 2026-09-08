@@ -1622,24 +1622,78 @@ if redis.call("HGET", KEYS[1], "task_id") ~= ARGV[2] then
     return 2
 end
 local identities_json = redis.call("HGET", KEYS[1], "asset_identities")
-local legacy = false
-if not identities_json then
-    identities_json = redis.call("HGET", KEYS[1], "asset_ids")
-    legacy = true
-end
+local asset_ids_json = redis.call("HGET", KEYS[1], "asset_ids")
+local asset_ids = {}
 if identities_json then
-    local identities = cjson.decode(identities_json)
-    for _, identity in ipairs(identities) do
-        local asset_id = identity
-        if not legacy then
-            asset_id = identity[1]
+    if string.sub(identities_json, 1, 1) ~= "[" then
+        return 3
+    end
+    local decoded, identities = pcall(cjson.decode, identities_json)
+    if not decoded or type(identities) ~= "table" then
+        return 3
+    end
+    for index, identity in ipairs(identities) do
+        if type(identity) ~= "table"
+            or #identity ~= 2
+            or type(identity[1]) ~= "string"
+            or (
+                identity[2] ~= cjson.null
+                and type(identity[2]) ~= "string"
+            ) then
+            return 3
         end
-        local asset_tasks_key = ARGV[3] .. ARGV[1] .. ":" .. asset_id
-        redis.call("SREM", asset_tasks_key, ARGV[2])
-        if redis.call("SCARD", asset_tasks_key) == 0 then
-            redis.call("DEL", asset_tasks_key)
+        if type(identity[2]) == "string"
+            and (
+                string.len(identity[2]) ~= 32
+                or string.match(identity[2], "^[0-9a-f]+$") == nil
+            ) then
+            return 3
+        end
+        asset_ids[index] = identity[1]
+    end
+    if asset_ids_json then
+        if string.sub(asset_ids_json, 1, 1) ~= "[" then
+            return 3
+        end
+        local decoded_ids, legacy_asset_ids = pcall(cjson.decode, asset_ids_json)
+        if not decoded_ids
+            or type(legacy_asset_ids) ~= "table"
+            or #legacy_asset_ids ~= #asset_ids then
+            return 3
+        end
+        for index, asset_id in ipairs(legacy_asset_ids) do
+            if type(asset_id) ~= "string" or asset_id ~= asset_ids[index] then
+                return 3
+            end
         end
     end
+elseif asset_ids_json then
+    if string.sub(asset_ids_json, 1, 1) ~= "[" then
+        return 3
+    end
+    local decoded, legacy_asset_ids = pcall(cjson.decode, asset_ids_json)
+    if not decoded or type(legacy_asset_ids) ~= "table" then
+        return 3
+    end
+    for index, asset_id in ipairs(legacy_asset_ids) do
+        if type(asset_id) ~= "string" then
+            return 3
+        end
+        asset_ids[index] = asset_id
+    end
+end
+for _, asset_id in ipairs(asset_ids) do
+    if string.len(asset_id) ~= 32
+        or string.match(asset_id, "^[0-9a-f]+$") == nil then
+        return 3
+    end
+end
+for _, asset_id in ipairs(asset_ids) do
+    local asset_tasks_key = ARGV[3] .. ARGV[1] .. ":" .. asset_id
+    redis.call("SREM", asset_tasks_key, ARGV[2])
+    if redis.call("SCARD", asset_tasks_key) == 0 then
+        redis.call("DEL", asset_tasks_key)
+end
 end
 redis.call("DEL", KEYS[1])
 redis.call("SREM", KEYS[2], ARGV[2])
@@ -3059,6 +3113,8 @@ class RedisResourceCoordinator:
         )
         if result == 2:
             raise ResourceUnavailableError("Task pin ownership is invalid")
+        if result == 3:
+            raise ResourceUnavailableError("Task pin asset metadata is invalid")
         return result == 1
 
     def output_reserved_bytes(self) -> int:

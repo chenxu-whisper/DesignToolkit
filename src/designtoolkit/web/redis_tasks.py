@@ -203,10 +203,10 @@ local cleanup_prefix = ARGV[6]
 local owner_token = ARGV[7]
 local owner_ttl_ms = tonumber(ARGV[8])
 local asset_identities = cjson.decode(ARGV[9])
-local asset_task_prefix = ARGV[10]
-local asset_delete_prefix = ARGV[11]
-local asset_read_pin_token = ARGV[12]
-local asset_readers_prefix = ARGV[13]
+local asset_task_prefix = ARGV[11]
+local asset_delete_prefix = ARGV[12]
+local asset_read_pin_token = ARGV[13]
+local asset_readers_prefix = ARGV[14]
 
 if owner_id ~= "" then
     local deleting = redis.call("HGET", session_state_key, "deleting")
@@ -267,6 +267,8 @@ if owner_id ~= "" then
         task_id,
         "session_id",
         owner_id,
+        "asset_ids",
+        ARGV[10],
         "asset_identities",
         ARGV[9]
     )
@@ -300,6 +302,92 @@ local owner_token = ARGV[3]
 if redis.call("HGET", KEYS[5], "owner_token") ~= owner_token then
     return 0
 end
+local release_pin = false
+local asset_ids = {}
+if owner_id ~= "" then
+    local pin_session = redis.call("HGET", KEYS[6], "session_id")
+    local pin_task = redis.call("HGET", KEYS[6], "task_id")
+    if pin_session == owner_id and pin_task == task_id then
+        release_pin = true
+        local identities_json = redis.call(
+            "HGET",
+            KEYS[6],
+            "asset_identities"
+        )
+        local asset_ids_json = redis.call("HGET", KEYS[6], "asset_ids")
+        if identities_json then
+            if string.sub(identities_json, 1, 1) ~= "[" then
+                return 2
+            end
+            local decoded, identities = pcall(cjson.decode, identities_json)
+            if not decoded or type(identities) ~= "table" then
+                return 2
+            end
+            for index, identity in ipairs(identities) do
+                if type(identity) ~= "table"
+                    or #identity ~= 2
+                    or type(identity[1]) ~= "string"
+                    or (
+                        identity[2] ~= cjson.null
+                        and type(identity[2]) ~= "string"
+                    ) then
+                    return 2
+                end
+                if type(identity[2]) == "string"
+                    and (
+                        string.len(identity[2]) ~= 32
+                        or string.match(identity[2], "^[0-9a-f]+$") == nil
+                    ) then
+                    return 2
+                end
+                asset_ids[index] = identity[1]
+            end
+            if asset_ids_json then
+                if string.sub(asset_ids_json, 1, 1) ~= "[" then
+                    return 2
+                end
+                local decoded_ids, legacy_asset_ids = pcall(
+                    cjson.decode,
+                    asset_ids_json
+                )
+                if not decoded_ids
+                    or type(legacy_asset_ids) ~= "table"
+                    or #legacy_asset_ids ~= #asset_ids then
+                    return 2
+                end
+                for index, asset_id in ipairs(legacy_asset_ids) do
+                    if type(asset_id) ~= "string"
+                        or asset_id ~= asset_ids[index] then
+                        return 2
+                    end
+                end
+            end
+        elseif asset_ids_json then
+            if string.sub(asset_ids_json, 1, 1) ~= "[" then
+                return 2
+            end
+            local decoded, legacy_asset_ids = pcall(
+                cjson.decode,
+                asset_ids_json
+            )
+            if not decoded or type(legacy_asset_ids) ~= "table" then
+                return 2
+            end
+            for index, asset_id in ipairs(legacy_asset_ids) do
+                if type(asset_id) ~= "string" then
+                    return 2
+                end
+                asset_ids[index] = asset_id
+            end
+        end
+        for _, asset_id in ipairs(asset_ids) do
+            if string.len(asset_id) ~= 32
+                or string.match(asset_id, "^[0-9a-f]+$") == nil then
+                return 2
+            end
+        end
+    end
+end
 redis.call("LREM", KEYS[1], 0, task_id)
 redis.call(
     "DEL",
@@ -311,39 +399,18 @@ redis.call(
     KEYS[9],
     KEYS[10]
 )
-if owner_id ~= "" then
-    local pin_session = redis.call("HGET", KEYS[6], "session_id")
-    local pin_task = redis.call("HGET", KEYS[6], "task_id")
-    if pin_session == owner_id and pin_task == task_id then
-        local identities_json = redis.call(
-            "HGET",
-            KEYS[6],
-            "asset_identities"
-        )
-        local legacy = false
-        if not identities_json then
-            identities_json = redis.call("HGET", KEYS[6], "asset_ids")
-            legacy = true
+if release_pin then
+    for _, asset_id in ipairs(asset_ids) do
+        local asset_tasks_key = ARGV[4] .. owner_id .. ":" .. asset_id
+        redis.call("SREM", asset_tasks_key, task_id)
+        if redis.call("SCARD", asset_tasks_key) == 0 then
+            redis.call("DEL", asset_tasks_key)
         end
-        if identities_json then
-            local identities = cjson.decode(identities_json)
-            for _, identity in ipairs(identities) do
-                local asset_id = identity
-                if not legacy then
-                    asset_id = identity[1]
-                end
-                local asset_tasks_key = ARGV[4] .. owner_id .. ":" .. asset_id
-                redis.call("SREM", asset_tasks_key, task_id)
-                if redis.call("SCARD", asset_tasks_key) == 0 then
-                    redis.call("DEL", asset_tasks_key)
-                end
-            end
-        end
-        redis.call("DEL", KEYS[6])
-        redis.call("SREM", KEYS[7], task_id)
-        if redis.call("SCARD", KEYS[7]) == 0 then
-            redis.call("DEL", KEYS[7])
-        end
+    end
+    redis.call("DEL", KEYS[6])
+    redis.call("SREM", KEYS[7], task_id)
+    if redis.call("SCARD", KEYS[7]) == 0 then
+        redis.call("DEL", KEYS[7])
     end
 end
 return 1
@@ -2154,6 +2221,7 @@ class RedisTaskManager:
                         owner_token,
                         self._enqueue_intent_ttl_ms,
                         _asset_identities_json(asset_identities),
+                        _asset_ids_json(asset_identities),
                         _ASSET_TASK_PREFIX,
                         _ASSET_DELETE_PREFIX,
                         asset_read_pin_token or "",
@@ -2271,6 +2339,9 @@ class RedisTaskManager:
                             mapping={
                                 "task_id": task.task_id,
                                 "session_id": owner_id,
+                                "asset_ids": _asset_ids_json(
+                                    asset_identities
+                                ),
                                 "asset_identities": _asset_identities_json(
                                     asset_identities
                                 ),
@@ -2326,7 +2397,7 @@ class RedisTaskManager:
             else _enqueue_intent_key(task_id)
         )
         try:
-            return bool(
+            result = int(
                 self._rollback_enqueue_script(
                     keys=[
                         _queue_reservations_key(),
@@ -2343,18 +2414,29 @@ class RedisTaskManager:
                     args=[task_id, owner, owner_token, _ASSET_TASK_PREFIX],
                 )
             )
+            if result == 2:
+                raise TaskConflictError("Task pin asset metadata is invalid")
+            return result == 1
         except ResponseError as error_response:
             if "unknown command" not in str(error_response).lower():
                 raise
         while True:
             with self._redis.pipeline() as pipeline:
                 try:
-                    pipeline.watch(
+                    watched_keys = [
                         _enqueue_intent_key(task_id),
                         _event_key(task_id),
                         _event_generation_key(task_id),
                         _event_index_key(task_id),
-                    )
+                    ]
+                    if owner:
+                        watched_keys.extend(
+                            (
+                                _task_pin_key(task_id),
+                                _session_task_pins_key(owner),
+                            )
+                        )
+                    pipeline.watch(*watched_keys)
                     token = pipeline.hget(
                         _enqueue_intent_key(task_id),
                         "owner_token",
@@ -2914,6 +2996,8 @@ class RedisTaskManager:
                         continue
         if result == 2:
             raise TaskConflictError("Task pin ownership is invalid")
+        if result == 3:
+            raise TaskConflictError("Task pin asset metadata is invalid")
         return result == 1
 
     def _release_queue_slot(self, task_id: str) -> None:
@@ -3419,6 +3503,12 @@ def _asset_identities_json(
     return json.dumps(asset_identities, separators=(",", ":"))
 
 
+def _asset_ids_json(
+    asset_identities: tuple[AssetIdentity, ...],
+) -> str:
+    return json.dumps(_asset_ids(asset_identities), separators=(",", ":"))
+
+
 def _asset_read_pin_metadata_matches(
     metadata: dict[bytes | str, bytes | str],
     session_id: str,
@@ -3437,6 +3527,7 @@ def _asset_ids_from_pin_metadata(
     metadata: dict[bytes | str, bytes | str],
 ) -> tuple[str, ...]:
     identities_value = _redis_hash_text(metadata, "asset_identities")
+    legacy_value = _redis_hash_text(metadata, "asset_ids")
     if identities_value is not None:
         try:
             decoded = json.loads(identities_value)
@@ -3457,26 +3548,32 @@ def _asset_ids_from_pin_metadata(
             )
             if len(identities) != len(decoded):
                 raise ValueError
-            return _asset_ids(_normalize_asset_identities(identities))
+            asset_ids = _asset_ids(_normalize_asset_identities(identities))
+            if legacy_value is not None:
+                legacy_asset_ids = _decode_legacy_asset_ids(legacy_value)
+                if legacy_asset_ids != asset_ids:
+                    raise ValueError
+            return asset_ids
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
             raise TaskConflictError(
                 "Task pin asset metadata is invalid"
             ) from exc
 
-    legacy_value = _redis_hash_text(metadata, "asset_ids")
     if legacy_value is None:
         return ()
     try:
-        decoded = json.loads(legacy_value)
-        if not isinstance(decoded, list) or not all(
-            isinstance(asset_id, str) for asset_id in decoded
-        ):
-            raise ValueError
-        return _asset_ids(
-            _normalize_asset_identities(tuple(decoded))
-        )
+        return _decode_legacy_asset_ids(legacy_value)
     except (TypeError, ValueError, json.JSONDecodeError) as exc:
         raise TaskConflictError("Task pin asset metadata is invalid") from exc
+
+
+def _decode_legacy_asset_ids(value: str) -> tuple[str, ...]:
+    decoded = json.loads(value)
+    if not isinstance(decoded, list) or not all(
+        isinstance(asset_id, str) for asset_id in decoded
+    ):
+        raise ValueError
+    return _asset_ids(_normalize_asset_identities(tuple(decoded)))
 
 
 def _redis_hash_text(

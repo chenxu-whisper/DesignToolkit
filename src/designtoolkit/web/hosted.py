@@ -740,6 +740,7 @@ class HostedStorage:
         if manifest is None or not _asset_generation_matches(
             parsed.generation_id,
             manifest.get("generation_id"),
+            manifest["reference_version"],
         ):
             raise UploadRejectedError("Uploaded asset is not available")
         matches = [
@@ -1674,7 +1675,10 @@ def _decode_reference_filename(value: str) -> str:
 def _asset_generation_matches(
     reference_generation: str | None,
     manifest_generation: str | int | None,
+    reference_version: str | int,
 ) -> bool:
+    if reference_version == 1 and reference_generation is None:
+        return True
     if reference_generation is None or manifest_generation is None:
         return reference_generation is None and manifest_generation is None
     return isinstance(manifest_generation, str) and compare_digest(
@@ -1831,6 +1835,7 @@ def _write_asset_manifest(
     payload = {
         "asset_id": asset_id,
         "bytes": size,
+        "reference_version": 2 if generation_id is not None else 1,
     }
     if generation_id is not None:
         if not _SESSION_PATTERN.fullmatch(generation_id):
@@ -1858,9 +1863,14 @@ def _read_asset_manifest(
     try:
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
         generation_id = payload.get("generation_id")
+        reference_version = payload.get("reference_version", 1)
         size = payload["bytes"]
         if (
             payload["asset_id"] != asset_id
+            or isinstance(reference_version, bool)
+            or not isinstance(reference_version, int)
+            or reference_version not in {1, 2}
+            or (reference_version == 2 and generation_id is None)
             or (
                 generation_id is not None
                 and (
@@ -1878,6 +1888,7 @@ def _read_asset_manifest(
     result: dict[str, str | int] = {
         "asset_id": asset_id,
         "bytes": size,
+        "reference_version": reference_version,
     }
     if generation_id is not None:
         result["generation_id"] = generation_id

@@ -1098,11 +1098,156 @@ async def test_reused_asset_id_cannot_resolve_previous_generation(
     assert second.reference == (
         f"asset:{asset_id}:{second_registration.token}:second.png"
     )
+    second_manifest = json.loads(
+        (
+            tmp_path
+            / "sessions"
+            / session_id
+            / "assets"
+            / asset_id
+            / ".asset.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert second_manifest["reference_version"] == 2
     with pytest.raises(UploadRejectedError, match="not available"):
         storage.resolve(session_id, first.reference)
     with pytest.raises(UploadRejectedError, match="not available"):
         storage.resolve(session_id, f"asset:{asset_id}:first.png")
     assert storage.resolve(session_id, second.reference).read_bytes() == b"second"
+
+
+def test_previous_manifest_with_generation_accepts_legacy_reference(
+    tmp_path: Path,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    session_id = "a" * 32
+    asset_id = "1" * 32
+    generation_id = "2" * 32
+    asset_dir = tmp_path / "sessions" / session_id / "assets" / asset_id
+    asset_dir.mkdir(parents=True)
+    (asset_dir / "previous.png").write_bytes(b"previous")
+    (asset_dir / ".asset.json").write_text(
+        json.dumps(
+            {
+                "asset_id": asset_id,
+                "generation_id": generation_id,
+                "bytes": 8,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    resolved = storage.resolve(
+        session_id,
+        f"asset:{asset_id}:previous.png",
+    )
+
+    assert resolved.read_bytes() == b"previous"
+    assert storage.resolve(
+        session_id,
+        f"asset:{asset_id}:{generation_id}:previous.png",
+    ) == resolved
+
+
+@pytest.mark.anyio
+async def test_reused_v1_asset_id_rejects_legacy_reference_after_v2_upload(
+    tmp_path: Path,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    session_id = "a" * 32
+    asset_id = "1" * 32
+    old_generation_id = "2" * 32
+    asset_dir = tmp_path / "sessions" / session_id / "assets" / asset_id
+    asset_dir.mkdir(parents=True)
+    (asset_dir / "shared.png").write_bytes(b"old")
+    (asset_dir / ".asset.json").write_text(
+        json.dumps(
+            {
+                "asset_id": asset_id,
+                "generation_id": old_generation_id,
+                "bytes": 3,
+            }
+        ),
+        encoding="utf-8",
+    )
+    old_reference = f"asset:{asset_id}:shared.png"
+    assert storage.resolve(session_id, old_reference).read_bytes() == b"old"
+    assert storage.delete_asset(session_id, f"asset:{asset_id}") is not None
+    storage.finalize_asset_deletion(session_id, asset_id)
+
+    registration = RecordingUploadRegistration()
+    registration.token = "3" * 32
+    storage.claim_upload_generation(
+        session_id,
+        asset_id,
+        token=registration.token,
+    )
+    replacement = await storage.store_stream(
+        session_id,
+        asset_id=asset_id,
+        filename="shared.png",
+        content_length=3,
+        chunks=_chunks(b"new"),
+        reservation=RecordingReservation(),
+        registration=registration,
+    )
+
+    with pytest.raises(UploadRejectedError, match="not available"):
+        storage.resolve(session_id, old_reference)
+    assert storage.resolve(session_id, replacement.reference).read_bytes() == b"new"
+
+
+@pytest.mark.parametrize("reference_version", [0, 3, True, "2"])
+def test_corrupt_manifest_reference_version_is_rejected(
+    tmp_path: Path,
+    reference_version: object,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    session_id = "a" * 32
+    asset_id = "1" * 32
+    generation_id = "2" * 32
+    asset_dir = tmp_path / "sessions" / session_id / "assets" / asset_id
+    asset_dir.mkdir(parents=True)
+    (asset_dir / "image.png").write_bytes(b"image")
+    (asset_dir / ".asset.json").write_text(
+        json.dumps(
+            {
+                "asset_id": asset_id,
+                "generation_id": generation_id,
+                "bytes": 5,
+                "reference_version": reference_version,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(UploadRejectedError, match="not available"):
+        storage.resolve(
+            session_id,
+            f"asset:{asset_id}:{generation_id}:image.png",
+        )
+
+
+def test_v2_manifest_without_generation_is_rejected(tmp_path: Path) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    session_id = "a" * 32
+    asset_id = "1" * 32
+    asset_dir = tmp_path / "sessions" / session_id / "assets" / asset_id
+    asset_dir.mkdir(parents=True)
+    (asset_dir / "image.png").write_bytes(b"image")
+    (asset_dir / ".asset.json").write_text(
+        json.dumps(
+            {
+                "asset_id": asset_id,
+                "bytes": 5,
+                "reference_version": 2,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(UploadRejectedError, match="not available"):
+        storage.resolve(session_id, f"asset:{asset_id}:image.png")
 
 
 @pytest.mark.anyio
@@ -1123,6 +1268,17 @@ async def test_legacy_reference_only_resolves_manifest_without_generation(
     )
 
     assert asset.reference == f"asset:{asset_id}:legacy%20image.png"
+    manifest = json.loads(
+        (
+            tmp_path
+            / "sessions"
+            / session_id
+            / "assets"
+            / asset_id
+            / ".asset.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert manifest["reference_version"] == 1
     assert storage.resolve(session_id, asset.reference).read_bytes() == b"legacy"
     with pytest.raises(UploadRejectedError, match="not available"):
         storage.resolve(

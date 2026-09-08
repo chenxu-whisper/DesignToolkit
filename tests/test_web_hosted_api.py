@@ -2961,6 +2961,52 @@ def test_hosted_task_uses_uploaded_asset_and_is_session_isolated(
     assert stranger_status.status_code == 404
 
 
+def test_hosted_task_accepts_previous_generation_manifest_legacy_reference(
+    tmp_path: Path,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = RedisTaskManager(
+        redis_connection=redis_connection,
+        queue=Queue("designtoolkit", connection=redis_connection),
+        data_dir=tmp_path,
+        max_queued_tasks=20,
+        retention_seconds=7200,
+    )
+    asset_id = "1" * 32
+    generation_id = "2" * 32
+    with _client(tmp_path, task_manager=manager) as client:
+        assert client.get("/api/config").status_code == 200
+        session_id = client.cookies["dt_session"]
+        asset_dir = tmp_path / "sessions" / session_id / "assets" / asset_id
+        asset_dir.mkdir(parents=True)
+        (asset_dir / "previous.mp4").write_bytes(b"video")
+        (asset_dir / ".asset.json").write_text(
+            json.dumps(
+                {
+                    "asset_id": asset_id,
+                    "generation_id": generation_id,
+                    "bytes": 5,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        created = client.post(
+            "/api/tasks/video-frames",
+            json={
+                "input_path": f"asset:{asset_id}:previous.mp4",
+                "image_format": "png",
+            },
+        )
+
+    assert created.status_code == 202
+    task_pin = redis_connection.hgetall(
+        f"dt:resource:task-pin:{created.json()['task_id']}"
+    )
+    assert json.loads(task_pin[b"asset_ids"]) == [asset_id]
+    assert json.loads(task_pin[b"asset_identities"]) == [[asset_id, None]]
+
+
 def test_reused_upload_id_rejects_stale_generation_without_pin_or_task_leak(
     tmp_path: Path,
 ) -> None:

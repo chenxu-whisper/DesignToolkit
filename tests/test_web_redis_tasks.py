@@ -62,6 +62,35 @@ from designtoolkit.web.schemas import (
 from designtoolkit.web.tasks import TaskConflictError, TaskRecord
 from designtoolkit.web.worker import RedisTaskExecutor
 
+_PRE_GENERATION_RELEASE_TASK_PIN_SCRIPT = """-- release_task_pin
+if redis.call("EXISTS", KEYS[1]) == 0 then
+    return 0
+end
+if redis.call("HGET", KEYS[1], "session_id") ~= ARGV[1] then
+    return 2
+end
+if redis.call("HGET", KEYS[1], "task_id") ~= ARGV[2] then
+    return 2
+end
+local asset_ids_json = redis.call("HGET", KEYS[1], "asset_ids")
+if asset_ids_json then
+    local asset_ids = cjson.decode(asset_ids_json)
+    for _, asset_id in ipairs(asset_ids) do
+        local asset_tasks_key = ARGV[3] .. ARGV[1] .. ":" .. asset_id
+        redis.call("SREM", asset_tasks_key, ARGV[2])
+        if redis.call("SCARD", asset_tasks_key) == 0 then
+            redis.call("DEL", asset_tasks_key)
+        end
+    end
+end
+redis.call("DEL", KEYS[1])
+redis.call("SREM", KEYS[2], ARGV[2])
+if redis.call("SCARD", KEYS[2]) == 0 then
+    redis.call("DEL", KEYS[2])
+end
+return 1
+"""
+
 
 class StubTaskResources:
     def __init__(self) -> None:
@@ -669,7 +698,9 @@ def test_real_redis_asset_identity_handoff_validates_and_persists_generations(
     assert json.loads(task_pin[b"asset_identities"]) == [
         list(identity) for identity in identities
     ]
-    assert b"asset_ids" not in task_pin
+    assert json.loads(task_pin[b"asset_ids"]) == [
+        asset_id for asset_id, _generation_id in identities
+    ]
     for asset_id, _generation_id in identities:
         with pytest.raises(TaskConflictError, match="active task"):
             manager.claim_asset_deletion(session_id, asset_id)
@@ -678,6 +709,142 @@ def test_real_redis_asset_identity_handoff_validates_and_persists_generations(
     for asset_id, _generation_id in identities:
         claim = manager.claim_asset_deletion(session_id, asset_id)
         manager.release_asset_deletion(session_id, asset_id, claim)
+
+
+def test_real_redis_old_worker_releases_new_generation_task_pin(
+    real_redis_connection: Redis,
+    tmp_path: Path,
+) -> None:
+    manager = _manager(real_redis_connection, tmp_path)
+    session_id = "a" * 32
+    identities = (
+        ("1" * 32, "3" * 32),
+        ("2" * 32, "4" * 32),
+    )
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_paths=[str(tmp_path / "clip.mp4")] * 2),
+        owner_id=session_id,
+        asset_identities=identities,
+    )
+    pin_key = f"dt:resource:task-pin:{task.task_id}"
+    session_pins_key = f"dt:resource:session:{session_id}:task-pins"
+    old_release = real_redis_connection.register_script(
+        _PRE_GENERATION_RELEASE_TASK_PIN_SCRIPT
+    )
+
+    assert json.loads(real_redis_connection.hget(pin_key, "asset_ids")) == [
+        asset_id for asset_id, _generation_id in identities
+    ]
+    assert int(
+        old_release(
+            keys=[pin_key, session_pins_key],
+            args=[session_id, task.task_id, "dt:resource:asset-tasks:"],
+        )
+    ) == 1
+
+    assert not real_redis_connection.exists(pin_key)
+    assert not real_redis_connection.exists(session_pins_key)
+    assert list(
+        real_redis_connection.scan_iter(match="dt:resource:asset-tasks:*")
+    ) == []
+    for asset_id, _generation_id in identities:
+        claim = manager.claim_asset_deletion(session_id, asset_id)
+        manager.release_asset_deletion(session_id, asset_id, claim)
+
+
+@pytest.mark.parametrize("use_lua", [True, False], ids=["lua", "fallback"])
+@pytest.mark.parametrize(
+    "legacy_asset_ids",
+    [
+        json.dumps(["f" * 32]),
+        '{"not":"an-asset-list"}',
+    ],
+    ids=["divergent", "malformed"],
+)
+def test_real_redis_task_pin_release_preserves_divergent_metadata(
+    real_redis_connection: Redis,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    use_lua: bool,
+    legacy_asset_ids: str,
+) -> None:
+    manager = _manager(real_redis_connection, tmp_path)
+    session_id = "a" * 32
+    asset_id = "1" * 32
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+        owner_id=session_id,
+        asset_identities=((asset_id, "2" * 32),),
+    )
+    pin_key = f"dt:resource:task-pin:{task.task_id}"
+    asset_tasks_key = f"dt:resource:asset-tasks:{session_id}:{asset_id}"
+    real_redis_connection.hset(pin_key, "asset_ids", legacy_asset_ids)
+    if not use_lua:
+        monkeypatch.setattr(
+            manager,
+            "_release_task_pin_script",
+            lambda **_kwargs: (_ for _ in ()).throw(
+                ResponseError("unknown command 'evalsha'")
+            ),
+        )
+
+    with pytest.raises(TaskConflictError, match="asset metadata is invalid"):
+        manager.release_task_pin(task.task_id)
+
+    assert real_redis_connection.exists(pin_key)
+    assert real_redis_connection.sismember(asset_tasks_key, task.task_id)
+    with pytest.raises(TaskConflictError, match="active task"):
+        manager.claim_asset_deletion(session_id, asset_id)
+
+
+@pytest.mark.parametrize("use_lua", [True, False], ids=["lua", "fallback"])
+def test_real_redis_enqueue_rollback_preserves_divergent_task_pin(
+    real_redis_connection: Redis,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    use_lua: bool,
+) -> None:
+    manager = _manager(real_redis_connection, tmp_path)
+    session_id = "a" * 32
+    asset_id = "1" * 32
+    pin_key: bytes | str | None = None
+
+    if not use_lua:
+        monkeypatch.setattr(
+            manager,
+            "_rollback_enqueue_script",
+            lambda **_kwargs: (_ for _ in ()).throw(
+                ResponseError("unknown command 'evalsha'")
+            ),
+        )
+
+    def corrupt_pin_then_reject(_enqueue) -> None:
+        nonlocal pin_key
+        [pin_key] = list(
+            real_redis_connection.scan_iter(match="dt:resource:task-pin:*")
+        )
+        real_redis_connection.hset(
+            pin_key,
+            "asset_ids",
+            json.dumps(["f" * 32]),
+        )
+        raise TaskConflictError("enqueue rejected")
+
+    with pytest.raises(TaskConflictError, match="asset metadata is invalid"):
+        manager.create_video_frames_task(
+            VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+            owner_id=session_id,
+            commit=corrupt_pin_then_reject,
+            asset_identities=((asset_id, "2" * 32),),
+        )
+
+    assert pin_key is not None
+    assert real_redis_connection.exists(pin_key)
+    pin_key_text = pin_key.decode() if isinstance(pin_key, bytes) else pin_key
+    assert real_redis_connection.sismember(
+        f"dt:resource:asset-tasks:{session_id}:{asset_id}",
+        pin_key_text.rsplit(":", 1)[-1],
+    )
 
 
 def test_task_pin_release_conservatively_migrates_legacy_asset_id_metadata(
@@ -874,11 +1041,18 @@ def test_real_redis_reconcile_releases_terminal_asset_pin_after_ack_loss(
     manager = _manager(real_redis_connection, tmp_path)
     session_id = "a" * 32
     asset_id = "1" * 32
+    identities = ((asset_id, "2" * 32),)
     task = manager.create_video_frames_task(
         VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
         owner_id=session_id,
-        asset_ids=(asset_id,),
+        asset_identities=identities,
     )
+    pin_key = f"dt:resource:task-pin:{task.task_id}"
+    pin_metadata = real_redis_connection.hgetall(pin_key)
+    assert json.loads(pin_metadata[b"asset_ids"]) == [asset_id]
+    assert json.loads(pin_metadata[b"asset_identities"]) == [
+        list(identity) for identity in identities
+    ]
     release_task_pin = manager.release_task_pin
 
     def lose_release_acknowledgement(_task_id: str) -> bool:
@@ -892,6 +1066,54 @@ def test_real_redis_reconcile_releases_terminal_asset_pin_after_ack_loss(
     assert manager.get_task(task.task_id).status is TaskStatus.SUCCEEDED
     monkeypatch.setattr(manager, "release_task_pin", release_task_pin)
     assert manager.reconcile_tasks(grace_seconds=60) == 1
+    assert not real_redis_connection.exists(pin_key)
+    assert not real_redis_connection.exists(
+        f"dt:resource:session:{session_id}:task-pins"
+    )
+    assert list(
+        real_redis_connection.scan_iter(match="dt:resource:asset-tasks:*")
+    ) == []
+    claim = manager.claim_asset_deletion(session_id, asset_id)
+    manager.release_asset_deletion(session_id, asset_id, claim)
+
+
+def test_real_redis_task_pin_release_ack_loss_leaves_no_asset_blocker(
+    real_redis_connection: Redis,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(real_redis_connection, tmp_path)
+    session_id = "a" * 32
+    asset_id = "1" * 32
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+        owner_id=session_id,
+        asset_identities=((asset_id, "2" * 32),),
+    )
+    pin_key = f"dt:resource:task-pin:{task.task_id}"
+    release = manager._release_task_pin_script
+
+    def release_then_lose_ack(*args, **kwargs):
+        release(*args, **kwargs)
+        raise RedisConnectionError("task pin release acknowledgement lost")
+
+    monkeypatch.setattr(
+        manager,
+        "_release_task_pin_script",
+        release_then_lose_ack,
+    )
+
+    with pytest.raises(RedisConnectionError, match="acknowledgement lost"):
+        manager.mark_finished(task.task_id, status=TaskStatus.SUCCEEDED)
+
+    assert manager.get_task(task.task_id).status is TaskStatus.SUCCEEDED
+    assert not real_redis_connection.exists(pin_key)
+    assert not real_redis_connection.exists(
+        f"dt:resource:session:{session_id}:task-pins"
+    )
+    assert list(
+        real_redis_connection.scan_iter(match="dt:resource:asset-tasks:*")
+    ) == []
     claim = manager.claim_asset_deletion(session_id, asset_id)
     manager.release_asset_deletion(session_id, asset_id, claim)
 
