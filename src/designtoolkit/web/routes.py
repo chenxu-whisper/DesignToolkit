@@ -737,6 +737,7 @@ def _get_stable_video_preview_entry(
     read_frame: _PreprobedFrameReader,
     create_png_bytes: Callable[[np.ndarray], bytes],
     *,
+    owner_id: str | None = None,
     samples: list[list[int]] | None = None,
     params: dict[str, float | int] | None = None,
     view_mode: ChromaViewMode | None = None,
@@ -779,6 +780,7 @@ def _get_stable_video_preview_entry(
             preview_entry = store.get_or_put_entry(
                 cache_key,
                 create_stable_preview,
+                owner_id=owner_id,
             )
         except _VideoSourceChangedError:
             continue
@@ -886,8 +888,6 @@ def create_router(
         decoder.read_preview_frame,
     )
     chroma_preview_store = ChromaPreviewStore()
-    chroma_preview_owners: OrderedDict[str, str] = OrderedDict()
-    chroma_preview_owners_lock = Lock()
     media_validator = (
         HostedMediaValidator(
             HostedMediaLimits(
@@ -978,15 +978,6 @@ def create_router(
         path = resolve_hosted_asset(http_request, reference)
         validate_hosted_paths(http_request, [path])
         return path
-
-    def owned_preview_url(http_request: Request, preview_id: str) -> str:
-        if storage is not None:
-            with chroma_preview_owners_lock:
-                chroma_preview_owners[preview_id] = http_request.state.session_id
-                chroma_preview_owners.move_to_end(preview_id)
-                if len(chroma_preview_owners) > 32:
-                    chroma_preview_owners.popitem(last=False)
-        return _chroma_preview_url(preview_id)
 
     def preview_capacity() -> Iterator[bool]:
         if storage is None:
@@ -1808,6 +1799,9 @@ def create_router(
             preview_entry = chroma_preview_store.get_or_put_entry(
                 cache_key,
                 lambda: make_preview_png(rgb),
+                owner_id=(
+                    http_request.state.session_id if storage is not None else None
+                ),
             )
         except KeyerError as exc:
             raise _chroma_keyer_error_response(exc) from exc
@@ -1821,7 +1815,7 @@ def create_router(
             height=int(height),
             preview_width=int(preview_width),
             preview_height=int(preview_height),
-            preview_url=owned_preview_url(http_request, preview_entry.preview_id),
+            preview_url=_chroma_preview_url(preview_entry.preview_id),
         )
 
     @router.post(
@@ -1847,6 +1841,11 @@ def create_router(
                     get_video_metadata,
                     read_video_preview_frame,
                     make_preview_png,
+                    owner_id=(
+                        http_request.state.session_id
+                        if storage is not None
+                        else None
+                    ),
                 )
             )
         except KeyerError as exc:
@@ -1860,7 +1859,7 @@ def create_router(
             height=metadata.height,
             preview_width=preview_width,
             preview_height=preview_height,
-            preview_url=owned_preview_url(http_request, preview_entry.preview_id),
+            preview_url=_chroma_preview_url(preview_entry.preview_id),
             duration_seconds=metadata.duration_seconds,
             fps=metadata.fps,
             estimated_frame_count=metadata.estimated_frame_count,
@@ -1890,13 +1889,18 @@ def create_router(
                     get_video_metadata,
                     read_video_preview_frame,
                     make_preview_png,
+                    owner_id=(
+                        http_request.state.session_id
+                        if storage is not None
+                        else None
+                    ),
                 )
             )
         except KeyerError as exc:
             raise _chroma_video_error_response(exc) from exc
 
         return ChromaVideoFrameResponse(
-            preview_url=owned_preview_url(http_request, preview_entry.preview_id),
+            preview_url=_chroma_preview_url(preview_entry.preview_id),
             timestamp_seconds=timestamp_seconds,
         )
 
@@ -1985,6 +1989,11 @@ def create_router(
                     get_video_metadata,
                     read_video_preview_frame,
                     create_preview_png,
+                    owner_id=(
+                        http_request.state.session_id
+                        if storage is not None
+                        else None
+                    ),
                     samples=payload.samples,
                     params=params_data,
                     view_mode=payload.view_mode,
@@ -1994,7 +2003,7 @@ def create_router(
             raise _chroma_video_error_response(exc) from exc
 
         return ChromaVideoPreviewResponse(
-            preview_url=owned_preview_url(http_request, preview_entry.preview_id),
+            preview_url=_chroma_preview_url(preview_entry.preview_id),
             timestamp_seconds=timestamp_seconds,
         )
 
@@ -2089,22 +2098,28 @@ def create_router(
                     preview_rgb = np.repeat(alpha[..., np.newaxis], 3, axis=2)
                     return make_preview_png(preview_rgb)
 
-            preview_id = chroma_preview_store.get_or_put(cache_key, create_preview_png)
+            preview_id = chroma_preview_store.get_or_put(
+                cache_key,
+                create_preview_png,
+                owner_id=(
+                    http_request.state.session_id if storage is not None else None
+                ),
+            )
         except KeyerError as exc:
             raise _chroma_keyer_error_response(exc) from exc
 
         return ChromaPreviewResponse(
-            preview_url=owned_preview_url(http_request, preview_id)
+            preview_url=_chroma_preview_url(preview_id)
         )
 
     @router.get("/chroma-keyer/previews/{preview_id}")
     def get_chroma_preview(preview_id: str, http_request: Request) -> Response:
-        if storage is not None:
-            with chroma_preview_owners_lock:
-                owner_id = chroma_preview_owners.get(preview_id)
-            if owner_id != http_request.state.session_id:
-                raise ApiError("preview_not_found", "Preview not found", 404)
-        preview_png = chroma_preview_store.get(preview_id)
+        preview_png = chroma_preview_store.get(
+            preview_id,
+            owner_id=(
+                http_request.state.session_id if storage is not None else None
+            ),
+        )
         if preview_png is None:
             raise ApiError("preview_not_found", "Preview not found", 404)
         return Response(content=preview_png, media_type="image/png")

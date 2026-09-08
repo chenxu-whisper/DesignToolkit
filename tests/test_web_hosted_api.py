@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextvars import ContextVar
 from io import BytesIO
 from pathlib import Path
-from threading import BoundedSemaphore, Event, Timer
+from threading import BoundedSemaphore, Event, Lock, Timer
 from time import monotonic, sleep
 from unittest.mock import Mock
 from urllib.parse import quote
@@ -38,6 +38,7 @@ from designtoolkit.chroma_keyer.video_models import VideoMetadata
 from designtoolkit.web import app as app_module
 from designtoolkit.web import routes as routes_module
 from designtoolkit.web.app import create_app
+from designtoolkit.web.chroma_previews import ChromaPreviewStore
 from designtoolkit.web.hosted import (
     HostedSettings,
     HostedStorage,
@@ -2069,6 +2070,124 @@ def test_hosted_upload_reference_can_drive_image_inspection(tmp_path: Path) -> N
     assert response.json()["height"] == 1
     assert own_preview.status_code == 200
     assert stranger_preview.status_code == 404
+
+
+def test_hosted_concurrent_same_key_previews_are_owner_scoped(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_generation_started = Event()
+    release_generation = Event()
+    second_lookup_entered = Event()
+    lookup_count = 0
+    lookup_count_lock = Lock()
+    generation_calls = 0
+    generation_calls_lock = Lock()
+
+    class CoordinatedPreviewStore(ChromaPreviewStore):
+        def __init__(self) -> None:
+            super().__init__(max_entries=2)
+
+        def get_or_put_entry(
+            self,
+            cache_key: str,
+            create_png_bytes,
+            *,
+            owner_id: str | None = None,
+        ):
+            nonlocal lookup_count
+            with lookup_count_lock:
+                lookup_count += 1
+                if lookup_count == 2:
+                    second_lookup_entered.set()
+            if owner_id is None:
+                return super().get_or_put_entry(cache_key, create_png_bytes)
+            return super().get_or_put_entry(
+                cache_key,
+                create_png_bytes,
+                owner_id=owner_id,
+            )
+
+    original_make_preview_png = routes_module.make_preview_png
+
+    def make_blocking_preview(*args, **kwargs) -> bytes:
+        nonlocal generation_calls
+        with generation_calls_lock:
+            generation_calls += 1
+        first_generation_started.set()
+        assert release_generation.wait(timeout=5)
+        return original_make_preview_png(*args, **kwargs)
+
+    shared_rgb = np.zeros((1, 2, 3), dtype=np.uint8)
+    shared_fingerprint = {
+        "path": "shared-image",
+        "mtime_ns": 1,
+        "size": 1,
+        "content_sha256": "shared",
+    }
+    monkeypatch.setattr(routes_module, "ChromaPreviewStore", CoordinatedPreviewStore)
+    monkeypatch.setattr(routes_module, "make_preview_png", make_blocking_preview)
+    monkeypatch.setattr(
+        routes_module,
+        "_read_rgb_snapshot",
+        lambda _path: (shared_rgb, shared_fingerprint),
+    )
+
+    with _client(tmp_path) as owner_a:
+        owner_b = TestClient(owner_a.app)
+        owner_a.cookies.set("dt_session", "a" * 32)
+        owner_b.cookies.set("dt_session", "b" * 32)
+        try:
+            reference_a = _upload(
+                owner_a,
+                "owner-a.png",
+                _png_bytes(),
+            ).json()["reference"]
+            reference_b = _upload(
+                owner_b,
+                "owner-b.png",
+                _png_bytes(),
+            ).json()["reference"]
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                first = executor.submit(
+                    owner_a.post,
+                    "/api/chroma-keyer/images/inspect",
+                    json={"input_path": reference_a},
+                )
+                assert first_generation_started.wait(timeout=5)
+                second = executor.submit(
+                    owner_b.post,
+                    "/api/chroma-keyer/images/inspect",
+                    json={"input_path": reference_b},
+                )
+                assert second_lookup_entered.wait(timeout=5)
+                release_generation.set()
+                response_a = first.result(timeout=5)
+                response_b = second.result(timeout=5)
+
+            preview_url_a = response_a.json()["preview_url"]
+            preview_url_b = response_b.json()["preview_url"]
+            own_a = owner_a.get(preview_url_a)
+            own_b = owner_b.get(preview_url_b)
+            cross_a = owner_a.get(preview_url_b)
+            cross_b = owner_b.get(preview_url_a)
+            unknown = owner_a.get(
+                f"/api/chroma-keyer/previews/{uuid4()}"
+            )
+        finally:
+            owner_b.close()
+
+    assert response_a.status_code == 200
+    assert response_b.status_code == 200
+    assert preview_url_a != preview_url_b
+    assert generation_calls == 2
+    assert own_a.status_code == 200
+    assert own_b.status_code == 200
+    assert cross_a.status_code == 404
+    assert cross_b.status_code == 404
+    assert unknown.status_code == 404
+    assert unknown.json()["error"]["code"] == "preview_not_found"
 
 
 def test_hosted_image_inspection_holds_one_session_lease_during_resolution(
@@ -4359,9 +4478,11 @@ def test_local_mode_does_not_apply_hosted_media_limits(tmp_path: Path) -> None:
             "/api/chroma-keyer/images/inspect",
             json={"input_path": str(image_path)},
         )
+        preview = client.get(response.json()["preview_url"])
 
     assert response.status_code == 200
     assert response.json()["width"] == 2
+    assert preview.status_code == 200
 
 
 def test_create_app_passes_independent_task_timeout_to_redis_manager(
