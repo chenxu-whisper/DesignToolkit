@@ -306,6 +306,7 @@ if redis.call("HGET", KEYS[5], "owner_token") ~= owner_token then
     return 0
 end
 local release_pin = false
+local repair_pin = false
 local asset_ids = {}
 if owner_id ~= "" then
     local pin_session = redis.call("HGET", KEYS[6], "session_id")
@@ -318,6 +319,9 @@ if owner_id ~= "" then
             "asset_identities"
         )
         local asset_ids_json = redis.call("HGET", KEYS[6], "asset_ids")
+        if not identities_json and not asset_ids_json then
+            repair_pin = true
+        end
         if identities_json then
             if string.sub(identities_json, 1, 1) ~= "[" then
                 return 2
@@ -353,15 +357,18 @@ if owner_id ~= "" then
                     cjson.decode,
                     asset_ids_json
                 )
-                if not decoded_ids
-                    or type(legacy_asset_ids) ~= "table"
-                    or #legacy_asset_ids ~= #asset_ids then
+                if not decoded_ids or type(legacy_asset_ids) ~= "table" then
                     return 2
                 end
+                if #legacy_asset_ids ~= #asset_ids then
+                    repair_pin = true
+                end
                 for index, asset_id in ipairs(legacy_asset_ids) do
-                    if type(asset_id) ~= "string"
-                        or asset_id ~= asset_ids[index] then
+                    if type(asset_id) ~= "string" then
                         return 2
+                    end
+                    if asset_id ~= asset_ids[index] then
+                        repair_pin = true
                     end
                 end
             end
@@ -402,7 +409,7 @@ redis.call(
     KEYS[9],
     KEYS[10]
 )
-if release_pin then
+if release_pin and not repair_pin then
     for _, asset_id in ipairs(asset_ids) do
         local asset_tasks_key = ARGV[4] .. owner_id .. ":" .. asset_id
         redis.call("SREM", asset_tasks_key, task_id)
@@ -415,6 +422,9 @@ if release_pin then
     if redis.call("SCARD", KEYS[7]) == 0 then
         redis.call("DEL", KEYS[7])
     end
+end
+if repair_pin then
+    return 4
 end
 return 1
 """
@@ -2419,6 +2429,13 @@ class RedisTaskManager:
             )
             if result == 2:
                 raise TaskConflictError("Task pin asset metadata is invalid")
+            if result in {0, 4} and self._repair_corrupt_rolled_back_enqueue_pin(
+                task_id,
+                owner,
+            ):
+                return True
+            if result == 4:
+                raise TaskConflictError("Task pin asset metadata is invalid")
             return result == 1
         except ResponseError as error_response:
             if "unknown command" not in str(error_response).lower():
@@ -2446,9 +2463,23 @@ class RedisTaskManager:
                     )
                     if _redis_text(token) != owner_token:
                         pipeline.unwatch()
-                        return False
+                        return self._repair_corrupt_rolled_back_enqueue_pin(
+                            task_id,
+                            owner,
+                        )
                     pin_metadata = pipeline.hgetall(_task_pin_key(task_id))
-                    asset_ids = _asset_ids_from_pin_metadata(pin_metadata)
+                    release_pin = bool(owner) and (
+                        _redis_hash_text(pin_metadata, "session_id") == owner
+                        and _redis_hash_text(pin_metadata, "task_id") == task_id
+                    )
+                    repair_pin = release_pin and _task_pin_asset_metadata_corrupt(
+                        pin_metadata
+                    )
+                    asset_ids = (
+                        ()
+                        if not release_pin or repair_pin
+                        else _asset_ids_from_pin_metadata(pin_metadata)
+                    )
                     asset_task_keys = [
                         _asset_tasks_key(owner, asset_id)
                         for asset_id in asset_ids
@@ -2466,15 +2497,43 @@ class RedisTaskManager:
                         _enqueue_intent_key(task_id),
                         _enqueue_owner_key(task_id),
                     )
-                    if owner:
+                    if release_pin and not repair_pin:
                         for asset_task_key in asset_task_keys:
                             pipeline.srem(asset_task_key, task_id)
                         pipeline.delete(_task_pin_key(task_id))
                         pipeline.srem(_session_task_pins_key(owner), task_id)
                     pipeline.execute()
+                    if repair_pin:
+                        return self._repair_corrupt_rolled_back_enqueue_pin(
+                            task_id,
+                            owner,
+                        )
                     return True
                 except WatchError:
                     continue
+
+    def _repair_corrupt_rolled_back_enqueue_pin(
+        self,
+        task_id: str,
+        owner_id: str,
+    ) -> bool:
+        if not owner_id:
+            return False
+        pipeline = self._redis.pipeline(transaction=False)
+        pipeline.get(_task_key(task_id))
+        pipeline.hgetall(_enqueue_intent_key(task_id))
+        pipeline.hgetall(_task_pin_key(task_id))
+        task_value, intent_metadata, pin_metadata = pipeline.execute()
+        if task_value is not None or intent_metadata:
+            return False
+        if (
+            _redis_hash_text(pin_metadata, "session_id") != owner_id
+            or _redis_hash_text(pin_metadata, "task_id") != task_id
+            or not _task_pin_asset_metadata_corrupt(pin_metadata)
+        ):
+            return False
+        self._repair_corrupt_task_pin_indexes(task_id, pin_metadata)
+        return True
 
     def _clear_enqueue_intent(
         self,
@@ -3023,7 +3082,7 @@ class RedisTaskManager:
     ) -> bool:
         if _redis_hash_text(metadata, "task_id") != task_id:
             raise TaskConflictError("Task pin ownership is invalid")
-        if not _task_pin_asset_metadata_missing(metadata):
+        if not _task_pin_asset_metadata_corrupt(metadata):
             raise TaskConflictError("Task pin asset metadata is invalid")
 
         session_id = _redis_hash_text(metadata, "session_id")
@@ -3067,7 +3126,7 @@ class RedisTaskManager:
                     if _redis_hash_text(current, "task_id") != task_id:
                         pipeline.unwatch()
                         raise TaskConflictError("Task pin ownership is invalid")
-                    if not _task_pin_asset_metadata_missing(current):
+                    if not _task_pin_asset_metadata_corrupt(current):
                         pipeline.unwatch()
                         raise TaskConflictError(
                             "Task pin asset metadata is invalid"
@@ -3674,6 +3733,25 @@ def _task_pin_asset_metadata_missing(
         _redis_hash_text(metadata, "asset_identities") is None
         and _redis_hash_text(metadata, "asset_ids") is None
     )
+
+
+def _task_pin_asset_metadata_corrupt(
+    metadata: dict[bytes | str, bytes | str],
+) -> bool:
+    if _task_pin_asset_metadata_missing(metadata):
+        return True
+    identities_value = _redis_hash_text(metadata, "asset_identities")
+    legacy_value = _redis_hash_text(metadata, "asset_ids")
+    if identities_value is None or legacy_value is None:
+        return False
+    try:
+        identity_asset_ids = _asset_ids_from_pin_metadata(
+            {"asset_identities": identities_value}
+        )
+        legacy_asset_ids = _decode_legacy_asset_ids(legacy_value)
+    except (TaskConflictError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+    return identity_asset_ids != legacy_asset_ids
 
 
 def _validated_index_key_batches(

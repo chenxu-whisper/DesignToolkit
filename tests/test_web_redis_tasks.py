@@ -1025,16 +1025,30 @@ def test_real_redis_task_pin_normal_release_does_not_scan(
 
 
 @pytest.mark.parametrize("use_lua", [True, False], ids=["lua", "fallback"])
-def test_real_redis_enqueue_rollback_preserves_divergent_task_pin(
+@pytest.mark.parametrize(
+    "corruption",
+    ["missing", "divergent"],
+)
+def test_real_redis_enqueue_rollback_repairs_corrupt_task_pin_indexes(
     real_redis_connection: Redis,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     use_lua: bool,
+    corruption: str,
 ) -> None:
     manager = _manager(real_redis_connection, tmp_path)
     session_id = "a" * 32
-    asset_id = "1" * 32
+    shared_asset_id = "1" * 32
+    exclusive_asset_id = "2" * 32
+    orphan_asset_id = "3" * 32
+    other_task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "other.mp4")),
+        owner_id=session_id,
+        asset_identities=((shared_asset_id, "4" * 32),),
+    )
     pin_key: bytes | str | None = None
+    task_id: str | None = None
+    owner_token: str | None = None
 
     if not use_lua:
         monkeypatch.setattr(
@@ -1046,18 +1060,206 @@ def test_real_redis_enqueue_rollback_preserves_divergent_task_pin(
         )
 
     def corrupt_pin_then_reject(_enqueue) -> None:
-        nonlocal pin_key
-        [pin_key] = list(
-            real_redis_connection.scan_iter(match="dt:resource:task-pin:*")
+        nonlocal owner_token, pin_key, task_id
+        [pin_key] = [
+            key
+            for key in real_redis_connection.scan_iter(
+                match="dt:resource:task-pin:*"
+            )
+            if not key.decode().endswith(other_task.task_id)
+        ]
+        task_id = real_redis_connection.hget(pin_key, "task_id").decode()
+        owner_token = real_redis_connection.hget(
+            f"dt:enqueue-intent:{task_id}",
+            "owner_token",
+        ).decode()
+        real_redis_connection.sadd(
+            f"dt:resource:asset-tasks:{session_id}:{orphan_asset_id}",
+            task_id,
         )
-        real_redis_connection.hset(
-            pin_key,
-            "asset_ids",
-            json.dumps(["f" * 32]),
+        if corruption == "missing":
+            real_redis_connection.hdel(
+                pin_key,
+                "asset_ids",
+                "asset_identities",
+            )
+        else:
+            real_redis_connection.hset(
+                pin_key,
+                "asset_ids",
+                json.dumps(["f" * 32]),
+            )
+        raise TaskConflictError("enqueue rejected")
+
+    with pytest.raises(TaskConflictError, match="enqueue rejected"):
+        manager.create_video_frames_task(
+            VideoFramesTaskRequest(
+                input_paths=[str(tmp_path / "clip.mp4")] * 2
+            ),
+            owner_id=session_id,
+            commit=corrupt_pin_then_reject,
+            asset_identities=(
+                (shared_asset_id, "5" * 32),
+                (exclusive_asset_id, "6" * 32),
+            ),
+        )
+
+    assert pin_key is not None
+    assert task_id is not None
+    assert owner_token is not None
+    assert not real_redis_connection.exists(pin_key)
+    assert real_redis_connection.smembers(
+        f"dt:resource:session:{session_id}:task-pins"
+    ) == {other_task.task_id.encode()}
+    assert real_redis_connection.smembers(
+        f"dt:resource:asset-tasks:{session_id}:{shared_asset_id}"
+    ) == {other_task.task_id.encode()}
+    assert not real_redis_connection.exists(
+        f"dt:resource:asset-tasks:{session_id}:{exclusive_asset_id}"
+    )
+    assert not real_redis_connection.exists(
+        f"dt:resource:asset-tasks:{session_id}:{orphan_asset_id}"
+    )
+    assert not manager._rollback_enqueue(
+        task_id,
+        owner_id=session_id,
+        owner_token=owner_token,
+    )
+    for asset_id in (exclusive_asset_id, orphan_asset_id):
+        claim = manager.claim_asset_deletion(session_id, asset_id)
+        manager.release_asset_deletion(session_id, asset_id, claim)
+
+
+@pytest.mark.parametrize("use_lua", [True, False], ids=["lua", "fallback"])
+def test_real_redis_normal_enqueue_rollback_does_not_scan(
+    real_redis_connection: Redis,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    use_lua: bool,
+) -> None:
+    manager = _manager(real_redis_connection, tmp_path)
+    session_id = "a" * 32
+    asset_id = "1" * 32
+    if not use_lua:
+        monkeypatch.setattr(
+            manager,
+            "_rollback_enqueue_script",
+            lambda **_kwargs: (_ for _ in ()).throw(
+                ResponseError("unknown command 'evalsha'")
+            ),
+        )
+
+    def reject_enqueue(_enqueue) -> None:
+        monkeypatch.setattr(
+            real_redis_connection,
+            "scan_iter",
+            lambda **_kwargs: pytest.fail(
+                "normal enqueue rollback must not scan"
+            ),
         )
         raise TaskConflictError("enqueue rejected")
 
-    with pytest.raises(TaskConflictError, match="asset metadata is invalid"):
+    with pytest.raises(TaskConflictError, match="enqueue rejected"):
+        manager.create_video_frames_task(
+            VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+            owner_id=session_id,
+            commit=reject_enqueue,
+            asset_identities=((asset_id, "2" * 32),),
+        )
+
+    claim = manager.claim_asset_deletion(session_id, asset_id)
+    manager.release_asset_deletion(session_id, asset_id, claim)
+
+
+@pytest.mark.parametrize("use_lua", [True, False], ids=["lua", "fallback"])
+@pytest.mark.parametrize(
+    "corruption",
+    ["missing", "divergent"],
+)
+def test_real_redis_enqueue_rollback_repairs_corrupt_pin_after_ack_loss(
+    real_redis_connection: Redis,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    use_lua: bool,
+    corruption: str,
+) -> None:
+    manager = _manager(real_redis_connection, tmp_path)
+    session_id = "a" * 32
+    asset_id = "1" * 32
+    task_id: str | None = None
+    owner_token: str | None = None
+    pin_key: bytes | str | None = None
+    rollback_script = manager._rollback_enqueue_script
+    pipeline_type = type(real_redis_connection.pipeline())
+    pipeline_execute = pipeline_type.execute
+    acknowledgement_lost = False
+
+    def corrupt_pin_then_reject(_enqueue) -> None:
+        nonlocal acknowledgement_lost, owner_token, pin_key, task_id
+        [pin_key] = list(
+            real_redis_connection.scan_iter(match="dt:resource:task-pin:*")
+        )
+        task_id = real_redis_connection.hget(pin_key, "task_id").decode()
+        intent_key = f"dt:enqueue-intent:{task_id}"
+        owner_token = real_redis_connection.hget(
+            intent_key,
+            "owner_token",
+        ).decode()
+        if corruption == "missing":
+            real_redis_connection.hdel(
+                pin_key,
+                "asset_ids",
+                "asset_identities",
+            )
+        else:
+            real_redis_connection.hset(
+                pin_key,
+                "asset_ids",
+                json.dumps(["f" * 32]),
+            )
+
+        if use_lua:
+            def rollback_then_lose_ack(*args, **kwargs):
+                rollback_script(*args, **kwargs)
+                raise RedisConnectionError("rollback acknowledgement lost")
+
+            monkeypatch.setattr(
+                manager,
+                "_rollback_enqueue_script",
+                rollback_then_lose_ack,
+            )
+        else:
+            monkeypatch.setattr(
+                manager,
+                "_rollback_enqueue_script",
+                lambda **_kwargs: (_ for _ in ()).throw(
+                    ResponseError("unknown command 'evalsha'")
+                ),
+            )
+
+            def execute_then_lose_ack(pipeline, *args, **kwargs):
+                nonlocal acknowledgement_lost
+                lose_ack = not acknowledgement_lost and any(
+                    command[0][0] == "DEL"
+                    and intent_key in command[0]
+                    for command in pipeline.command_stack
+                )
+                result = pipeline_execute(pipeline, *args, **kwargs)
+                if lose_ack:
+                    acknowledgement_lost = True
+                    raise RedisConnectionError(
+                        "rollback acknowledgement lost"
+                    )
+                return result
+
+            monkeypatch.setattr(
+                pipeline_type,
+                "execute",
+                execute_then_lose_ack,
+            )
+        raise TaskConflictError("enqueue rejected")
+
+    with pytest.raises(RedisConnectionError, match="acknowledgement lost"):
         manager.create_video_frames_task(
             VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
             owner_id=session_id,
@@ -1065,13 +1267,38 @@ def test_real_redis_enqueue_rollback_preserves_divergent_task_pin(
             asset_identities=((asset_id, "2" * 32),),
         )
 
+    assert task_id is not None
+    assert owner_token is not None
     assert pin_key is not None
+    assert not real_redis_connection.exists(f"dt:task:{task_id}")
+    assert not real_redis_connection.exists(f"dt:enqueue-intent:{task_id}")
     assert real_redis_connection.exists(pin_key)
-    pin_key_text = pin_key.decode() if isinstance(pin_key, bytes) else pin_key
-    assert real_redis_connection.sismember(
-        f"dt:resource:asset-tasks:{session_id}:{asset_id}",
-        pin_key_text.rsplit(":", 1)[-1],
+    if use_lua:
+        monkeypatch.setattr(
+            manager,
+            "_rollback_enqueue_script",
+            rollback_script,
+        )
+
+    assert manager._rollback_enqueue(
+        task_id,
+        owner_id=session_id,
+        owner_token=owner_token,
     )
+    assert not manager._rollback_enqueue(
+        task_id,
+        owner_id=session_id,
+        owner_token=owner_token,
+    )
+    assert not real_redis_connection.exists(pin_key)
+    assert not real_redis_connection.exists(
+        f"dt:resource:session:{session_id}:task-pins"
+    )
+    assert not real_redis_connection.exists(
+        f"dt:resource:asset-tasks:{session_id}:{asset_id}"
+    )
+    claim = manager.claim_asset_deletion(session_id, asset_id)
+    manager.release_asset_deletion(session_id, asset_id, claim)
 
 
 def test_task_pin_release_conservatively_migrates_legacy_asset_id_metadata(
