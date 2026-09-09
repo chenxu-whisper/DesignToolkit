@@ -90,7 +90,6 @@ def test_pam_parser_emits_multiple_frames_from_arbitrary_chunks() -> None:
         (_pam(1, 1, b"abcd", tuple_type="RGB"), "TUPLTYPE"),
         (_pam(100_000, 100_000, b""), "dimensions"),
         (_pam(16_384, 16_384, b""), "pixel count"),
-        (_pam(8_192, 8_192, b""), "frame size"),
         (
             b"P7\nWIDTH 1\nHEIGHT 1\nDEPTH 4\nMAXVAL 255\nENDHDR\n",
             "TUPLTYPE",
@@ -166,6 +165,62 @@ def test_pam_parser_rejects_complete_oversized_header() -> None:
 
 
 @pytest.mark.parametrize(
+    ("width", "height", "max_frame_bytes"),
+    [
+        (3840, 2160, 3840 * 2160 * 4),
+        (10_000, 10_000, 100_000_000 * 4),
+    ],
+)
+def test_pam_parser_accepts_hosted_raw_media_limits(
+    width: int,
+    height: int,
+    max_frame_bytes: int,
+) -> None:
+    from designtoolkit.video_frames.ffmpeg_streaming import (
+        FfmpegOutputError,
+        PamStreamParser,
+    )
+
+    parser = PamStreamParser(max_frame_bytes=max_frame_bytes)
+
+    parser.feed(_pam(width, height, b""))
+
+    with pytest.raises(FfmpegOutputError, match="truncated"):
+        parser.finish()
+
+
+def test_pam_parser_rejects_frame_above_configured_limit_before_pixels() -> None:
+    from designtoolkit.video_frames.ffmpeg_streaming import (
+        FfmpegOutputError,
+        PamStreamParser,
+    )
+
+    parser = PamStreamParser(max_frame_bytes=15)
+
+    with pytest.raises(FfmpegOutputError, match="frame size"):
+        parser.feed(_pam(2, 2, b""))
+
+
+def test_guarded_pam_rejects_frame_above_remaining_budget_before_pixels(
+    tmp_path: Path,
+) -> None:
+    from designtoolkit.video_frames.ffmpeg_streaming import (
+        FfmpegOutputError,
+        GuardedFfmpegOutput,
+    )
+
+    session = GuardedFfmpegOutput(
+        ["ffmpeg", str(tmp_path / "output.png")],
+        OutputBudgetGuard(tmp_path, max_bytes=16, safety_bytes=1),
+    )
+
+    with pytest.raises(FfmpegOutputError, match="frame size"):
+        session.consume(_pam(2, 2, b""))
+
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize(
     ("suffix", "pillow_format"),
     [
         (".png", "PNG"),
@@ -173,6 +228,7 @@ def test_pam_parser_rejects_complete_oversized_header() -> None:
         (".jpeg", "JPEG"),
         (".webp", "WEBP"),
         (".bmp", "BMP"),
+        (".gif", "GIF"),
         (".tif", "TIFF"),
         (".tiff", "TIFF"),
     ],
@@ -217,6 +273,8 @@ def test_guarded_single_image_rewrites_to_rgba_pam_and_pillow_decodes(
         if suffix in {".png", ".webp", ".tif", ".tiff"}:
             assert image.mode == "RGBA"
             assert image.getchannel("A").tobytes() == b"\x11\xcc"
+        elif suffix == ".gif":
+            assert image.convert("RGBA").getchannel("A").tobytes() == b"\x00\xff"
         else:
             assert image.mode == "RGB"
 
@@ -230,6 +288,7 @@ def test_guarded_sequence_publishes_numbered_frames_with_escaped_percent(
     session = GuardedFfmpegOutput(
         ["ffmpeg", "-i", "input", str(pattern)],
         OutputBudgetGuard(tmp_path, 1_000_000),
+        output_kind="sequence",
     )
 
     assert "-frames:v" not in session.command
@@ -287,6 +346,30 @@ def test_guarded_single_video_allows_literal_percent(tmp_path: Path) -> None:
     assert target.read_bytes() == b"container"
 
 
+@pytest.mark.parametrize("suffix", [".png", ".mp4"])
+def test_guarded_single_output_treats_sequence_marker_as_literal(
+    tmp_path: Path,
+    suffix: str,
+) -> None:
+    from designtoolkit.video_frames.ffmpeg_streaming import GuardedFfmpegOutput
+
+    target = tmp_path / f"clip_%02d{suffix}"
+    session = GuardedFfmpegOutput(
+        ["ffmpeg", "-i", "input", str(target)],
+        OutputBudgetGuard(tmp_path, 1_000_000),
+        output_kind="single",
+    )
+
+    if suffix == ".png":
+        session.consume(_pam(1, 1, b"\x01\x02\x03\x04"))
+    else:
+        session.consume(b"container")
+    session.finish()
+
+    assert target.exists()
+    assert not (tmp_path / f"clip_01{suffix}").exists()
+
+
 @pytest.mark.parametrize(
     "target",
     [
@@ -309,6 +392,7 @@ def test_guarded_output_rejects_invalid_sequence_markers(
         GuardedFfmpegOutput(
             ["ffmpeg", str(tmp_path / target)],
             OutputBudgetGuard(tmp_path, 1_000_000),
+            output_kind="sequence",
         )
 
 
@@ -341,8 +425,7 @@ def test_guarded_single_image_treats_invalid_marker_as_literal_percent(
 @pytest.mark.parametrize(
     "target",
     [
-        "output.gif",
-        "frames_%06d.webp",
+        "output.xyz",
         "output",
     ],
 )
@@ -373,6 +456,7 @@ def test_guarded_image_rollback_removes_only_this_run_outputs(
     session = GuardedFfmpegOutput(
         ["ffmpeg", str(tmp_path / "frame_%02d.jpg")],
         guard,
+        output_kind="sequence",
     )
     session.consume(_pam(1, 1, b"abcd") + _pam(1, 1, b"efgh"))
     assert guard.used_bytes > 0
@@ -670,7 +754,7 @@ def test_guarded_backend_rejects_unknown_target_before_popen(
     )
 
     with pytest.raises(RuntimeError, match="unsupported"):
-        backend.run(["ffmpeg", str(tmp_path / "output.gif")])
+        backend.run(["ffmpeg", str(tmp_path / "output.xyz")])
 
     assert calls == []
 
@@ -710,7 +794,10 @@ def test_guarded_backend_rolls_back_nonzero_output(
         popen=_streaming_popen_factory([process], []),
     )
 
-    result = backend.run(["ffmpeg", str(tmp_path / "frame_%06d.png")])
+    result = backend.run(
+        ["ffmpeg", str(tmp_path / "frame_%06d.png")],
+        output_kind="sequence",
+    )
 
     assert result.returncode == 1
     assert result.stderr == "decode failed"
@@ -804,7 +891,10 @@ def test_guarded_backend_sequence_stops_at_exact_aggregate_budget(
     )
 
     with pytest.raises(OutputLimitExceeded):
-        backend.run(["ffmpeg", str(tmp_path / "frame_%06d.png")])
+        backend.run(
+            ["ffmpeg", str(tmp_path / "frame_%06d.png")],
+            output_kind="sequence",
+        )
 
     assert max(observed_sizes) == frame_bytes * accepted_frames
     assert process.terminate_called
@@ -854,6 +944,88 @@ def test_webm_decoder_fallback_recovers_full_budget_after_failed_first_run(
     assert result.output_pattern == output_dir / "input%%take_%06d.png"
 
 
+def test_video_frame_export_declares_sequence_for_primary_and_fallback(
+    tmp_path: Path,
+) -> None:
+    from designtoolkit.video_frames.core import BackendResult
+
+    class RecordingBackend:
+        def __init__(self) -> None:
+            self.output_kinds: list[str] = []
+
+        def get_ffmpeg_exe(self) -> str:
+            return "ffmpeg"
+
+        def get_duration_seconds(self, _video_path: Path) -> float | None:
+            return None
+
+        def run(
+            self,
+            _command: list[str],
+            *,
+            output_kind: str,
+        ) -> BackendResult:
+            self.output_kinds.append(output_kind)
+            if len(self.output_kinds) == 1:
+                return BackendResult(
+                    returncode=1,
+                    stderr=(
+                        "libvpx-vp9: Bitstream not supported by this decoder"
+                    ),
+                )
+            return BackendResult(returncode=0)
+
+    input_path = tmp_path / "input.webm"
+    input_path.write_bytes(b"input")
+    backend = RecordingBackend()
+
+    export_video_frames(
+        VideoFrameOptions(
+            input_path=input_path,
+            output_dir=tmp_path / "frames",
+            image_format="png",
+        ),
+        backend,
+    )
+
+    assert backend.output_kinds == ["sequence", "sequence"]
+
+
+def test_media_resize_declares_single_output_contract(tmp_path: Path) -> None:
+    from designtoolkit.media_resize.core import ResizeBackendResult
+
+    class RecordingBackend:
+        def __init__(self) -> None:
+            self.output_kinds: list[str] = []
+
+        def get_ffmpeg_exe(self) -> str:
+            return "ffmpeg"
+
+        def run(
+            self,
+            _command: list[str],
+            *,
+            output_kind: str,
+        ) -> ResizeBackendResult:
+            self.output_kinds.append(output_kind)
+            return ResizeBackendResult(returncode=0)
+
+    input_path = tmp_path / "input.png"
+    input_path.write_bytes(b"input")
+    backend = RecordingBackend()
+
+    resize_media(
+        MediaResizeOptions(
+            input_path=input_path,
+            output_path=tmp_path / "clip_%02d.png",
+            size=(10, 10),
+        ),
+        backend,
+    )
+
+    assert backend.output_kinds == ["single"]
+
+
 def test_guarded_backend_never_uses_prlimit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -881,7 +1053,7 @@ def test_guarded_backend_never_uses_prlimit(
 
 @pytest.mark.parametrize(
     "suffix",
-    [".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"],
+    [".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"],
 )
 def test_bundled_ffmpeg_guarded_single_image_formats(
     tmp_path: Path,
@@ -889,7 +1061,7 @@ def test_bundled_ffmpeg_guarded_single_image_formats(
 ) -> None:
     source = tmp_path / "source.png"
     Image.new("RGB", (16, 8), "red").save(source)
-    target = tmp_path / f"image{suffix}"
+    target = tmp_path / f"image_%02d{suffix}"
     backend = FfmpegBackend(
         output_guard=OutputBudgetGuard(tmp_path, 10_000_000)
     )
@@ -907,6 +1079,46 @@ def test_bundled_ffmpeg_guarded_single_image_formats(
     with Image.open(target) as image:
         image.load()
         assert image.size == (8, 4)
+
+
+def test_bundled_ffmpeg_guarded_gif_resize_preserves_basic_transparency(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "transparent.png"
+    source_pixels = Image.new("RGBA", (4, 2))
+    source_pixels.putdata(
+        [
+            (255, 0, 0, 0),
+            (255, 0, 0, 0),
+            (0, 255, 0, 255),
+            (0, 255, 0, 255),
+            (255, 0, 0, 0),
+            (255, 0, 0, 0),
+            (0, 255, 0, 255),
+            (0, 255, 0, 255),
+        ]
+    )
+    source_pixels.save(source)
+    target = tmp_path / "resized.gif"
+
+    result = resize_media(
+        MediaResizeOptions(
+            input_path=source,
+            output_path=target,
+            size=(4, 2),
+        ),
+        FfmpegBackend(
+            output_guard=OutputBudgetGuard(tmp_path, 10_000_000)
+        ),
+    )
+
+    assert result.output_path == target
+    with Image.open(target) as image:
+        image.load()
+        alpha = image.convert("RGBA").getchannel("A")
+        assert image.format == "GIF"
+        assert image.size == (4, 2)
+        assert set(alpha.tobytes()) == {0, 255}
 
 
 def test_bundled_ffmpeg_guarded_transparent_png_resize_preserves_alpha(
@@ -1028,7 +1240,8 @@ def test_bundled_ffmpeg_guarded_image_sequences(
             "-frames:v",
             "3",
             str(pattern),
-        ]
+        ],
+        output_kind="sequence",
     )
 
     assert result.returncode == 0, result.stderr
@@ -1056,7 +1269,7 @@ def test_bundled_ffmpeg_guarded_video_formats(
     suffix: str,
     codec: str,
 ) -> None:
-    target = tmp_path / f"video{suffix}"
+    target = tmp_path / f"video_%02d{suffix}"
     plain_backend = FfmpegBackend()
     ffmpeg_exe = plain_backend.get_ffmpeg_exe()
     backend = FfmpegBackend(

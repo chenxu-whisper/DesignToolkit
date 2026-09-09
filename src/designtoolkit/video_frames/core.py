@@ -5,7 +5,7 @@ import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Protocol
 
 SUPPORTED_FORMATS = {"png", "jpg", "jpeg"}
 
@@ -53,7 +53,12 @@ class FrameExportBackend(Protocol):
     def get_duration_seconds(self, video_path: Path) -> float | None:
         raise NotImplementedError
 
-    def run(self, command: Sequence[str]) -> BackendResult:
+    def run(
+        self,
+        command: Sequence[str],
+        *,
+        output_kind: Literal["single", "sequence"] = "sequence",
+    ) -> BackendResult:
         raise NotImplementedError
 
 
@@ -126,7 +131,7 @@ def export_video_frames(
         image_format=image_format,
     )
 
-    result = backend.run(command)
+    result = backend.run(command, output_kind="sequence")
     if result.returncode != 0 and _should_retry_with_automatic_decoder(
         input_path=input_path,
         image_format=image_format,
@@ -141,7 +146,7 @@ def export_video_frames(
             image_format=image_format,
             use_input_decoder_args=False,
         )
-        result = backend.run(fallback_command)
+        result = backend.run(fallback_command, output_kind="sequence")
         command = fallback_command
 
     if result.returncode != 0:

@@ -16,7 +16,7 @@ from pathlib import Path
 from queue import Empty, Full, Queue
 from shutil import which
 from threading import Event, Lock, RLock, Thread
-from typing import BinaryIO, Protocol
+from typing import BinaryIO, Literal, Protocol
 
 import imageio_ffmpeg
 
@@ -1093,14 +1093,18 @@ class FfmpegBackend:
         poll_interval: float = 0.25,
         popen: PopenFactory = subprocess.Popen,
         max_file_bytes: int | None = None,
+        max_frame_bytes: int | None = None,
         windows_launch_gate_factory: (
             Callable[[Sequence[str]], _WindowsLaunchGate] | None
         ) = None,
     ) -> None:
+        if max_frame_bytes is not None and max_frame_bytes < 0:
+            raise ValueError("max_frame_bytes must not be negative")
         self._output_guard = output_guard
         self._poll_interval = poll_interval
         self._popen = popen
         self._max_file_bytes = max_file_bytes
+        self._max_frame_bytes = max_frame_bytes
         self._windows_launch_gate_factory = (
             windows_launch_gate_factory or _WindowsLaunchGate.create
         )
@@ -1150,9 +1154,18 @@ class FfmpegBackend:
             return None
         return float(duration_seconds)
 
-    def run(self, command: Sequence[str]) -> BackendResult:
+    def run(
+        self,
+        command: Sequence[str],
+        *,
+        output_kind: Literal["single", "sequence"] = "single",
+    ) -> BackendResult:
         if isinstance(self._output_guard, OutputBudgetGuard):
-            return self._run_guarded(command, self._output_guard)
+            return self._run_guarded(
+                command,
+                self._output_guard,
+                output_kind=output_kind,
+            )
         popen_kwargs: dict[str, object] = {
             "stdout": subprocess.PIPE,
             "stderr": subprocess.PIPE,
@@ -1276,8 +1289,15 @@ class FfmpegBackend:
         self,
         command: Sequence[str],
         guard: OutputBudgetGuard,
+        *,
+        output_kind: Literal["single", "sequence"],
     ) -> BackendResult:
-        output = GuardedFfmpegOutput(command, guard)
+        output = GuardedFfmpegOutput(
+            command,
+            guard,
+            output_kind=output_kind,
+            max_frame_bytes=self._max_frame_bytes,
+        )
         popen_kwargs: dict[str, object] = {
             "stdout": subprocess.PIPE,
             "stderr": subprocess.PIPE,

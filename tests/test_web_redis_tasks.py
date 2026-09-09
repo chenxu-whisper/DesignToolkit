@@ -8791,7 +8791,13 @@ def test_worker_removes_partial_ffmpeg_output_after_any_failure(
         def get_ffmpeg_exe(self) -> str:
             return "ffmpeg"
 
-        def run(self, command) -> ResizeBackendResult:
+        def run(
+            self,
+            command,
+            *,
+            output_kind: str = "single",
+        ) -> ResizeBackendResult:
+            assert output_kind == "single"
             Path(command[-1]).write_bytes(b"partial")
             if failure_mode == "exception":
                 raise RuntimeError("FFmpeg process failed")
@@ -8830,7 +8836,13 @@ def test_worker_failure_cleanup_preserves_input_inside_output_root(
         def get_ffmpeg_exe(self) -> str:
             return "ffmpeg"
 
-        def run(self, command) -> ResizeBackendResult:
+        def run(
+            self,
+            command,
+            *,
+            output_kind: str = "single",
+        ) -> ResizeBackendResult:
+            assert output_kind == "single"
             Path(command[-1]).write_bytes(b"partial")
             return ResizeBackendResult(returncode=1, stderr="encode failed")
 

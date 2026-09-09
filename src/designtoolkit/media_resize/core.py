@@ -3,12 +3,12 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Protocol
 
 from designtoolkit.video_frames import BackendUnavailableError
 
 IMAGE_SUFFIXES = frozenset(
-    {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
+    {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
 )
 VIDEO_SUFFIXES = frozenset({".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"})
 
@@ -44,7 +44,12 @@ class ResizeBackend(Protocol):
     def get_ffmpeg_exe(self) -> str:
         raise NotImplementedError
 
-    def run(self, command: Sequence[str]) -> ResizeBackendResult:
+    def run(
+        self,
+        command: Sequence[str],
+        *,
+        output_kind: Literal["single", "sequence"] = "single",
+    ) -> ResizeBackendResult:
         raise NotImplementedError
 
 
@@ -72,7 +77,7 @@ def resize_media(
         output_path=output_path,
         size=options.size,
     )
-    result = backend.run(command)
+    result = backend.run(command, output_kind="single")
     if result.returncode != 0:
         detail = f": {result.stderr.strip()}" if result.stderr.strip() else ""
         raise MediaResizeError(

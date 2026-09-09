@@ -5,10 +5,15 @@ import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO
+from typing import BinaryIO, Literal
 
 from PIL import Image
 
+from designtoolkit.media_constraints import (
+    HOSTED_MAX_IMAGE_PIXELS,
+    HOSTED_MAX_IMAGE_RGBA_BYTES,
+    HOSTED_MAX_VIDEO_RGBA_FRAME_BYTES,
+)
 from designtoolkit.web.output_limits import (
     OutputBudgetGuard,
     _parse_sequential_pattern,
@@ -16,8 +21,6 @@ from designtoolkit.web.output_limits import (
 
 _MAX_PAM_HEADER_BYTES = 64 * 1024
 _MAX_PAM_DIMENSION = 16_384
-_MAX_PAM_PIXELS = 100_000_000
-_MAX_PAM_FRAME_BYTES = 25 * 1024 * 1024
 _PAM_FEED_CHUNK_BYTES = 64 * 1024
 _PAM_HEADER_KEYS = frozenset(
     {b"WIDTH", b"HEIGHT", b"DEPTH", b"MAXVAL", b"TUPLTYPE"}
@@ -29,6 +32,7 @@ _SINGLE_IMAGE_FORMATS = {
     ".jpeg": "JPEG",
     ".webp": "WEBP",
     ".bmp": "BMP",
+    ".gif": "GIF",
     ".tif": "TIFF",
     ".tiff": "TIFF",
 }
@@ -56,7 +60,14 @@ class PamFrame:
 
 
 class PamStreamParser:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        max_frame_bytes: int = HOSTED_MAX_IMAGE_RGBA_BYTES,
+    ) -> None:
+        if max_frame_bytes < 0:
+            raise ValueError("max_frame_bytes must not be negative")
+        self._max_frame_bytes = max_frame_bytes
         self._buffer = bytearray()
         self._frame_width: int | None = None
         self._frame_height: int | None = None
@@ -76,7 +87,10 @@ class PamStreamParser:
         frames: list[PamFrame] = []
         while True:
             if self._frame_bytes is None:
-                header = _parse_pam_header(self._buffer)
+                header = _parse_pam_header(
+                    self._buffer,
+                    max_frame_bytes=self._max_frame_bytes,
+                )
                 if header is None:
                     if len(self._buffer) > _MAX_PAM_HEADER_BYTES:
                         raise FfmpegOutputError(
@@ -147,18 +161,34 @@ class GuardedFfmpegOutput:
         self,
         command: Sequence[str],
         guard: OutputBudgetGuard,
+        *,
+        output_kind: Literal["single", "sequence"] = "single",
+        max_frame_bytes: int | None = None,
     ) -> None:
         if not command:
             raise FfmpegOutputError("FFmpeg command has no output target")
+        if output_kind not in {"single", "sequence"}:
+            raise ValueError(f"Unsupported FFmpeg output kind: {output_kind}")
+        if max_frame_bytes is not None and max_frame_bytes < 0:
+            raise ValueError("max_frame_bytes must not be negative")
         self._guard = guard
         self._original_target = str(command[-1])
-        try:
-            self._sequence = _parse_sequential_pattern(self._original_target)
-        except ValueError as exc:
-            raise FfmpegOutputError(
-                f"FFmpeg guarded output target is unsupported: "
-                f"{self._original_target}"
-            ) from exc
+        self._sequence: tuple[str, int, str] | None = None
+        if output_kind == "sequence":
+            try:
+                self._sequence = _parse_sequential_pattern(
+                    self._original_target
+                )
+            except ValueError as exc:
+                raise FfmpegOutputError(
+                    f"FFmpeg guarded output target is unsupported: "
+                    f"{self._original_target}"
+                ) from exc
+            if self._sequence is None:
+                raise FfmpegOutputError(
+                    f"FFmpeg guarded output target is unsupported: "
+                    f"{self._original_target}"
+                )
         self._target = Path(self._original_target)
         guard.validate_path(self._target)
         self._parser: PamStreamParser | None = None
@@ -173,14 +203,32 @@ class GuardedFfmpegOutput:
         self._video_temporary: Path | None = None
 
         suffix = self._target.suffix.lower()
-        if self._sequence is not None:
+        raw_media_limit = (
+            HOSTED_MAX_VIDEO_RGBA_FRAME_BYTES
+            if output_kind == "sequence"
+            else HOSTED_MAX_IMAGE_RGBA_BYTES
+        )
+        parser_frame_limit = min(
+            raw_media_limit,
+            guard.remaining_bytes,
+            (
+                max_frame_bytes
+                if max_frame_bytes is not None
+                else raw_media_limit
+            ),
+        )
+        if output_kind == "sequence":
+            if self._sequence is None:
+                raise RuntimeError("FFmpeg sequence contract has no pattern")
             _prefix, width, _pattern_suffix = self._sequence
             if width <= 0 or suffix not in _SEQUENCE_IMAGE_SUFFIXES:
                 raise FfmpegOutputError(
                     f"FFmpeg guarded output target is unsupported: "
                     f"{self._original_target}"
                 )
-            self._parser = PamStreamParser()
+            self._parser = PamStreamParser(
+                max_frame_bytes=parser_frame_limit
+            )
             self._image_format = _SINGLE_IMAGE_FORMATS[suffix]
             output_args = [
                 "-f",
@@ -196,7 +244,9 @@ class GuardedFfmpegOutput:
                 raise FfmpegOutputError(
                     f"FFmpeg output target already exists: {self._target}"
                 )
-            self._parser = PamStreamParser()
+            self._parser = PamStreamParser(
+                max_frame_bytes=parser_frame_limit
+            )
             self._image_format = _SINGLE_IMAGE_FORMATS[suffix]
             self._single_image = True
             output_args = [
@@ -350,6 +400,8 @@ class GuardedFfmpegOutput:
                     if self._image_format in _RGB_ONLY_IMAGE_FORMATS:
                         with image.convert("RGB") as rgb_image:
                             rgb_image.save(file, format=self._image_format)
+                    elif self._image_format == "GIF":
+                        _save_rgba_gif(image, file)
                     else:
                         image.save(file, format=self._image_format)
                 file.flush()
@@ -390,6 +442,8 @@ def _sequence_start_number(command: Sequence[str]) -> int:
 
 def _parse_pam_header(
     buffer: bytearray,
+    *,
+    max_frame_bytes: int,
 ) -> tuple[int, int, int, int] | None:
     if not buffer:
         return None
@@ -456,13 +510,13 @@ def _parse_pam_header(
     pixels = _checked_pam_product(
         width,
         height,
-        _MAX_PAM_PIXELS,
+        HOSTED_MAX_IMAGE_PIXELS,
         "pixel count",
     )
     frame_bytes = _checked_pam_product(
         pixels,
         depth,
-        _MAX_PAM_FRAME_BYTES,
+        max_frame_bytes,
         "frame size",
     )
     return index, width, height, frame_bytes
@@ -492,3 +546,16 @@ def _checked_pam_product(
     if left > limit // right:
         raise FfmpegOutputError(f"FFmpeg PAM {name} exceeds its hard limit")
     return left * right
+
+
+def _save_rgba_gif(image: Image.Image, file: _BudgetedFile) -> None:
+    with image.convert(
+        "P",
+        palette=Image.Palette.ADAPTIVE,
+        colors=255,
+    ) as paletted:
+        with image.getchannel("A").point(
+            lambda alpha: 255 if alpha < 128 else 0
+        ) as transparent:
+            paletted.paste(255, mask=transparent)
+        paletted.save(file, format="GIF", transparency=255)

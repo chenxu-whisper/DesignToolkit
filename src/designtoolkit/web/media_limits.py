@@ -16,6 +16,12 @@ from PIL import Image
 
 from designtoolkit.chroma_keyer.video_io import ImageioVideoDecoder
 from designtoolkit.chroma_keyer.video_models import VideoMetadata
+from designtoolkit.media_constraints import (
+    HOSTED_MAX_IMAGE_PIXELS,
+    HOSTED_MAX_VIDEO_DURATION_SECONDS,
+    HOSTED_MAX_VIDEO_HEIGHT,
+    HOSTED_MAX_VIDEO_WIDTH,
+)
 
 _IMAGE_SUFFIXES = frozenset({".bmp", ".gif", ".jpeg", ".jpg", ".png", ".webp"})
 _VIDEO_SUFFIXES = frozenset({".avi", ".m4v", ".mkv", ".mov", ".mp4", ".webm"})
@@ -23,10 +29,10 @@ _VIDEO_SUFFIXES = frozenset({".avi", ".m4v", ".mkv", ".mov", ".mp4", ".webm"})
 
 @dataclass(frozen=True)
 class HostedMediaLimits:
-    max_image_pixels: int = 100_000_000
-    max_video_width: int = 3840
-    max_video_height: int = 2160
-    max_video_duration_seconds: float = 1800.0
+    max_image_pixels: int = HOSTED_MAX_IMAGE_PIXELS
+    max_video_width: int = HOSTED_MAX_VIDEO_WIDTH
+    max_video_height: int = HOSTED_MAX_VIDEO_HEIGHT
+    max_video_duration_seconds: float = HOSTED_MAX_VIDEO_DURATION_SECONDS
 
 
 class MediaLimitError(ValueError):
