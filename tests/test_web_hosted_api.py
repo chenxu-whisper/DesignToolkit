@@ -39,6 +39,7 @@ from designtoolkit.web import app as app_module
 from designtoolkit.web import routes as routes_module
 from designtoolkit.web.app import create_app
 from designtoolkit.web.chroma_previews import ChromaPreviewStore
+from designtoolkit.web.heartbeat import HeartbeatStopTimeoutError
 from designtoolkit.web.hosted import (
     HostedSettings,
     HostedStorage,
@@ -4395,6 +4396,116 @@ def test_hosted_preview_heartbeat_redis_outage_returns_503_and_releases_pin(
     ) == []
 
 
+def test_hosted_preview_pin_outlives_failed_heartbeat_until_blocked_read_finishes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = RedisTaskManager(
+        redis_connection=redis_connection,
+        queue=Queue("designtoolkit", connection=redis_connection),
+        data_dir=tmp_path,
+        max_queued_tasks=20,
+        retention_seconds=7200,
+        asset_read_pin_ttl=0.05,
+        asset_read_pin_heartbeat_interval=0.01,
+    )
+    reader_entered = Event()
+    heartbeat_failed = Event()
+    resume_reader = Event()
+    original_read_snapshot = routes_module._read_rgb_snapshot
+
+    def fail_refresh(_session_id, _asset_identities, _token):
+        heartbeat_failed.set()
+        raise RedisConnectionError("redis unavailable")
+
+    def blocked_read(path: Path):
+        reader_entered.set()
+        assert resume_reader.wait(timeout=5)
+        return original_read_snapshot(path)
+
+    monkeypatch.setattr(manager, "refresh_asset_read_pin", fail_refresh)
+    monkeypatch.setattr(routes_module, "_read_rgb_snapshot", blocked_read)
+    with _client(tmp_path, task_manager=manager) as client:
+        reference = _upload(
+            client,
+            "screen.png",
+            _png_bytes(),
+        ).json()["reference"]
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            preview = executor.submit(
+                client.post,
+                "/api/chroma-keyer/images/inspect",
+                json={"input_path": reference},
+            )
+            try:
+                assert reader_entered.wait(timeout=5)
+                assert heartbeat_failed.wait(timeout=5)
+                pin_key = next(
+                    redis_connection.scan_iter(
+                        match="dt:resource:asset-read-pin:*"
+                    )
+                )
+                assert redis_connection.hget(pin_key, "ttl_ms") == b"7200000"
+                sleep(0.1)
+                during_read = _delete_uploaded_asset(client, reference)
+            finally:
+                resume_reader.set()
+            response = preview.result(timeout=5)
+
+        after_read = _delete_uploaded_asset(client, reference)
+
+    assert during_read.status_code == 409
+    assert during_read.json()["error"]["code"] == "asset_in_use"
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "storage_unavailable"
+    assert after_read.status_code == 204
+
+
+def test_hosted_preview_decode_error_survives_pin_heartbeat_stop_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    original_stop = routes_module._AssetReadPinHeartbeat.stop
+
+    def stop_then_timeout(heartbeat) -> None:
+        original_stop(heartbeat)
+        raise HeartbeatStopTimeoutError(
+            "Asset read pin heartbeat did not stop within 0.01 seconds"
+        )
+
+    def fail_decode(_path: Path):
+        raise ValueError("decode failed")
+
+    monkeypatch.setattr(
+        routes_module._AssetReadPinHeartbeat,
+        "stop",
+        stop_then_timeout,
+    )
+    monkeypatch.setattr(routes_module, "_read_rgb_snapshot", fail_decode)
+    caplog.set_level("ERROR", logger="designtoolkit.web.routes")
+
+    with _client(tmp_path) as client:
+        reference = _upload(
+            client,
+            "screen.png",
+            _png_bytes(),
+        ).json()["reference"]
+        with pytest.raises(ValueError, match="decode failed"):
+            client.post(
+                "/api/chroma-keyer/images/inspect",
+                json={"input_path": reference},
+            )
+        deleted = _delete_uploaded_asset(client, reference)
+
+    assert deleted.status_code == 204
+    assert "asset read pin heartbeat failed during preview endpoint error" in (
+        caplog.text
+    )
+    assert "Asset read pin heartbeat did not stop" in caplog.text
+
+
 def test_hosted_preview_pin_redis_outage_returns_503(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -4457,9 +4568,9 @@ def test_hosted_preview_pins_stale_generation_before_resolve(
     original_acquire = manager.acquire_asset_read_pin
     original_resolve = storage.resolve
 
-    def acquire_pin(session_id, asset_identities):
+    def acquire_pin(session_id, asset_identities, **kwargs):
         calls.append(("acquire", asset_identities))
-        return original_acquire(session_id, asset_identities)
+        return original_acquire(session_id, asset_identities, **kwargs)
 
     def resolve_asset(session_id: str, reference: str) -> Path:
         calls.append(("resolve", reference))

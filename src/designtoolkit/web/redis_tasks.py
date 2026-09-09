@@ -4,6 +4,7 @@ import json
 from collections.abc import Callable, Iterable, Iterator
 from datetime import UTC, datetime
 from enum import StrEnum
+from math import isfinite
 from pathlib import Path
 from queue import Empty
 from threading import Event, Thread
@@ -511,7 +512,9 @@ redis.call(
     "session_id",
     session_id,
     "asset_identities",
-    asset_identities_json
+    asset_identities_json,
+    "ttl_ms",
+    ttl_ms
 )
 redis.call("PEXPIRE", KEYS[1], ttl_ms)
 for index = 1, asset_count do
@@ -527,10 +530,15 @@ if redis.call("HGET", KEYS[1], "token") ~= ARGV[1]
     or redis.call("HGET", KEYS[1], "asset_identities") ~= ARGV[4] then
     return 0
 end
+local ttl_ms = tonumber(redis.call("HGET", KEYS[1], "ttl_ms"))
+local max_ttl_ms = tonumber(ARGV[3])
+if not ttl_ms or ttl_ms < 1 or ttl_ms > max_ttl_ms then
+    return 0
+end
 local redis_time = redis.call("TIME")
 local now_ms = redis_time[1] * 1000 + math.floor(redis_time[2] / 1000)
-local expires_at = now_ms + tonumber(ARGV[3])
-redis.call("PEXPIRE", KEYS[1], ARGV[3])
+local expires_at = now_ms + ttl_ms
+redis.call("PEXPIRE", KEYS[1], ttl_ms)
 for index = 2, #KEYS do
     redis.call("ZREMRANGEBYSCORE", KEYS[index], "-inf", now_ms)
     redis.call("ZADD", KEYS[index], expires_at, ARGV[1])
@@ -1315,6 +1323,10 @@ class RedisTaskManager:
                 * 1000
             ),
         )
+        self._asset_read_pin_max_ttl_ms = max(
+            self._asset_read_pin_ttl_ms,
+            retention_seconds * 1000,
+        )
         self._allow_request_script = self._redis.register_script(
             _ALLOW_REQUEST_SCRIPT
         )
@@ -1705,11 +1717,14 @@ class RedisTaskManager:
         self,
         session_id: str,
         asset_identities: tuple[str | AssetIdentity, ...],
+        *,
+        ttl_seconds: float | None = None,
     ) -> RedisAssetReadPin:
         session_id = _validate_session_id(session_id)
         identities = _normalize_asset_identities(asset_identities)
         if not identities:
             raise ValueError("Asset read pin requires at least one asset")
+        ttl_ms = self._asset_read_pin_ttl_override_ms(ttl_seconds)
         asset_ids = _asset_ids(identities)
         token = uuid4().hex
         identities_json = _asset_identities_json(identities)
@@ -1732,7 +1747,7 @@ class RedisTaskManager:
                         args=[
                             token,
                             session_id,
-                            self._asset_read_pin_ttl_ms,
+                            ttl_ms,
                             identities_json,
                             len(asset_ids),
                         ],
@@ -1745,6 +1760,7 @@ class RedisTaskManager:
                     session_id,
                     identities,
                     token,
+                    ttl_ms,
                 )
         except RedisError as acquire_error:
             try:
@@ -1787,7 +1803,7 @@ class RedisTaskManager:
                         args=[
                             token,
                             session_id,
-                            self._asset_read_pin_ttl_ms,
+                            self._asset_read_pin_max_ttl_ms,
                             _asset_identities_json(identities),
                         ],
                     )
@@ -1867,6 +1883,7 @@ class RedisTaskManager:
         session_id: str,
         asset_identities: tuple[AssetIdentity, ...],
         token: str,
+        ttl_ms: int,
     ) -> int:
         asset_ids = _asset_ids(asset_identities)
         claim_keys = [
@@ -1887,7 +1904,7 @@ class RedisTaskManager:
                     ):
                         pipeline.unwatch()
                         return 1
-                    expires_at = now_ms + self._asset_read_pin_ttl_ms
+                    expires_at = now_ms + ttl_ms
                     pipeline.multi()
                     for key in claim_keys:
                         pipeline.zremrangebyscore(key, "-inf", now_ms)
@@ -1899,9 +1916,10 @@ class RedisTaskManager:
                             "asset_identities": _asset_identities_json(
                                 asset_identities
                             ),
+                            "ttl_ms": ttl_ms,
                         },
                     )
-                    pipeline.pexpire(pin_key, self._asset_read_pin_ttl_ms)
+                    pipeline.pexpire(pin_key, ttl_ms)
                     for key in reader_keys:
                         pipeline.zremrangebyscore(key, "-inf", now_ms)
                         pipeline.zadd(key, {token: expires_at})
@@ -1925,18 +1943,26 @@ class RedisTaskManager:
             with self._redis.pipeline() as pipeline:
                 try:
                     pipeline.watch(pin_key, *reader_keys)
+                    metadata = pipeline.hgetall(pin_key)
                     if not _asset_read_pin_metadata_matches(
-                        pipeline.hgetall(pin_key),
+                        metadata,
                         session_id,
                         asset_identities,
                         token,
                     ):
                         pipeline.unwatch()
                         return False
+                    ttl_ms = _asset_read_pin_metadata_ttl_ms(
+                        metadata,
+                        max_ttl_ms=self._asset_read_pin_max_ttl_ms,
+                    )
+                    if ttl_ms is None:
+                        pipeline.unwatch()
+                        return False
                     now_ms = round(time() * 1000)
-                    expires_at = now_ms + self._asset_read_pin_ttl_ms
+                    expires_at = now_ms + ttl_ms
                     pipeline.multi()
-                    pipeline.pexpire(pin_key, self._asset_read_pin_ttl_ms)
+                    pipeline.pexpire(pin_key, ttl_ms)
                     for key in reader_keys:
                         pipeline.zremrangebyscore(key, "-inf", now_ms)
                         pipeline.zadd(key, {token: expires_at})
@@ -1944,6 +1970,22 @@ class RedisTaskManager:
                     return True
                 except WatchError:
                     continue
+
+    def _asset_read_pin_ttl_override_ms(
+        self,
+        ttl_seconds: float | None,
+    ) -> int:
+        if ttl_seconds is None:
+            return self._asset_read_pin_ttl_ms
+        if not isfinite(ttl_seconds) or ttl_seconds <= 0:
+            raise ValueError("Asset read pin TTL must be positive and finite")
+        ttl_ms = max(1, round(ttl_seconds * 1000))
+        if ttl_ms > self._asset_read_pin_max_ttl_ms:
+            max_seconds = self._asset_read_pin_max_ttl_ms / 1000
+            raise ValueError(
+                f"Asset read pin TTL must not exceed {max_seconds:g} seconds"
+            )
+        return ttl_ms
 
     def _release_asset_read_pin_without_lua(
         self,
@@ -3849,6 +3891,21 @@ def _asset_read_pin_metadata_matches(
         and _redis_hash_text(metadata, "asset_identities")
         == _asset_identities_json(asset_identities)
     )
+
+
+def _asset_read_pin_metadata_ttl_ms(
+    metadata: dict[bytes | str, bytes | str],
+    *,
+    max_ttl_ms: int,
+) -> int | None:
+    value = _redis_hash_text(metadata, "ttl_ms")
+    try:
+        ttl_ms = int(value) if value is not None else 0
+    except ValueError:
+        return None
+    if ttl_ms < 1 or ttl_ms > max_ttl_ms:
+        return None
+    return ttl_ms
 
 
 def _asset_ids_from_pin_metadata(

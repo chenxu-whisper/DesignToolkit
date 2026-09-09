@@ -996,6 +996,7 @@ def create_router(
             pin = task_manager.acquire_asset_read_pin(
                 http_request.state.session_id,
                 asset_identity,
+                ttl_seconds=settings.retention_seconds,
             )
         except TaskConflictError as exc:
             raise ApiError("asset_in_use", str(exc), 409) from exc
@@ -2367,12 +2368,14 @@ def _stop_asset_read_pin_heartbeat(
     *,
     failure_context: str | None = None,
 ) -> None:
-    heartbeat.stop()
+    if failure_context is None:
+        heartbeat.stop()
+        heartbeat.raise_if_failed()
+        return
     try:
+        heartbeat.stop()
         heartbeat.raise_if_failed()
     except BaseException:
-        if failure_context is None:
-            raise
         _LOGGER.error(
             "storage_unavailable: %s",
             failure_context,

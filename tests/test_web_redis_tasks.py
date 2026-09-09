@@ -2360,6 +2360,151 @@ def test_real_redis_asset_read_pin_refresh_and_stale_reconcile(
     manager.release_asset_deletion(session_id, asset_id, claim)
 
 
+@pytest.mark.parametrize("use_lua", [True, False], ids=["lua", "fallback"])
+def test_real_redis_asset_read_pin_refresh_preserves_per_pin_ttl(
+    real_redis_connection: Redis,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    use_lua: bool,
+) -> None:
+    manager = RedisTaskManager(
+        redis_connection=real_redis_connection,
+        queue=Queue("designtoolkit", connection=real_redis_connection),
+        data_dir=tmp_path,
+        max_queued_tasks=20,
+        retention_seconds=2,
+        asset_read_pin_ttl=0.05,
+        asset_read_pin_heartbeat_interval=0.01,
+    )
+    session_id = "a" * 32
+    asset_id = "1" * 32
+    identities = ((asset_id, "2" * 32),)
+
+    if not use_lua:
+        def unknown_command(**_kwargs):
+            raise ResponseError("unknown command 'evalsha'")
+
+        monkeypatch.setattr(
+            manager,
+            "_acquire_asset_read_pin_script",
+            unknown_command,
+        )
+        monkeypatch.setattr(
+            manager,
+            "_refresh_asset_read_pin_script",
+            unknown_command,
+        )
+
+    pin = manager.acquire_asset_read_pin(
+        session_id,
+        identities,
+        ttl_seconds=0.4,
+    )
+    pin_key = f"dt:resource:asset-read-pin:{pin.token}"
+    readers_key = f"dt:resource:asset-readers:{session_id}:{asset_id}"
+    assert real_redis_connection.hget(pin_key, "ttl_ms") == b"400"
+    real_redis_connection.pexpire(pin_key, 20)
+    real_redis_connection.zadd(readers_key, {pin.token: 0})
+
+    pin.refresh()
+
+    refreshed_ttl = real_redis_connection.pttl(pin_key)
+    refreshed_expiry = real_redis_connection.zscore(readers_key, pin.token)
+    assert 200 <= refreshed_ttl <= 400
+    assert refreshed_expiry is not None
+    assert 200 <= refreshed_expiry - time.time() * 1000 <= 500
+    assert pin.release()
+
+
+def test_asset_read_pin_default_ttl_and_override_are_manager_bounded(
+    tmp_path: Path,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = _manager(redis_connection, tmp_path, retention_seconds=7200)
+    session_id = "a" * 32
+    asset_id = "1" * 32
+
+    pin = manager.acquire_asset_read_pin(session_id, (asset_id,))
+    pin_key = f"dt:resource:asset-read-pin:{pin.token}"
+
+    assert redis_connection.hget(pin_key, "ttl_ms") == b"60000"
+    with pytest.raises(ValueError, match="must not exceed 7200 seconds"):
+        manager.acquire_asset_read_pin(
+            session_id,
+            (asset_id,),
+            ttl_seconds=7200.001,
+        )
+    assert pin.release()
+
+
+@pytest.mark.parametrize("use_lua", [True, False], ids=["lua", "fallback"])
+def test_asset_read_pin_refresh_rejects_metadata_ttl_above_manager_bound(
+    real_redis_connection: Redis,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    use_lua: bool,
+) -> None:
+    manager = _manager(real_redis_connection, tmp_path, retention_seconds=7200)
+    session_id = "a" * 32
+    asset_id = "1" * 32
+    identities = ((asset_id, "2" * 32),)
+    pin = manager.acquire_asset_read_pin(
+        session_id,
+        identities,
+        ttl_seconds=300,
+    )
+    pin_key = f"dt:resource:asset-read-pin:{pin.token}"
+    ttl_before = real_redis_connection.pttl(pin_key)
+    real_redis_connection.hset(pin_key, "ttl_ms", 7_200_001)
+    if not use_lua:
+        def unknown_command(**_kwargs):
+            raise ResponseError("unknown command 'evalsha'")
+
+        monkeypatch.setattr(
+            manager,
+            "_refresh_asset_read_pin_script",
+            unknown_command,
+        )
+
+    assert not manager.refresh_asset_read_pin(
+        session_id,
+        identities,
+        pin.token,
+    )
+    assert real_redis_connection.pttl(pin_key) <= ttl_before
+    assert pin.release()
+
+
+def test_real_redis_crashed_asset_read_pin_expires_and_reconciles(
+    real_redis_connection: Redis,
+    tmp_path: Path,
+) -> None:
+    manager = RedisTaskManager(
+        redis_connection=real_redis_connection,
+        queue=Queue("designtoolkit", connection=real_redis_connection),
+        data_dir=tmp_path,
+        max_queued_tasks=20,
+        retention_seconds=7200,
+        asset_read_pin_ttl=0.05,
+        asset_read_pin_heartbeat_interval=0.01,
+    )
+    session_id = "a" * 32
+    asset_id = "1" * 32
+    pin = manager.acquire_asset_read_pin(session_id, (asset_id,))
+    pin_key = f"dt:resource:asset-read-pin:{pin.token}"
+    readers_key = f"dt:resource:asset-readers:{session_id}:{asset_id}"
+
+    deadline = time.monotonic() + 2
+    while real_redis_connection.exists(pin_key) and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    assert not real_redis_connection.exists(pin_key)
+    assert manager.reconcile_tasks(grace_seconds=60) == 1
+    assert not real_redis_connection.exists(readers_key)
+    claim = manager.claim_asset_deletion(session_id, asset_id)
+    manager.release_asset_deletion(session_id, asset_id, claim)
+
+
 def test_real_redis_asset_read_pin_release_recovers_acknowledgement_loss(
     real_redis_connection: Redis,
     tmp_path: Path,
