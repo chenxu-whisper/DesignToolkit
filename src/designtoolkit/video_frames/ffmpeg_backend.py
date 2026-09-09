@@ -13,14 +13,16 @@ from dataclasses import dataclass
 from importlib import resources
 from os import name as os_name
 from pathlib import Path
+from queue import Empty, Full, Queue
 from shutil import which
 from threading import Event, Lock, RLock, Thread
-from typing import Protocol
+from typing import BinaryIO, Protocol
 
 import imageio_ffmpeg
 
 from designtoolkit.video_frames.core import BackendResult, BackendUnavailableError
-from designtoolkit.web.output_limits import OutputBudgetGuard, OutputTargetMonitor
+from designtoolkit.video_frames.ffmpeg_streaming import GuardedFfmpegOutput
+from designtoolkit.web.output_limits import OutputBudgetGuard
 
 PopenFactory = Callable[..., subprocess.Popen[str]]
 _LOGGER = logging.getLogger(__name__)
@@ -32,6 +34,9 @@ _WINDOWS_LAUNCH_CLEANUP_TIMEOUT_SECONDS = 5.0
 _WINDOWS_LAUNCH_WAIT_POLL_SECONDS = 0.01
 _WINDOWS_STARTUP_ERROR_RETURN_CODE = 126
 _WINDOWS_STARTUP_ERROR_MAX_BYTES = 4096
+_STREAM_CHUNK_BYTES = 64 * 1024
+_STREAM_QUEUE_CHUNKS = 4
+_STDERR_MAX_BYTES = 1024 * 1024
 _WINDOWS_HANDLE_INHERITANCE_LOCK = RLock()
 _WINDOWS_LAUNCHER_EXECUTABLE = getattr(
     sys,
@@ -1020,6 +1025,66 @@ def _file_size_limited_command(
     return [prlimit, f"--fsize={max_bytes}", "--", *command]
 
 
+class _BoundedStderr:
+    def __init__(self, max_bytes: int = _STDERR_MAX_BYTES) -> None:
+        self._max_bytes = max_bytes
+        self._value = bytearray()
+        self.exception: BaseException | None = None
+
+    def append(self, data: bytes) -> None:
+        if len(data) >= self._max_bytes:
+            self._value[:] = data[-self._max_bytes :]
+            return
+        overflow = len(self._value) + len(data) - self._max_bytes
+        if overflow > 0:
+            del self._value[:overflow]
+        self._value.extend(data)
+
+    def text(self) -> str:
+        return bytes(self._value).decode("utf-8", errors="replace")
+
+
+def _put_pipe_item(
+    queue: Queue[bytes | BaseException | None],
+    item: bytes | BaseException | None,
+    cancelled: Event,
+) -> None:
+    while not cancelled.is_set():
+        try:
+            queue.put(item, timeout=0.05)
+        except Full:
+            continue
+        return
+
+
+def _read_stdout(
+    pipe: BinaryIO,
+    queue: Queue[bytes | BaseException | None],
+    cancelled: Event,
+) -> None:
+    try:
+        while True:
+            chunk = pipe.read(_STREAM_CHUNK_BYTES)
+            if not chunk:
+                break
+            _put_pipe_item(queue, chunk, cancelled)
+    except BaseException as exc:
+        _put_pipe_item(queue, exc, cancelled)
+    finally:
+        _put_pipe_item(queue, None, cancelled)
+
+
+def _read_stderr(pipe: BinaryIO, captured: _BoundedStderr) -> None:
+    try:
+        while True:
+            chunk = pipe.read(_STREAM_CHUNK_BYTES)
+            if not chunk:
+                return
+            captured.append(chunk)
+    except BaseException as exc:
+        captured.exception = exc
+
+
 class FfmpegBackend:
     def __init__(
         self,
@@ -1086,11 +1151,8 @@ class FfmpegBackend:
         return float(duration_seconds)
 
     def run(self, command: Sequence[str]) -> BackendResult:
-        monitor = (
-            OutputTargetMonitor(self._output_guard, command[-1])
-            if isinstance(self._output_guard, OutputBudgetGuard)
-            else None
-        )
+        if isinstance(self._output_guard, OutputBudgetGuard):
+            return self._run_guarded(command, self._output_guard)
         popen_kwargs: dict[str, object] = {
             "stdout": subprocess.PIPE,
             "stderr": subprocess.PIPE,
@@ -1154,10 +1216,7 @@ class FfmpegBackend:
                 except subprocess.TimeoutExpired:
                     if self._output_guard is None:
                         continue
-                    if monitor is not None:
-                        monitor.poll()
-                    else:
-                        self._output_guard()
+                    self._output_guard()
                     continue
                 if process_tree_owner is not None:
                     startup_error = process_tree_owner.read_startup_error(
@@ -1165,8 +1224,6 @@ class FfmpegBackend:
                     )
                     if startup_error is not None:
                         raise startup_error
-                if monitor is not None:
-                    monitor.finish()
                 return BackendResult(
                     returncode=(
                         process.returncode if process.returncode is not None else 1
@@ -1200,6 +1257,182 @@ class FfmpegBackend:
                         pass
             raise
         finally:
+            if (
+                process_tree_owner is not None
+                and (
+                    launch_transaction is None
+                    or launch_transaction.was_accepted
+                )
+            ):
+                try:
+                    process_tree_owner.close()
+                except BaseException:
+                    try:
+                        _LOGGER.exception("Failed to close FFmpeg Windows Job")
+                    except BaseException:
+                        pass
+
+    def _run_guarded(
+        self,
+        command: Sequence[str],
+        guard: OutputBudgetGuard,
+    ) -> BackendResult:
+        output = GuardedFfmpegOutput(command, guard)
+        popen_kwargs: dict[str, object] = {
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+        }
+        if os_name == "posix":
+            popen_kwargs["start_new_session"] = True
+        elif os_name == "nt":
+            popen_kwargs["creationflags"] = _WINDOWS_NEW_PROCESS_GROUP
+
+        process_tree_owner: _WindowsLaunchGate | None = None
+        posix_launch_transaction: _PosixLaunchTransaction | None = None
+        launch_transaction: _WindowsLaunchTransaction | None = None
+        process: subprocess.Popen[bytes] | None = None
+        cancelled = Event()
+        stdout_thread: Thread | None = None
+        stderr_thread: Thread | None = None
+        if os_name == "posix":
+            posix_launch_transaction = _PosixLaunchTransaction(
+                output.command,
+                self._popen,
+                popen_kwargs,
+                self._abort_posix_launch,
+            )
+        elif os_name == "nt":
+            launch_transaction = _WindowsLaunchTransaction(
+                output.command,
+                self._windows_launch_gate_factory,
+                self._popen,
+                popen_kwargs,
+                self._abort_windows_launch,
+            )
+        try:
+            if launch_transaction is not None:
+                try:
+                    launch_transaction.start()
+                    launch_result = launch_transaction.wait()
+                except _WindowsContainmentError as exc:
+                    raise BackendUnavailableError(
+                        "Windows FFmpeg launch containment could not be established."
+                    ) from exc.original_error
+                process = launch_result.process  # type: ignore[assignment]
+                process_tree_owner = launch_result.gate
+                if process is None or process_tree_owner is None:
+                    raise RuntimeError("Windows FFmpeg launch result was incomplete")
+                launch_transaction.accept()
+            elif posix_launch_transaction is not None:
+                posix_launch_transaction.start()
+                launch_result = posix_launch_transaction.wait()
+                process = launch_result.process  # type: ignore[assignment]
+                if process is None:
+                    raise RuntimeError("POSIX FFmpeg launch result was incomplete")
+                posix_launch_transaction.accept()
+            else:
+                process = self._popen(  # type: ignore[assignment]
+                    output.command,
+                    **popen_kwargs,
+                )
+
+            if process.stdout is None or process.stderr is None:
+                raise RuntimeError("FFmpeg output pipes were not created")
+            stdout_queue: Queue[bytes | BaseException | None] = Queue(
+                maxsize=_STREAM_QUEUE_CHUNKS
+            )
+            captured_stderr = _BoundedStderr()
+            stdout_thread = Thread(
+                target=_read_stdout,
+                args=(process.stdout, stdout_queue, cancelled),
+                name="designtoolkit-ffmpeg-stdout",
+                daemon=True,
+            )
+            stderr_thread = Thread(
+                target=_read_stderr,
+                args=(process.stderr, captured_stderr),
+                name="designtoolkit-ffmpeg-stderr",
+                daemon=True,
+            )
+            stdout_thread.start()
+            stderr_thread.start()
+
+            while True:
+                try:
+                    item = stdout_queue.get(timeout=self._poll_interval)
+                except Empty:
+                    if captured_stderr.exception is not None:
+                        raise captured_stderr.exception from None
+                    continue
+                if item is None:
+                    break
+                if isinstance(item, BaseException):
+                    raise item
+                output.consume(item)
+
+            returncode = process.wait()
+            while stderr_thread.is_alive():
+                stderr_thread.join(timeout=self._poll_interval)
+            if captured_stderr.exception is not None:
+                raise captured_stderr.exception
+            if process_tree_owner is not None:
+                startup_error = process_tree_owner.read_startup_error(
+                    returncode
+                )
+                if startup_error is not None:
+                    raise startup_error
+            stderr = captured_stderr.text()
+            if returncode != 0:
+                output.rollback()
+                return BackendResult(returncode=returncode, stderr=stderr)
+            output.finish()
+            return BackendResult(returncode=returncode, stderr=stderr)
+        except BaseException:
+            cancelled.set()
+            if launch_transaction is not None:
+                launch_transaction.cancel()
+            if posix_launch_transaction is not None:
+                posix_launch_transaction.abandon()
+            if (
+                process is not None
+                and (
+                    launch_transaction is None
+                    or launch_transaction.was_accepted
+                )
+                and (
+                    posix_launch_transaction is None
+                    or posix_launch_transaction.was_accepted
+                )
+            ):
+                try:
+                    self._stop_process(process, process_tree_owner)
+                except BaseException:
+                    try:
+                        _LOGGER.exception(
+                            "Failed to stop FFmpeg after worker interruption"
+                        )
+                    except BaseException:
+                        pass
+            try:
+                output.rollback()
+            except BaseException:
+                try:
+                    _LOGGER.exception("Failed to roll back guarded FFmpeg output")
+                except BaseException:
+                    pass
+            raise
+        finally:
+            cancelled.set()
+            if process is not None:
+                for pipe in (process.stdout, process.stderr):
+                    if pipe is not None:
+                        try:
+                            pipe.close()
+                        except BaseException:
+                            pass
+            for thread in (stdout_thread, stderr_thread):
+                if thread is not None:
+                    thread.join(timeout=self._poll_interval)
             if (
                 process_tree_owner is not None
                 and (

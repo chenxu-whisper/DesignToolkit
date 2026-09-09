@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from stat import S_ISREG
 from threading import RLock
+from typing import BinaryIO
 
 type FileIdentity = tuple[str, int, int] | tuple[str, Path]
 
@@ -27,6 +29,8 @@ class OutputBudgetGuard:
         self.safety_bytes = safety_bytes
         self._used_bytes = 0
         self._sizes: dict[FileIdentity, int] = {}
+        self._path_identities: dict[Path, FileIdentity] = {}
+        self._created_identities: set[FileIdentity] = set()
         self._lock = RLock()
 
     @property
@@ -42,6 +46,10 @@ class OutputBudgetGuard:
                 0,
             )
 
+    def validate_path(self, path: str | Path) -> Path:
+        with self._lock:
+            return self._contained_path(Path(path))
+
     def account(self, path: Path) -> None:
         with self._lock:
             resolved = self._contained_path(path)
@@ -56,12 +64,170 @@ class OutputBudgetGuard:
             previous_size = self._sizes.get(identity, 0)
             self._used_bytes += max(stat_result.st_size - previous_size, 0)
             self._sizes[identity] = stat_result.st_size
+            self._path_identities[resolved] = identity
             self._enforce(self._used_bytes)
+
+    def register_created(self, file: BinaryIO, path: str | Path) -> None:
+        with self._lock:
+            resolved = self._contained_path(Path(path))
+            stat_result = os.fstat(file.fileno())
+            if not S_ISREG(stat_result.st_mode):
+                raise ValueError(f"Output path is not a file: {resolved}")
+            identity = self._identity(
+                resolved,
+                stat_result.st_dev,
+                stat_result.st_ino,
+            )
+            previous_size = self._sizes.get(identity, 0)
+            growth = max(stat_result.st_size - previous_size, 0)
+            self._enforce(self._used_bytes + growth)
+            self._used_bytes += growth
+            self._sizes[identity] = max(previous_size, stat_result.st_size)
+            self._path_identities[resolved] = identity
+            self._created_identities.add(identity)
+
+    def write(
+        self,
+        file: BinaryIO,
+        path: str | Path,
+        data: bytes | bytearray | memoryview,
+    ) -> int:
+        with self._lock:
+            resolved = self._contained_path(Path(path))
+            stat_result = os.fstat(file.fileno())
+            if not S_ISREG(stat_result.st_mode):
+                raise ValueError(f"Output path is not a file: {resolved}")
+            identity = self._identity(
+                resolved,
+                stat_result.st_dev,
+                stat_result.st_ino,
+            )
+            position = file.tell()
+            if position < 0:
+                raise ValueError("Output file position must not be negative")
+
+            previous_size = self._sizes.get(identity, 0)
+            observed_extent = stat_result.st_size
+            baseline_growth = max(observed_extent - previous_size, 0)
+            tracked_extent = max(previous_size, observed_extent)
+            requested_extent = max(tracked_extent, position + len(data))
+            requested_growth = requested_extent - tracked_extent
+            self._enforce(
+                self._used_bytes + baseline_growth + requested_growth
+            )
+
+            self._used_bytes += baseline_growth
+            self._sizes[identity] = tracked_extent
+            self._path_identities[resolved] = identity
+            try:
+                written = file.write(data)
+            except BaseException:
+                self._account_open_file(file, resolved, identity)
+                raise
+            minimum_extent = (
+                position + written
+                if isinstance(written, int) and 0 <= written <= len(data)
+                else 0
+            )
+            self._account_open_file(
+                file,
+                resolved,
+                identity,
+                minimum_extent=minimum_extent,
+            )
+            if not isinstance(written, int) or written < 0 or written > len(data):
+                raise OSError("Output writer returned an invalid byte count")
+            return written
+
+    def rename(self, source: str | Path, target: str | Path) -> None:
+        with self._lock:
+            resolved_source = self._contained_path(Path(source))
+            resolved_target = self._contained_path(Path(target))
+            if resolved_target.exists():
+                raise FileExistsError(f"Output path already exists: {resolved_target}")
+            identity = self._path_identities.get(resolved_source)
+            try:
+                os.replace(resolved_source, resolved_target)
+            except BaseException:
+                if not resolved_source.exists() and resolved_target.exists():
+                    self._path_identities.pop(resolved_source, None)
+                    if identity is not None:
+                        self._path_identities[resolved_target] = identity
+                raise
+            if identity is None:
+                stat_result = resolved_target.stat()
+                identity = self._identity(
+                    resolved_target,
+                    stat_result.st_dev,
+                    stat_result.st_ino,
+                )
+            self._path_identities.pop(resolved_source, None)
+            self._path_identities[resolved_target] = identity
+
+    def truncate(
+        self,
+        file: BinaryIO,
+        path: str | Path,
+        size: int | None = None,
+    ) -> int:
+        with self._lock:
+            resolved = self._contained_path(Path(path))
+            stat_result = os.fstat(file.fileno())
+            identity = self._identity(
+                resolved,
+                stat_result.st_dev,
+                stat_result.st_ino,
+            )
+            requested_extent = file.tell() if size is None else size
+            if requested_extent < 0:
+                raise ValueError("Output file size must not be negative")
+            previous_size = self._sizes.get(identity, 0)
+            observed_extent = stat_result.st_size
+            baseline_growth = max(observed_extent - previous_size, 0)
+            tracked_extent = max(previous_size, observed_extent)
+            requested_growth = max(requested_extent - tracked_extent, 0)
+            self._enforce(
+                self._used_bytes + baseline_growth + requested_growth
+            )
+            self._used_bytes += baseline_growth
+            self._sizes[identity] = tracked_extent
+            self._path_identities[resolved] = identity
+            try:
+                result = file.truncate(size)
+            except BaseException:
+                self._account_open_file(file, resolved, identity)
+                raise
+            self._account_open_file(
+                file,
+                resolved,
+                identity,
+                minimum_extent=requested_extent,
+            )
+            return result
+
+    def rollback_created(self, path: str | Path) -> None:
+        with self._lock:
+            resolved = self._contained_path(Path(path))
+            identity = self._path_identities.get(resolved)
+            if identity is None or identity not in self._created_identities:
+                return
+            resolved.unlink(missing_ok=True)
+            self._path_identities.pop(resolved, None)
+            for known_path, known_identity in tuple(
+                self._path_identities.items()
+            ):
+                if known_identity == identity and not known_path.exists():
+                    self._path_identities.pop(known_path, None)
+            if identity in self._path_identities.values():
+                return
+            self._used_bytes -= self._sizes.pop(identity, 0)
+            self._created_identities.discard(identity)
 
     def check_tree(self) -> None:
         if not self.root.exists():
             return
         current_sizes: dict[FileIdentity, int] = {}
+        current_paths: dict[Path, FileIdentity] = {}
         with self._lock:
             for path in self.root.rglob("*"):
                 resolved = self._contained_path(path)
@@ -74,10 +240,30 @@ class OutputBudgetGuard:
                     stat_result.st_ino,
                 )
                 current_sizes[identity] = stat_result.st_size
+                current_paths[resolved] = identity
                 previous_size = self._sizes.get(identity, 0)
                 self._used_bytes += max(stat_result.st_size - previous_size, 0)
                 self._sizes[identity] = stat_result.st_size
+            self._path_identities.update(current_paths)
             self._enforce(max(self._used_bytes, sum(current_sizes.values())))
+
+    def _account_open_file(
+        self,
+        file: BinaryIO,
+        resolved: Path,
+        identity: FileIdentity,
+        *,
+        minimum_extent: int = 0,
+    ) -> None:
+        actual_extent = max(
+            os.fstat(file.fileno()).st_size,
+            file.tell(),
+            minimum_extent,
+        )
+        previous_size = self._sizes.get(identity, 0)
+        self._used_bytes += max(actual_extent - previous_size, 0)
+        self._sizes[identity] = max(previous_size, actual_extent)
+        self._path_identities[resolved] = identity
 
     def _contained_path(self, path: Path) -> Path:
         resolved = Path(path).resolve()

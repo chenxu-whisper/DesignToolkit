@@ -75,6 +75,111 @@ def test_account_tracks_only_positive_deltas_after_shrink(tmp_path: Path) -> Non
     assert guard.used_bytes == 7
 
 
+def test_budgeted_write_rejects_growth_before_underlying_write(
+    tmp_path: Path,
+) -> None:
+    guard = OutputBudgetGuard(tmp_path, max_bytes=8, safety_bytes=1)
+    output = tmp_path / ".output.tmp"
+
+    with output.open("w+b") as file:
+        assert guard.write(file, output, b"12345") == 5
+        with pytest.raises(OutputLimitExceeded, match="8-byte limit"):
+            guard.write(file, output, b"678")
+
+    assert output.read_bytes() == b"12345"
+    assert guard.used_bytes == 5
+
+
+def test_budgeted_write_accounts_partial_growth_and_not_seek_rewrites(
+    tmp_path: Path,
+) -> None:
+    class PartialWriter:
+        def __init__(self, file: Any) -> None:
+            self._file = file
+
+        def tell(self) -> int:
+            return self._file.tell()
+
+        def fileno(self) -> int:
+            return self._file.fileno()
+
+        def write(self, data: bytes) -> int:
+            return self._file.write(data[:2])
+
+    guard = OutputBudgetGuard(tmp_path, max_bytes=100)
+    output = tmp_path / ".output.tmp"
+
+    with output.open("w+b") as file:
+        writer = PartialWriter(file)
+        assert guard.write(writer, output, b"1234") == 2
+        file.seek(0)
+        assert guard.write(file, output, b"xy") == 2
+
+    assert output.read_bytes() == b"xy"
+    assert guard.used_bytes == 2
+
+
+def test_budgeted_rename_preserves_identity_and_rollback_releases_extent(
+    tmp_path: Path,
+) -> None:
+    guard = OutputBudgetGuard(tmp_path, max_bytes=100)
+    temporary = tmp_path / ".output.tmp"
+    target = tmp_path / "output.bin"
+
+    with temporary.open("w+b") as file:
+        guard.register_created(file, temporary)
+        guard.write(file, temporary, b"1234")
+    guard.rename(temporary, target)
+    guard.account(target)
+
+    assert guard.used_bytes == 4
+    assert not temporary.exists()
+    assert target.read_bytes() == b"1234"
+
+    guard.rollback_created(target)
+
+    assert not target.exists()
+    assert guard.used_bytes == 0
+    assert guard.remaining_bytes == 99
+
+
+def test_budgeted_truncate_rejects_growth_before_file_expands(
+    tmp_path: Path,
+) -> None:
+    guard = OutputBudgetGuard(tmp_path, max_bytes=8, safety_bytes=1)
+    output = tmp_path / ".output.tmp"
+
+    with output.open("w+b") as file:
+        assert guard.truncate(file, output, 7) == 7
+        with pytest.raises(OutputLimitExceeded, match="8-byte limit"):
+            guard.truncate(file, output, 8)
+
+    assert output.stat().st_size == 7
+    assert guard.used_bytes == 7
+
+
+def test_budgeted_writes_serialize_aggregate_reservations(
+    tmp_path: Path,
+) -> None:
+    guard = OutputBudgetGuard(tmp_path, max_bytes=50, safety_bytes=0)
+    outputs = [tmp_path / f".{index}.tmp" for index in range(100)]
+
+    def write_one(output: Path) -> bool:
+        with output.open("w+b") as file:
+            try:
+                guard.write(file, output, b"x")
+            except OutputLimitExceeded:
+                return False
+        return True
+
+    with ThreadPoolExecutor(max_workers=16) as executor:
+        accepted = list(executor.map(write_one, outputs))
+
+    assert accepted.count(True) == 50
+    assert sum(path.stat().st_size for path in outputs) == 50
+    assert guard.used_bytes == 50
+
+
 def test_account_is_thread_safe_for_distinct_files(tmp_path: Path) -> None:
     guard = OutputBudgetGuard(tmp_path, max_bytes=10_000)
     outputs = [tmp_path / f"{index}.bin" for index in range(50)]
@@ -1227,44 +1332,6 @@ def test_windows_gate_close_attempts_event_after_job_close_failure() -> None:
     assert api.closed == ["job", "event"]
 
 
-def test_ffmpeg_backend_stops_when_active_sequence_tail_grows(
-    tmp_path: Path,
-) -> None:
-    first = tmp_path / "frame_000001.png"
-    first.write_bytes(b"1")
-
-    class GrowingSequencePopen(FakePopen):
-        def __init__(self) -> None:
-            super().__init__([])
-            self.communicate_calls = 0
-
-        def communicate(self, timeout: float | None = None) -> tuple[str, str]:
-            del timeout
-            self.communicate_calls += 1
-            if self.communicate_calls == 2:
-                first.write_bytes(b"x" * 80)
-            if self.communicate_calls <= 2:
-                raise subprocess.TimeoutExpired("ffmpeg", 0.01)
-            raise AssertionError("FFmpeg was allowed to exit before rejection")
-
-    process = GrowingSequencePopen()
-    backend = FfmpegBackend(
-        output_guard=OutputBudgetGuard(
-            tmp_path,
-            max_bytes=80,
-            safety_bytes=1,
-        ),
-        poll_interval=0.01,
-        popen=_popen_factory(process, []),
-    )
-
-    with pytest.raises(OutputLimitExceeded, match="80-byte limit"):
-        backend.run(["ffmpeg", str(tmp_path / "frame_%06d.png")])
-
-    assert process.terminate_called
-    assert process.communicate_calls == 2
-
-
 def test_ffmpeg_backend_preserves_captured_stderr_on_success() -> None:
     process = FakePopen([("ignored stdout", "diagnostic")], returncode=3)
     calls: list[tuple[list[str], dict[str, Any]]] = []
@@ -1405,35 +1472,6 @@ def test_ffmpeg_backend_polls_guard_between_timeouts() -> None:
     assert result.returncode == 0
     assert guard_calls == 1
     assert not process.terminate_called
-
-
-def test_ffmpeg_backend_runs_full_tree_check_after_process_exit(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    process = FakePopen([("", "")])
-    target = tmp_path / "clip_000001.png"
-    target.write_bytes(b"1")
-    (tmp_path / "unmonitored.bin").write_bytes(b"12345")
-    guard = OutputBudgetGuard(tmp_path, max_bytes=6, safety_bytes=1)
-    check_calls = 0
-    original_check_tree = guard.check_tree
-
-    def check_tree() -> None:
-        nonlocal check_calls
-        check_calls += 1
-        original_check_tree()
-
-    monkeypatch.setattr(guard, "check_tree", check_tree)
-    backend = FfmpegBackend(
-        output_guard=guard,
-        popen=_popen_factory(process, []),
-    )
-
-    with pytest.raises(OutputLimitExceeded, match="6-byte limit"):
-        backend.run(["ffmpeg", str(tmp_path / "clip_%06d.png")])
-
-    assert check_calls == 1
 
 
 def test_ffmpeg_backend_terminates_when_guard_rejects() -> None:
@@ -1628,45 +1666,6 @@ def test_ffmpeg_backend_does_not_signal_reused_posix_group_after_term_esrch(
     assert exc_info.value is timeout
     assert signals == [(process.pid, signal.SIGTERM)]
     assert process.wait_calls == [ffmpeg_backend._PROCESS_CLEANUP_TIMEOUT_SECONDS]
-
-
-def test_ffmpeg_backend_does_not_signal_reaped_posix_group_after_finish_timeout(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    timeout = JobTimeoutException("worker timed out after communicate")
-
-    class GroupedPopen(FakePopen):
-        pid = 4321
-
-    process = GroupedPopen([("", "")])
-    signals: list[tuple[int, int]] = []
-
-    def fail_finish(_monitor: OutputTargetMonitor) -> None:
-        raise timeout
-
-    monkeypatch.setattr(ffmpeg_backend, "os_name", "posix")
-    monkeypatch.setattr(ffmpeg_backend.OutputTargetMonitor, "finish", fail_finish)
-    monkeypatch.setattr(
-        os,
-        "killpg",
-        lambda process_group, sent_signal: signals.append(
-            (process_group, sent_signal)
-        ),
-        raising=False,
-    )
-    backend = FfmpegBackend(
-        output_guard=OutputBudgetGuard(tmp_path, max_bytes=80, safety_bytes=1),
-        popen=_popen_factory(process, []),
-    )
-
-    with pytest.raises(JobTimeoutException) as exc_info:
-        backend.run(["ffmpeg", str(tmp_path / "out.mp4")])
-
-    assert exc_info.value is timeout
-    assert process.returncode == 0
-    assert signals == []
-    assert process.wait_calls == []
 
 
 def test_ffmpeg_backend_does_not_signal_posix_group_reaped_by_poll(
@@ -2232,37 +2231,6 @@ def test_windows_timeout_closes_job_after_launcher_and_root_exit(
     finally:
         if child_pid is not None and _windows_process_is_active(child_pid):
             _terminate_windows_process(child_pid)
-
-
-def test_ffmpeg_backend_falls_back_to_monitor_when_prlimit_is_missing(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    target = tmp_path / "out.mp4"
-
-    class GrowingOutputPopen(FakePopen):
-        def communicate(self, timeout: float | None = None) -> tuple[str, str]:
-            del timeout
-            target.write_bytes(b"x" * 80)
-            raise subprocess.TimeoutExpired("ffmpeg", 0.01)
-
-    process = GrowingOutputPopen([])
-    calls: list[tuple[list[str], dict[str, Any]]] = []
-    monkeypatch.setattr(ffmpeg_backend, "os_name", "posix")
-    monkeypatch.setattr(ffmpeg_backend, "which", lambda _executable: None)
-    backend = FfmpegBackend(
-        output_guard=OutputBudgetGuard(tmp_path, max_bytes=80, safety_bytes=1),
-        poll_interval=0.01,
-        popen=_popen_factory(process, calls),
-        max_file_bytes=79,
-    )
-
-    with pytest.raises(OutputLimitExceeded, match="80-byte limit"):
-        backend.run(["ffmpeg", str(target)])
-
-    assert calls[0][0] == ["ffmpeg", str(target)]
-    assert "preexec_fn" not in calls[0][1]
-    assert process.terminate_called
 
 
 def test_windows_launcher_passes_command_as_base64_json_arguments() -> None:
