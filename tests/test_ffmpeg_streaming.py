@@ -88,8 +88,9 @@ def test_pam_parser_emits_multiple_frames_from_arbitrary_chunks() -> None:
         (_pam(1, 1, b"abcd", maxval=65_535), "MAXVAL"),
         (_pam(1, 1, b"abc", depth=3, tuple_type="RGB"), "DEPTH"),
         (_pam(1, 1, b"abcd", tuple_type="RGB"), "TUPLTYPE"),
-        (_pam(100_000, 100_000, b""), "dimensions"),
+        (_pam(100_000, 100_000, b""), "pixel count"),
         (_pam(16_384, 16_384, b""), "pixel count"),
+        (_pam(1, 100_000_001, b""), "pixel count"),
         (
             b"P7\nWIDTH 1\nHEIGHT 1\nDEPTH 4\nMAXVAL 255\nENDHDR\n",
             "TUPLTYPE",
@@ -164,11 +165,30 @@ def test_pam_parser_rejects_complete_oversized_header() -> None:
         parser.feed(payload)
 
 
+def test_pam_parser_rejects_oversized_integer_token_before_conversion() -> None:
+    from designtoolkit.video_frames.ffmpeg_streaming import (
+        FfmpegOutputError,
+        PamStreamParser,
+    )
+
+    parser = PamStreamParser()
+    payload = (
+        b"P7\nWIDTH "
+        + b"1" * 1_000
+        + b"\nHEIGHT 1\nDEPTH 4\nMAXVAL 255\nTUPLTYPE RGB_ALPHA\nENDHDR\n"
+    )
+
+    with pytest.raises(FfmpegOutputError, match="WIDTH integer token"):
+        parser.feed(payload)
+
+
 @pytest.mark.parametrize(
     ("width", "height", "max_frame_bytes"),
     [
         (3840, 2160, 3840 * 2160 * 4),
         (10_000, 10_000, 100_000_000 * 4),
+        (20_000, 2, 20_000 * 2 * 4),
+        (1, 100_000_000, 100_000_000 * 4),
     ],
 )
 def test_pam_parser_accepts_hosted_raw_media_limits(
@@ -1128,6 +1148,30 @@ def test_bundled_ffmpeg_guarded_single_image_formats(
     with Image.open(target) as image:
         image.load()
         assert image.size == (8, 4)
+
+
+def test_bundled_ffmpeg_guarded_wide_image_round_trips_through_pillow(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "wide-source.png"
+    Image.new("RGB", (20_000, 2), "red").save(source)
+    target = tmp_path / "wide-output.png"
+
+    result = resize_media(
+        MediaResizeOptions(
+            input_path=source,
+            output_path=target,
+            size=(20_000, 2),
+        ),
+        FfmpegBackend(
+            output_guard=OutputBudgetGuard(tmp_path, 10_000_000)
+        ),
+    )
+
+    assert result.output_path == target
+    with Image.open(target) as image:
+        image.load()
+        assert image.size == (20_000, 2)
 
 
 def test_bundled_ffmpeg_guarded_gif_resize_preserves_basic_transparency(

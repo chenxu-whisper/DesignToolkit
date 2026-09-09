@@ -209,21 +209,67 @@ class OutputBudgetGuard:
 
     def rollback_created(self, path: str | Path) -> None:
         with self._lock:
-            resolved = self._contained_path(Path(path))
+            resolved = self._contained_entry_path(Path(path))
             identity = self._path_identities.get(resolved)
             if identity is None or identity not in self._created_identities:
                 return
-            resolved.unlink(missing_ok=True)
-            self._path_identities.pop(resolved, None)
-            for known_path, known_identity in tuple(
-                self._path_identities.items()
-            ):
-                if known_identity == identity and not known_path.exists():
-                    self._path_identities.pop(known_path, None)
-            if identity in self._path_identities.values():
+            try:
+                stat_result = resolved.lstat()
+            except FileNotFoundError:
+                self._release_created_path(resolved, identity)
                 return
-            self._used_bytes -= self._sizes.pop(identity, 0)
-            self._created_identities.discard(identity)
+            if not S_ISREG(stat_result.st_mode):
+                self._release_created_path(resolved, identity)
+                return
+            current_identity = self._identity(
+                resolved,
+                stat_result.st_dev,
+                stat_result.st_ino,
+            )
+            if identity[0] != "inode":
+                return
+            if current_identity != identity:
+                self._release_created_path(resolved, identity)
+                return
+            try:
+                resolved.unlink()
+            except FileNotFoundError:
+                pass
+            self._release_created_path(resolved, identity)
+
+    def _release_created_path(
+        self,
+        resolved: Path,
+        identity: FileIdentity,
+    ) -> None:
+        self._path_identities.pop(resolved, None)
+        for known_path, known_identity in tuple(
+            self._path_identities.items()
+        ):
+            if known_identity != identity:
+                continue
+            try:
+                stat_result = known_path.lstat()
+            except FileNotFoundError:
+                self._path_identities.pop(known_path, None)
+                continue
+            if not S_ISREG(stat_result.st_mode):
+                self._path_identities.pop(known_path, None)
+                continue
+            if (
+                identity[0] == "inode"
+                and self._identity(
+                    known_path,
+                    stat_result.st_dev,
+                    stat_result.st_ino,
+                )
+                != identity
+            ):
+                self._path_identities.pop(known_path, None)
+        if identity in self._path_identities.values():
+            return
+        self._used_bytes -= self._sizes.pop(identity, 0)
+        self._created_identities.discard(identity)
 
     def check_tree(self) -> None:
         if not self.root.exists():
@@ -269,10 +315,20 @@ class OutputBudgetGuard:
 
     def _discard_publication_source(self, source: Path) -> None:
         self.rollback_created(source)
-        source.unlink(missing_ok=True)
 
     def _contained_path(self, path: Path) -> Path:
         resolved = Path(path).resolve()
+        try:
+            resolved.relative_to(self.root)
+        except ValueError as exc:
+            raise ValueError(
+                f"Output path is outside output root: {resolved}"
+            ) from exc
+        return resolved
+
+    def _contained_entry_path(self, path: Path) -> Path:
+        absolute = Path(os.path.abspath(path))
+        resolved = absolute.parent.resolve() / absolute.name
         try:
             resolved.relative_to(self.root)
         except ValueError as exc:

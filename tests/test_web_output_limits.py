@@ -144,6 +144,93 @@ def test_budgeted_publish_preserves_identity_and_rollback_releases_extent(
     assert guard.remaining_bytes == 99
 
 
+def test_rollback_preserves_concurrent_replacement_and_releases_old_extent(
+    tmp_path: Path,
+) -> None:
+    guard = OutputBudgetGuard(tmp_path, max_bytes=100)
+    temporary = tmp_path / ".output.tmp"
+    replacement = tmp_path / ".replacement.tmp"
+    target = tmp_path / "output.bin"
+    published = Barrier(2)
+    replaced = Barrier(2)
+
+    with temporary.open("x+b") as file:
+        guard.register_created(file, temporary)
+        guard.write(file, temporary, b"old")
+    guard.publish(temporary, target)
+    replacement.write_bytes(b"new-content")
+
+    def replace_target() -> None:
+        published.wait(timeout=5)
+        os.replace(replacement, target)
+        replaced.wait(timeout=5)
+
+    thread = Thread(target=replace_target)
+    thread.start()
+    published.wait(timeout=5)
+    replaced.wait(timeout=5)
+    guard.rollback_created(target)
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert target.read_bytes() == b"new-content"
+    assert guard.used_bytes == 0
+
+
+def test_rollback_preserves_symlink_replacement_without_following_it(
+    tmp_path: Path,
+) -> None:
+    guard = OutputBudgetGuard(tmp_path, max_bytes=100)
+    temporary = tmp_path / ".output.tmp"
+    target = tmp_path / "output.bin"
+    external = tmp_path / "external.bin"
+
+    with temporary.open("x+b") as file:
+        guard.register_created(file, temporary)
+        guard.write(file, temporary, b"old")
+    guard.publish(temporary, target)
+    target.unlink()
+    external.write_bytes(b"external")
+    try:
+        target.symlink_to(external)
+    except OSError as exc:
+        pytest.skip(f"symlinks are unavailable: {exc}")
+
+    guard.rollback_created(target)
+
+    assert target.is_symlink()
+    assert target.read_bytes() == b"external"
+    assert external.read_bytes() == b"external"
+    assert guard.used_bytes == 0
+
+
+def test_rollback_preserves_replacement_when_inode_identity_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    guard = OutputBudgetGuard(tmp_path, max_bytes=100)
+    temporary = tmp_path / ".output.tmp"
+    replacement = tmp_path / ".replacement.tmp"
+    target = tmp_path / "output.bin"
+    monkeypatch.setattr(
+        guard,
+        "_identity",
+        lambda path, _device, _inode: ("path", path),
+    )
+
+    with temporary.open("x+b") as file:
+        guard.register_created(file, temporary)
+        guard.write(file, temporary, b"old")
+    guard.publish(temporary, target)
+    replacement.write_bytes(b"new-content")
+    os.replace(replacement, target)
+
+    guard.rollback_created(target)
+
+    assert target.read_bytes() == b"new-content"
+    assert guard.used_bytes == 3
+
+
 def test_budgeted_publish_is_atomic_no_clobber_across_guards(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

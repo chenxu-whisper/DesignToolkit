@@ -20,7 +20,7 @@ from designtoolkit.web.output_limits import (
 )
 
 _MAX_PAM_HEADER_BYTES = 64 * 1024
-_MAX_PAM_DIMENSION = 16_384
+_MAX_PAM_INTEGER_BYTES = len(str(HOSTED_MAX_IMAGE_PIXELS))
 _PAM_FEED_CHUNK_BYTES = 64 * 1024
 _PAM_HEADER_KEYS = frozenset(
     {b"WIDTH", b"HEIGHT", b"DEPTH", b"MAXVAL", b"TUPLTYPE"}
@@ -509,13 +509,8 @@ def _parse_pam_header(
     height = _parse_pam_integer(fields[b"HEIGHT"], "HEIGHT")
     depth = _parse_pam_integer(fields[b"DEPTH"], "DEPTH")
     maxval = _parse_pam_integer(fields[b"MAXVAL"], "MAXVAL")
-    if (
-        width <= 0
-        or height <= 0
-        or width > _MAX_PAM_DIMENSION
-        or height > _MAX_PAM_DIMENSION
-    ):
-        raise FfmpegOutputError("FFmpeg PAM dimensions exceed their hard limit")
+    if width <= 0 or height <= 0:
+        raise FfmpegOutputError("FFmpeg PAM dimensions must be positive")
     if depth != 4:
         raise FfmpegOutputError("FFmpeg PAM DEPTH must be 4")
     if maxval != 255:
@@ -543,10 +538,12 @@ def _pam_header_line(buffer: bytearray, start: int, end: int) -> bytes:
 
 
 def _parse_pam_integer(token: bytes, name: str) -> int:
-    if (
-        not token
-        or len(token) > 10
-        or any(byte < ord("0") or byte > ord("9") for byte in token)
+    if len(token) > _MAX_PAM_INTEGER_BYTES:
+        raise FfmpegOutputError(
+            f"FFmpeg PAM {name} integer token exceeds its size limit"
+        )
+    if not token or any(
+        byte < ord("0") or byte > ord("9") for byte in token
     ):
         raise FfmpegOutputError(f"FFmpeg PAM {name} is not a decimal integer")
     return int(token)
