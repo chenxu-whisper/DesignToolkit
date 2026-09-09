@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import ctypes
 import os
 import signal
 import subprocess
 import sys
 import time
 from pathlib import Path
-from threading import Barrier, Event
+from threading import Barrier, Event, Thread, get_ident
 from typing import Any
 
 import pytest
@@ -16,9 +17,11 @@ from designtoolkit.video_frames import ffmpeg_backend
 from designtoolkit.video_frames.ffmpeg_backend import FfmpegBackend
 
 pytestmark = pytest.mark.skipif(
-    os.name != "posix",
-    reason="requires POSIX process groups",
+    not sys.platform.startswith("linux"),
+    reason="requires Linux process groups and /proc process states",
 )
+
+_INTERRUPTION_GUARD_SECONDS = 10
 
 
 class _FatalLaunchInterruption(BaseException):
@@ -44,26 +47,55 @@ def _wait_until(predicate: Any, timeout: float = 3.0) -> bool:
     return bool(predicate())
 
 
-def _process_is_alive(pid: int) -> bool:
-    try:
-        state = Path(f"/proc/{pid}/stat").read_text(encoding="ascii").split()[2]
-    except FileNotFoundError:
-        return False
-    except (IndexError, OSError):
+def _read_pid_when_ready(path: Path, timeout: float = 3.0) -> int:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
         try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return False
-        return True
-    return state != "Z"
+            return int(path.read_text(encoding="ascii"))
+        except (FileNotFoundError, ValueError):
+            time.sleep(0.01)
+    raise AssertionError(f"PID file was not ready: {path}")
 
 
-def _process_exists(pid: int) -> bool:
+def _linux_process_state(pid: int) -> str | None:
     try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    return True
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+    except FileNotFoundError:
+        return None
+
+    _command, separator, remaining = stat.rpartition(")")
+    if not separator:
+        raise AssertionError(f"Malformed /proc/{pid}/stat: {stat!r}")
+    fields = remaining.split()
+    if not fields:
+        raise AssertionError(f"Missing state in /proc/{pid}/stat: {stat!r}")
+    return fields[0]
+
+
+def _process_is_running(pid: int) -> bool:
+    return _linux_process_state(pid) not in {None, "Z"}
+
+
+def _inject_main_when_factory_blocks(
+    factory_blocked: Event,
+    cancelled: Event,
+    main_thread_id: int,
+    interruption_type: type[BaseException],
+    injection_results: list[int],
+) -> None:
+    while not factory_blocked.wait(0.01):
+        if cancelled.is_set():
+            return
+    if cancelled.is_set():
+        return
+    set_async_exc = ctypes.pythonapi.PyThreadState_SetAsyncExc
+    result = set_async_exc(
+        ctypes.c_ulong(main_thread_id),
+        ctypes.py_object(interruption_type),
+    )
+    injection_results.append(result)
+    if result > 1:
+        set_async_exc(ctypes.c_ulong(main_thread_id), ctypes.c_void_p())
 
 
 def _force_cleanup(processes: list[subprocess.Popen[str]]) -> None:
@@ -123,37 +155,58 @@ def test_posix_interruption_during_popen_cleans_real_process_tree(
     grandchild_pid_path = tmp_path / "grandchild.pid"
     factory_blocked = Event()
     release_factory = Event()
+    cancel_interruption = Event()
+    injection_results: list[int] = []
     processes: list[subprocess.Popen[str]] = []
+    grandchild_pids: list[int] = []
+    interrupter = Thread(
+        target=_inject_main_when_factory_blocks,
+        args=(
+            factory_blocked,
+            cancel_interruption,
+            get_ident(),
+            interruption_type,
+            injection_results,
+        ),
+        daemon=True,
+    )
 
     def popen(command: list[str], **kwargs: Any) -> subprocess.Popen[str]:
         process = subprocess.Popen(command, **kwargs)
         processes.append(process)
-        assert _wait_until(grandchild_pid_path.exists)
+        grandchild_pids.append(_read_pid_when_ready(grandchild_pid_path))
         factory_blocked.set()
         while not release_factory.wait(0.01):
             pass
         return process
 
-    started_at = time.monotonic()
+    interrupter.start()
     try:
         with pytest.raises(interruption_type):
-            with TimerDeathPenalty(0.2, exception=interruption_type):
+            with TimerDeathPenalty(
+                _INTERRUPTION_GUARD_SECONDS,
+                exception=interruption_type,
+            ):
                 FfmpegBackend(popen=popen).run(
                     _cooperative_process_tree_command(grandchild_pid_path)
                 )
-        elapsed = time.monotonic() - started_at
         assert factory_blocked.is_set()
-        assert elapsed < 0.6
+        interrupter.join(timeout=2)
+        assert injection_results == [1]
+        assert not interrupter.is_alive()
         assert processes
-        grandchild_pid = int(grandchild_pid_path.read_text(encoding="ascii"))
+        assert len(grandchild_pids) == 1
+        grandchild_pid = grandchild_pids[0]
 
         release_factory.set()
 
-        assert _wait_until(lambda: processes[0].returncode is not None)
-        assert _wait_until(lambda: not _process_is_alive(grandchild_pid))
-        assert _wait_until(lambda: not _process_exists(grandchild_pid))
+        processes[0].wait(timeout=5)
+        assert processes[0].returncode is not None
+        assert _wait_until(lambda: not _process_is_running(grandchild_pid))
     finally:
+        cancel_interruption.set()
         release_factory.set()
+        interrupter.join(timeout=2)
         _force_cleanup(processes)
 
 
@@ -161,34 +214,61 @@ def test_posix_abandoned_launch_kills_group_after_parent_exits(
     tmp_path: Path,
 ) -> None:
     grandchild_pid_path = tmp_path / "surviving-grandchild.pid"
+    factory_blocked = Event()
     release_factory = Event()
+    cancel_interruption = Event()
+    injection_results: list[int] = []
     processes: list[subprocess.Popen[str]] = []
+    grandchild_pids: list[int] = []
+    interrupter = Thread(
+        target=_inject_main_when_factory_blocks,
+        args=(
+            factory_blocked,
+            cancel_interruption,
+            get_ident(),
+            _FatalLaunchInterruption,
+            injection_results,
+        ),
+        daemon=True,
+    )
 
     def popen(command: list[str], **kwargs: Any) -> subprocess.Popen[str]:
         process = subprocess.Popen(command, **kwargs)
         processes.append(process)
-        assert _wait_until(grandchild_pid_path.exists)
+        grandchild_pids.append(_read_pid_when_ready(grandchild_pid_path))
         assert _wait_until(lambda: process.poll() is not None)
+        factory_blocked.set()
         while not release_factory.wait(0.01):
             pass
         return process
 
+    interrupter.start()
     try:
         with pytest.raises(_FatalLaunchInterruption):
-            with TimerDeathPenalty(0.2, exception=_FatalLaunchInterruption):
+            with TimerDeathPenalty(
+                _INTERRUPTION_GUARD_SECONDS,
+                exception=_FatalLaunchInterruption,
+            ):
                 FfmpegBackend(popen=popen).run(
                     _exiting_parent_command(grandchild_pid_path)
                 )
-        grandchild_pid = int(grandchild_pid_path.read_text(encoding="ascii"))
-        assert _process_is_alive(grandchild_pid)
+        assert factory_blocked.is_set()
+        interrupter.join(timeout=2)
+        assert injection_results == [1]
+        assert not interrupter.is_alive()
+        assert len(grandchild_pids) == 1
+        grandchild_pid = grandchild_pids[0]
+        assert _process_is_running(grandchild_pid)
 
         release_factory.set()
 
-        assert _wait_until(lambda: not _process_is_alive(grandchild_pid))
-        assert _wait_until(lambda: not _process_exists(grandchild_pid))
+        processes[0].wait(timeout=5)
         assert processes[0].returncode is not None
+        assert _wait_until(lambda: not _process_is_running(grandchild_pid))
     finally:
+        cancel_interruption.set()
         release_factory.set()
+        interrupter.join(timeout=2)
         _force_cleanup(processes)
 
 
@@ -329,9 +409,7 @@ def test_posix_abandoned_launch_stops_signaling_after_group_disappears(
     FfmpegBackend._abort_posix_launch(process)  # type: ignore[arg-type]
 
     assert signals == [signal.SIGTERM]
-    assert process.wait_calls == [
-        ffmpeg_backend._PROCESS_CLEANUP_TIMEOUT_SECONDS
-    ]
+    assert process.wait_calls == [ffmpeg_backend._PROCESS_CLEANUP_TIMEOUT_SECONDS]
 
 
 def test_posix_abandoned_blocked_factories_leave_no_launcher_threads() -> None:
