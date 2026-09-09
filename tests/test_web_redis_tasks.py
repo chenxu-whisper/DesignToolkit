@@ -5383,6 +5383,222 @@ def test_hosted_event_sanitizer_finds_managed_path_later_in_same_token(
     assert "8" * 32 not in sanitized
 
 
+def test_hosted_event_sanitizer_fails_closed_for_mixed_encoding_paths() -> None:
+    data_dir = PurePosixPath("/srv/data")
+    first_session = "1" * 32
+    first_asset = "2" * 32
+    second_session = "3" * 32
+    second_asset = "4" * 32
+    first_path = (
+        data_dir
+        / "sessions"
+        / first_session
+        / "assets"
+        / first_asset
+        / "first.mov"
+    )
+    second_path = (
+        data_dir
+        / "sessions"
+        / second_session
+        / "assets"
+        / second_asset
+        / "second.mov"
+    )
+    first_encoded = quote(quote(str(first_path), safe=""), safe="")
+    second_encoded = quote(str(second_path), safe="")
+
+    sanitized = event_sanitization_module.sanitize_event_text(
+        f"{first_encoded}:{second_encoded}",
+        data_dir=data_dir,
+        task_payload={"input_path": str(second_path)},
+    )
+
+    assert sanitized == event_sanitization_module.MANAGED_PATH_PLACEHOLDER
+
+
+@pytest.mark.parametrize(
+    ("order", "separators", "known_index"),
+    [
+        ((0, 1, 2), (":", ":"), 2),
+        ((2, 0, 1), (":", ":"), 2),
+        ((1, 2, 0), ("?next=", "&then="), 0),
+        ((2, 1, 0), ("&first=", "?next="), 1),
+    ],
+    ids=["known-last", "known-first", "query-chain", "query-permutation"],
+)
+def test_hosted_event_sanitizer_redacts_managed_path_permutations(
+    order: tuple[int, int, int],
+    separators: tuple[str, str],
+    known_index: int,
+) -> None:
+    data_dir = PurePosixPath("/srv/data")
+    session_ids = tuple(str(index) * 32 for index in range(1, 4))
+    asset_ids = tuple(str(index) * 32 for index in range(4, 7))
+    paths = tuple(
+        str(
+            data_dir
+            / "sessions"
+            / session_id
+            / "assets"
+            / asset_id
+            / f"{index}.mov"
+        )
+        for index, (session_id, asset_id) in enumerate(
+            zip(session_ids, asset_ids, strict=True)
+        )
+    )
+    encoded = tuple(
+        quote(path, safe="") if index % 2 else quote(quote(path, safe=""), safe="")
+        for index, path in enumerate(paths)
+    )
+    value = (
+        encoded[order[0]]
+        + separators[0]
+        + encoded[order[1]]
+        + separators[1]
+        + encoded[order[2]]
+    )
+
+    sanitized = event_sanitization_module.sanitize_event_text(
+        value,
+        data_dir=data_dir,
+        task_payload={"input_path": paths[known_index]},
+    )
+    decoded_output = event_sanitization_module._canonical_path(
+        sanitized,
+        path_style="posix",
+    )
+
+    assert str(data_dir) not in decoded_output
+    assert all(session_id not in decoded_output for session_id in session_ids)
+    assert all(asset_id not in decoded_output for asset_id in asset_ids)
+
+
+def test_hosted_event_sanitizer_fuzzes_residual_managed_paths() -> None:
+    random = Random(32_062)
+    data_dir = PurePosixPath("/srv/data")
+    session_ids = tuple(f"{index:x}" * 32 for index in range(1, 5))
+    asset_ids = tuple(f"{index:x}" * 32 for index in range(5, 9))
+    paths = tuple(
+        str(
+            data_dir
+            / "sessions"
+            / session_id
+            / "assets"
+            / asset_id
+            / f"{index}.mov"
+        )
+        for index, (session_id, asset_id) in enumerate(
+            zip(session_ids, asset_ids, strict=True)
+        )
+    )
+
+    for _ in range(200):
+        order = list(range(len(paths)))
+        random.shuffle(order)
+        variants: list[str] = []
+        for path_index in order:
+            variant = paths[path_index]
+            if random.choice([False, True]):
+                variant = variant.replace("/sessions/", "//./sessions/")
+            for _ in range(random.randrange(0, 8)):
+                variant = quote(variant, safe="")
+            variants.append(variant)
+        separator = random.choice([":", "::", "?next=", "&next="])
+        value = separator.join(variants)
+        decoded_normalized_input = event_sanitization_module._canonical_path(
+            value,
+            path_style="posix",
+        )
+        assert str(data_dir) in decoded_normalized_input
+
+        sanitized = event_sanitization_module.sanitize_event_text(
+            value,
+            data_dir=data_dir,
+            task_payload={"input_path": paths[order[-1]]},
+        )
+        decoded_normalized_output = (
+            event_sanitization_module._canonical_path(
+                sanitized,
+                path_style="posix",
+            )
+        )
+
+        assert str(data_dir) not in decoded_normalized_output
+        assert all(
+            session_id not in decoded_normalized_output
+            for session_id in session_ids
+        )
+        assert all(
+            asset_id not in decoded_normalized_output
+            for asset_id in asset_ids
+        )
+
+
+def test_hosted_event_sanitizer_detects_path_across_truncation_marker() -> None:
+    data_dir = PurePosixPath("/srv/data")
+    marker = event_sanitization_module.PUBLIC_EVENT_TRUNCATED_MARKER
+    retained_length = (
+        event_sanitization_module.MAX_PUBLIC_EVENT_STRING_LENGTH - len(marker)
+    )
+    prefix = "x" * (retained_length - 3)
+    value = (
+        f"{prefix}{data_dir}/sessions/{'7' * 32}/failure.log"
+        + "y" * event_sanitization_module.MAX_PUBLIC_EVENT_STRING_LENGTH
+    )
+
+    sanitized = event_sanitization_module.sanitize_event_text(
+        value,
+        data_dir=data_dir,
+        task_payload=None,
+    )
+
+    assert sanitized == (
+        event_sanitization_module.MANAGED_PATH_PLACEHOLDER + marker
+    )
+
+
+def test_hosted_event_sanitizer_residual_scan_scales_linearly() -> None:
+    data_dir = PurePosixPath("/srv/data")
+    first_path = (
+        data_dir / "sessions" / ("1" * 32) / "private" / "first.mov"
+    )
+    known_path = (
+        data_dir / "sessions" / ("2" * 32) / "private" / "known.mov"
+    )
+
+    def elapsed(prefix_size: int) -> float:
+        value = (
+            quote(str(first_path), safe="")
+            + ":"
+            + str(known_path)
+            + ":"
+            + ("x:" * ((prefix_size // 2) + 1))[:prefix_size]
+        )
+        expected = event_sanitization_module.MANAGED_PATH_PLACEHOLDER
+        if (
+            len(value)
+            > event_sanitization_module.MAX_PUBLIC_EVENT_STRING_LENGTH
+        ):
+            expected += event_sanitization_module.PUBLIC_EVENT_TRUNCATED_MARKER
+        started = perf_counter()
+        for _ in range(20):
+            sanitized = event_sanitization_module.sanitize_event_text(
+                value,
+                data_dir=data_dir,
+                task_payload={"input_path": str(known_path)},
+            )
+            assert sanitized == expected
+        return perf_counter() - started
+
+    elapsed_4k = elapsed(4 * 1024)
+    elapsed_8k = elapsed(8 * 1024)
+
+    assert elapsed_8k < 0.5
+    assert elapsed_8k / elapsed_4k < 3
+
+
 def test_hosted_event_sanitizer_same_token_scan_scales_linearly() -> None:
     data_dir = PurePosixPath("/srv/data")
     private_path = (

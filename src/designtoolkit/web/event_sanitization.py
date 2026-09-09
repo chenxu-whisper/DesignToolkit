@@ -131,6 +131,8 @@ class EventSanitizer:
         *,
         paths: _TaskPaths,
     ) -> str:
+        bounded_source = value[:MAX_PUBLIC_EVENT_STRING_LENGTH]
+        was_truncated = len(value) > MAX_PUBLIC_EVENT_STRING_LENGTH
         value = _truncate_public_string(value)
         if not self._managed_roots:
             return value
@@ -148,12 +150,20 @@ class EventSanitizer:
             blocked=known_replacements,
         )
         if candidate_replacements is None:
-            return MANAGED_PATH_PLACEHOLDER
-        return _apply_text_replacements(
+            return _managed_path_placeholder(was_truncated=was_truncated)
+        candidate = _apply_text_replacements(
             value,
             decoded=decoded,
             replacements=(*known_replacements, *candidate_replacements),
         )
+        residual_source = bounded_source if was_truncated else candidate
+        if _contains_managed_root(
+            residual_source,
+            managed_roots=self._managed_roots,
+            path_style=self._path_style,
+        ):
+            return _managed_path_placeholder(was_truncated=was_truncated)
+        return candidate
 
     def sanitize_details(
         self,
@@ -668,6 +678,39 @@ def _decode_path(value: str) -> str:
     return _decode_text(value).value
 
 
+def _contains_managed_root(
+    value: str,
+    *,
+    managed_roots: tuple[str, ...],
+    path_style: _PathStyle,
+) -> bool:
+    shadow = _normalized_path_shadow(value, path_style=path_style)
+    return any(
+        _normalized_path_shadow(root, path_style=path_style) in shadow
+        for root in managed_roots
+    )
+
+
+def _normalized_path_shadow(value: str, *, path_style: _PathStyle) -> str:
+    decoded = _decode_text(value).value.replace("\\", "/")
+    absolute = decoded.startswith("/")
+    components: list[str] = []
+    for component in decoded.split("/"):
+        if not component or component == ".":
+            continue
+        if component == "..":
+            if components and components[-1] != "..":
+                components.pop()
+            elif not absolute:
+                components.append(component)
+            continue
+        components.append(component)
+    shadow = "/".join(components)
+    if absolute:
+        shadow = "/" + shadow
+    return shadow.casefold() if path_style == "windows" else shadow
+
+
 def _decode_text(value: str) -> _DecodedText:
     byte_values = bytearray()
     byte_starts: list[int] = []
@@ -881,6 +924,12 @@ def _truncate_public_string(value: str) -> str:
         MAX_PUBLIC_EVENT_STRING_LENGTH - len(PUBLIC_EVENT_TRUNCATED_MARKER)
     )
     return value[:prefix_length] + PUBLIC_EVENT_TRUNCATED_MARKER
+
+
+def _managed_path_placeholder(*, was_truncated: bool) -> str:
+    if was_truncated:
+        return MANAGED_PATH_PLACEHOLDER + PUBLIC_EVENT_TRUNCATED_MARKER
+    return MANAGED_PATH_PLACEHOLDER
 
 
 def _looks_like_file_path(path: str) -> bool:
