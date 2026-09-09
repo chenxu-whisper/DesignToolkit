@@ -27,6 +27,7 @@ _LOGGER = logging.getLogger(__name__)
 _POSIX_SIGKILL = getattr(signal, "SIGKILL", 9)
 _WINDOWS_NEW_PROCESS_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200)
 _PROCESS_CLEANUP_TIMEOUT_SECONDS = 5.0
+_POSIX_LAUNCH_WAIT_POLL_SECONDS = 0.01
 _WINDOWS_LAUNCH_CLEANUP_TIMEOUT_SECONDS = 5.0
 _WINDOWS_LAUNCH_WAIT_POLL_SECONDS = 0.01
 _WINDOWS_STARTUP_ERROR_RETURN_CODE = 126
@@ -695,6 +696,112 @@ class _WindowsLaunchResult:
     exception: BaseException | None = None
 
 
+@dataclass(frozen=True)
+class _PosixLaunchResult:
+    process: subprocess.Popen[str] | None = None
+    exception: BaseException | None = None
+
+
+class _PosixLaunchTransaction:
+    def __init__(
+        self,
+        command: Sequence[str],
+        popen: PopenFactory,
+        popen_kwargs: dict[str, object],
+        abort: Callable[[subprocess.Popen[str]], None],
+    ) -> None:
+        self._command = list(command)
+        self._popen = popen
+        self._popen_kwargs = dict(popen_kwargs)
+        self._abort = abort
+        self._ready = Event()
+        self._decision = Event()
+        self._done = Event()
+        self._state_lock = Lock()
+        self._state = "STARTING"
+        self._result: _PosixLaunchResult | None = None
+        self._thread = Thread(
+            target=self._run,
+            name="designtoolkit-ffmpeg-posix-launch",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def wait(self) -> _PosixLaunchResult:
+        while not self._ready.wait(timeout=_POSIX_LAUNCH_WAIT_POLL_SECONDS):
+            pass
+        with self._state_lock:
+            result = self._result
+        if result is None:
+            raise RuntimeError("POSIX FFmpeg launch produced no result")
+        if result.exception is not None:
+            raise result.exception
+        if result.process is None:
+            raise RuntimeError("POSIX FFmpeg launch result was incomplete")
+        return result
+
+    def accept(self) -> None:
+        with self._state_lock:
+            if self._state == "ABANDONED":
+                raise RuntimeError("POSIX FFmpeg launch was already abandoned")
+            if self._state != "PUBLISHED":
+                raise RuntimeError("POSIX FFmpeg launch was not ready")
+            self._state = "ACCEPTED"
+        self._decision.set()
+
+    def abandon(self) -> None:
+        with self._state_lock:
+            if self._state != "ACCEPTED":
+                self._state = "ABANDONED"
+        self._decision.set()
+
+    @property
+    def was_accepted(self) -> bool:
+        with self._state_lock:
+            return self._state == "ACCEPTED"
+
+    def _run(self) -> None:
+        process: subprocess.Popen[str] | None = None
+        try:
+            try:
+                process = self._popen(self._command, **self._popen_kwargs)
+            except BaseException as exc:
+                with self._state_lock:
+                    if self._state != "ABANDONED":
+                        self._state = "FAILED"
+                        self._result = _PosixLaunchResult(exception=exc)
+                        self._ready.set()
+                return
+
+            with self._state_lock:
+                if self._state == "ABANDONED":
+                    should_abort = True
+                else:
+                    should_abort = False
+                    self._state = "PUBLISHED"
+                    self._result = _PosixLaunchResult(process=process)
+                    self._ready.set()
+
+            while not should_abort:
+                self._decision.wait(timeout=_POSIX_LAUNCH_WAIT_POLL_SECONDS)
+                with self._state_lock:
+                    if self._state == "ACCEPTED":
+                        return
+                    should_abort = self._state == "ABANDONED"
+
+            try:
+                self._abort(process)
+            except BaseException:
+                try:
+                    _LOGGER.exception("Failed to clean abandoned POSIX FFmpeg launch")
+                except BaseException:
+                    pass
+        finally:
+            self._done.set()
+
+
 class _WindowsLaunchTransaction:
     def __init__(
         self,
@@ -997,9 +1104,17 @@ class FfmpegBackend:
             popen_kwargs["creationflags"] = _WINDOWS_NEW_PROCESS_GROUP
         gated_command = _file_size_limited_command(command, self._max_file_bytes)
         process_tree_owner: _WindowsLaunchGate | None = None
+        posix_launch_transaction: _PosixLaunchTransaction | None = None
         launch_transaction: _WindowsLaunchTransaction | None = None
         process: subprocess.Popen[str] | None = None
-        if os_name == "nt":
+        if os_name == "posix":
+            posix_launch_transaction = _PosixLaunchTransaction(
+                gated_command,
+                self._popen,
+                popen_kwargs,
+                self._abort_posix_launch,
+            )
+        elif os_name == "nt":
             launch_transaction = _WindowsLaunchTransaction(
                 gated_command,
                 self._windows_launch_gate_factory,
@@ -1021,6 +1136,13 @@ class FfmpegBackend:
                 if process is None or process_tree_owner is None:
                     raise RuntimeError("Windows FFmpeg launch result was incomplete")
                 launch_transaction.accept()
+            elif posix_launch_transaction is not None:
+                posix_launch_transaction.start()
+                launch_result = posix_launch_transaction.wait()
+                process = launch_result.process
+                if process is None:
+                    raise RuntimeError("POSIX FFmpeg launch result was incomplete")
+                posix_launch_transaction.accept()
             else:
                 process = self._popen(gated_command, **popen_kwargs)
 
@@ -1054,11 +1176,17 @@ class FfmpegBackend:
         except BaseException:
             if launch_transaction is not None:
                 launch_transaction.cancel()
+            if posix_launch_transaction is not None:
+                posix_launch_transaction.abandon()
             if (
                 process is not None
                 and (
                     launch_transaction is None
                     or launch_transaction.was_accepted
+                )
+                and (
+                    posix_launch_transaction is None
+                    or posix_launch_transaction.was_accepted
                 )
             ):
                 try:
@@ -1191,3 +1319,63 @@ class FfmpegBackend:
             "reap Windows FFmpeg launcher",
             lambda: process.wait(timeout=_PROCESS_CLEANUP_TIMEOUT_SECONDS),
         )
+
+    @staticmethod
+    def _abort_posix_launch(process: subprocess.Popen[str]) -> None:
+        def attempt(description: str, cleanup: Callable[[], object]) -> None:
+            try:
+                cleanup()
+            except ProcessLookupError:
+                pass
+            except BaseException:
+                try:
+                    _LOGGER.exception("Failed to %s", description)
+                except BaseException:
+                    pass
+
+        def wait_for_process(description: str) -> bool:
+            try:
+                process.wait(timeout=_PROCESS_CLEANUP_TIMEOUT_SECONDS)
+            except ProcessLookupError:
+                return True
+            except subprocess.TimeoutExpired:
+                return False
+            except BaseException:
+                try:
+                    _LOGGER.exception("Failed to %s", description)
+                except BaseException:
+                    pass
+                return False
+            return True
+
+        def signal_process_group(sent_signal: int, description: str) -> bool:
+            try:
+                os.killpg(pid, sent_signal)
+            except ProcessLookupError:
+                return False
+            except BaseException:
+                try:
+                    _LOGGER.exception("Failed to %s", description)
+                except BaseException:
+                    pass
+            return True
+
+        pid = getattr(process, "pid", None)
+        if pid is None:
+            attempt("terminate abandoned POSIX FFmpeg launch", process.terminate)
+            if wait_for_process("reap abandoned POSIX FFmpeg launch"):
+                return
+            attempt("kill abandoned POSIX FFmpeg launch", process.kill)
+            wait_for_process("reap killed POSIX FFmpeg launch")
+            return
+
+        group_exists = signal_process_group(
+            signal.SIGTERM,
+            "terminate abandoned POSIX FFmpeg process group",
+        )
+        if group_exists:
+            signal_process_group(
+                _POSIX_SIGKILL,
+                "kill abandoned POSIX FFmpeg process group",
+            )
+        wait_for_process("reap abandoned POSIX FFmpeg launch")
