@@ -34,6 +34,78 @@ def _default_ffmpeg_tests_to_posix(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(ffmpeg_backend, "os_name", "posix")
 
 
+class _RejectingHealthGuard(OutputBudgetGuard):
+    def __init__(self, root: Path) -> None:
+        super().__init__(root, max_bytes=100)
+        self.blocked = False
+        self.checks = 0
+        self.failure = RuntimeError("resource heartbeat failed")
+
+    def check_health(self) -> None:
+        self.checks += 1
+        if self.blocked:
+            raise self.failure
+
+
+def test_output_budget_guard_default_health_check_is_noop(tmp_path: Path) -> None:
+    guard = OutputBudgetGuard(tmp_path, max_bytes=100)
+
+    assert guard.check_health() is None
+
+
+@pytest.mark.parametrize(
+    "operation",
+    ["account", "register_created", "write", "truncate", "publish", "check_tree"],
+)
+def test_output_budget_guard_checks_health_before_mutating_operation(
+    tmp_path: Path,
+    operation: str,
+) -> None:
+    guard = _RejectingHealthGuard(tmp_path)
+    target = tmp_path / "output.bin"
+    temporary = tmp_path / f".output.bin.{'1' * 32}.tmp"
+
+    if operation in {"account", "check_tree"}:
+        target.write_bytes(b"existing")
+    elif operation in {"write", "truncate", "publish"}:
+        with temporary.open("x+b") as file:
+            guard.register_created(file, temporary)
+            if operation == "publish":
+                guard.write(file, temporary, b"temporary")
+
+    guard.blocked = True
+    checks_before = guard.checks
+
+    with pytest.raises(RuntimeError, match="resource heartbeat failed") as exc_info:
+        if operation == "account":
+            guard.account(target)
+        elif operation == "register_created":
+            with temporary.open("x+b") as file:
+                guard.register_created(file, temporary)
+        elif operation == "write":
+            with temporary.open("r+b") as file:
+                guard.write(file, temporary, b"growth")
+        elif operation == "truncate":
+            with temporary.open("r+b") as file:
+                guard.truncate(file, temporary, 6)
+        elif operation == "publish":
+            guard.publish(temporary, target)
+        else:
+            guard.check_tree()
+
+    assert exc_info.value is guard.failure
+    assert guard.checks == checks_before + 1
+    if operation in {"account", "check_tree"}:
+        assert guard.used_bytes == 0
+    elif operation == "register_created":
+        assert guard.used_bytes == 0
+    elif operation in {"write", "truncate"}:
+        assert temporary.stat().st_size == 0
+    else:
+        assert temporary.read_bytes() == b"temporary"
+        assert not target.exists()
+
+
 def test_budget_rejects_aggregate_files_at_safety_boundary(tmp_path: Path) -> None:
     guard = OutputBudgetGuard(tmp_path, max_bytes=8, safety_bytes=1)
     assert guard.remaining_bytes == 7

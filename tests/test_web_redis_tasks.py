@@ -3,6 +3,8 @@ from __future__ import annotations
 import inspect
 import json
 import os
+import subprocess
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime, timedelta
@@ -4040,6 +4042,87 @@ def test_run_task_heartbeats_resources_during_slow_processing(
     assert resources.events.count("refresh:lease") >= 2
     assert resources.events.count("refresh:output") >= 2
     assert resources.events[-2:] == ["release:output", "release:lease"]
+
+
+@pytest.mark.timeout(10)
+def test_real_redis_guarded_stream_prevents_duplicate_output_reservation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    real_redis_connection: Redis,
+) -> None:
+    from designtoolkit.video_frames import ffmpeg_backend
+    from designtoolkit.video_frames.ffmpeg_backend import FfmpegBackend
+
+    resources = RedisResourceCoordinator(
+        redis_connection=real_redis_connection,
+        max_upload_concurrency=1,
+        max_session_bytes=100,
+        min_free_bytes=0,
+        reservation_ttl=0.08,
+        lease_ttl=1,
+        reservation_heartbeat_interval=0.01,
+        lease_heartbeat_interval=0.1,
+    )
+    reservation = resources.reserve_output(
+        "stream-task",
+        "a" * 32,
+        10,
+        free_bytes=15,
+    )
+    process_started = Event()
+
+    def popen(
+        command: list[str],
+        **kwargs: object,
+    ) -> subprocess.Popen[bytes]:
+        process = subprocess.Popen(command, **kwargs)
+        process_started.set()
+        return process
+
+    monkeypatch.setattr(ffmpeg_backend, "os_name", "other")
+    guard = worker_module._HeartbeatOutputBudgetGuard(
+        tmp_path,
+        10,
+        heartbeat=reservation.refresh,
+    )
+    backend = FfmpegBackend(
+        output_guard=guard,
+        popen=popen,
+        poll_interval=0.01,
+    )
+    target = tmp_path / "output.avi"
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            run = executor.submit(
+                backend.run,
+                [
+                    sys.executable,
+                    "-c",
+                    "import time; time.sleep(0.25)",
+                    str(target),
+                ],
+            )
+            assert process_started.wait(timeout=1), (
+                run.exception(timeout=0) if run.done() else "process did not start"
+            )
+            time.sleep(0.12)
+
+            assert resources.reconcile_reservations() == 0
+            with pytest.raises(ResourceUnavailableError, match="disk"):
+                resources.reserve_output(
+                    "competing-task",
+                    "b" * 32,
+                    10,
+                    free_bytes=15,
+                )
+
+            result = run.result(timeout=2)
+    finally:
+        reservation.release()
+
+    assert result.returncode == 0
+    assert target.is_file()
 
 
 def test_run_task_heartbeats_lease_while_output_reservation_blocks(

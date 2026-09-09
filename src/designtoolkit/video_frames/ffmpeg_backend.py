@@ -1381,18 +1381,32 @@ class FfmpegBackend:
                 try:
                     item = stdout_queue.get(timeout=self._poll_interval)
                 except Empty:
+                    guard.check_health()
                     if captured_stderr.exception is not None:
                         raise captured_stderr.exception from None
                     continue
                 if item is None:
+                    guard.check_health()
                     break
                 if isinstance(item, BaseException):
                     raise item
+                guard.check_health()
                 output.consume(item)
+                guard.check_health()
 
-            returncode = process.wait()
+            while True:
+                guard.check_health()
+                try:
+                    returncode = process.wait(timeout=self._poll_interval)
+                except subprocess.TimeoutExpired:
+                    guard.check_health()
+                    continue
+                guard.check_health()
+                break
             while stderr_thread.is_alive():
+                guard.check_health()
                 stderr_thread.join(timeout=self._poll_interval)
+                guard.check_health()
             if captured_stderr.exception is not None:
                 raise captured_stderr.exception
             if process_tree_owner is not None:
@@ -1405,6 +1419,7 @@ class FfmpegBackend:
             if returncode != 0:
                 output.rollback()
                 return BackendResult(returncode=returncode, stderr=stderr)
+            guard.check_health()
             output.finish()
             return BackendResult(returncode=returncode, stderr=stderr)
         except BaseException:

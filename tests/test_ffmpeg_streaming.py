@@ -3,8 +3,10 @@ from __future__ import annotations
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from io import BytesIO
 from pathlib import Path
+from threading import Event
 from typing import Any
 
 import pytest
@@ -829,6 +831,99 @@ class _StreamingPopen:
         self.returncode = 1
 
 
+class _DelayedEofPipe:
+    def __init__(self, delay: float) -> None:
+        self._delay = delay
+        self._released = Event()
+        self.read_started = Event()
+        self.done = False
+        self.closed = False
+
+    def read(self, _size: int = -1) -> bytes:
+        self.read_started.set()
+        self._released.wait(self._delay)
+        self.done = True
+        return b""
+
+    def close(self) -> None:
+        self.closed = True
+        self._released.set()
+
+
+class _PollingStreamingPopen:
+    def __init__(
+        self,
+        stdout: _BytesPipe | _DelayedEofPipe,
+        stderr: _BytesPipe | _DelayedEofPipe,
+        *,
+        wait_timeouts: int = 0,
+    ) -> None:
+        self.stdout = stdout
+        self.stderr = stderr
+        self.returncode: int | None = None
+        self.terminate_called = False
+        self.kill_called = False
+        self.wait_calls: list[float | None] = []
+        self.wait_timeouts = wait_timeouts
+        self.wait_timeouts_observed = 0
+
+    def wait(self, timeout: float | None = None) -> int:
+        self.wait_calls.append(timeout)
+        if self.returncode is not None:
+            return self.returncode
+        if timeout is not None and self.wait_timeouts_observed < self.wait_timeouts:
+            self.wait_timeouts_observed += 1
+            raise subprocess.TimeoutExpired("ffmpeg", timeout)
+        self.returncode = 0
+        return 0
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def terminate(self) -> None:
+        self.terminate_called = True
+        self.returncode = 1
+
+    def kill(self) -> None:
+        self.kill_called = True
+        self.returncode = 1
+
+
+class _HealthGuard(OutputBudgetGuard):
+    def __init__(
+        self,
+        root: Path,
+        *,
+        fail_after: int | None = None,
+        failure_when: Callable[[], bool] | None = None,
+        max_bytes: int = 1_000_000,
+    ) -> None:
+        super().__init__(root, max_bytes=max_bytes)
+        self.fail_after = fail_after
+        self.failure_when = failure_when
+        self.checks = 0
+        self.max_observed_bytes = 0
+        self.failure = RuntimeError("resource heartbeat failed")
+
+    def check_health(self) -> None:
+        self.checks += 1
+        if (
+            self.fail_after is not None
+            and self.checks >= self.fail_after
+        ) or (self.failure_when is not None and self.failure_when()):
+            raise self.failure
+
+    def write(
+        self,
+        file: Any,
+        path: str | Path,
+        data: bytes | bytearray | memoryview,
+    ) -> int:
+        written = super().write(file, path, data)
+        self.max_observed_bytes = max(self.max_observed_bytes, self.used_bytes)
+        return written
+
+
 def _streaming_popen_factory(
     processes: list[_StreamingPopen],
     calls: list[tuple[list[str], dict[str, Any]]],
@@ -838,6 +933,137 @@ def _streaming_popen_factory(
         return processes.pop(0)
 
     return popen
+
+
+def test_guarded_backend_stops_idle_process_on_health_failure_before_ttl(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stdout = _DelayedEofPipe(0.25)
+    process = _PollingStreamingPopen(stdout, _BytesPipe([]))
+    guard = _HealthGuard(tmp_path, fail_after=1)
+    target = tmp_path / "output.avi"
+    monkeypatch.setattr(ffmpeg_backend, "os_name", "other")
+    backend = FfmpegBackend(
+        output_guard=guard,
+        popen=lambda *_args, **_kwargs: process,
+        poll_interval=0.01,
+    )
+
+    started_at = time.monotonic()
+    with pytest.raises(RuntimeError, match="resource heartbeat failed") as exc_info:
+        backend.run(["ffmpeg", str(target)])
+    elapsed = time.monotonic() - started_at
+
+    assert exc_info.value is guard.failure
+    assert elapsed < 0.15
+    assert process.terminate_called
+    assert not target.exists()
+    assert not list(tmp_path.glob(".*.tmp"))
+
+
+def test_guarded_backend_stops_stream_growth_on_health_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _StreamingPopen([b"x"] * 100)
+    guard = _HealthGuard(tmp_path, fail_after=12, max_bytes=16)
+    monkeypatch.setattr(ffmpeg_backend, "os_name", "other")
+    backend = FfmpegBackend(
+        output_guard=guard,
+        popen=_streaming_popen_factory([process], []),
+        poll_interval=0.01,
+    )
+
+    with pytest.raises(RuntimeError, match="resource heartbeat failed") as exc_info:
+        backend.run(["ffmpeg", str(tmp_path / "output.avi")])
+
+    assert exc_info.value is guard.failure
+    assert process.terminate_called
+    assert guard.max_observed_bytes <= 15
+    assert not list(tmp_path.iterdir())
+    assert guard.used_bytes == 0
+
+
+def test_guarded_backend_checks_health_while_waiting_for_process(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _PollingStreamingPopen(
+        _BytesPipe([]),
+        _BytesPipe([]),
+        wait_timeouts=1,
+    )
+    guard = _HealthGuard(
+        tmp_path,
+        failure_when=lambda: process.wait_timeouts_observed > 0,
+    )
+    monkeypatch.setattr(ffmpeg_backend, "os_name", "other")
+    backend = FfmpegBackend(
+        output_guard=guard,
+        popen=lambda *_args, **_kwargs: process,
+        poll_interval=0.01,
+    )
+
+    with pytest.raises(RuntimeError, match="resource heartbeat failed") as exc_info:
+        backend.run(["ffmpeg", str(tmp_path / "output.avi")])
+
+    assert exc_info.value is guard.failure
+    assert process.wait_timeouts_observed == 1
+    assert process.terminate_called
+    assert not list(tmp_path.iterdir())
+
+
+def test_guarded_backend_checks_health_while_draining_stderr(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stderr = _DelayedEofPipe(0.25)
+    process = _PollingStreamingPopen(_BytesPipe([]), stderr)
+    guard = _HealthGuard(
+        tmp_path,
+        failure_when=lambda: process.returncode is not None and not stderr.done,
+    )
+    monkeypatch.setattr(ffmpeg_backend, "os_name", "other")
+    backend = FfmpegBackend(
+        output_guard=guard,
+        popen=lambda *_args, **_kwargs: process,
+        poll_interval=0.01,
+    )
+
+    with pytest.raises(RuntimeError, match="resource heartbeat failed") as exc_info:
+        backend.run(["ffmpeg", str(tmp_path / "output.avi")])
+
+    assert exc_info.value is guard.failure
+    assert stderr.read_started.is_set()
+    assert not list(tmp_path.iterdir())
+
+
+def test_guarded_backend_checks_health_through_normal_stream_lifecycle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stderr = _DelayedEofPipe(0.05)
+    process = _PollingStreamingPopen(
+        _BytesPipe([b"first", b"-second"]),
+        stderr,
+        wait_timeouts=1,
+    )
+    guard = _HealthGuard(tmp_path)
+    target = tmp_path / "output.avi"
+    monkeypatch.setattr(ffmpeg_backend, "os_name", "other")
+    backend = FfmpegBackend(
+        output_guard=guard,
+        popen=lambda *_args, **_kwargs: process,
+        poll_interval=0.01,
+    )
+
+    result = backend.run(["ffmpeg", str(target)])
+
+    assert result.returncode == 0
+    assert target.read_bytes() == b"first-second"
+    assert guard.checks >= 10
+    assert process.wait_timeouts_observed == 1
 
 
 def test_guarded_backend_streams_binary_stdout_to_video(

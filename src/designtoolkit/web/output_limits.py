@@ -49,11 +49,15 @@ class OutputBudgetGuard:
                 0,
             )
 
+    def check_health(self) -> None:
+        pass
+
     def validate_path(self, path: str | Path) -> Path:
         with self._lock:
             return self._contained_path(Path(path))
 
     def account(self, path: Path) -> None:
+        self.check_health()
         with self._lock:
             resolved = self._contained_path(path)
             stat_result = resolved.stat()
@@ -71,6 +75,7 @@ class OutputBudgetGuard:
             self._enforce(self._used_bytes)
 
     def register_created(self, file: BinaryIO, path: str | Path) -> None:
+        self.check_health()
         with self._lock:
             resolved = self._contained_path(Path(path))
             stat_result = os.fstat(file.fileno())
@@ -95,6 +100,7 @@ class OutputBudgetGuard:
         path: str | Path,
         data: bytes | bytearray | memoryview,
     ) -> int:
+        self.check_health()
         with self._lock:
             resolved = self._contained_path(Path(path))
             stat_result = os.fstat(file.fileno())
@@ -143,6 +149,7 @@ class OutputBudgetGuard:
             return written
 
     def publish(self, source: str | Path, target: str | Path) -> None:
+        self.check_health()
         with self._lock:
             resolved_source = self._temporary_path(Path(source))
             resolved_target = self._contained_path(Path(target))
@@ -183,6 +190,7 @@ class OutputBudgetGuard:
         path: str | Path,
         size: int | None = None,
     ) -> int:
+        self.check_health()
         with self._lock:
             resolved = self._contained_path(Path(path))
             stat_result = os.fstat(file.fileno())
@@ -283,6 +291,7 @@ class OutputBudgetGuard:
         self._created_identities.discard(identity)
 
     def check_tree(self) -> None:
+        self.check_health()
         if not self.root.exists():
             with self._lock:
                 self._used_bytes = 0

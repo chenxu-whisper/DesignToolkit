@@ -315,13 +315,8 @@ class _HeartbeatOutputBudgetGuard(OutputBudgetGuard):
         super().__init__(root, max_bytes)
         self._heartbeat = heartbeat
 
-    def account(self, path: Path) -> None:
+    def check_health(self) -> None:
         self._heartbeat()
-        super().account(path)
-
-    def check_tree(self) -> None:
-        self._heartbeat()
-        super().check_tree()
 
 
 class _PeriodicResourceHeartbeat:
