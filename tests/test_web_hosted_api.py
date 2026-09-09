@@ -4064,6 +4064,443 @@ def test_delete_upload_is_blocked_from_validation_through_task_terminal(
     assert after_terminal.status_code == 204
 
 
+def test_hosted_image_inspection_pins_generation_before_decode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = RedisTaskManager(
+        redis_connection=redis_connection,
+        queue=Queue("designtoolkit", connection=redis_connection),
+        data_dir=tmp_path,
+        max_queued_tasks=20,
+        retention_seconds=7200,
+        asset_read_pin_ttl=0.05,
+        asset_read_pin_heartbeat_interval=0.01,
+    )
+    reader_entered = Event()
+    resume_reader = Event()
+    original_read_snapshot = routes_module._read_rgb_snapshot
+
+    def read_after_barrier(path: Path):
+        reader_entered.set()
+        assert resume_reader.wait(timeout=5)
+        return original_read_snapshot(path)
+
+    monkeypatch.setattr(routes_module, "_read_rgb_snapshot", read_after_barrier)
+    upload_id = "1" * 32
+    with _client(tmp_path, task_manager=manager) as client:
+        first_reference = _upload(
+            client,
+            "screen.png",
+            _png_bytes((2, 1)),
+            upload_id=upload_id,
+        ).json()["reference"]
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            inspection = executor.submit(
+                client.post,
+                "/api/chroma-keyer/images/inspect",
+                json={"input_path": first_reference},
+            )
+            try:
+                assert reader_entered.wait(timeout=5)
+                sleep(0.1)
+                during_read = _delete_uploaded_asset(client, first_reference)
+                replacement = _upload(
+                    client,
+                    "screen.png",
+                    _png_bytes((3, 1)),
+                    upload_id=upload_id,
+                )
+            finally:
+                resume_reader.set()
+            inspected = inspection.result(timeout=5)
+
+        after_read = _delete_uploaded_asset(client, first_reference)
+
+    assert during_read.status_code == 409
+    assert during_read.json()["error"]["code"] == "asset_in_use"
+    assert replacement.status_code == 409
+    assert inspected.status_code == 200
+    assert inspected.json()["width"] == 2
+    assert after_read.status_code == 204
+
+
+@pytest.mark.parametrize(
+    ("route", "payload", "media_kind", "reader_kind"),
+    [
+        ("/api/chroma-keyer/images/inspect", {}, "image", "snapshot"),
+        (
+            "/api/chroma-keyer/images/sample",
+            {
+                "x": 0.0,
+                "y": 0.0,
+                "preview_width": 2.0,
+                "preview_height": 1.0,
+            },
+            "image",
+            "image",
+        ),
+        (
+            "/api/chroma-keyer/preview",
+            {"samples": [[0, 255, 0]], "params": {}},
+            "image",
+            "snapshot",
+        ),
+        (
+            "/api/chroma-keyer/previews",
+            {"samples": [[0, 255, 0]], "params": {}},
+            "image",
+            "snapshot",
+        ),
+        ("/api/chroma-keyer/videos/inspect", {}, "video", "video"),
+        (
+            "/api/chroma-keyer/videos/frame",
+            {"timestamp_seconds": 0.0},
+            "video",
+            "video",
+        ),
+        (
+            "/api/chroma-keyer/videos/sample",
+            {
+                "timestamp_seconds": 0.0,
+                "x": 0.0,
+                "y": 0.0,
+                "preview_width": 2.0,
+                "preview_height": 2.0,
+            },
+            "video",
+            "video",
+        ),
+        (
+            "/api/chroma-keyer/videos/preview",
+            {
+                "timestamp_seconds": 0.0,
+                "samples": [[0, 255, 0]],
+                "params": {},
+            },
+            "video",
+            "video",
+        ),
+    ],
+)
+def test_hosted_preview_readers_hold_generation_pin(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    route: str,
+    payload: dict[str, object],
+    media_kind: str,
+    reader_kind: str,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = RedisTaskManager(
+        redis_connection=redis_connection,
+        queue=Queue("designtoolkit", connection=redis_connection),
+        data_dir=tmp_path,
+        max_queued_tasks=20,
+        retention_seconds=7200,
+    )
+    decoder = StubHostedVideoDecoder()
+    reader_observed_pin = Event()
+
+    with _client(
+        tmp_path,
+        task_manager=manager,
+        video_decoder=decoder,
+    ) as client:
+        filename = "clip.mp4" if media_kind == "video" else "screen.png"
+        content = b"video" if media_kind == "video" else _png_bytes()
+        reference = _upload(client, filename, content).json()["reference"]
+        _scheme, asset_id, _generation_id, _filename = reference.split(":", 3)
+        session_id = client.cookies["dt_session"]
+        readers_key = f"dt:resource:asset-readers:{session_id}:{asset_id}"
+
+        def assert_pin_held() -> None:
+            assert redis_connection.zcard(readers_key) == 1
+            reader_observed_pin.set()
+
+        if reader_kind == "snapshot":
+            original_reader = routes_module._read_rgb_snapshot
+
+            def read_snapshot(path: Path):
+                assert_pin_held()
+                return original_reader(path)
+
+            monkeypatch.setattr(routes_module, "_read_rgb_snapshot", read_snapshot)
+        elif reader_kind == "image":
+            original_reader = routes_module.read_rgb_image
+
+            def read_image(path: Path):
+                assert_pin_held()
+                return original_reader(path)
+
+            monkeypatch.setattr(routes_module, "read_rgb_image", read_image)
+        else:
+            original_reader = decoder.read_frame
+
+            def read_video(path: Path, timestamp_seconds: float):
+                assert_pin_held()
+                frame = original_reader(path, timestamp_seconds)
+                frame[:, :] = (0, 255, 0)
+                return frame
+
+            monkeypatch.setattr(decoder, "read_frame", read_video)
+
+        response = client.post(route, json={"input_path": reference, **payload})
+
+    assert response.status_code == 200
+    assert reader_observed_pin.is_set()
+    assert list(
+        redis_connection.scan_iter(match="dt:resource:asset-read-pin:*")
+    ) == []
+    assert list(
+        redis_connection.scan_iter(match="dt:resource:asset-readers:*")
+    ) == []
+
+
+def test_hosted_preview_reader_error_releases_generation_pin(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = RedisTaskManager(
+        redis_connection=redis_connection,
+        queue=Queue("designtoolkit", connection=redis_connection),
+        data_dir=tmp_path,
+        max_queued_tasks=20,
+        retention_seconds=7200,
+    )
+
+    def fail_read(_path: Path):
+        raise RuntimeError("decode failed")
+
+    monkeypatch.setattr(routes_module, "_read_rgb_snapshot", fail_read)
+    with _client(tmp_path, task_manager=manager) as client:
+        reference = _upload(
+            client,
+            "screen.png",
+            _png_bytes(),
+        ).json()["reference"]
+        with pytest.raises(RuntimeError, match="decode failed"):
+            client.post(
+                "/api/chroma-keyer/images/inspect",
+                json={"input_path": reference},
+            )
+        deleted = _delete_uploaded_asset(client, reference)
+
+    assert deleted.status_code == 204
+    assert list(
+        redis_connection.scan_iter(match="dt:resource:asset-read-pin:*")
+    ) == []
+    assert list(
+        redis_connection.scan_iter(match="dt:resource:asset-readers:*")
+    ) == []
+
+
+def test_hosted_preview_heartbeat_failure_fails_and_releases_pin(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = RedisTaskManager(
+        redis_connection=redis_connection,
+        queue=Queue("designtoolkit", connection=redis_connection),
+        data_dir=tmp_path,
+        max_queued_tasks=20,
+        retention_seconds=7200,
+        asset_read_pin_heartbeat_interval=0.001,
+    )
+    heartbeat_failed = Event()
+    original_read_snapshot = routes_module._read_rgb_snapshot
+
+    def expire_pin(_session_id, _asset_identities, _token):
+        heartbeat_failed.set()
+        return False
+
+    def read_after_heartbeat(path: Path):
+        assert heartbeat_failed.wait(timeout=5)
+        return original_read_snapshot(path)
+
+    monkeypatch.setattr(manager, "refresh_asset_read_pin", expire_pin)
+    monkeypatch.setattr(routes_module, "_read_rgb_snapshot", read_after_heartbeat)
+    with _client(tmp_path, task_manager=manager) as client:
+        reference = _upload(
+            client,
+            "screen.png",
+            _png_bytes(),
+        ).json()["reference"]
+        response = client.post(
+            "/api/chroma-keyer/images/inspect",
+            json={"input_path": reference},
+        )
+        deleted = _delete_uploaded_asset(client, reference)
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "asset_in_use"
+    assert deleted.status_code == 204
+    assert list(
+        redis_connection.scan_iter(match="dt:resource:asset-read-pin:*")
+    ) == []
+    assert list(
+        redis_connection.scan_iter(match="dt:resource:asset-readers:*")
+    ) == []
+
+
+def test_hosted_preview_heartbeat_redis_outage_returns_503_and_releases_pin(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = RedisTaskManager(
+        redis_connection=redis_connection,
+        queue=Queue("designtoolkit", connection=redis_connection),
+        data_dir=tmp_path,
+        max_queued_tasks=20,
+        retention_seconds=7200,
+        asset_read_pin_heartbeat_interval=0.001,
+    )
+    heartbeat_failed = Event()
+    original_read_snapshot = routes_module._read_rgb_snapshot
+
+    def fail_refresh(_session_id, _asset_identities, _token):
+        heartbeat_failed.set()
+        raise RedisConnectionError("redis unavailable")
+
+    def read_after_heartbeat(path: Path):
+        assert heartbeat_failed.wait(timeout=5)
+        return original_read_snapshot(path)
+
+    monkeypatch.setattr(manager, "refresh_asset_read_pin", fail_refresh)
+    monkeypatch.setattr(routes_module, "_read_rgb_snapshot", read_after_heartbeat)
+    with _client(tmp_path, task_manager=manager) as client:
+        reference = _upload(
+            client,
+            "screen.png",
+            _png_bytes(),
+        ).json()["reference"]
+        response = client.post(
+            "/api/chroma-keyer/images/inspect",
+            json={"input_path": reference},
+        )
+        deleted = _delete_uploaded_asset(client, reference)
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "storage_unavailable"
+    assert deleted.status_code == 204
+    assert list(
+        redis_connection.scan_iter(match="dt:resource:asset-read-pin:*")
+    ) == []
+    assert list(
+        redis_connection.scan_iter(match="dt:resource:asset-readers:*")
+    ) == []
+
+
+def test_hosted_preview_pin_redis_outage_returns_503(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _client(tmp_path) as client:
+        manager = client.app.state.task_manager
+        reference = _upload(
+            client,
+            "screen.png",
+            _png_bytes(),
+        ).json()["reference"]
+        monkeypatch.setattr(
+            manager,
+            "acquire_asset_read_pin",
+            Mock(side_effect=RedisConnectionError("redis unavailable")),
+        )
+
+        response = client.post(
+            "/api/chroma-keyer/images/inspect",
+            json={"input_path": reference},
+        )
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "storage_unavailable"
+
+
+def test_hosted_preview_rejects_malformed_reference_before_pin(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _client(tmp_path) as client:
+        manager = client.app.state.task_manager
+        acquire_pin = Mock(side_effect=AssertionError("pin must not be acquired"))
+        monkeypatch.setattr(manager, "acquire_asset_read_pin", acquire_pin)
+
+        response = client.post(
+            "/api/chroma-keyer/images/inspect",
+            json={"input_path": "not-an-asset"},
+        )
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "asset_not_found"
+    acquire_pin.assert_not_called()
+
+
+def test_hosted_preview_pins_stale_generation_before_resolve(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = RedisTaskManager(
+        redis_connection=redis_connection,
+        queue=Queue("designtoolkit", connection=redis_connection),
+        data_dir=tmp_path,
+        max_queued_tasks=20,
+        retention_seconds=7200,
+    )
+    storage = HostedStorage(tmp_path, max_upload_bytes=1024)
+    calls: list[tuple[str, object]] = []
+    original_acquire = manager.acquire_asset_read_pin
+    original_resolve = storage.resolve
+
+    def acquire_pin(session_id, asset_identities):
+        calls.append(("acquire", asset_identities))
+        return original_acquire(session_id, asset_identities)
+
+    def resolve_asset(session_id: str, reference: str) -> Path:
+        calls.append(("resolve", reference))
+        return original_resolve(session_id, reference)
+
+    monkeypatch.setattr(manager, "acquire_asset_read_pin", acquire_pin)
+    monkeypatch.setattr(storage, "resolve", resolve_asset)
+    with _client(
+        tmp_path,
+        task_manager=manager,
+        hosted_storage=storage,
+    ) as client:
+        reference = _upload(
+            client,
+            "screen.png",
+            _png_bytes(),
+        ).json()["reference"]
+        scheme, asset_id, generation_id, filename = reference.split(":", 3)
+        stale_generation = "f" * 32 if generation_id != "f" * 32 else "e" * 32
+        stale_reference = f"{scheme}:{asset_id}:{stale_generation}:{filename}"
+        calls.clear()
+
+        response = client.post(
+            "/api/chroma-keyer/images/inspect",
+            json={"input_path": stale_reference},
+        )
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "asset_not_found"
+    assert calls == [
+        ("acquire", ((asset_id, stale_generation),)),
+        ("resolve", stale_reference),
+    ]
+    assert list(
+        redis_connection.scan_iter(match="dt:resource:asset-read-pin:*")
+    ) == []
+    assert list(
+        redis_connection.scan_iter(match="dt:resource:asset-readers:*")
+    ) == []
+
+
 def test_failed_hosted_task_validation_releases_asset_read_pin(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -5650,6 +6087,34 @@ def test_local_mode_does_not_apply_hosted_media_limits(tmp_path: Path) -> None:
     assert response.status_code == 200
     assert response.json()["width"] == 2
     assert preview.status_code == 200
+
+
+def test_local_preview_does_not_acquire_redis_asset_pin(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image_path = tmp_path / "local.png"
+    image_path.write_bytes(_png_bytes((2, 1)))
+    acquire_pin = Mock(side_effect=AssertionError("local reads must not use Redis"))
+    monkeypatch.setattr(
+        RedisTaskManager,
+        "acquire_asset_read_pin",
+        acquire_pin,
+    )
+    settings = HostedSettings(
+        enabled=False,
+        data_dir=tmp_path,
+        redis_url="redis://unused",
+    )
+
+    with TestClient(create_app(hosted_settings=settings)) as client:
+        response = client.post(
+            "/api/chroma-keyer/images/inspect",
+            json={"input_path": str(image_path)},
+        )
+
+    assert response.status_code == 200
+    acquire_pin.assert_not_called()
 
 
 def test_create_app_passes_independent_task_timeout_to_redis_manager(

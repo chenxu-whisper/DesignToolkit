@@ -979,6 +979,56 @@ def create_router(
         validate_hosted_paths(http_request, [path])
         return path
 
+    @contextmanager
+    def pinned_hosted_input_path(
+        http_request: Request,
+        reference: str,
+    ) -> Iterator[Path]:
+        if storage is None or not isinstance(task_manager, RedisTaskManager):
+            yield resolve_input_path(http_request, reference)
+            return
+        try:
+            parsed = parse_asset_reference(reference)
+        except UploadRejectedError as exc:
+            raise ApiError("asset_not_found", str(exc), 404) from exc
+        asset_identity = ((parsed.asset_id, parsed.generation_id),)
+        try:
+            pin = task_manager.acquire_asset_read_pin(
+                http_request.state.session_id,
+                asset_identity,
+            )
+        except TaskConflictError as exc:
+            raise ApiError("asset_in_use", str(exc), 409) from exc
+        heartbeat = _AssetReadPinHeartbeat(
+            pin,
+            task_manager.asset_read_pin_heartbeat_interval,
+            task_manager.heartbeat_stop_timeout_seconds,
+        )
+        heartbeat.start()
+        try:
+            yield resolve_input_path(http_request, reference)
+        except BaseException:
+            _stop_asset_read_pin_heartbeat(
+                heartbeat,
+                failure_context=(
+                    "asset read pin heartbeat failed during preview endpoint error"
+                ),
+            )
+            raise
+        else:
+            try:
+                _stop_asset_read_pin_heartbeat(heartbeat)
+            except TaskConflictError as exc:
+                raise ApiError("asset_in_use", str(exc), 409) from exc
+            except ResourceUnavailableError as exc:
+                raise ApiError("storage_unavailable", str(exc), 503) from exc
+        finally:
+            if heartbeat.quiesced:
+                _release_redis_resource_best_effort(
+                    pin.release,
+                    "asset read pin",
+                )
+
     def preview_capacity() -> Iterator[bool]:
         if storage is None:
             yield True
@@ -1795,19 +1845,24 @@ def create_router(
         http_request: Request,
     ) -> ChromaImageInspectResponse:
         try:
-            input_path = resolve_input_path(http_request, payload.input_path)
-            rgb, source_fingerprint = _read_rgb_snapshot(input_path)
-            cache_key = _chroma_preview_cache_key(
-                "inspect",
-                source_fingerprint,
-            )
-            preview_entry = chroma_preview_store.get_or_put_entry(
-                cache_key,
-                lambda: make_preview_png(rgb),
-                owner_id=(
-                    http_request.state.session_id if storage is not None else None
-                ),
-            )
+            with pinned_hosted_input_path(
+                http_request,
+                payload.input_path,
+            ) as input_path:
+                rgb, source_fingerprint = _read_rgb_snapshot(input_path)
+                cache_key = _chroma_preview_cache_key(
+                    "inspect",
+                    source_fingerprint,
+                )
+                preview_entry = chroma_preview_store.get_or_put_entry(
+                    cache_key,
+                    lambda: make_preview_png(rgb),
+                    owner_id=(
+                        http_request.state.session_id
+                        if storage is not None
+                        else None
+                    ),
+                )
         except KeyerError as exc:
             raise _chroma_keyer_error_response(exc) from exc
 
@@ -1836,23 +1891,26 @@ def create_router(
         http_request: Request,
     ) -> ChromaVideoInspectResponse:
         try:
-            input_path = resolve_input_path(http_request, payload.input_path)
-            metadata, timestamp_seconds, preview_entry = (
-                _get_stable_video_preview_entry(
-                    chroma_preview_store,
-                    input_path,
-                    "video_inspect",
-                    0.0,
-                    get_video_metadata,
-                    read_video_preview_frame,
-                    make_preview_png,
-                    owner_id=(
-                        http_request.state.session_id
-                        if storage is not None
-                        else None
-                    ),
+            with pinned_hosted_input_path(
+                http_request,
+                payload.input_path,
+            ) as input_path:
+                metadata, timestamp_seconds, preview_entry = (
+                    _get_stable_video_preview_entry(
+                        chroma_preview_store,
+                        input_path,
+                        "video_inspect",
+                        0.0,
+                        get_video_metadata,
+                        read_video_preview_frame,
+                        make_preview_png,
+                        owner_id=(
+                            http_request.state.session_id
+                            if storage is not None
+                            else None
+                        ),
+                    )
                 )
-            )
         except KeyerError as exc:
             raise _chroma_video_error_response(exc) from exc
 
@@ -1884,23 +1942,26 @@ def create_router(
         http_request: Request,
     ) -> ChromaVideoFrameResponse:
         try:
-            input_path = resolve_input_path(http_request, payload.input_path)
-            _metadata, timestamp_seconds, preview_entry = (
-                _get_stable_video_preview_entry(
-                    chroma_preview_store,
-                    input_path,
-                    "video_frame",
-                    payload.timestamp_seconds,
-                    get_video_metadata,
-                    read_video_preview_frame,
-                    make_preview_png,
-                    owner_id=(
-                        http_request.state.session_id
-                        if storage is not None
-                        else None
-                    ),
+            with pinned_hosted_input_path(
+                http_request,
+                payload.input_path,
+            ) as input_path:
+                _metadata, timestamp_seconds, preview_entry = (
+                    _get_stable_video_preview_entry(
+                        chroma_preview_store,
+                        input_path,
+                        "video_frame",
+                        payload.timestamp_seconds,
+                        get_video_metadata,
+                        read_video_preview_frame,
+                        make_preview_png,
+                        owner_id=(
+                            http_request.state.session_id
+                            if storage is not None
+                            else None
+                        ),
+                    )
                 )
-            )
         except KeyerError as exc:
             raise _chroma_video_error_response(exc) from exc
 
@@ -1922,13 +1983,16 @@ def create_router(
         http_request: Request,
     ) -> ChromaVideoSampleResponse:
         try:
-            input_path = resolve_input_path(http_request, payload.input_path)
-            metadata, timestamp_seconds, rgb = _read_stable_video_frame(
-                input_path,
-                payload.timestamp_seconds,
-                get_video_metadata,
-                read_video_frame,
-            )
+            with pinned_hosted_input_path(
+                http_request,
+                payload.input_path,
+            ) as input_path:
+                metadata, timestamp_seconds, rgb = _read_stable_video_frame(
+                    input_path,
+                    payload.timestamp_seconds,
+                    get_video_metadata,
+                    read_video_frame,
+                )
         except KeyerError as exc:
             raise _chroma_video_error_response(exc) from exc
 
@@ -1973,37 +2037,40 @@ def create_router(
         http_request: Request,
     ) -> ChromaVideoPreviewResponse:
         try:
-            input_path = resolve_input_path(http_request, payload.input_path)
-            model = screen_model_from_samples(payload.samples)
-            params_data = payload.params.model_dump(mode="json")
+            with pinned_hosted_input_path(
+                http_request,
+                payload.input_path,
+            ) as input_path:
+                model = screen_model_from_samples(payload.samples)
+                params_data = payload.params.model_dump(mode="json")
 
-            def create_preview_png(rgb: np.ndarray) -> bytes:
-                params = KeyerParams(**params_data)
-                preview_rgb, alpha = key_rgb(rgb, model, params)
-                if payload.view_mode is ChromaViewMode.FINAL:
-                    return make_preview_png(preview_rgb, alpha=alpha)
-                alpha_rgb = np.repeat(alpha[..., np.newaxis], 3, axis=2)
-                return make_preview_png(alpha_rgb)
+                def create_preview_png(rgb: np.ndarray) -> bytes:
+                    params = KeyerParams(**params_data)
+                    preview_rgb, alpha = key_rgb(rgb, model, params)
+                    if payload.view_mode is ChromaViewMode.FINAL:
+                        return make_preview_png(preview_rgb, alpha=alpha)
+                    alpha_rgb = np.repeat(alpha[..., np.newaxis], 3, axis=2)
+                    return make_preview_png(alpha_rgb)
 
-            _metadata, timestamp_seconds, preview_entry = (
-                _get_stable_video_preview_entry(
-                    chroma_preview_store,
-                    input_path,
-                    "video_generated",
-                    payload.timestamp_seconds,
-                    get_video_metadata,
-                    read_video_preview_frame,
-                    create_preview_png,
-                    owner_id=(
-                        http_request.state.session_id
-                        if storage is not None
-                        else None
-                    ),
-                    samples=payload.samples,
-                    params=params_data,
-                    view_mode=payload.view_mode,
+                _metadata, timestamp_seconds, preview_entry = (
+                    _get_stable_video_preview_entry(
+                        chroma_preview_store,
+                        input_path,
+                        "video_generated",
+                        payload.timestamp_seconds,
+                        get_video_metadata,
+                        read_video_preview_frame,
+                        create_preview_png,
+                        owner_id=(
+                            http_request.state.session_id
+                            if storage is not None
+                            else None
+                        ),
+                        samples=payload.samples,
+                        params=params_data,
+                        view_mode=payload.view_mode,
+                    )
                 )
-            )
         except KeyerError as exc:
             raise _chroma_video_error_response(exc) from exc
 
@@ -2025,9 +2092,11 @@ def create_router(
         http_request: Request,
     ) -> ChromaSampleResponse:
         try:
-            rgb = read_rgb_image(
-                resolve_input_path(http_request, payload.input_path)
-            )
+            with pinned_hosted_input_path(
+                http_request,
+                payload.input_path,
+            ) as input_path:
+                rgb = read_rgb_image(input_path)
         except KeyerError as exc:
             raise _chroma_keyer_error_response(exc) from exc
 
@@ -2082,34 +2151,39 @@ def create_router(
             raise _chroma_keyer_error_response(exc) from exc
 
         try:
-            input_path = resolve_input_path(http_request, payload.input_path)
-            rgb, source_fingerprint = _read_rgb_snapshot(input_path)
-            params_data = payload.params.model_dump(mode="json")
-            cache_key = _chroma_preview_cache_key(
-                "generated",
-                source_fingerprint,
-                samples=payload.samples,
-                params=params_data,
-                view_mode=payload.view_mode,
-            )
+            with pinned_hosted_input_path(
+                http_request,
+                payload.input_path,
+            ) as input_path:
+                rgb, source_fingerprint = _read_rgb_snapshot(input_path)
+                params_data = payload.params.model_dump(mode="json")
+                cache_key = _chroma_preview_cache_key(
+                    "generated",
+                    source_fingerprint,
+                    samples=payload.samples,
+                    params=params_data,
+                    view_mode=payload.view_mode,
+                )
 
-            def create_preview_png() -> bytes:
-                params = KeyerParams(**params_data)
-                preview_rgb = resize_preview_rgb(rgb)
-                preview_rgb, alpha = key_rgb(preview_rgb, model, params)
-                if payload.view_mode is ChromaViewMode.FINAL:
-                    return make_preview_png(preview_rgb, alpha=alpha)
-                else:
-                    preview_rgb = np.repeat(alpha[..., np.newaxis], 3, axis=2)
-                    return make_preview_png(preview_rgb)
+                def create_preview_png() -> bytes:
+                    params = KeyerParams(**params_data)
+                    preview_rgb = resize_preview_rgb(rgb)
+                    preview_rgb, alpha = key_rgb(preview_rgb, model, params)
+                    if payload.view_mode is ChromaViewMode.FINAL:
+                        return make_preview_png(preview_rgb, alpha=alpha)
+                    else:
+                        preview_rgb = np.repeat(alpha[..., np.newaxis], 3, axis=2)
+                        return make_preview_png(preview_rgb)
 
-            preview_id = chroma_preview_store.get_or_put(
-                cache_key,
-                create_preview_png,
-                owner_id=(
-                    http_request.state.session_id if storage is not None else None
-                ),
-            )
+                preview_id = chroma_preview_store.get_or_put(
+                    cache_key,
+                    create_preview_png,
+                    owner_id=(
+                        http_request.state.session_id
+                        if storage is not None
+                        else None
+                    ),
+                )
         except KeyerError as exc:
             raise _chroma_keyer_error_response(exc) from exc
 
