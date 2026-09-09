@@ -7,6 +7,7 @@ import shutil
 from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import ContextVar
+from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
 from threading import BoundedSemaphore, Event, Lock, Timer
@@ -643,6 +644,70 @@ def test_task_event_stream_synthesizes_terminal_event_from_task_state(
         ]
     ) == 1
     assert EmptyThenFailSubscriber.calls == 1
+
+
+def test_hosted_old_redis_task_is_sanitized_only_at_get_and_sse_boundaries(
+    tmp_path: Path,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = RedisTaskManager(
+        redis_connection=redis_connection,
+        queue=Queue("designtoolkit", connection=redis_connection),
+        data_dir=tmp_path,
+        max_queued_tasks=20,
+        retention_seconds=7200,
+    )
+    task_id = "legacy-public-task"
+    input_path = tmp_path / "sessions" / ("1" * 32) / "legacy.mov"
+    output_path = tmp_path / "sessions" / ("1" * 32) / "result.png"
+    private_path = tmp_path / "sessions" / ("2" * 32) / "failure.log"
+    finished_at = datetime.now(UTC)
+
+    with _client(tmp_path, task_manager=manager) as client:
+        assert client.get("/api/config").status_code == 200
+        owner_id = client.cookies["dt_session"]
+        redis_connection.set(
+            f"dt:task:{task_id}",
+            json.dumps(
+                {
+                    "task_id": task_id,
+                    "kind": TaskKind.VIDEO_FRAMES.value,
+                    "status": TaskStatus.FAILED.value,
+                    "created_at": finished_at.isoformat(),
+                    "started_at": finished_at.isoformat(),
+                    "finished_at": finished_at.isoformat(),
+                    "input_path": str(input_path),
+                    "output_path": str(output_path),
+                    "error": f"failed at {private_path}",
+                    "owner_id": owner_id,
+                    "result_path": str(output_path),
+                }
+            ),
+            ex=7200,
+        )
+
+        task_response = client.get(f"/api/tasks/{task_id}")
+        event_response = client.get(f"/api/tasks/{task_id}/events")
+
+    assert task_response.status_code == 200
+    assert task_response.json()["input_path"] == "legacy.mov"
+    assert task_response.json()["output_path"] == "result.png"
+    assert task_response.json()["error"] == "failed at [managed path]"
+
+    terminal_payload = json.loads(
+        next(
+            line.removeprefix("data: ")
+            for line in event_response.text.splitlines()
+            if line.startswith("data: ")
+        )
+    )
+    assert terminal_payload["message"] == "failed at [managed path]"
+
+    internal_task = manager.get_task(task_id)
+    assert internal_task is not None
+    assert internal_task.input_path == str(input_path)
+    assert internal_task.output_path == str(output_path)
+    assert internal_task.error == f"failed at {private_path}"
 
 
 def test_task_event_stream_slow_subscriber_has_no_duplicates_or_lost_terminal(

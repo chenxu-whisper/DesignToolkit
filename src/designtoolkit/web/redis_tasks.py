@@ -3507,8 +3507,6 @@ class RedisTaskManager:
         terminal_event: LogEventResponse | None = None,
     ) -> tuple[TaskRecord, TerminalTransitionResult]:
         finished_at = datetime.now(UTC)
-        if error is not None:
-            error = self.log_store.sanitize_text(task_id, error)
         if terminal_event is not None:
             terminal_event = self.log_store.sanitize_event(terminal_event)
         event_json = (

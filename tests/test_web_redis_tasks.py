@@ -6,9 +6,11 @@ import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from queue import Empty
+from random import Random
 from threading import Barrier, Event, Lock
+from time import perf_counter
 from urllib.parse import quote
 from zipfile import ZipFile
 
@@ -4887,7 +4889,7 @@ def test_hosted_redis_transition_events_and_errors_are_sanitized(
 
     stored_failure = manager.get_task(failed_task_id)
     assert stored_failure is not None
-    assert stored_failure.error == "Decoder failed at [managed path]"
+    assert stored_failure.error == f"Decoder failed at {unknown_path}"
     assert manager.log_store.history(failed_task_id)[-1].message == (
         "Decoder failed at [managed path]"
     )
@@ -5092,6 +5094,245 @@ def test_hosted_event_sanitizer_handles_encoded_normalized_embedded_paths(
     assert asset_id not in exposed
 
 
+@pytest.mark.parametrize("encoding_layers", [5, 50, 100])
+def test_hosted_event_sanitizer_decodes_paths_to_fixed_point(
+    tmp_path: Path,
+    encoding_layers: int,
+) -> None:
+    session_id = "1" * 32
+    asset_id = "2" * 32
+    input_path = (
+        tmp_path
+        / "sessions"
+        / session_id
+        / "assets"
+        / asset_id
+        / "source.mov"
+    )
+    encoded = input_path.as_uri()
+    for _ in range(encoding_layers):
+        encoded = quote(encoded, safe="")
+
+    sanitized = event_sanitization_module.sanitize_event_text(
+        encoded,
+        data_dir=tmp_path,
+        task_payload={"input_path": str(input_path)},
+    )
+
+    assert sanitized == "source.mov"
+    assert session_id not in sanitized
+    assert asset_id not in sanitized
+
+
+def test_hosted_event_sanitizer_bounds_every_public_string(
+    tmp_path: Path,
+) -> None:
+    limit = event_sanitization_module.MAX_PUBLIC_EVENT_STRING_LENGTH
+    marker = event_sanitization_module.PUBLIC_EVENT_TRUNCATED_MARKER
+    oversized = "x" * (limit + 100)
+    event = redis_tasks_module.LogEventResponse(
+        task_id="bounded-event",
+        timestamp=datetime.now(UTC),
+        level=LogLevel.INFO,
+        phase=LogPhase.RUNNING,
+        message=oversized,
+        details={oversized: [oversized]},
+    )
+
+    sanitized = event_sanitization_module.EventSanitizer(tmp_path).sanitize_event(
+        event,
+        task_payload=None,
+    )
+    detail_key = next(iter(sanitized.details))
+    detail_value = sanitized.details[detail_key][0]
+
+    assert len(sanitized.message) == limit
+    assert sanitized.message.endswith(marker)
+    assert len(detail_key) == limit
+    assert detail_key.endswith(marker)
+    assert len(detail_value) == limit
+    assert detail_value.endswith(marker)
+
+
+def test_hosted_event_sanitizer_keeps_marker_when_truncated_path_is_redacted(
+    tmp_path: Path,
+) -> None:
+    marker = event_sanitization_module.PUBLIC_EVENT_TRUNCATED_MARKER
+    private_path = tmp_path / "sessions" / ("6" * 32) / "failure.log"
+    oversized_path = str(private_path) + ("x" * 9000)
+
+    sanitized = event_sanitization_module.sanitize_event_text(
+        oversized_path,
+        data_dir=tmp_path,
+        task_payload=None,
+    )
+
+    assert sanitized.endswith(marker)
+    assert len(sanitized) <= (
+        event_sanitization_module.MAX_PUBLIC_EVENT_STRING_LENGTH
+    )
+    assert str(private_path) not in sanitized
+
+
+def test_hosted_event_sanitizer_bounds_nested_details(
+    tmp_path: Path,
+) -> None:
+    marker = event_sanitization_module.PUBLIC_EVENT_TRUNCATED_MARKER
+    nested: dict[str, object] = {}
+    cursor = nested
+    for _ in range(100):
+        child: dict[str, object] = {}
+        cursor["child"] = child
+        cursor = child
+    nested["many"] = list(range(5000))
+
+    sanitized = event_sanitization_module.sanitize_event_details(
+        nested,
+        data_dir=tmp_path,
+        task_payload=None,
+    )
+
+    pending = [sanitized]
+    nodes = 0
+    strings: list[str] = []
+    while pending:
+        current = pending.pop()
+        nodes += 1
+        if isinstance(current, dict):
+            pending.extend(current.keys())
+            pending.extend(current.values())
+        elif isinstance(current, (list, tuple)):
+            pending.extend(current)
+        elif isinstance(current, str):
+            strings.append(current)
+
+    assert marker in strings
+    assert nodes <= event_sanitization_module.MAX_PUBLIC_EVENT_NODES + 100
+
+
+def test_hosted_event_sanitizer_handles_hostile_6kb_text_in_under_half_second(
+    tmp_path: Path,
+) -> None:
+    hostile = ("/a " * 2048)[: 6 * 1024]
+    known_path = tmp_path / "sessions" / ("9" * 32) / "source.mov"
+
+    started = perf_counter()
+    sanitized = event_sanitization_module.sanitize_event_text(
+        hostile,
+        data_dir=tmp_path,
+        task_payload={"input_path": str(known_path)},
+    )
+    elapsed = perf_counter() - started
+
+    assert len(sanitized) <= len(hostile)
+    assert elapsed < 0.5
+
+
+def test_hosted_event_sanitizer_bounds_task_path_candidates(
+    tmp_path: Path,
+) -> None:
+    class HostilePathList(list[str]):
+        def __iter__(self):
+            for index in range(129):
+                yield f"/external/{index}"
+            raise AssertionError("sanitizer consumed unbounded path candidates")
+
+    sanitized = event_sanitization_module.sanitize_event_text(
+        "ordinary message",
+        data_dir=tmp_path,
+        task_payload={"input_paths": HostilePathList()},
+    )
+
+    assert sanitized == "ordinary message"
+
+
+def test_hosted_event_sanitizer_does_not_skip_later_managed_path(
+    tmp_path: Path,
+) -> None:
+    private_path = tmp_path / "sessions" / ("8" * 32) / "failure.log"
+
+    sanitized = event_sanitization_module.sanitize_event_text(
+        f"/outside/path {private_path}",
+        data_dir=tmp_path,
+        task_payload=None,
+    )
+
+    assert sanitized == "/outside/path [managed path]"
+
+
+def test_hosted_event_sanitizer_preserves_file_uri_suffixes(
+    tmp_path: Path,
+) -> None:
+    input_path = tmp_path / "sessions" / ("3" * 32) / "source clip.mov"
+    uri = input_path.as_uri()
+
+    sanitized = event_sanitization_module.sanitize_event_text(
+        f"{uri}?mode=metadata#preview trailing text",
+        data_dir=tmp_path,
+        task_payload={"input_path": str(input_path)},
+    )
+
+    assert sanitized == "source clip.mov?mode=metadata#preview trailing text"
+
+
+def test_posix_double_slash_root_is_not_treated_as_unc() -> None:
+    data_dir = PurePosixPath("//srv/data")
+    input_path = "//srv/data/sessions/asset/source.mov"
+
+    sanitized = event_sanitization_module.sanitize_event_text(
+        "//srv//data/./sessions/asset/source.mov",
+        data_dir=data_dir,
+        task_payload={"input_path": input_path},
+    )
+
+    assert sanitized == "source.mov"
+    assert (
+        event_sanitization_module.sanitize_event_text(
+            "//SRV/data/sessions/asset/source.mov",
+            data_dir=data_dir,
+            task_payload={"input_path": input_path},
+        )
+        == "//SRV/data/sessions/asset/source.mov"
+    )
+
+
+def test_hosted_event_sanitizer_fuzzes_encoded_path_variants(
+    tmp_path: Path,
+) -> None:
+    random = Random(0)
+    session_id = "4" * 32
+    asset_id = "5" * 32
+    input_path = (
+        tmp_path
+        / "sessions"
+        / session_id
+        / "assets"
+        / asset_id
+        / "source.mov"
+    )
+    canonical = str(input_path).replace("\\", "/")
+
+    for _ in range(200):
+        variant = canonical
+        if random.choice([False, True]):
+            variant = variant.replace("/", random.choice(["//", "/./", "\\"]))
+        if random.choice([False, True]):
+            variant = f"file:///{variant.lstrip('/')}"
+        for _ in range(random.randrange(0, 12)):
+            variant = quote(variant, safe="")
+        prefix = random.choice(["", "path=", "processing "])
+        suffix = random.choice(["", "?mode=metadata", " trailing text"])
+
+        sanitized = event_sanitization_module.sanitize_event_text(
+            f"{prefix}{variant}{suffix}",
+            data_dir=tmp_path,
+            task_payload={"input_path": str(input_path)},
+        )
+
+        assert session_id not in sanitized
+        assert asset_id not in sanitized
+
+
 def test_hosted_event_sanitizer_preserves_text_after_unknown_managed_file(
     tmp_path: Path,
 ) -> None:
@@ -5129,7 +5370,7 @@ def test_hosted_event_sanitizer_preserves_text_after_unknown_managed_file(
             + "/source.mov",
         ),
         (
-            Path("//Server/Share/Data"),
+            PureWindowsPath("//Server/Share/Data"),
             "file://server/share/data/sessions/"
             + "7" * 32
             + "/assets/"
@@ -5140,7 +5381,7 @@ def test_hosted_event_sanitizer_preserves_text_after_unknown_managed_file(
     ids=["windows-drive", "windows-unc"],
 )
 def test_hosted_event_sanitizer_normalizes_windows_managed_paths(
-    data_dir: Path,
+    data_dir: Path | PureWindowsPath,
     candidate: str,
 ) -> None:
     payload_path = (

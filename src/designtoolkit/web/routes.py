@@ -48,6 +48,7 @@ from designtoolkit.chroma_keyer.video_models import (
 from designtoolkit.media_resize import MediaResizeError
 from designtoolkit.video_frames import VideoFrameError
 from designtoolkit.web.chroma_previews import ChromaPreviewEntry, ChromaPreviewStore
+from designtoolkit.web.event_sanitization import EventSanitizer
 from designtoolkit.web.heartbeat import (
     DEFAULT_HEARTBEAT_STOP_TIMEOUT_SECONDS,
     HeartbeatStopTimeoutError,
@@ -816,7 +817,51 @@ def _is_terminal_event(event: LogEventResponse) -> bool:
     return event.phase in _TERMINAL_PHASES
 
 
-def _terminal_event_from_task(task: TaskRecord | None) -> LogEventResponse | None:
+def _task_public_payload(task: TaskRecord) -> dict[str, object]:
+    return {
+        "input_path": task.input_path,
+        "output_path": task.output_path,
+    }
+
+
+def _public_task_response(
+    task: TaskRecord,
+    sanitizer: EventSanitizer | None,
+) -> TaskResponse:
+    response = task.to_response()
+    if sanitizer is None:
+        return response
+    payload = _task_public_payload(task)
+    return response.model_copy(
+        update={
+            "input_path": sanitizer.sanitize_text(
+                response.input_path,
+                task_payload=payload,
+            ),
+            "output_path": (
+                sanitizer.sanitize_text(
+                    response.output_path,
+                    task_payload=payload,
+                )
+                if response.output_path is not None
+                else None
+            ),
+            "error": (
+                sanitizer.sanitize_text(
+                    response.error,
+                    task_payload=payload,
+                )
+                if response.error is not None
+                else None
+            ),
+        }
+    )
+
+
+def _terminal_event_from_task(
+    task: TaskRecord | None,
+    sanitizer: EventSanitizer | None = None,
+) -> LogEventResponse | None:
     if task is None or task.finished_at is None:
         return None
     if task.status is TaskStatus.SUCCEEDED:
@@ -829,13 +874,19 @@ def _terminal_event_from_task(task: TaskRecord | None) -> LogEventResponse | Non
         message = task.error or "Task failed"
     else:
         return None
-    return LogEventResponse(
+    event = LogEventResponse(
         task_id=task.task_id,
         timestamp=task.finished_at,
         level=level,
         phase=phase,
         message=message,
         details={"source": "task_state", "status": task.status.value},
+    )
+    if sanitizer is None:
+        return event
+    return sanitizer.sanitize_event(
+        event,
+        task_payload=_task_public_payload(task),
     )
 
 
@@ -876,6 +927,7 @@ def create_router(
     settings = hosted_settings or HostedSettings.from_env({})
     storage = hosted_storage
     resources = resource_coordinator
+    public_sanitizer = EventSanitizer(storage.root) if storage is not None else None
     preview_semaphore = BoundedSemaphore(settings.max_preview_concurrency)
     read_video_frame = _select_video_frame_reader(
         decoder,
@@ -2212,7 +2264,7 @@ def create_router(
         )
         if task is None:
             raise ApiError("task_not_found", f"Task not found: {task_id}", 404)
-        return task.to_response()
+        return _public_task_response(task, public_sanitizer)
 
     @router.get("/tasks/{task_id}/download")
     def download_task_result(
@@ -2302,7 +2354,8 @@ def create_router(
                         event = subscriber.get(timeout=0.25)
                     except Empty:
                         terminal_event = _terminal_event_from_task(
-                            task_manager.get_task(task_id, owner_id=owner_id)
+                            task_manager.get_task(task_id, owner_id=owner_id),
+                            public_sanitizer,
                         )
                         if terminal_event is not None:
                             yield _sse_line(terminal_event)
