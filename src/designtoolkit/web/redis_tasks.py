@@ -1258,6 +1258,7 @@ class RedisTaskManager:
         heartbeat_stop_timeout_seconds: float = (
             DEFAULT_HEARTBEAT_STOP_TIMEOUT_SECONDS
         ),
+        on_task_pin_released: Callable[[str], None] | None = None,
     ) -> None:
         if enqueue_intent_ttl <= 0:
             raise ValueError("enqueue_intent_ttl must be positive")
@@ -1282,6 +1283,7 @@ class RedisTaskManager:
         self.retention_seconds = retention_seconds
         self.task_timeout_seconds = task_timeout_seconds
         self.resource_coordinator = resource_coordinator
+        self._on_task_pin_released = on_task_pin_released
         self.live_task_ttl = max(retention_seconds * 2, 24 * 60 * 60)
         self.enqueue_intent_heartbeat_interval = (
             enqueue_intent_heartbeat_interval
@@ -3145,6 +3147,12 @@ class RedisTaskManager:
                     self._remove_task_from_index(raw_member, key)
 
     def release_task_pin(self, task_id: str) -> bool:
+        released = self._release_task_pin(task_id)
+        if self._on_task_pin_released is not None:
+            self._on_task_pin_released(task_id)
+        return released
+
+    def _release_task_pin(self, task_id: str) -> bool:
         task = self.get_task(task_id)
         if task is None:
             return self._repair_task_reverse_indexes(task_id)

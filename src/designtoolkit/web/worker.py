@@ -420,6 +420,13 @@ def run_task(task_id: str, job_kind: str, payload: dict[str, object]) -> None:
         **redis_connection_options(settings),
     )
     resources = _build_resource_coordinator(settings, redis_connection)
+    pin_released = False
+
+    def record_pin_release(released_task_id: str) -> None:
+        nonlocal pin_released
+        if released_task_id == task_id:
+            pin_released = True
+
     state = RedisTaskManager(
         redis_connection=redis_connection,
         queue=Queue("designtoolkit", connection=redis_connection),
@@ -429,6 +436,7 @@ def run_task(task_id: str, job_kind: str, payload: dict[str, object]) -> None:
         task_timeout_seconds=settings.task_timeout_seconds,
         resource_coordinator=resources,
         heartbeat_stop_timeout_seconds=settings.heartbeat_stop_timeout_seconds,
+        on_task_pin_released=record_pin_release,
     )
     task = state.get_task(task_id)
     if task is None:
@@ -515,7 +523,7 @@ def run_task(task_id: str, job_kind: str, payload: dict[str, object]) -> None:
             cleanup_steps.append(("output release", output.release))
         if lease is not None:
             cleanup_steps.append(("lease release", lease.release))
-        if task.has_canonical_asset_identities:
+        if not pin_released and task.has_canonical_asset_identities:
             cleanup_steps.append(
                 (
                     "task pin release",
@@ -526,7 +534,7 @@ def run_task(task_id: str, job_kind: str, payload: dict[str, object]) -> None:
                     ),
                 )
             )
-        else:
+        elif not pin_released:
             cleanup_steps.append(
                 ("legacy task pin release", lambda: state.release_task_pin(task_id))
             )

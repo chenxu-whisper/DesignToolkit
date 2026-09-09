@@ -183,6 +183,21 @@ class TrackingTaskResources:
         )
 
 
+class LegacyTrackingTaskResources(TrackingTaskResources):
+    def release_task_resources(
+        self,
+        task_id: str,
+        *,
+        expected_session_id: str | None = None,
+        expected_asset_identities: (
+            tuple[tuple[str, str | None], ...] | None
+        ) = None,
+    ) -> None:
+        assert expected_session_id is not None
+        assert expected_asset_identities is None
+        self.events.append(f"release-task:{task_id}")
+
+
 def _manager(
     redis_connection,
     tmp_path: Path,
@@ -2918,9 +2933,7 @@ def test_run_task_reserves_refreshes_and_releases_worker_resources(
     assert resources.events.count("refresh:output") >= 2
     assert resources.events.count("refresh:lease") >= 3
     assert resources.events[-2:] == ["release:output", "release:lease"]
-    assert resources.task_pin_releases == [
-        (task.task_id, "a" * 32, ()),
-    ]
+    assert resources.task_pin_releases == []
     assert manager_options["task_timeout_seconds"] == 9000
     assert manager_options["retention_seconds"] == 300
     assert manager.get_task(task.task_id).status is TaskStatus.SUCCEEDED
@@ -2939,7 +2952,7 @@ def test_run_task_reserves_refreshes_and_releases_worker_resources(
         ),
     ],
 )
-def test_run_task_repairs_legacy_pin_after_terminal_outcome(
+def test_run_task_releases_legacy_pin_once_after_real_terminal_outcome(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     outcome: str,
@@ -2949,7 +2962,7 @@ def test_run_task_repairs_legacy_pin_after_terminal_outcome(
 ) -> None:
     redis_connection = fakeredis.FakeRedis(decode_responses=False)
     settings = _hosted_settings(tmp_path)
-    resources = TrackingTaskResources()
+    resources = LegacyTrackingTaskResources()
     manager = _manager(redis_connection, tmp_path)
     session_id = "a" * 32
     asset_id = "1" * 32
@@ -2997,21 +3010,28 @@ def test_run_task_repairs_legacy_pin_after_terminal_outcome(
 
         monkeypatch.setattr(resources.lease, "release", release_then_fail)
 
-    def execute(executor, reserved_task, _request) -> None:
-        terminal = executor.get_task(reserved_task.task_id)
-        assert terminal is not None
+    output_file = tmp_path / "frame.png"
+
+    def export(_options, _backend) -> ExportResult:
         if outcome == "failure":
-            terminal.status = TaskStatus.FAILED
-            terminal.error = "worker failed"
-        else:
-            terminal.status = TaskStatus.SUCCEEDED
-        terminal.finished_at = datetime.now(UTC)
-        executor._state._save_task(terminal)
+            raise RuntimeError("worker failed")
+        output_file.write_bytes(b"png")
+        return ExportResult(
+            output_dir=output_file,
+            output_pattern=output_file,
+            command=("ffmpeg",),
+        )
+
+    executor_init = worker_module.RedisTaskExecutor.__init__
+
+    def initialize_executor(executor, *args, **kwargs) -> None:
+        executor_init(executor, *args, **kwargs)
+        executor._exporter = export
 
     monkeypatch.setattr(
         worker_module.RedisTaskExecutor,
-        "execute_reserved_task",
-        execute,
+        "__init__",
+        initialize_executor,
     )
 
     def run() -> None:
@@ -3045,6 +3065,184 @@ def test_run_task_repairs_legacy_pin_after_terminal_outcome(
     assert not redis_connection.exists(
         f"dt:resource:asset-tasks:{session_id}:{orphan_asset_id}"
     )
+
+
+@pytest.mark.parametrize("retry_succeeds", [True, False])
+def test_run_task_retries_legacy_pin_release_when_terminal_release_raises(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    retry_succeeds: bool,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    settings = _hosted_settings(tmp_path)
+    resources = LegacyTrackingTaskResources()
+    manager = _manager(redis_connection, tmp_path)
+    session_id = "a" * 32
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+        owner_id=session_id,
+        asset_identities=(("1" * 32, "2" * 32),),
+    )
+    task_key = f"dt:task:{task.task_id}"
+    task_data = json.loads(redis_connection.get(task_key))
+    task_data.pop("asset_identities")
+    redis_connection.set(task_key, json.dumps(task_data))
+    _patch_worker_dependencies(
+        monkeypatch,
+        settings=settings,
+        redis_connection=redis_connection,
+        resources=resources,
+    )
+    release_calls: list[str] = []
+    release_task_pin = RedisTaskManager.release_task_pin
+
+    def fail_first_release(
+        self: RedisTaskManager,
+        released_task_id: str,
+    ) -> bool:
+        release_calls.append(released_task_id)
+        if len(release_calls) == 1 or not retry_succeeds:
+            raise RedisConnectionError("task pin release acknowledgement lost")
+        return release_task_pin(self, released_task_id)
+
+    monkeypatch.setattr(
+        RedisTaskManager,
+        "release_task_pin",
+        fail_first_release,
+    )
+    output_file = tmp_path / "frame.png"
+
+    def export(_options, _backend) -> ExportResult:
+        output_file.write_bytes(b"png")
+        return ExportResult(
+            output_dir=output_file,
+            output_pattern=output_file,
+            command=("ffmpeg",),
+        )
+
+    executor_init = worker_module.RedisTaskExecutor.__init__
+
+    def initialize_executor(executor, *args, **kwargs) -> None:
+        executor_init(executor, *args, **kwargs)
+        executor._exporter = export
+
+    monkeypatch.setattr(
+        worker_module.RedisTaskExecutor,
+        "__init__",
+        initialize_executor,
+    )
+
+    def run() -> None:
+        worker_module.run_task(
+            task.task_id,
+            "video_frames",
+            VideoFramesTaskRequest(
+                input_path=str(tmp_path / "clip.mp4")
+            ).model_dump(mode="json"),
+        )
+
+    if retry_succeeds:
+        run()
+    else:
+        with pytest.raises(
+            RedisConnectionError,
+            match="task pin release acknowledgement lost",
+        ):
+            run()
+
+    assert release_calls == [task.task_id, task.task_id]
+    completed = manager.get_task(task.task_id)
+    assert completed is not None
+    assert completed.status is TaskStatus.SUCCEEDED
+    assert bool(
+        redis_connection.exists(f"dt:resource:task-pin:{task.task_id}")
+    ) is (not retry_succeeds)
+
+
+@pytest.mark.parametrize("failure_stage", ["lease", "reservation", "heartbeat"])
+def test_run_task_releases_legacy_pin_once_after_setup_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    settings = _hosted_settings(tmp_path)
+    resources = LegacyTrackingTaskResources()
+    manager = _manager(redis_connection, tmp_path)
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+        owner_id="a" * 32,
+        asset_identities=(("1" * 32, "2" * 32),),
+    )
+    task_key = f"dt:task:{task.task_id}"
+    task_data = json.loads(redis_connection.get(task_key))
+    task_data.pop("asset_identities")
+    redis_connection.set(task_key, json.dumps(task_data))
+    _patch_worker_dependencies(
+        monkeypatch,
+        settings=settings,
+        redis_connection=redis_connection,
+        resources=resources,
+    )
+    release_calls: list[str] = []
+    release_task_pin = RedisTaskManager.release_task_pin
+
+    def track_release(
+        self: RedisTaskManager,
+        released_task_id: str,
+    ) -> bool:
+        release_calls.append(released_task_id)
+        return release_task_pin(self, released_task_id)
+
+    monkeypatch.setattr(RedisTaskManager, "release_task_pin", track_release)
+
+    def fail(message: str):
+        def raise_failure(*_args, **_kwargs):
+            raise RuntimeError(message)
+
+        return raise_failure
+
+    expected_error = f"{failure_stage} setup failed"
+    if failure_stage == "lease":
+        monkeypatch.setattr(
+            resources,
+            "acquire_session",
+            fail(expected_error),
+        )
+    elif failure_stage == "reservation":
+        monkeypatch.setattr(
+            resources,
+            "reserve_output",
+            fail(expected_error),
+        )
+    else:
+        monkeypatch.setattr(
+            resources.lease,
+            "refresh",
+            fail(expected_error),
+        )
+    monkeypatch.setattr(
+        worker_module.RedisTaskExecutor,
+        "execute_reserved_task",
+        lambda *_args, **_kwargs: pytest.fail(
+            "executor must not run after setup failure"
+        ),
+    )
+
+    worker_module.run_task(
+        task.task_id,
+        "video_frames",
+        VideoFramesTaskRequest(
+            input_path=str(tmp_path / "clip.mp4")
+        ).model_dump(mode="json"),
+    )
+
+    assert release_calls == [task.task_id]
+    failed = manager.get_task(task.task_id)
+    assert failed is not None
+    assert failed.status is TaskStatus.FAILED
+    assert failed.error == expected_error
+    assert not redis_connection.exists(f"dt:resource:task-pin:{task.task_id}")
 
 
 def test_run_task_heartbeats_resources_during_slow_processing(
