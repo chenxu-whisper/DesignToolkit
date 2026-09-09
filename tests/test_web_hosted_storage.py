@@ -15,6 +15,7 @@ from types import SimpleNamespace
 from urllib.parse import quote
 from zipfile import ZipFile
 
+import anyio
 import pytest
 from redis.exceptions import ConnectionError as RedisConnectionError
 
@@ -678,6 +679,106 @@ async def test_upload_cancellation_waits_for_write_before_close_and_cleanup(
 
 
 @pytest.mark.anyio
+async def test_anyio_cancellation_during_write_cleans_owned_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    reservation = RecordingReservation()
+    registration = RecordingUploadRegistration()
+    session_id = "a" * 32
+    upload_id = "1" * 32
+    write_started = Event()
+    release_write = Event()
+    write_active = Event()
+    writer_type = getattr(hosted_module, "_UploadWriter", None)
+    assert writer_type is not None, "upload writer helper is required"
+    original_write = writer_type.write
+    original_close = writer_type.close
+
+    def blocked_write(writer: object, chunk: bytes) -> None:
+        write_active.set()
+        write_started.set()
+        try:
+            assert release_write.wait(timeout=1)
+            original_write(writer, chunk)
+        finally:
+            write_active.clear()
+
+    def checked_close(writer: object) -> None:
+        assert not write_active.is_set()
+        original_close(writer)
+
+    async def run_upload() -> None:
+        await storage.store_stream(
+            session_id,
+            asset_id=upload_id,
+            filename="screen.png",
+            content_length=4,
+            chunks=_chunks(b"data"),
+            reservation=reservation,
+            registration=registration,
+        )
+
+    storage.claim_upload_generation(
+        session_id,
+        upload_id,
+        token=registration.token,
+    )
+    monkeypatch.setattr(writer_type, "write", blocked_write)
+    monkeypatch.setattr(writer_type, "close", checked_close)
+
+    async with anyio.create_task_group() as task_group:
+        task_group.start_soon(run_upload)
+        while not write_started.is_set():
+            await asyncio.sleep(0)
+        task_group.cancel_scope.cancel()
+        release_write.set()
+
+    assert reservation.operations.count("release") == 1
+    assert reservation.charge_count == 0
+    assert list(tmp_path.rglob(".uploading")) == []
+    assert list(tmp_path.rglob("*")) == []
+
+
+@pytest.mark.anyio
+async def test_cancellation_preserves_original_error_when_cleanup_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    reservation = RecordingReservation()
+    stream_started = asyncio.Event()
+
+    async def blocked_chunks() -> AsyncIterator[bytes]:
+        yield b"im"
+        stream_started.set()
+        await asyncio.Event().wait()
+
+    def fail_discard(_session_id: str, _asset_dir: Path) -> None:
+        raise OSError("discard failed")
+
+    async def run_upload() -> None:
+        await storage.store_stream(
+            "a" * 32,
+            filename="screen.png",
+            content_length=4,
+            chunks=blocked_chunks(),
+            reservation=reservation,
+        )
+
+    monkeypatch.setattr(storage, "_discard_upload", fail_discard)
+    async with anyio.create_task_group() as task_group:
+        task_group.start_soon(run_upload)
+        await stream_started.wait()
+        task_group.cancel_scope.cancel()
+
+    assert reservation.operations == ["release"]
+    assert "Failed to discard partial upload after upload error" in caplog.text
+
+
+@pytest.mark.anyio
 async def test_upload_cancellation_during_commit_rolls_back_committed_quota(
     tmp_path: Path,
 ) -> None:
@@ -717,6 +818,91 @@ async def test_upload_cancellation_during_commit_rolls_back_committed_quota(
     assert reservation.rolled_back is True
     assert reservation.released is False
     assert list(tmp_path.rglob("*")) == []
+
+
+@pytest.mark.anyio
+async def test_anyio_cancellation_during_commit_rolls_back_committed_quota(
+    tmp_path: Path,
+) -> None:
+    commit_started = Event()
+    release_commit = Event()
+
+    class BlockingCommitReservation(RecordingReservation):
+        def commit(self) -> None:
+            commit_started.set()
+            assert release_commit.wait(timeout=1)
+            super().commit()
+
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    reservation = BlockingCommitReservation()
+
+    async def run_upload() -> None:
+        await storage.store_stream(
+            "a" * 32,
+            filename="screen.png",
+            content_length=4,
+            chunks=_chunks(b"data"),
+            reservation=reservation,
+        )
+
+    async with anyio.create_task_group() as task_group:
+        task_group.start_soon(run_upload)
+        while not commit_started.is_set():
+            await asyncio.sleep(0)
+        task_group.cancel_scope.cancel()
+        release_commit.set()
+
+    assert reservation.operations == ["commit", "rollback"]
+    assert reservation.charge_count == 1
+    assert reservation.rolled_back is True
+    assert reservation.released is False
+    assert list(tmp_path.rglob("*")) == []
+
+
+@pytest.mark.anyio
+async def test_cancellation_during_ambiguous_commit_preserves_hidden_data(
+    tmp_path: Path,
+) -> None:
+    commit_started = Event()
+    release_commit = Event()
+
+    class BlockingAmbiguousReservation(RecordingReservation):
+        def commit(self) -> None:
+            if not commit_started.is_set():
+                commit_started.set()
+                assert release_commit.wait(timeout=1)
+            super().commit()
+
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    reservation = BlockingAmbiguousReservation(
+        commit_transport_errors=3,
+        state_transport_errors=3,
+    )
+
+    async def run_upload() -> None:
+        await storage.store_stream(
+            "a" * 32,
+            filename="screen.png",
+            content_length=4,
+            chunks=_chunks(b"data"),
+            reservation=reservation,
+        )
+
+    with pytest.raises(ExceptionGroup) as error:
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(run_upload)
+            while not commit_started.is_set():
+                await asyncio.sleep(0)
+            task_group.cancel_scope.cancel()
+            release_commit.set()
+
+    assert len(error.value.exceptions) == 1
+    assert isinstance(error.value.exceptions[0], hosted_module._AmbiguousCommitError)
+    assert reservation.charge_count == 1
+    assert reservation.rolled_back is False
+    assert reservation.released is False
+    assert len(list(tmp_path.rglob(".uploading"))) == 1
+    assert list(tmp_path.rglob("screen.png")) == []
 
 
 @pytest.mark.anyio
@@ -1076,6 +1262,70 @@ async def test_upload_registration_heartbeat_refreshes_generation_fence(
 
     assert generation.stat().st_mtime > 1.0
     assert registration.refresh_count >= 4
+
+
+def test_stale_abandon_cannot_remove_replacement_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    session_id = "a" * 32
+    upload_id = "1" * 32
+    first_generation = "2" * 32
+    second_generation = "3" * 32
+    marker_read = Event()
+    release_marker_read = Event()
+    original_read = hosted_module._read_upload_generation_marker
+
+    def blocked_read(marker: Path, expected_asset_id: str) -> str | None:
+        generation = original_read(marker, expected_asset_id)
+        if generation == first_generation:
+            marker_read.set()
+            assert release_marker_read.wait(timeout=1)
+        return generation
+
+    storage.claim_upload_generation(
+        session_id,
+        upload_id,
+        token=first_generation,
+    )
+    monkeypatch.setattr(
+        hosted_module,
+        "_read_upload_generation_marker",
+        blocked_read,
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        stale_cleanup = executor.submit(
+            storage.abandon_upload_generation,
+            session_id,
+            upload_id,
+            token=first_generation,
+        )
+        assert marker_read.wait(timeout=1)
+        replacement = executor.submit(
+            storage.claim_upload_generation,
+            session_id,
+            upload_id,
+            token=second_generation,
+        )
+        assert not replacement.done()
+        release_marker_read.set()
+        assert stale_cleanup.result(timeout=1) is True
+        replacement.result(timeout=1)
+
+    assert (
+        storage.abandon_upload_generation(
+            session_id,
+            upload_id,
+            token=first_generation,
+        )
+        is False
+    )
+    marker = (
+        tmp_path / "sessions" / session_id / ".upload-generations" / upload_id
+    )
+    assert marker.read_text(encoding="ascii") == second_generation
 
 
 @pytest.mark.anyio

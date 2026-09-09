@@ -20,7 +20,7 @@ from urllib.parse import quote, unquote_to_bytes
 from uuid import UUID, uuid4
 from zipfile import ZIP_DEFLATED, ZipFile
 
-from anyio import to_thread
+from anyio import CancelScope, get_cancelled_exc_class, to_thread
 from redis.exceptions import RedisError
 
 from designtoolkit.web.heartbeat import (
@@ -261,9 +261,29 @@ class _UploadResourceHeartbeat:
     async def __aexit__(
         self,
         _exc_type: type[BaseException] | None,
-        *_args: object,
+        exc_value: BaseException | None,
+        _traceback: object,
     ) -> None:
-        await to_thread.run_sync(self.seal)
+        try:
+            with CancelScope(shield=True):
+                await to_thread.run_sync(self.seal)
+        except BaseException as heartbeat_error:
+            if exc_value is None or not isinstance(
+                exc_value,
+                get_cancelled_exc_class(),
+            ):
+                raise
+            exc_value.add_note(
+                f"Upload resource heartbeat also failed: {heartbeat_error}"
+            )
+            _LOGGER.error(
+                "Upload resource heartbeat failed during upload error",
+                exc_info=(
+                    type(heartbeat_error),
+                    heartbeat_error,
+                    heartbeat_error.__traceback__,
+                ),
+            )
 
     def seal(self) -> None:
         try:
@@ -614,6 +634,7 @@ class HostedStorage:
         reservation: RedisReservation,
         lease: RedisSessionLease | None = None,
         registration: RedisUploadRegistration | None = None,
+        ownership: Event | None = None,
     ) -> UploadedAsset:
         """Store an upload with conservative Redis/filesystem recovery.
 
@@ -640,7 +661,8 @@ class HostedStorage:
             if content_length > self.max_upload_bytes:
                 raise UploadRejectedError("File exceeds the configured file limit")
         except Exception:
-            await to_thread.run_sync(_release_best_effort, reservation)
+            if ownership is None:
+                await to_thread.run_sync(_release_best_effort, reservation)
             raise
 
         session_dir = self._session_dir(session_id)
@@ -656,6 +678,9 @@ class HostedStorage:
             else getattr(reservation, "generation_id", None)
         )
         try:
+            if ownership is not None:
+                ownership.set()
+
             def refresh_generation() -> None:
                 if registration is None:
                     return
@@ -700,8 +725,20 @@ class HostedStorage:
                                 "File exceeds the configured file limit"
                             )
                         await to_thread.run_sync(writer.write, chunk)
-                finally:
-                    await to_thread.run_sync(writer.close)
+                except BaseException as stream_error:
+                    with CancelScope(shield=True):
+                        if isinstance(stream_error, get_cancelled_exc_class()):
+                            await self._run_upload_cleanup_step(
+                                writer.close,
+                                "close upload writer",
+                                stream_error,
+                            )
+                        else:
+                            await to_thread.run_sync(writer.close)
+                    raise
+                else:
+                    with CancelScope(shield=True):
+                        await to_thread.run_sync(writer.close)
                 heartbeat.raise_if_failed()
                 if size != content_length:
                     raise UploadRejectedError(
@@ -742,26 +779,18 @@ class HostedStorage:
             raise
         except _AmbiguousCommitError:
             raise
-        except BaseException:
-            if committed.is_set():
-                if await to_thread.run_sync(
-                    _rollback_with_recovery,
-                    reservation,
-                ):
-                    if writer.owns_asset_dir:
-                        await to_thread.run_sync(
-                            self._discard_upload,
-                            session_id,
-                            asset_dir,
-                        )
-            else:
-                await to_thread.run_sync(_release_best_effort, reservation)
-                if writer.owns_asset_dir:
-                    await to_thread.run_sync(
-                        self._discard_upload,
-                        session_id,
-                        asset_dir,
-                    )
+        except BaseException as upload_error:
+            with CancelScope(shield=True):
+                await self._cleanup_failed_upload(
+                    session_id=session_id,
+                    asset_id=asset_id,
+                    asset_dir=asset_dir,
+                    reservation=reservation,
+                    registration=registration,
+                    writer=writer,
+                    committed=committed.is_set(),
+                    upload_error=upload_error,
+                )
             raise
 
         await to_thread.run_sync(_finalize_best_effort, reservation)
@@ -845,6 +874,112 @@ class HostedStorage:
                     marker.write(token)
             except FileExistsError as exc:
                 raise UploadConflictError("Upload ID already exists") from exc
+
+    def abandon_upload_generation(
+        self,
+        session_id: str,
+        asset_id: str,
+        *,
+        token: str,
+    ) -> bool:
+        session_id = _validate_session_id(session_id)
+        asset_id = _asset_id(f"asset:{asset_id}")
+        if not _SESSION_PATTERN.fullmatch(token):
+            raise UploadRejectedError("Upload generation token is invalid")
+        session_dir = self._session_dir(session_id)
+        asset_dir = session_dir / "assets" / asset_id
+        generation = session_dir / _UPLOAD_GENERATIONS_NAME / asset_id
+        cancellation = session_dir / _UPLOAD_CANCELLATIONS_NAME / asset_id
+        with self._deletion_lock:
+            marker_generation = _read_upload_generation_marker(
+                generation,
+                asset_id,
+            )
+            if marker_generation is None or not compare_digest(
+                marker_generation,
+                token,
+            ):
+                return False
+            if asset_dir.exists():
+                if not asset_dir.is_dir() or any(asset_dir.iterdir()):
+                    return False
+                asset_dir.rmdir()
+            cancellation.unlink(missing_ok=True)
+            generation.unlink(missing_ok=True)
+            self._remove_empty_session(session_id)
+            return True
+
+    async def _cleanup_failed_upload(
+        self,
+        *,
+        session_id: str,
+        asset_id: str,
+        asset_dir: Path,
+        reservation: RedisReservation,
+        registration: RedisUploadRegistration | None,
+        writer: _UploadWriter,
+        committed: bool,
+        upload_error: BaseException,
+    ) -> None:
+        may_discard = True
+        if committed:
+            may_discard = await self._run_upload_cleanup_step(
+                _rollback_with_recovery,
+                "roll back upload reservation",
+                upload_error,
+                reservation,
+                fallback=False,
+            )
+        else:
+            await self._run_upload_cleanup_step(
+                _release_best_effort,
+                "release upload reservation",
+                upload_error,
+                reservation,
+            )
+        if may_discard and writer.owns_asset_dir:
+            await self._run_upload_cleanup_step(
+                self._discard_upload,
+                "discard partial upload",
+                upload_error,
+                session_id,
+                asset_dir,
+            )
+        if may_discard and registration is not None:
+            await self._run_upload_cleanup_step(
+                self.abandon_upload_generation,
+                "abandon upload generation",
+                upload_error,
+                session_id,
+                asset_id,
+                token=registration.token,
+            )
+
+    @staticmethod
+    async def _run_upload_cleanup_step[T](
+        action: Callable[..., T],
+        description: str,
+        upload_error: BaseException,
+        *args: object,
+        fallback: T | None = None,
+        **kwargs: object,
+    ) -> T | None:
+        try:
+            return await to_thread.run_sync(
+                lambda: action(*args, **kwargs),
+            )
+        except BaseException as cleanup_error:
+            upload_error.add_note(f"Failed to {description}: {cleanup_error}")
+            _LOGGER.error(
+                "Failed to %s after upload error",
+                description,
+                exc_info=(
+                    type(cleanup_error),
+                    cleanup_error,
+                    cleanup_error.__traceback__,
+                ),
+            )
+            return fallback
 
     def resolve(self, session_id: str, reference: str) -> Path:
         session_id = _validate_session_id(session_id)

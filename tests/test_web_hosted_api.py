@@ -36,6 +36,7 @@ from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 from rq import Queue
 
+import designtoolkit.web.hosted as hosted_module
 from designtoolkit.chroma_keyer.video_models import VideoMetadata
 from designtoolkit.web import app as app_module
 from designtoolkit.web import routes as routes_module
@@ -1431,6 +1432,89 @@ async def test_hosted_upload_cancellation_during_setup_releases_resources_once(
 
 
 @pytest.mark.anyio
+async def test_hosted_upload_cancellation_after_claim_abandons_local_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    coordinator = StubCoordinator(
+        max_upload_concurrency=4,
+        max_session_bytes=16,
+        min_free_bytes=0,
+    )
+    client = _client(
+        tmp_path,
+        max_bytes=16,
+        max_session_bytes=16,
+        resource_coordinator=coordinator,
+        hosted_storage=storage,
+    )
+    reserve_started = Event()
+    release_reserve = Event()
+    abandon_finished = Event()
+    original_disk_usage = routes_module.disk_usage
+    original_abandon = storage.abandon_upload_generation
+    cleanup_progress: list[int] = []
+    ticks = 0
+    stop_ticker = False
+
+    def blocked_disk_usage(path: Path):
+        reserve_started.set()
+        assert release_reserve.wait(timeout=2)
+        return original_disk_usage(path)
+
+    def slow_abandon(
+        session_id: str,
+        upload_id: str,
+        *,
+        token: str,
+    ) -> bool:
+        before = ticks
+        sleep(0.04)
+        result = original_abandon(
+            session_id,
+            upload_id,
+            token=token,
+        )
+        cleanup_progress.append(ticks - before)
+        abandon_finished.set()
+        return result
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while not stop_ticker:
+            ticks += 1
+            await asyncio.sleep(0)
+
+    async def run_upload() -> None:
+        await _async_upload(client)
+
+    monkeypatch.setattr(routes_module, "disk_usage", blocked_disk_usage)
+    monkeypatch.setattr(storage, "abandon_upload_generation", slow_abandon)
+    ticker_task = asyncio.create_task(ticker())
+    await asyncio.sleep(0)
+    try:
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(run_upload)
+            while not reserve_started.is_set():
+                await asyncio.sleep(0)
+            task_group.cancel_scope.cancel()
+            release_reserve.set()
+    finally:
+        release_reserve.set()
+        stop_ticker = True
+        await ticker_task
+        client.close()
+
+    assert abandon_finished.is_set()
+    assert cleanup_progress and cleanup_progress[0] > 0
+    assert coordinator.active_uploads == 0
+    assert coordinator.inflight == {}
+    assert list(tmp_path.rglob(".uploading")) == []
+    assert list(tmp_path.rglob("*")) == []
+
+
+@pytest.mark.anyio
 async def test_hosted_upload_cancellation_during_stream_releases_resources_once(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1493,6 +1577,66 @@ async def test_hosted_upload_cancellation_during_stream_releases_resources_once(
     assert coordinator.active_leases == 0
     assert coordinator.active_uploads == 0
     assert coordinator.inflight == {}
+
+
+@pytest.mark.anyio
+async def test_hosted_upload_cancellation_during_slow_write_cleans_all_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    coordinator = StubCoordinator(
+        max_upload_concurrency=4,
+        max_session_bytes=16,
+        min_free_bytes=0,
+    )
+    client = _client(
+        tmp_path,
+        max_bytes=16,
+        max_session_bytes=16,
+        resource_coordinator=coordinator,
+        hosted_storage=storage,
+    )
+    write_started = Event()
+    release_write = Event()
+    writer_type = hosted_module._UploadWriter
+    original_write = writer_type.write
+    original_reservation_release = StubReservation.release
+    reservation_release_calls = 0
+
+    def blocked_write(writer: object, chunk: bytes) -> None:
+        write_started.set()
+        assert release_write.wait(timeout=2)
+        original_write(writer, chunk)
+
+    def release_reservation(reservation: StubReservation) -> None:
+        nonlocal reservation_release_calls
+        reservation_release_calls += 1
+        original_reservation_release(reservation)
+
+    async def run_upload() -> None:
+        await _async_upload(client)
+
+    monkeypatch.setattr(writer_type, "write", blocked_write)
+    monkeypatch.setattr(StubReservation, "release", release_reservation)
+    try:
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(run_upload)
+            while not write_started.is_set():
+                await asyncio.sleep(0)
+            task_group.cancel_scope.cancel()
+            release_write.set()
+    finally:
+        release_write.set()
+        client.close()
+
+    assert coordinator.active_leases == 0
+    assert coordinator.active_uploads == 0
+    assert coordinator.committed == {}
+    assert coordinator.inflight == {}
+    assert reservation_release_calls == 1
+    assert list(tmp_path.rglob(".uploading")) == []
+    assert list(tmp_path.rglob("*")) == []
 
 
 @pytest.mark.anyio

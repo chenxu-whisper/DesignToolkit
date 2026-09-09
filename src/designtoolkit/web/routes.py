@@ -1434,6 +1434,9 @@ def create_router(
         reservation = None
         lease = None
         registration = None
+        claimed_generation: str | None = None
+        stream_started = Event()
+        stream_completed = False
         release_resources = True
         try:
             try:
@@ -1451,6 +1454,7 @@ def create_router(
                 }:
                     raise ApiError("upload_conflict", str(exc), 409) from exc
                 raise
+            claimed_generation = registration.token
             await to_thread.run_sync(
                 _claim_upload_generation,
                 storage,
@@ -1480,7 +1484,9 @@ def create_router(
                 reservation=reservation,
                 lease=lease,
                 registration=registration,
+                ownership=stream_started,
             )
+            stream_completed = True
         except UploadConflictError as exc:
             raise ApiError("upload_conflict", str(exc), 409) from exc
         except UploadRejectedError as exc:
@@ -1504,20 +1510,19 @@ def create_router(
                 503,
             ) from exc
         finally:
-            if release_resources and lease is not None:
-                await _release_redis_resource_best_effort_async(
-                    lease.release,
-                    "upload session lease",
-                )
-            if release_resources and reservation is not None:
-                await _release_redis_resource_best_effort_async(
-                    reservation.release,
-                    "upload reservation",
-                )
-            if registration is not None:
-                await _release_redis_resource_best_effort_async(
-                    registration.finish,
-                    "upload registration",
+            with CancelScope(shield=True):
+                await to_thread.run_sync(
+                    _cleanup_upload_route,
+                    storage,
+                    http_request.state.session_id,
+                    upload_id,
+                    claimed_generation,
+                    stream_started.is_set(),
+                    stream_completed,
+                    release_resources,
+                    lease,
+                    reservation,
+                    registration,
                 )
         return UploadResponse(
             reference=asset.reference,
@@ -2469,16 +2474,65 @@ def _reserve_upload(
     )
 
 
-async def _release_redis_resource_best_effort_async(
-    release: Callable[[], None],
-    resource_name: str,
+def _cleanup_upload_route(
+    storage: HostedStorage,
+    session_id: str,
+    upload_id: str,
+    claimed_generation: str | None,
+    stream_started: bool,
+    stream_completed: bool,
+    release_resources: bool,
+    lease: RedisSessionLease | None,
+    reservation: RedisReservation | None,
+    registration: RedisUploadRegistration | None,
 ) -> None:
-    with CancelScope(shield=True):
-        await to_thread.run_sync(
-            _release_redis_resource_best_effort,
-            release,
-            resource_name,
+    def cleanup_step(action: Callable[[], None], description: str) -> None:
+        try:
+            action()
+        except BaseException:
+            _LOGGER.warning(
+                "Failed to %s during upload cleanup",
+                description,
+                extra={
+                    "session_id": session_id,
+                    "upload_id": upload_id,
+                },
+                exc_info=True,
+            )
+
+    if release_resources and lease is not None:
+        cleanup_step(lease.release, "release upload session lease")
+    if (
+        release_resources
+        and reservation is not None
+        and (not stream_started or stream_completed)
+    ):
+        cleanup_step(reservation.release, "release upload reservation")
+    if claimed_generation is not None and not stream_started:
+        cleanup_step(
+            lambda: _abandon_upload_generation(
+                storage,
+                session_id,
+                upload_id,
+                claimed_generation,
+            ),
+            "abandon local upload generation",
         )
+    if registration is not None:
+        cleanup_step(registration.finish, "finish upload registration")
+
+
+def _abandon_upload_generation(
+    storage: HostedStorage,
+    session_id: str,
+    upload_id: str,
+    token: str,
+) -> None:
+    storage.abandon_upload_generation(
+        session_id,
+        upload_id,
+        token=token,
+    )
 
 
 def _release_redis_resource_best_effort(
