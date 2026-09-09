@@ -21,6 +21,7 @@ from threading import BoundedSemaphore, Event, Lock, Thread
 from urllib.parse import unquote
 
 import numpy as np
+from anyio import CancelScope, to_thread
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from PIL import Image
@@ -81,8 +82,10 @@ from designtoolkit.web.redis_errors import (
 from designtoolkit.web.redis_tasks import RedisAssetReadPin, RedisTaskManager
 from designtoolkit.web.resources import (
     AssetReleaseMismatchError,
+    RedisReservation,
     RedisResourceCoordinator,
     RedisSessionLease,
+    RedisUploadRegistration,
     ResourceUnavailableError,
 )
 from designtoolkit.web.schemas import (
@@ -1434,10 +1437,12 @@ def create_router(
         release_resources = True
         try:
             try:
-                registration = resources.register_upload(
+                registration = await to_thread.run_sync(
+                    _register_upload,
+                    resources,
                     http_request.state.session_id,
                     upload_id,
-                    generation_token=upload_generation,
+                    upload_generation,
                 )
             except ResourceUnavailableError as exc:
                 if str(exc) in {
@@ -1446,19 +1451,26 @@ def create_router(
                 }:
                     raise ApiError("upload_conflict", str(exc), 409) from exc
                 raise
-            storage.claim_upload_generation(
+            await to_thread.run_sync(
+                _claim_upload_generation,
+                storage,
                 http_request.state.session_id,
                 upload_id,
-                token=registration.token,
+                registration.token,
             )
-            reservation = resources.reserve_upload(
+            reservation = await to_thread.run_sync(
+                _reserve_upload,
+                resources,
+                settings.data_dir,
                 http_request.state.session_id,
                 content_length,
-                free_bytes=disk_usage(settings.data_dir).free,
-                asset_id=upload_id,
-                generation_id=registration.token,
+                upload_id,
+                registration.token,
             )
-            lease = resources.acquire_session(http_request.state.session_id)
+            lease = await to_thread.run_sync(
+                resources.acquire_session,
+                http_request.state.session_id,
+            )
             asset = await storage.store_stream(
                 http_request.state.session_id,
                 asset_id=upload_id,
@@ -1493,17 +1505,17 @@ def create_router(
             ) from exc
         finally:
             if release_resources and lease is not None:
-                _release_redis_resource_best_effort(
+                await _release_redis_resource_best_effort_async(
                     lease.release,
                     "upload session lease",
                 )
             if release_resources and reservation is not None:
-                _release_redis_resource_best_effort(
+                await _release_redis_resource_best_effort_async(
                     reservation.release,
                     "upload reservation",
                 )
             if registration is not None:
-                _release_redis_resource_best_effort(
+                await _release_redis_resource_best_effort_async(
                     registration.finish,
                     "upload registration",
                 )
@@ -2412,6 +2424,61 @@ def create_router(
         )
 
     return router
+
+
+def _register_upload(
+    resources: RedisResourceCoordinator,
+    session_id: str,
+    upload_id: str,
+    generation_token: str | None,
+) -> RedisUploadRegistration:
+    return resources.register_upload(
+        session_id,
+        upload_id,
+        generation_token=generation_token,
+    )
+
+
+def _claim_upload_generation(
+    storage: HostedStorage,
+    session_id: str,
+    upload_id: str,
+    token: str,
+) -> None:
+    storage.claim_upload_generation(
+        session_id,
+        upload_id,
+        token=token,
+    )
+
+
+def _reserve_upload(
+    resources: RedisResourceCoordinator,
+    data_dir: Path,
+    session_id: str,
+    content_length: int,
+    upload_id: str,
+    generation_id: str,
+) -> RedisReservation:
+    return resources.reserve_upload(
+        session_id,
+        content_length,
+        free_bytes=disk_usage(data_dir).free,
+        asset_id=upload_id,
+        generation_id=generation_id,
+    )
+
+
+async def _release_redis_resource_best_effort_async(
+    release: Callable[[], None],
+    resource_name: str,
+) -> None:
+    with CancelScope(shield=True):
+        await to_thread.run_sync(
+            _release_redis_resource_best_effort,
+            release,
+            resource_name,
+        )
 
 
 def _release_redis_resource_best_effort(

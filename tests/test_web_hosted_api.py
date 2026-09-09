@@ -10,18 +10,19 @@ from contextvars import ContextVar
 from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
-from threading import BoundedSemaphore, Event, Lock, Timer
+from threading import BoundedSemaphore, Event, Lock, Timer, get_ident
 from time import monotonic, sleep
 from unittest.mock import Mock
 from urllib.parse import quote
 from uuid import uuid4
 
+import anyio
 import fakeredis
 import numpy as np
 import pytest
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.testclient import TestClient
-from httpx import ASGITransport, AsyncClient
+from httpx import ASGITransport, AsyncClient, Response
 from PIL import Image
 from redis import Redis
 from redis.exceptions import (
@@ -550,6 +551,29 @@ def _upload(
         content=content,
         headers=headers,
     )
+
+
+async def _async_upload(
+    client: TestClient,
+    *,
+    content: bytes = b"image",
+    upload_id: str = "1" * 32,
+) -> Response:
+    transport = ASGITransport(app=client.app)
+    async with AsyncClient(
+        transport=transport,
+        base_url="http://testserver",
+    ) as async_client:
+        return await async_client.post(
+            "/api/uploads",
+            content=content,
+            headers={
+                "content-length": str(len(content)),
+                "content-type": "application/octet-stream",
+                "x-upload-filename": "screen.png",
+                "x-upload-id": upload_id,
+            },
+        )
 
 
 def _delete_uploaded_asset(client: TestClient, reference: str):
@@ -1142,6 +1166,406 @@ def test_successful_upload_ignores_redis_cleanup_failures(
     assert response.json()["size"] == 5
     assert lease.release_count == 1
     assert len(list(tmp_path.rglob("screen.png"))) == 1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("stage", "owner_name", "attribute"),
+    [
+        ("register", "coordinator", "register_upload"),
+        ("claim", "storage", "claim_upload_generation"),
+        ("disk_usage", "module", "disk_usage"),
+        ("reserve", "coordinator", "reserve_upload"),
+        ("acquire", "coordinator", "acquire_session"),
+    ],
+)
+async def test_hosted_upload_setup_stages_do_not_block_event_loop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    owner_name: str,
+    attribute: str,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    coordinator = StubCoordinator(
+        max_upload_concurrency=4,
+        max_session_bytes=16,
+        min_free_bytes=0,
+    )
+    client = _client(
+        tmp_path,
+        max_bytes=16,
+        max_session_bytes=16,
+        resource_coordinator=coordinator,
+        hosted_storage=storage,
+    )
+    owners = {
+        "coordinator": coordinator,
+        "storage": storage,
+        "module": routes_module,
+    }
+    owner = owners[owner_name]
+    original = getattr(owner, attribute)
+    event_loop_thread = get_ident()
+    stage_threads: list[int] = []
+    progress_during_stage: list[int] = []
+    ticks = 0
+    stopped = False
+
+    def slow_stage(*args: object, **kwargs: object) -> object:
+        before = ticks
+        stage_threads.append(get_ident())
+        sleep(0.04)
+        progress_during_stage.append(ticks - before)
+        return original(*args, **kwargs)
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while not stopped:
+            ticks += 1
+            await asyncio.sleep(0)
+
+    monkeypatch.setattr(owner, attribute, slow_stage)
+    ticker_task = asyncio.create_task(ticker())
+    await asyncio.sleep(0)
+    try:
+        response = await _async_upload(client)
+    finally:
+        stopped = True
+        await ticker_task
+        client.close()
+
+    assert response.status_code == 201, stage
+    assert stage_threads
+    assert all(thread_id != event_loop_thread for thread_id in stage_threads)
+    assert all(progress > 0 for progress in progress_during_stage)
+
+
+@pytest.mark.anyio
+async def test_hosted_upload_setup_stages_remain_sequential(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    coordinator = StubCoordinator(
+        max_upload_concurrency=4,
+        max_session_bytes=16,
+        min_free_bytes=0,
+    )
+    client = _client(
+        tmp_path,
+        max_bytes=16,
+        max_session_bytes=16,
+        resource_coordinator=coordinator,
+        hosted_storage=storage,
+    )
+    calls: list[str] = []
+
+    def wrap(owner: object, attribute: str, stage: str) -> None:
+        original = getattr(owner, attribute)
+
+        def record(*args: object, **kwargs: object) -> object:
+            calls.append(f"{stage}:start")
+            result = original(*args, **kwargs)
+            calls.append(f"{stage}:end")
+            return result
+
+        monkeypatch.setattr(owner, attribute, record)
+
+    wrap(coordinator, "register_upload", "register")
+    wrap(storage, "claim_upload_generation", "claim")
+    wrap(routes_module, "disk_usage", "disk_usage")
+    wrap(coordinator, "reserve_upload", "reserve")
+    wrap(coordinator, "acquire_session", "acquire")
+    try:
+        response = await _async_upload(client)
+    finally:
+        client.close()
+
+    assert response.status_code == 201
+    assert calls == [
+        "register:start",
+        "register:end",
+        "claim:start",
+        "claim:end",
+        "disk_usage:start",
+        "disk_usage:end",
+        "reserve:start",
+        "reserve:end",
+        "acquire:start",
+        "acquire:end",
+    ]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("stage", "owner", "attribute"),
+    [
+        ("lease", StubLease, "release"),
+        ("reservation", StubReservation, "release"),
+        ("registration", StubUploadRegistration, "finish"),
+    ],
+)
+async def test_hosted_upload_cleanup_stages_do_not_block_event_loop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    owner: type[object],
+    attribute: str,
+) -> None:
+    coordinator = StubCoordinator(
+        max_upload_concurrency=4,
+        max_session_bytes=16,
+        min_free_bytes=0,
+    )
+    client = _client(
+        tmp_path,
+        max_bytes=16,
+        max_session_bytes=16,
+        resource_coordinator=coordinator,
+    )
+    original = getattr(owner, attribute)
+    event_loop_thread = get_ident()
+    stage_threads: list[int] = []
+    progress_during_stage: list[int] = []
+    ticks = 0
+    stopped = False
+
+    def slow_release(resource: object) -> None:
+        before = ticks
+        stage_threads.append(get_ident())
+        sleep(0.04)
+        progress_during_stage.append(ticks - before)
+        original(resource)
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while not stopped:
+            ticks += 1
+            await asyncio.sleep(0)
+
+    monkeypatch.setattr(owner, attribute, slow_release)
+    ticker_task = asyncio.create_task(ticker())
+    await asyncio.sleep(0)
+    try:
+        response = await _async_upload(client)
+    finally:
+        stopped = True
+        await ticker_task
+        client.close()
+
+    assert response.status_code == 201, stage
+    assert len(stage_threads) == 1
+    assert stage_threads[0] != event_loop_thread
+    assert progress_during_stage[0] > 0
+
+
+@pytest.mark.anyio
+async def test_hosted_upload_cancellation_during_setup_releases_resources_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coordinator = StubCoordinator(
+        max_upload_concurrency=4,
+        max_session_bytes=16,
+        min_free_bytes=0,
+    )
+    client = _client(
+        tmp_path,
+        max_bytes=16,
+        max_session_bytes=16,
+        resource_coordinator=coordinator,
+    )
+    acquire_started = Event()
+    release_acquire = Event()
+    cleanup_calls = {"lease": 0, "reservation": 0, "registration": 0}
+    original_acquire = coordinator.acquire_session
+    original_lease_release = StubLease.release
+    original_reservation_release = StubReservation.release
+    original_registration_finish = StubUploadRegistration.finish
+
+    def blocked_acquire(session_id: str) -> StubLease:
+        acquire_started.set()
+        assert release_acquire.wait(timeout=2)
+        return original_acquire(session_id)
+
+    def release_lease(lease: StubLease) -> None:
+        cleanup_calls["lease"] += 1
+        sleep(0.02)
+        original_lease_release(lease)
+
+    def release_reservation(reservation: StubReservation) -> None:
+        cleanup_calls["reservation"] += 1
+        sleep(0.02)
+        original_reservation_release(reservation)
+
+    def finish_registration(registration: StubUploadRegistration) -> None:
+        cleanup_calls["registration"] += 1
+        sleep(0.02)
+        original_registration_finish(registration)
+
+    monkeypatch.setattr(coordinator, "acquire_session", blocked_acquire)
+    monkeypatch.setattr(StubLease, "release", release_lease)
+    monkeypatch.setattr(StubReservation, "release", release_reservation)
+    monkeypatch.setattr(StubUploadRegistration, "finish", finish_registration)
+
+    async def run_upload() -> None:
+        await _async_upload(client)
+
+    try:
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(run_upload)
+            while not acquire_started.is_set():
+                await asyncio.sleep(0)
+            task_group.cancel_scope.cancel()
+            release_acquire.set()
+    finally:
+        release_acquire.set()
+        client.close()
+
+    assert acquire_started.is_set()
+    assert cleanup_calls == {"lease": 1, "reservation": 1, "registration": 1}
+    assert coordinator.active_leases == 0
+    assert coordinator.active_uploads == 0
+    assert coordinator.inflight == {}
+
+
+@pytest.mark.anyio
+async def test_hosted_upload_cancellation_during_stream_releases_resources_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    coordinator = StubCoordinator(
+        max_upload_concurrency=4,
+        max_session_bytes=16,
+        min_free_bytes=0,
+    )
+    client = _client(
+        tmp_path,
+        max_bytes=16,
+        max_session_bytes=16,
+        resource_coordinator=coordinator,
+        hosted_storage=storage,
+    )
+    stream_started = asyncio.Event()
+    cleanup_calls = {"lease": 0, "reservation": 0, "registration": 0}
+    original_lease_release = StubLease.release
+    original_reservation_release = StubReservation.release
+    original_registration_finish = StubUploadRegistration.finish
+
+    async def blocked_store(*_args: object, **_kwargs: object) -> None:
+        stream_started.set()
+        await asyncio.Event().wait()
+
+    def release_lease(lease: StubLease) -> None:
+        cleanup_calls["lease"] += 1
+        sleep(0.02)
+        original_lease_release(lease)
+
+    def release_reservation(reservation: StubReservation) -> None:
+        cleanup_calls["reservation"] += 1
+        sleep(0.02)
+        original_reservation_release(reservation)
+
+    def finish_registration(registration: StubUploadRegistration) -> None:
+        cleanup_calls["registration"] += 1
+        sleep(0.02)
+        original_registration_finish(registration)
+
+    monkeypatch.setattr(storage, "store_stream", blocked_store)
+    monkeypatch.setattr(StubLease, "release", release_lease)
+    monkeypatch.setattr(StubReservation, "release", release_reservation)
+    monkeypatch.setattr(StubUploadRegistration, "finish", finish_registration)
+
+    async def run_upload() -> None:
+        await _async_upload(client)
+
+    try:
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(run_upload)
+            await stream_started.wait()
+            task_group.cancel_scope.cancel()
+    finally:
+        client.close()
+
+    assert cleanup_calls == {"lease": 1, "reservation": 1, "registration": 1}
+    assert coordinator.active_leases == 0
+    assert coordinator.active_uploads == 0
+    assert coordinator.inflight == {}
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("stage", "error", "expected_status", "expected_code"),
+    [
+        (
+            "register",
+            ResourceUnavailableError("Upload is already in progress"),
+            409,
+            "upload_conflict",
+        ),
+        ("claim", OSError("claim failed"), 503, "storage_unavailable"),
+        ("disk_usage", OSError("disk failed"), 503, "storage_unavailable"),
+        (
+            "reserve",
+            ResourceUnavailableError("Upload concurrency limit reached"),
+            429,
+            "upload_concurrency",
+        ),
+        (
+            "acquire",
+            ResourceUnavailableError("Session is being deleted"),
+            503,
+            "storage_unavailable",
+        ),
+    ],
+)
+async def test_hosted_upload_setup_exception_mapping_is_preserved(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    error: Exception,
+    expected_status: int,
+    expected_code: str,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    coordinator = StubCoordinator(
+        max_upload_concurrency=4,
+        max_session_bytes=16,
+        min_free_bytes=0,
+    )
+    client = _client(
+        tmp_path,
+        max_bytes=16,
+        max_session_bytes=16,
+        resource_coordinator=coordinator,
+        hosted_storage=storage,
+        raise_server_exceptions=False,
+    )
+    targets = {
+        "register": (coordinator, "register_upload"),
+        "claim": (storage, "claim_upload_generation"),
+        "disk_usage": (routes_module, "disk_usage"),
+        "reserve": (coordinator, "reserve_upload"),
+        "acquire": (coordinator, "acquire_session"),
+    }
+    owner, attribute = targets[stage]
+
+    def fail(*_args: object, **_kwargs: object) -> None:
+        raise error
+
+    monkeypatch.setattr(owner, attribute, fail)
+    try:
+        response = await _async_upload(client)
+    finally:
+        client.close()
+
+    assert response.status_code == expected_status
+    assert response.json()["error"]["code"] == expected_code
+    assert coordinator.active_leases == 0
+    assert coordinator.active_uploads == 0
+    assert coordinator.inflight == {}
 
 
 def test_hosted_upload_rejects_declared_actual_length_mismatch(
