@@ -4646,6 +4646,281 @@ def test_redis_log_store_persists_events_for_other_processes() -> None:
     assert events[0].details == {"position": 1}
 
 
+@pytest.mark.parametrize(
+    "job_kind",
+    [
+        "video_frames",
+        "media_resize",
+        "chroma_keyer",
+        "chroma_video_keyer",
+    ],
+)
+def test_hosted_redis_events_redact_managed_paths_for_every_task_kind(
+    tmp_path: Path,
+    job_kind: str,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = _manager(redis_connection, tmp_path)
+    task_id = f"event-redaction-{job_kind}"
+    session_id = "1" * 32
+    asset_id = "2" * 32
+    task_directory_id = "3" * 32
+    input_path = (
+        tmp_path
+        / "sessions"
+        / session_id
+        / "assets"
+        / asset_id
+        / "source clip.mp4"
+    )
+    task_root = (
+        tmp_path / "sessions" / session_id / "tasks" / task_directory_id
+    )
+    payload: dict[str, object] = {"input_path": str(input_path)}
+    if job_kind == "video_frames":
+        output_root = task_root / "frames"
+        output_path = output_root / "source clip_000001.png"
+        payload.update(
+            {
+                "input_path": None,
+                "input_paths": [str(input_path)],
+                "output_dir": str(output_root),
+            }
+        )
+        expected_output = "source clip_000001.png"
+    elif job_kind == "media_resize":
+        output_path = task_root / "source clip_resized.mp4"
+        payload["output_path"] = str(output_path)
+        expected_output = "source clip_resized.mp4"
+    elif job_kind == "chroma_keyer":
+        output_path = task_root / "source clip_keyed.png"
+        payload["output_path"] = str(output_path)
+        expected_output = "source clip_keyed.png"
+    else:
+        output_root = task_root
+        output_path = (
+            output_root
+            / "source clip_keyed_frames"
+            / "source clip_keyed_000001.png"
+        )
+        payload["output_root"] = str(output_root)
+        expected_output = (
+            "source clip_keyed_frames/source clip_keyed_000001.png"
+        )
+    manager._save_work(task_id, job_kind, payload)
+    unknown_path = (
+        tmp_path
+        / "sessions"
+        / session_id
+        / "private files"
+        / task_directory_id
+        / "trace.log"
+    )
+    details = {
+        "filename": "source clip.mp4",
+        "progress": 0.5,
+        "nested": [
+            {"input": input_path.as_uri()},
+            {"output": output_path.as_uri()},
+            {"unknown": unknown_path.as_uri()},
+        ],
+        "external": "User selected D:\\Media\\source clip.mp4",
+    }
+
+    manager.log_store.append(
+        task_id=task_id,
+        level=LogLevel.PROGRESS,
+        phase=LogPhase.RUNNING,
+        message=f"Processing {input_path}",
+        details=details,
+    )
+    history, subscriber = manager.log_store.history_and_subscribe(task_id)
+    manager.log_store.append(
+        task_id=task_id,
+        level=LogLevel.ERROR,
+        phase=LogPhase.FAILED,
+        message=f"Failed at '{str(unknown_path).replace(os.sep, '/')}'",
+    )
+
+    assert history[0].message == "Processing source clip.mp4"
+    assert history[0].details == {
+        "filename": "source clip.mp4",
+        "progress": 0.5,
+        "nested": [
+            {"input": "source clip.mp4"},
+            {"output": expected_output},
+            {"unknown": "[managed path]"},
+        ],
+        "external": "User selected D:\\Media\\source clip.mp4",
+    }
+    assert subscriber.get(timeout=0.2).message == "Failed at '[managed path]'"
+    assert details["nested"][0]["input"] == input_path.as_uri()
+    persisted = redis_connection.lrange(f"dt:task:{task_id}:events", 0, -1)
+    exposed = b"\n".join(persisted).decode()
+    assert str(tmp_path).replace("\\", "/") not in exposed.replace("\\", "/")
+    assert session_id not in exposed
+    assert asset_id not in exposed
+    assert task_directory_id not in exposed
+
+
+def test_hosted_redis_transition_events_and_errors_are_sanitized(
+    tmp_path: Path,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = _manager(redis_connection, tmp_path)
+    session_id = "4" * 32
+    task_directory_id = "5" * 32
+    task_id = "60000000-0000-0000-0000-000000000000"
+    input_path = (
+        tmp_path
+        / "sessions"
+        / session_id
+        / "assets"
+        / ("7" * 32)
+        / "movie.mov"
+    )
+    task_root = (
+        tmp_path / "sessions" / session_id / "tasks" / task_directory_id
+    )
+    output_root = task_root / "frames"
+    task = TaskRecord(
+        task_id=task_id,
+        kind=TaskKind.VIDEO_FRAMES,
+        status=TaskStatus.QUEUED,
+        created_at=datetime.now(UTC),
+        started_at=None,
+        finished_at=None,
+        input_path=input_path.name,
+        output_path=None,
+        error=None,
+        owner_id=None,
+    )
+    manager._save_task(task)
+    manager._save_work(
+        task_id,
+        "video_frames",
+        {
+            "input_path": str(input_path),
+            "input_paths": None,
+            "output_dir": str(output_root),
+        },
+    )
+    history, subscriber = manager.log_store.history_and_subscribe(task_id)
+
+    manager.mark_running(task_id)
+    running = subscriber.get(timeout=0.2)
+    progress_path = output_root / "movie_000001.png"
+    manager.log_store.append(
+        task_id=task_id,
+        level=LogLevel.PROGRESS,
+        phase=LogPhase.RUNNING,
+        message=f"Wrote {progress_path}",
+        details={"current_path": str(progress_path), "progress": 0.25},
+    )
+    progress = subscriber.get(timeout=0.2)
+    terminal_event = redis_tasks_module.LogEventResponse(
+        task_id=task_id,
+        timestamp=datetime.now(UTC),
+        level=LogLevel.SUCCESS,
+        phase=LogPhase.COMPLETED,
+        message=f"Completed {output_root}",
+        details={"output_path": str(output_root), "filename": "result.zip"},
+    )
+    manager._transition_finished(
+        task_id,
+        status=TaskStatus.SUCCEEDED,
+        output_path=f"/api/tasks/{task_id}/download",
+        terminal_event=terminal_event,
+    )
+    completed = subscriber.get(timeout=0.2)
+
+    assert history == []
+    assert running.message == "Task is running"
+    assert progress.message == "Wrote movie_000001.png"
+    assert progress.details == {
+        "current_path": "movie_000001.png",
+        "progress": 0.25,
+    }
+    assert completed.message == f"Completed {output_root.name}"
+    assert completed.details == {
+        "output_path": output_root.name,
+        "filename": "result.zip",
+    }
+
+    failed_task_id = "80000000-0000-0000-0000-000000000000"
+    failed_task = TaskRecord(
+        task_id=failed_task_id,
+        kind=TaskKind.CHROMA_KEYER,
+        status=TaskStatus.RUNNING,
+        created_at=datetime.now(UTC),
+        started_at=datetime.now(UTC),
+        finished_at=None,
+        input_path=input_path.name,
+        output_path=None,
+        error=None,
+        owner_id=None,
+    )
+    manager._save_task(failed_task)
+    manager._save_work(
+        failed_task_id,
+        "chroma_keyer",
+        {
+            "input_path": str(input_path),
+            "output_path": str(output_root / "movie_keyed.png"),
+        },
+    )
+    unknown_path = (
+        tmp_path
+        / "sessions"
+        / session_id
+        / "private files"
+        / task_directory_id
+        / "failure.txt"
+    )
+
+    manager._finalize_external_failure(
+        failed_task_id,
+        f"Decoder failed at {unknown_path}",
+    )
+
+    stored_failure = manager.get_task(failed_task_id)
+    assert stored_failure is not None
+    assert stored_failure.error == "Decoder failed at [managed path]"
+    assert manager.log_store.history(failed_task_id)[-1].message == (
+        "Decoder failed at [managed path]"
+    )
+
+
+def test_hosted_redis_events_preserve_task_paths_outside_data_dir(
+    tmp_path: Path,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = _manager(redis_connection, tmp_path)
+    task_id = "external-path-event"
+    external_input = "D:\\Customer Files\\source.mov"
+    external_output = "D:\\Customer Files\\source_frames"
+    manager._save_work(
+        task_id,
+        "video_frames",
+        {
+            "input_path": external_input,
+            "input_paths": None,
+            "output_dir": external_output,
+        },
+    )
+
+    event = manager.log_store.append(
+        task_id=task_id,
+        level=LogLevel.PROGRESS,
+        phase=LogPhase.RUNNING,
+        message=f"Processing {external_input}",
+        details={"output_path": external_output},
+    )
+
+    assert event.message == f"Processing {external_input}"
+    assert event.details == {"output_path": external_output}
+
+
 def test_redis_subscriber_polls_only_the_event_at_its_cursor() -> None:
     event = redis_tasks_module.LogEventResponse(
         task_id="task-1",

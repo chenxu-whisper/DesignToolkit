@@ -30,6 +30,10 @@ from designtoolkit.web.adapters import (
     media_resize_options_list_from_request,
     video_frame_options_list_from_request,
 )
+from designtoolkit.web.event_sanitization import (
+    sanitize_event_details,
+    sanitize_event_text,
+)
 from designtoolkit.web.heartbeat import (
     DEFAULT_HEARTBEAT_STOP_TIMEOUT_SECONDS,
     HeartbeatStopTimeoutError,
@@ -837,9 +841,11 @@ class RedisLogStore:
         redis_connection: Redis,
         *,
         retention_seconds: int,
+        data_dir: Path | None = None,
     ) -> None:
         self._redis = redis_connection
         self._retention_seconds = retention_seconds
+        self._data_dir = data_dir
         self._append_event_script = self._redis.register_script(
             _APPEND_EVENT_SCRIPT
         )
@@ -867,6 +873,7 @@ class RedisLogStore:
             message=message,
             details=dict(details or {}),
         )
+        event = self.sanitize_event(event)
         event_json = event.model_dump_json()
         try:
             self._append_event_script(
@@ -886,6 +893,47 @@ class RedisLogStore:
                 raise
             self._append_without_lua(task_id, event_json)
         return event
+
+    def sanitize_event(self, event: LogEventResponse) -> LogEventResponse:
+        if self._data_dir is None:
+            return event
+        payload = self._task_payload(event.task_id)
+        return event.model_copy(
+            update={
+                "message": sanitize_event_text(
+                    event.message,
+                    data_dir=self._data_dir,
+                    task_payload=payload,
+                ),
+                "details": sanitize_event_details(
+                    event.details,
+                    data_dir=self._data_dir,
+                    task_payload=payload,
+                ),
+            }
+        )
+
+    def sanitize_text(self, task_id: str, value: str) -> str:
+        if self._data_dir is None:
+            return value
+        return sanitize_event_text(
+            value,
+            data_dir=self._data_dir,
+            task_payload=self._task_payload(task_id),
+        )
+
+    def _task_payload(self, task_id: str) -> dict[str, object] | None:
+        value = self._redis.get(_task_work_key(task_id))
+        if value is None:
+            return None
+        try:
+            work = json.loads(value)
+        except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
+            return None
+        if not isinstance(work, dict):
+            return None
+        payload = work.get("payload")
+        return payload if isinstance(payload, dict) else None
 
     def history(self, task_id: str) -> list[LogEventResponse]:
         _generation, events, _next_sequence = self._snapshot(task_id)
@@ -1371,6 +1419,7 @@ class RedisTaskManager:
         self.log_store = RedisLogStore(
             redis_connection,
             retention_seconds=retention_seconds,
+            data_dir=data_dir,
         )
 
     def create_video_frames_task(
@@ -1500,6 +1549,7 @@ class RedisTaskManager:
             message="Task is running",
             details={},
         )
+        event = self.log_store.sanitize_event(event)
         try:
             result = self._mark_running_script(
                 keys=[
@@ -2923,6 +2973,7 @@ class RedisTaskManager:
             message=_UNCERTAIN_ENQUEUE_ERROR,
             details={},
         )
+        event = self.log_store.sanitize_event(event)
         reconciler_token = uuid4().hex
         if (
             self._claim_expired_enqueue_intent(
@@ -3442,6 +3493,10 @@ class RedisTaskManager:
         terminal_event: LogEventResponse | None = None,
     ) -> tuple[TaskRecord, TerminalTransitionResult]:
         finished_at = datetime.now(UTC)
+        if error is not None:
+            error = self.log_store.sanitize_text(task_id, error)
+        if terminal_event is not None:
+            terminal_event = self.log_store.sanitize_event(terminal_event)
         event_json = (
             terminal_event.model_dump_json() if terminal_event is not None else ""
         )
