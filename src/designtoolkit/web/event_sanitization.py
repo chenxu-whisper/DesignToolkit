@@ -6,14 +6,21 @@ import posixpath
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import date, time, timedelta
+from decimal import Decimal
+from enum import Enum
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Literal
 from urllib.parse import urlsplit
+from uuid import UUID
+
+from pydantic_core import to_jsonable_python
 
 from designtoolkit.web.schemas import LogEventResponse
 
 MANAGED_PATH_PLACEHOLDER = "[managed path]"
 PUBLIC_EVENT_TRUNCATED_MARKER = " [truncated]"
+UNSUPPORTED_PUBLIC_EVENT_VALUE = "[unsupported value]"
 MAX_PUBLIC_EVENT_STRING_LENGTH = 8 * 1024
 MAX_PUBLIC_EVENT_DEPTH = 16
 MAX_PUBLIC_EVENT_NODES = 1024
@@ -102,7 +109,7 @@ class EventSanitizer:
         budget = _TraversalBudget()
         return event.model_copy(
             update={
-                "message": self._sanitize_text(
+                "message": self._sanitize_message(
                     event.message,
                     paths=paths,
                 ),
@@ -189,10 +196,17 @@ class EventSanitizer:
             paths=paths,
             budget=budget,
             depth=0,
+            active_containers=set(),
         )
         if not isinstance(sanitized, dict):
             raise TypeError("Event details must remain a dictionary")
         return sanitized
+
+    def _sanitize_message(self, value: object, *, paths: _TaskPaths) -> str:
+        text = _event_text(value)
+        if text is None:
+            return UNSUPPORTED_PUBLIC_EVENT_VALUE
+        return self._sanitize_text(text, paths=paths)
 
     def _sanitize_nested(
         self,
@@ -201,28 +215,81 @@ class EventSanitizer:
         paths: _TaskPaths,
         budget: _TraversalBudget,
         depth: int,
+        active_containers: set[int],
     ) -> Any:
         if not budget.consume():
             return PUBLIC_EVENT_TRUNCATED_MARKER
+        if isinstance(value, Enum):
+            return self._sanitize_json_scalar(value, paths=paths)
         if isinstance(value, str):
             return self._sanitize_text(
                 value,
                 paths=paths,
             )
-        if depth >= MAX_PUBLIC_EVENT_DEPTH and isinstance(
+        text = _event_text(value)
+        if text is not None:
+            return self._sanitize_text(text, paths=paths)
+        if value is None or isinstance(value, (bool, int, float)):
+            return to_jsonable_python(value, inf_nan_mode="null")
+        if isinstance(value, (date, time, timedelta, Decimal, UUID, complex)):
+            return self._sanitize_json_scalar(value, paths=paths)
+        is_container = isinstance(
             value,
-            (dict, list, tuple),
-        ):
+            (dict, list, tuple, set, frozenset),
+        )
+        if depth >= MAX_PUBLIC_EVENT_DEPTH and is_container:
             return PUBLIC_EVENT_TRUNCATED_MARKER
+        if not is_container:
+            return UNSUPPORTED_PUBLIC_EVENT_VALUE
+        container_id = id(value)
+        if container_id in active_containers:
+            return PUBLIC_EVENT_TRUNCATED_MARKER
+        active_containers.add(container_id)
+        try:
+            return self._sanitize_container(
+                value,
+                paths=paths,
+                budget=budget,
+                depth=depth,
+                active_containers=active_containers,
+            )
+        finally:
+            active_containers.remove(container_id)
+
+    def _sanitize_json_scalar(
+        self,
+        value: object,
+        *,
+        paths: _TaskPaths,
+    ) -> Any:
+        try:
+            normalized = to_jsonable_python(value, inf_nan_mode="null")
+        except (TypeError, ValueError):
+            return UNSUPPORTED_PUBLIC_EVENT_VALUE
+        if isinstance(normalized, str):
+            return self._sanitize_text(normalized, paths=paths)
+        if normalized is None or isinstance(normalized, (bool, int, float)):
+            return normalized
+        return UNSUPPORTED_PUBLIC_EVENT_VALUE
+
+    def _sanitize_container(
+        self,
+        value: dict[Any, Any] | list[Any] | tuple[Any, ...] | set[Any] | frozenset[Any],
+        *,
+        paths: _TaskPaths,
+        budget: _TraversalBudget,
+        depth: int,
+        active_containers: set[int],
+    ) -> dict[str, Any] | list[Any]:
         if isinstance(value, dict):
-            result: dict[Any, Any] = {}
+            result: dict[str, Any] = {}
             for key, item in value.items():
                 if budget.remaining_nodes <= 0:
                     result[PUBLIC_EVENT_TRUNCATED_MARKER] = (
                         PUBLIC_EVENT_TRUNCATED_MARKER
                     )
                     break
-                sanitized_key = self._sanitize_nested(
+                sanitized_key = self._sanitize_mapping_key(
                     key,
                     paths=paths,
                     budget=budget,
@@ -233,40 +300,42 @@ class EventSanitizer:
                     paths=paths,
                     budget=budget,
                     depth=depth + 1,
+                    active_containers=active_containers,
                 )
                 result[sanitized_key] = sanitized_item
             return result
-        if isinstance(value, list):
-            result_list: list[Any] = []
-            for item in value:
-                if budget.remaining_nodes <= 0:
-                    result_list.append(PUBLIC_EVENT_TRUNCATED_MARKER)
-                    break
-                result_list.append(
-                    self._sanitize_nested(
-                        item,
-                        paths=paths,
-                        budget=budget,
-                        depth=depth + 1,
-                    )
+        result_list: list[Any] = []
+        for item in value:
+            if budget.remaining_nodes <= 0:
+                result_list.append(PUBLIC_EVENT_TRUNCATED_MARKER)
+                break
+            result_list.append(
+                self._sanitize_nested(
+                    item,
+                    paths=paths,
+                    budget=budget,
+                    depth=depth + 1,
+                    active_containers=active_containers,
                 )
-            return result_list
-        if isinstance(value, tuple):
-            result_tuple: list[Any] = []
-            for item in value:
-                if budget.remaining_nodes <= 0:
-                    result_tuple.append(PUBLIC_EVENT_TRUNCATED_MARKER)
-                    break
-                result_tuple.append(
-                    self._sanitize_nested(
-                        item,
-                        paths=paths,
-                        budget=budget,
-                        depth=depth + 1,
-                    )
-                )
-            return tuple(result_tuple)
-        return value
+            )
+        return result_list
+
+    def _sanitize_mapping_key(
+        self,
+        value: object,
+        *,
+        paths: _TaskPaths,
+        budget: _TraversalBudget,
+        depth: int,
+    ) -> str:
+        if not budget.consume():
+            return PUBLIC_EVENT_TRUNCATED_MARKER
+        text = _json_key_text(
+            value,
+            budget=budget,
+            depth=depth,
+        )
+        return self._sanitize_text(text, paths=paths)
 
     def _task_paths(
         self,
@@ -277,6 +346,69 @@ class EventSanitizer:
             managed_roots=self._managed_roots,
             path_style=self._path_style,
         )
+
+
+def _event_text(value: object) -> str | None:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        try:
+            return bytes(value).decode("utf-8")
+        except (TypeError, UnicodeDecodeError, ValueError):
+            return None
+    if isinstance(value, os.PathLike):
+        try:
+            raw_path = os.fspath(value)
+        except Exception:
+            return None
+        if isinstance(raw_path, str):
+            return raw_path
+        try:
+            return raw_path.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    return None
+
+
+def _json_key_text(
+    value: object,
+    *,
+    budget: _TraversalBudget,
+    depth: int,
+) -> str:
+    text = _event_text(value)
+    if text is not None:
+        return text
+    if value is None:
+        return "None"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, tuple):
+        if depth >= MAX_PUBLIC_EVENT_DEPTH:
+            return PUBLIC_EVENT_TRUNCATED_MARKER
+        parts: list[str] = []
+        for item in value:
+            if not budget.consume():
+                parts.append(PUBLIC_EVENT_TRUNCATED_MARKER)
+                break
+            parts.append(
+                _json_key_text(
+                    item,
+                    budget=budget,
+                    depth=depth + 1,
+                )
+            )
+        return ",".join(parts)
+    if isinstance(value, (int, float, date, time, timedelta, Decimal, Enum, UUID)):
+        try:
+            normalized = to_jsonable_python(
+                {value: None},
+                inf_nan_mode="null",
+            )
+        except (TypeError, ValueError):
+            return UNSUPPORTED_PUBLIC_EVENT_VALUE
+        return next(iter(normalized))
+    return UNSUPPORTED_PUBLIC_EVENT_VALUE
 
 
 def sanitize_event_text(

@@ -5,7 +5,7 @@ import json
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from queue import Empty
 from random import Random
@@ -5294,6 +5294,224 @@ def test_hosted_event_sanitizer_bounds_nested_details(
 
     assert marker in strings
     assert nodes <= event_sanitization_module.MAX_PUBLIC_EVENT_NODES + 100
+
+
+def test_hosted_event_sanitizer_normalizes_json_values_before_redaction(
+    tmp_path: Path,
+) -> None:
+    class UnsupportedValue:
+        def __repr__(self) -> str:
+            raise AssertionError("repr must not be called")
+
+        def __str__(self) -> str:
+            raise AssertionError("str must not be called")
+
+    class ExplicitPathLike(os.PathLike[str]):
+        def __init__(self, value: str) -> None:
+            self.value = value
+
+        def __fspath__(self) -> str:
+            return self.value
+
+    class BrokenPathLike(os.PathLike[str]):
+        def __fspath__(self) -> str:
+            raise RuntimeError("path conversion failed")
+
+    private_path = (
+        tmp_path
+        / "sessions"
+        / ("1" * 32)
+        / "assets"
+        / ("2" * 32)
+        / "secret.txt"
+    )
+    encoded_path = str(private_path).encode("utf-8")
+    sanitizer = event_sanitization_module.EventSanitizer(tmp_path)
+
+    sanitized = sanitizer.sanitize_details(
+        {
+            "path": private_path,
+            "bytes": encoded_path,
+            "bytearray": bytearray(encoded_path),
+            "memoryview": memoryview(encoded_path),
+            "pathlike": ExplicitPathLike(str(private_path)),
+            "broken_pathlike": BrokenPathLike(),
+            "nested": ({"set": {private_path}},),
+            "unsupported": UnsupportedValue(),
+            "primitives": [None, True, False, 1, 1.5],
+            "date": date(2026, 9, 9),
+            "enum": LogPhase.RUNNING,
+            "keys": {
+                private_path: "path key",
+                (1, 2): "tuple key",
+                False: "bool key",
+            },
+        },
+        task_payload={"input_path": str(private_path)},
+    )
+
+    assert sanitized == {
+        "path": "secret.txt",
+        "bytes": "secret.txt",
+        "bytearray": "secret.txt",
+        "memoryview": "secret.txt",
+        "pathlike": "secret.txt",
+        "broken_pathlike": "[unsupported value]",
+        "nested": [{"set": ["secret.txt"]}],
+        "unsupported": "[unsupported value]",
+        "primitives": [None, True, False, 1, 1.5],
+        "date": "2026-09-09",
+        "enum": "running",
+        "keys": {
+            "secret.txt": "path key",
+            "1,2": "tuple key",
+            "false": "bool key",
+        },
+    }
+    assert json.loads(json.dumps(sanitized)) == sanitized
+
+
+def test_hosted_event_sanitizer_normalizes_pure_windows_paths() -> None:
+    data_dir = PureWindowsPath("C:/service/data")
+    private_path = (
+        data_dir
+        / "sessions"
+        / ("3" * 32)
+        / "assets"
+        / ("4" * 32)
+        / "secret.txt"
+    )
+
+    sanitized = event_sanitization_module.sanitize_event_details(
+        {"path": private_path, "keys": {private_path: "value"}},
+        data_dir=data_dir,
+        task_payload={"input_path": str(private_path)},
+    )
+
+    assert sanitized == {
+        "path": "secret.txt",
+        "keys": {"secret.txt": "value"},
+    }
+
+
+def test_hosted_event_sanitizer_keeps_message_string_and_bounds_cycles(
+    tmp_path: Path,
+) -> None:
+    private_path = tmp_path / "sessions" / ("5" * 32) / "secret.txt"
+    cyclic: list[object] = []
+    cyclic.append(cyclic)
+    event = redis_tasks_module.LogEventResponse.model_construct(
+        task_id="constructed-event",
+        timestamp=datetime.now(UTC),
+        level=LogLevel.INFO,
+        phase=LogPhase.RUNNING,
+        message=private_path,
+        details={"cyclic": cyclic},
+    )
+
+    sanitized = event_sanitization_module.EventSanitizer(tmp_path).sanitize_event(
+        event,
+        task_payload={"input_path": str(private_path)},
+    )
+
+    assert sanitized.message == "secret.txt"
+    assert isinstance(sanitized.message, str)
+    assert event_sanitization_module.PUBLIC_EVENT_TRUNCATED_MARKER in (
+        sanitized.model_dump_json()
+    )
+
+
+def test_hosted_event_sanitizer_fuzzes_mixed_serializable_values(
+    tmp_path: Path,
+) -> None:
+    class UnsupportedValue:
+        pass
+
+    random = Random(91_307)
+    session_id = "6" * 32
+    private_path = tmp_path / "sessions" / session_id / "private.txt"
+    path_bytes = str(private_path).encode("utf-8")
+    scalar_values: list[object] = [
+        private_path,
+        path_bytes,
+        bytearray(path_bytes),
+        memoryview(path_bytes),
+        UnsupportedValue(),
+        None,
+        True,
+        False,
+        0,
+        3.25,
+        "ordinary",
+        date(2026, 9, 9),
+        LogLevel.INFO,
+    ]
+    details: dict[str, object] = {}
+    for index in range(200):
+        value = random.choice(scalar_values)
+        for _ in range(random.randrange(4)):
+            wrapper = random.choice(("list", "tuple", "dict"))
+            if wrapper == "list":
+                value = [value]
+            elif wrapper == "tuple":
+                value = (value,)
+            else:
+                value = {private_path: value}
+        details[f"value-{index}"] = value
+    cycle: dict[str, object] = {}
+    cycle["self"] = cycle
+    details["cycle"] = cycle
+
+    sanitized = event_sanitization_module.sanitize_event_details(
+        details,
+        data_dir=tmp_path,
+        task_payload={"input_path": str(private_path)},
+    )
+    serialized = json.dumps(sanitized, ensure_ascii=False)
+
+    assert str(tmp_path).replace("\\", "/") not in serialized.replace("\\", "/")
+    assert session_id not in serialized
+    assert json.loads(serialized) == sanitized
+
+
+def test_hosted_redis_event_json_and_history_redact_serialized_detail_values(
+    tmp_path: Path,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = _manager(redis_connection, tmp_path)
+    task_id = "serialized-detail-values"
+    session_id = "7" * 32
+    private_path = tmp_path / "sessions" / session_id / "secret.txt"
+    manager._save_work(
+        task_id,
+        "video_frames",
+        {"input_path": str(private_path)},
+    )
+
+    appended = manager.log_store.append(
+        task_id=task_id,
+        level=LogLevel.INFO,
+        phase=LogPhase.RUNNING,
+        message="Processing",
+        details={
+            "path": private_path,
+            "bytes": str(private_path).encode("utf-8"),
+            "tuple": (private_path,),
+        },
+    )
+    stored = redis_connection.lindex(f"dt:task:{task_id}:events", 0)
+    history = manager.log_store.history(task_id)
+
+    assert appended.details == {
+        "path": "secret.txt",
+        "bytes": "secret.txt",
+        "tuple": ["secret.txt"],
+    }
+    assert stored is not None
+    stored_text = stored.decode("utf-8")
+    assert str(tmp_path).replace("\\", "/") not in stored_text.replace("\\", "/")
+    assert session_id not in stored_text
+    assert history == [appended]
 
 
 def test_hosted_event_sanitizer_handles_hostile_6kb_text_in_under_half_second(

@@ -776,6 +776,75 @@ def test_hosted_event_stream_sanitizes_injected_memory_history_and_live_events(
     assert "3" * 32 not in response.text
 
 
+def test_hosted_event_stream_redacts_values_serialized_after_sanitization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    log_store = LogStore()
+    manager = TaskManager(log_store=log_store, run_async=False)
+    subscribed = Event()
+    original_subscribe = log_store.history_and_subscribe
+
+    def tracked_subscribe(task_id: str):
+        result = original_subscribe(task_id)
+        subscribed.set()
+        return result
+
+    monkeypatch.setattr(log_store, "history_and_subscribe", tracked_subscribe)
+    session_id = "9" * 32
+    private_path = tmp_path / "sessions" / session_id / "private.log"
+    with _client(tmp_path, task_manager=manager) as client:
+        client.get("/api/config")
+        task = manager.reserve_task(
+            kind=TaskKind.VIDEO_FRAMES,
+            input_path=str(private_path),
+            output_path=None,
+            owner_id=client.cookies["dt_session"],
+        )
+        log_store.append(
+            task_id=task.task_id,
+            level=LogLevel.INFO,
+            phase=LogPhase.RUNNING,
+            message="History",
+            details={
+                "path": private_path,
+                "bytes": str(private_path).encode("utf-8"),
+            },
+        )
+
+        def publish_live_event() -> None:
+            assert subscribed.wait(timeout=1)
+            log_store.append(
+                task_id=task.task_id,
+                level=LogLevel.SUCCESS,
+                phase=LogPhase.COMPLETED,
+                message="Live",
+                details={"nested": ({private_path},)},
+            )
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            publisher = executor.submit(publish_live_event)
+            response = client.get(f"/api/tasks/{task.task_id}/events")
+            publisher.result(timeout=2)
+
+    payloads = [
+        json.loads(line.removeprefix("data: "))
+        for line in response.text.splitlines()
+        if line.startswith("data: ")
+    ]
+    history = next(
+        payload for payload in payloads if payload["message"] == "History"
+    )
+    live = next(payload for payload in payloads if payload["message"] == "Live")
+    assert history["details"] == {
+        "path": "private.log",
+        "bytes": "private.log",
+    }
+    assert live["details"] == {"nested": [["private.log"]]}
+    assert str(tmp_path).replace("\\", "/") not in response.text.replace("\\", "/")
+    assert session_id not in response.text
+
+
 def test_local_event_stream_preserves_injected_memory_store_paths(
     tmp_path: Path,
 ) -> None:
