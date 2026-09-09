@@ -3236,6 +3236,8 @@ class RedisTaskManager:
             )
         if result == 5:
             return True
+        if result == 6:
+            raise CorruptTaskPinError("Task pin Redis key type is invalid")
         if result in {0, 2, 3, 4}:
             return self._repair_task_reverse_indexes(task_id)
         return result == 1

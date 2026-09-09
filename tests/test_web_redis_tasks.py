@@ -1414,15 +1414,95 @@ def test_real_redis_task_pin_normal_release_does_not_scan(
 
 @pytest.mark.parametrize("use_lua", [True, False], ids=["lua", "fallback"])
 @pytest.mark.parametrize(
-    "receipt_kind",
-    ["string", "list", "set", "hash-extra"],
+    ("wrong_index", "wrong_type"),
+    [(0, "string"), (1, "list"), (2, "hash")],
+    ids=["first-string", "middle-list", "last-hash"],
 )
-def test_real_redis_task_pin_release_atomically_normalizes_receipt(
+def test_real_redis_task_pin_release_preflights_all_reverse_index_types(
     real_redis_connection: Redis,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     use_lua: bool,
-    receipt_kind: str,
+    wrong_index: int,
+    wrong_type: str,
+) -> None:
+    manager = _manager(real_redis_connection, tmp_path)
+    session_id = "a" * 32
+    identities = (
+        ("1" * 32, "3" * 32),
+        ("2" * 32, "4" * 32),
+    )
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_paths=[str(tmp_path / "clip.mp4")] * 2),
+        owner_id=session_id,
+        asset_identities=identities,
+    )
+    pin_key = f"dt:resource:task-pin:{task.task_id}"
+    receipt_key = f"dt:resource:task-pin-release-receipt:{task.task_id}"
+    reverse_keys = [
+        f"dt:resource:asset-tasks:{session_id}:{asset_id}"
+        for asset_id, _generation_id in identities
+    ]
+    reverse_keys.append(f"dt:resource:session:{session_id}:task-pins")
+    corrupt_key = reverse_keys[wrong_index]
+    real_redis_connection.delete(corrupt_key)
+    if wrong_type == "string":
+        real_redis_connection.set(corrupt_key, b"\x00corrupt-string")
+    elif wrong_type == "list":
+        real_redis_connection.rpush(
+            corrupt_key,
+            b"\x00corrupt-list-first",
+            b"\x00corrupt-list-last",
+        )
+    else:
+        real_redis_connection.hset(
+            corrupt_key,
+            mapping={b"\x00corrupt-field": b"\x00corrupt-value"},
+        )
+    if not use_lua:
+        monkeypatch.setattr(
+            manager,
+            "_release_task_pin_script",
+            lambda **_kwargs: (_ for _ in ()).throw(
+                ResponseError("unknown command 'evalsha'")
+            ),
+        )
+    snapshot_keys = [pin_key, receipt_key, *reverse_keys]
+    snapshot = {
+        key: real_redis_connection.dump(key)
+        for key in snapshot_keys
+    }
+
+    with pytest.raises(
+        CorruptTaskPinError,
+        match="Redis key type is invalid",
+    ):
+        manager.release_task_pin(task.task_id)
+
+    assert {
+        key: real_redis_connection.dump(key)
+        for key in snapshot_keys
+    } == snapshot
+    assert not real_redis_connection.exists(receipt_key)
+
+    real_redis_connection.delete(corrupt_key)
+    real_redis_connection.sadd(corrupt_key, task.task_id)
+
+    assert manager.release_task_pin(task.task_id)
+    assert not real_redis_connection.exists(pin_key)
+    assert all(
+        not real_redis_connection.exists(key)
+        for key in reverse_keys
+    )
+    assert real_redis_connection.hgetall(receipt_key)
+
+
+@pytest.mark.parametrize("use_lua", [True, False], ids=["lua", "fallback"])
+def test_real_redis_task_pin_release_atomically_normalizes_hash_receipt(
+    real_redis_connection: Redis,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    use_lua: bool,
 ) -> None:
     retention_seconds = 300
     manager = _manager(
@@ -1442,20 +1522,13 @@ def test_real_redis_task_pin_release_atomically_normalizes_receipt(
     session_pins_key = f"dt:resource:session:{session_id}:task-pins"
     asset_tasks_key = f"dt:resource:asset-tasks:{session_id}:{asset_id}"
     receipt_key = f"dt:resource:task-pin-release-receipt:{task.task_id}"
-    if receipt_kind == "string":
-        real_redis_connection.set(receipt_key, "corrupt")
-    elif receipt_kind == "list":
-        real_redis_connection.rpush(receipt_key, "corrupt")
-    elif receipt_kind == "set":
-        real_redis_connection.sadd(receipt_key, "corrupt")
-    else:
-        real_redis_connection.hset(
-            receipt_key,
-            mapping={
-                "task_id": "wrong",
-                "extra": "must-be-removed",
-            },
-        )
+    real_redis_connection.hset(
+        receipt_key,
+        mapping={
+            "task_id": "wrong",
+            "extra": "must-be-removed",
+        },
+    )
     if not use_lua:
         monkeypatch.setattr(
             manager,
@@ -1495,6 +1568,72 @@ def test_real_redis_task_pin_release_atomically_normalizes_receipt(
         retention_seconds,
     )
     assert manager.release_task_pin(task.task_id)
+
+
+@pytest.mark.parametrize("use_lua", [True, False], ids=["lua", "fallback"])
+@pytest.mark.parametrize("receipt_type", ["string", "list", "set"])
+def test_real_redis_task_pin_release_rejects_wrong_type_receipt_before_writes(
+    real_redis_connection: Redis,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    use_lua: bool,
+    receipt_type: str,
+) -> None:
+    manager = _manager(real_redis_connection, tmp_path)
+    session_id = "a" * 32
+    asset_id = "1" * 32
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+        owner_id=session_id,
+        asset_identities=((asset_id, "2" * 32),),
+    )
+    pin_key = f"dt:resource:task-pin:{task.task_id}"
+    session_pins_key = f"dt:resource:session:{session_id}:task-pins"
+    asset_tasks_key = f"dt:resource:asset-tasks:{session_id}:{asset_id}"
+    receipt_key = f"dt:resource:task-pin-release-receipt:{task.task_id}"
+    if receipt_type == "string":
+        real_redis_connection.set(receipt_key, b"\x00corrupt-string")
+    elif receipt_type == "list":
+        real_redis_connection.rpush(receipt_key, b"\x00corrupt-list")
+    else:
+        real_redis_connection.sadd(receipt_key, b"\x00corrupt-set")
+    if not use_lua:
+        monkeypatch.setattr(
+            manager,
+            "_release_task_pin_script",
+            lambda **_kwargs: (_ for _ in ()).throw(
+                ResponseError("unknown command 'evalsha'")
+            ),
+        )
+    snapshot_keys = [
+        pin_key,
+        receipt_key,
+        session_pins_key,
+        asset_tasks_key,
+    ]
+    snapshot = {
+        key: real_redis_connection.dump(key)
+        for key in snapshot_keys
+    }
+
+    with pytest.raises(
+        CorruptTaskPinError,
+        match="Redis key type is invalid",
+    ):
+        manager.release_task_pin(task.task_id)
+
+    assert {
+        key: real_redis_connection.dump(key)
+        for key in snapshot_keys
+    } == snapshot
+
+    real_redis_connection.delete(receipt_key)
+
+    assert manager.release_task_pin(task.task_id)
+    assert not real_redis_connection.exists(pin_key)
+    assert not real_redis_connection.exists(session_pins_key)
+    assert not real_redis_connection.exists(asset_tasks_key)
+    assert real_redis_connection.hgetall(receipt_key)
 
 
 @pytest.mark.parametrize("use_lua", [True, False], ids=["lua", "fallback"])

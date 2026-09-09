@@ -1619,8 +1619,16 @@ return 1
 """
 
 _RELEASE_TASK_PIN_SCRIPT = """-- release_task_pin
-if redis.call("EXISTS", KEYS[1]) == 0 then
-    if redis.call("TYPE", KEYS[3])["ok"] == "hash"
+local pin_type = redis.call("TYPE", KEYS[1])["ok"]
+local session_index_type = redis.call("TYPE", KEYS[2])["ok"]
+local receipt_type = redis.call("TYPE", KEYS[3])["ok"]
+if (pin_type ~= "none" and pin_type ~= "hash")
+    or (session_index_type ~= "none" and session_index_type ~= "set")
+    or (receipt_type ~= "none" and receipt_type ~= "hash") then
+    return 6
+end
+if pin_type == "none" then
+    if receipt_type == "hash"
         and redis.call("HGET", KEYS[3], "session_id") == ARGV[1]
         and redis.call("HGET", KEYS[3], "task_id") == ARGV[2]
         and redis.call("HGET", KEYS[3], "asset_identities") == ARGV[4]
@@ -1709,12 +1717,19 @@ for _, asset_id in ipairs(asset_ids) do
         return 3
     end
 end
-local receipt_type = redis.call("TYPE", KEYS[3])["ok"]
-if receipt_type ~= "none" then
+local asset_task_keys = {}
+for index, asset_id in ipairs(asset_ids) do
+    local asset_tasks_key = ARGV[3] .. ARGV[1] .. ":" .. asset_id
+    asset_task_keys[index] = asset_tasks_key
+    local asset_tasks_type = redis.call("TYPE", asset_tasks_key)["ok"]
+    if asset_tasks_type ~= "none" and asset_tasks_type ~= "set" then
+        return 6
+    end
+end
+if receipt_type == "hash" then
     redis.call("DEL", KEYS[3])
 end
-for _, asset_id in ipairs(asset_ids) do
-    local asset_tasks_key = ARGV[3] .. ARGV[1] .. ":" .. asset_id
+for _, asset_tasks_key in ipairs(asset_task_keys) do
     redis.call("SREM", asset_tasks_key, ARGV[2])
     if redis.call("SCARD", asset_tasks_key) == 0 then
         redis.call("DEL", asset_tasks_key)
@@ -3259,6 +3274,8 @@ class RedisResourceCoordinator:
             raise CorruptTaskPinError("Task pin ownership is invalid")
         if result in {3, 4}:
             raise CorruptTaskPinError("Task pin asset metadata is invalid")
+        if result == 6:
+            raise CorruptTaskPinError("Task pin Redis key type is invalid")
         return result == 1
 
     def output_reserved_bytes(self) -> int:
@@ -3601,18 +3618,47 @@ def _release_task_pin_without_lua(
     asset_ids_json: str,
     receipt_ttl_ms: int,
 ) -> int:
+    asset_ids = json.loads(asset_ids_json)
+    asset_task_keys = [
+        _asset_tasks_key(session_id, asset_id)
+        for asset_id in asset_ids
+    ]
+    watched_keys = [
+        pin_key,
+        session_task_pins_key,
+        receipt_key,
+        *asset_task_keys,
+    ]
     while True:
         with redis_connection.pipeline() as pipeline:
             try:
-                pipeline.watch(
-                    pin_key,
-                    session_task_pins_key,
-                    receipt_key,
-                )
+                pipeline.watch(*watched_keys)
+                pin_type = pipeline.type(pin_key)
+                session_index_type = pipeline.type(session_task_pins_key)
+                receipt_type = pipeline.type(receipt_key)
+                asset_task_types = [
+                    pipeline.type(asset_task_key)
+                    for asset_task_key in asset_task_keys
+                ]
+                if (
+                    pin_type not in {b"none", "none", b"hash", "hash"}
+                    or session_index_type
+                    not in {b"none", "none", b"set", "set"}
+                    or receipt_type
+                    not in {b"none", "none", b"hash", "hash"}
+                    or any(
+                        key_type not in {b"none", "none", b"set", "set"}
+                        for key_type in asset_task_types
+                    )
+                ):
+                    pipeline.reset()
+                    raise CorruptTaskPinError(
+                        "Task pin Redis key type is invalid"
+                    )
                 metadata = pipeline.hgetall(pin_key)
                 if not metadata:
                     receipt_matches = False
-                    if pipeline.type(receipt_key) in {b"hash", "hash"}:
+                    if receipt_type in {b"hash", "hash"}:
                         receipt_matches = _task_pin_release_metadata_matches(
                             pipeline.hgetall(receipt_key),
                             task_id=task_id,
@@ -3637,15 +3683,9 @@ def _release_task_pin_without_lua(
                 ):
                     pipeline.unwatch()
                     return 4
-                asset_ids = json.loads(asset_ids_json)
-                asset_task_keys = [
-                    _asset_tasks_key(session_id, asset_id)
-                    for asset_id in asset_ids
-                ]
-                if asset_task_keys:
-                    pipeline.watch(*asset_task_keys)
                 pipeline.multi()
-                pipeline.delete(receipt_key)
+                if receipt_type in {b"hash", "hash"}:
+                    pipeline.delete(receipt_key)
                 for asset_task_key in asset_task_keys:
                     pipeline.srem(asset_task_key, task_id)
                 pipeline.delete(pin_key)
