@@ -7645,6 +7645,27 @@ def test_external_failure_discards_output_before_releasing_task_lease(
     assert not output_root.exists()
 
 
+def test_worker_cleanup_removes_only_its_hosted_task_root(
+    tmp_path: Path,
+) -> None:
+    session_id = "a" * 32
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    failed_root = storage.create_task_dir(session_id)
+    concurrent_root = storage.create_task_dir(session_id)
+    (failed_root / "partial.bin").write_bytes(b"partial")
+    (concurrent_root / "result.bin").write_bytes(b"concurrent")
+    state = _manager(fakeredis.FakeRedis(decode_responses=False), tmp_path)
+    executor = RedisTaskExecutor(state)
+    executor._output_root = failed_root
+
+    executor._discard_partial_output()
+
+    assert failed_root.parent == concurrent_root.parent
+    assert failed_root != concurrent_root
+    assert not failed_root.exists()
+    assert (concurrent_root / "result.bin").read_bytes() == b"concurrent"
+
+
 def test_reconciler_retries_cleanup_after_crash_following_terminal_cas(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

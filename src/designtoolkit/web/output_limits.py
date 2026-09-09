@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from stat import S_ISREG
 from threading import RLock
 from typing import BinaryIO
 
 type FileIdentity = tuple[str, int, int] | tuple[str, Path]
+
+_TEMPORARY_NAME = re.compile(r"\..+\.[0-9a-f]{32}\.tmp\Z")
 
 
 class OutputLimitExceeded(RuntimeError):
@@ -141,15 +144,16 @@ class OutputBudgetGuard:
 
     def publish(self, source: str | Path, target: str | Path) -> None:
         with self._lock:
-            resolved_source = self._contained_path(Path(source))
+            resolved_source = self._temporary_path(Path(source))
             resolved_target = self._contained_path(Path(target))
             identity = self._path_identities.get(resolved_source)
-            if identity is None:
-                stat_result = resolved_source.stat()
-                identity = self._identity(
-                    resolved_source,
-                    stat_result.st_dev,
-                    stat_result.st_ino,
+            if (
+                identity is None
+                or identity not in self._created_identities
+            ):
+                raise ValueError(
+                    "Publication source is not a registered temporary file: "
+                    f"{resolved_source}"
                 )
             try:
                 os.link(resolved_source, resolved_target)
@@ -160,10 +164,17 @@ class OutputBudgetGuard:
             try:
                 resolved_source.unlink()
                 self._path_identities.pop(resolved_source, None)
+                self._transfer_published_identity(
+                    identity,
+                    resolved_target,
+                )
                 _fsync_parent_directory(resolved_target.parent)
             except BaseException:
-                self.rollback_created(resolved_target)
                 self._discard_publication_source(resolved_source)
+                self._transfer_published_identity(
+                    identity,
+                    resolved_target,
+                )
                 raise
 
     def truncate(
@@ -207,9 +218,9 @@ class OutputBudgetGuard:
             )
             return result
 
-    def rollback_created(self, path: str | Path) -> None:
+    def discard_temporary(self, path: str | Path) -> None:
         with self._lock:
-            resolved = self._contained_entry_path(Path(path))
+            resolved = self._temporary_path(Path(path))
             identity = self._path_identities.get(resolved)
             if identity is None or identity not in self._created_identities:
                 return
@@ -273,6 +284,11 @@ class OutputBudgetGuard:
 
     def check_tree(self) -> None:
         if not self.root.exists():
+            with self._lock:
+                self._used_bytes = 0
+                self._sizes.clear()
+                self._path_identities.clear()
+                self._created_identities.clear()
             return
         current_sizes: dict[FileIdentity, int] = {}
         current_paths: dict[Path, FileIdentity] = {}
@@ -289,11 +305,11 @@ class OutputBudgetGuard:
                 )
                 current_sizes[identity] = stat_result.st_size
                 current_paths[resolved] = identity
-                previous_size = self._sizes.get(identity, 0)
-                self._used_bytes += max(stat_result.st_size - previous_size, 0)
-                self._sizes[identity] = stat_result.st_size
-            self._path_identities.update(current_paths)
-            self._enforce(max(self._used_bytes, sum(current_sizes.values())))
+            self._used_bytes = sum(current_sizes.values())
+            self._sizes = current_sizes
+            self._path_identities = current_paths
+            self._created_identities.intersection_update(current_sizes)
+            self._enforce(self._used_bytes)
 
     def _account_open_file(
         self,
@@ -314,7 +330,26 @@ class OutputBudgetGuard:
         self._path_identities[resolved] = identity
 
     def _discard_publication_source(self, source: Path) -> None:
-        self.rollback_created(source)
+        self.discard_temporary(source)
+
+    def _transfer_published_identity(
+        self,
+        identity: FileIdentity,
+        target: Path,
+    ) -> None:
+        if identity[0] != "path":
+            return
+        target_identity: FileIdentity = ("path", target)
+        size = self._sizes.pop(identity, 0)
+        self._sizes[target_identity] = size
+        if identity in self._created_identities:
+            self._created_identities.remove(identity)
+            self._created_identities.add(target_identity)
+        for known_path, known_identity in tuple(
+            self._path_identities.items()
+        ):
+            if known_identity == identity:
+                self._path_identities[known_path] = target_identity
 
     def _contained_path(self, path: Path) -> Path:
         resolved = Path(path).resolve()
@@ -335,6 +370,15 @@ class OutputBudgetGuard:
             raise ValueError(
                 f"Output path is outside output root: {resolved}"
             ) from exc
+        return resolved
+
+    def _temporary_path(self, path: Path) -> Path:
+        resolved = self._contained_entry_path(path)
+        if _TEMPORARY_NAME.fullmatch(resolved.name) is None:
+            raise ValueError(
+                "Output path is not a unique hidden temporary file: "
+                f"{resolved}"
+            )
         return resolved
 
     @staticmethod

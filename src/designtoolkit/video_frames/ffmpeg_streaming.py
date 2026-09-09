@@ -59,6 +59,12 @@ class PamFrame:
     pixels: bytes
 
 
+@dataclass(frozen=True)
+class _PendingPublication:
+    temporary: Path
+    target: Path
+
+
 class PamStreamParser:
     def __init__(
         self,
@@ -201,8 +207,7 @@ class GuardedFfmpegOutput:
         self._single_frame: PamFrame | None = None
         self._frame_index = _sequence_start_number(command)
         self._frame_count = 0
-        self._temporary_paths: list[Path] = []
-        self._published_paths: list[Path] = []
+        self._pending_publications: list[_PendingPublication] = []
         self._is_video = False
         self._video_file: BinaryIO | None = None
         self._video_temporary: Path | None = None
@@ -327,10 +332,7 @@ class GuardedFfmpegOutput:
             os.fsync(self._video_file.fileno())
             self._video_file.close()
             self._video_file = None
-            self._published_paths.append(self._target)
-            self._guard.publish(temporary, self._target)
-            self._temporary_paths.remove(temporary)
-            self._video_temporary = None
+            self._publish_pending()
             return
         if self._parser is None:
             raise RuntimeError("Guarded image parser is unavailable")
@@ -345,6 +347,7 @@ class GuardedFfmpegOutput:
                 raise RuntimeError("Guarded single image frame is unavailable")
             self._write_image(frame, self._target)
             self._single_frame = None
+        self._publish_pending()
 
     def rollback(self) -> None:
         errors: list[BaseException] = []
@@ -354,18 +357,12 @@ class GuardedFfmpegOutput:
             except BaseException as exc:
                 errors.append(exc)
             self._video_file = None
-        for path in reversed(self._published_paths):
+        for publication in reversed(self._pending_publications):
             try:
-                self._guard.rollback_created(path)
+                self._guard.discard_temporary(publication.temporary)
             except BaseException as exc:
                 errors.append(exc)
-        for path in reversed(self._temporary_paths):
-            try:
-                self._rollback_path(path)
-            except BaseException as exc:
-                errors.append(exc)
-        self._temporary_paths.clear()
-        self._published_paths.clear()
+        self._pending_publications.clear()
         self._video_temporary = None
         if errors:
             raise errors[0]
@@ -375,8 +372,6 @@ class GuardedFfmpegOutput:
         temporary = self._target.with_name(
             f".{self._target.name}.{uuid.uuid4().hex}.tmp"
         )
-        self._temporary_paths.append(temporary)
-        self._video_temporary = temporary
         file = temporary.open("x+b")
         try:
             self._guard.register_created(file, temporary)
@@ -384,6 +379,10 @@ class GuardedFfmpegOutput:
             file.close()
             temporary.unlink(missing_ok=True)
             raise
+        self._pending_publications.append(
+            _PendingPublication(temporary, self._target)
+        )
+        self._video_temporary = temporary
         self._video_file = file
 
     def _frame_target(self) -> Path:
@@ -402,7 +401,6 @@ class GuardedFfmpegOutput:
         temporary = target.with_name(
             f".{target.name}.{uuid.uuid4().hex}.tmp"
         )
-        self._temporary_paths.append(temporary)
         try:
             with temporary.open("x+b") as raw_file:
                 self._guard.register_created(raw_file, temporary)
@@ -421,20 +419,19 @@ class GuardedFfmpegOutput:
                         image.save(file, format=self._image_format)
                 file.flush()
                 os.fsync(raw_file.fileno())
-            self._published_paths.append(target)
-            self._guard.publish(temporary, target)
-            self._temporary_paths.remove(temporary)
+            self._pending_publications.append(
+                _PendingPublication(temporary, target)
+            )
         except BaseException:
-            self._rollback_path(temporary)
+            self._guard.discard_temporary(temporary)
             raise
 
-    def _rollback_path(self, path: Path) -> None:
-        try:
-            self._guard.rollback_created(path)
-        finally:
-            path.unlink(missing_ok=True)
-            if path in self._temporary_paths:
-                self._temporary_paths.remove(path)
+    def _publish_pending(self) -> None:
+        for publication in self._pending_publications:
+            self._guard.publish(
+                publication.temporary,
+                publication.target,
+            )
 
 
 def _sequence_start_number(command: Sequence[str]) -> int:

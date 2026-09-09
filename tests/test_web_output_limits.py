@@ -120,14 +120,14 @@ def test_budgeted_write_accounts_partial_growth_and_not_seek_rewrites(
     assert guard.used_bytes == 2
 
 
-def test_budgeted_publish_preserves_identity_and_rollback_releases_extent(
+def test_budgeted_publish_preserves_identity_and_rejects_target_discard(
     tmp_path: Path,
 ) -> None:
     guard = OutputBudgetGuard(tmp_path, max_bytes=100)
-    temporary = tmp_path / ".output.tmp"
+    temporary = tmp_path / f".output.bin.{'1' * 32}.tmp"
     target = tmp_path / "output.bin"
 
-    with temporary.open("w+b") as file:
+    with temporary.open("x+b") as file:
         guard.register_created(file, temporary)
         guard.write(file, temporary, b"1234")
     guard.publish(temporary, target)
@@ -137,120 +137,101 @@ def test_budgeted_publish_preserves_identity_and_rollback_releases_extent(
     assert not temporary.exists()
     assert target.read_bytes() == b"1234"
 
-    guard.rollback_created(target)
+    with pytest.raises(ValueError, match="unique hidden temporary"):
+        guard.discard_temporary(target)
 
-    assert not target.exists()
-    assert guard.used_bytes == 0
-    assert guard.remaining_bytes == 99
-
-
-def test_rollback_preserves_concurrent_replacement_and_releases_old_extent(
-    tmp_path: Path,
-) -> None:
-    guard = OutputBudgetGuard(tmp_path, max_bytes=100)
-    temporary = tmp_path / ".output.tmp"
-    replacement = tmp_path / ".replacement.tmp"
-    target = tmp_path / "output.bin"
-    published = Barrier(2)
-    replaced = Barrier(2)
-
-    with temporary.open("x+b") as file:
-        guard.register_created(file, temporary)
-        guard.write(file, temporary, b"old")
-    guard.publish(temporary, target)
-    replacement.write_bytes(b"new-content")
-
-    def replace_target() -> None:
-        published.wait(timeout=5)
-        os.replace(replacement, target)
-        replaced.wait(timeout=5)
-
-    thread = Thread(target=replace_target)
-    thread.start()
-    published.wait(timeout=5)
-    replaced.wait(timeout=5)
-    guard.rollback_created(target)
-    thread.join(timeout=5)
-
-    assert not thread.is_alive()
-    assert target.read_bytes() == b"new-content"
-    assert guard.used_bytes == 0
+    assert target.read_bytes() == b"1234"
+    assert guard.used_bytes == 4
 
 
-def test_rollback_preserves_symlink_replacement_without_following_it(
-    tmp_path: Path,
-) -> None:
-    guard = OutputBudgetGuard(tmp_path, max_bytes=100)
-    temporary = tmp_path / ".output.tmp"
-    target = tmp_path / "output.bin"
-    external = tmp_path / "external.bin"
-
-    with temporary.open("x+b") as file:
-        guard.register_created(file, temporary)
-        guard.write(file, temporary, b"old")
-    guard.publish(temporary, target)
-    target.unlink()
-    external.write_bytes(b"external")
-    try:
-        target.symlink_to(external)
-    except OSError as exc:
-        pytest.skip(f"symlinks are unavailable: {exc}")
-
-    guard.rollback_created(target)
-
-    assert target.is_symlink()
-    assert target.read_bytes() == b"external"
-    assert external.read_bytes() == b"external"
-    assert guard.used_bytes == 0
-
-
-def test_rollback_preserves_replacement_when_inode_identity_is_unavailable(
+def test_budgeted_publish_transfers_path_identity_without_double_counting(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     guard = OutputBudgetGuard(tmp_path, max_bytes=100)
-    temporary = tmp_path / ".output.tmp"
-    replacement = tmp_path / ".replacement.tmp"
+    temporary = tmp_path / f".output.bin.{'1' * 32}.tmp"
     target = tmp_path / "output.bin"
     monkeypatch.setattr(
         guard,
         "_identity",
         lambda path, _device, _inode: ("path", path),
     )
+    with temporary.open("x+b") as file:
+        guard.register_created(file, temporary)
+        guard.write(file, temporary, b"1234")
+
+    guard.publish(temporary, target)
+    guard.account(target)
+
+    assert not temporary.exists()
+    assert target.read_bytes() == b"1234"
+    assert guard.used_bytes == 4
+
+
+def test_discard_temporary_removes_owned_unique_temp_and_releases_extent(
+    tmp_path: Path,
+) -> None:
+    guard = OutputBudgetGuard(tmp_path, max_bytes=100)
+    temporary = tmp_path / f".output.bin.{'1' * 32}.tmp"
+
+    with temporary.open("x+b") as file:
+        guard.register_created(file, temporary)
+        guard.write(file, temporary, b"temporary")
+
+    guard.discard_temporary(temporary)
+
+    assert not temporary.exists()
+    assert guard.used_bytes == 0
+
+
+def test_discard_temporary_rejects_non_uuid_name(
+    tmp_path: Path,
+) -> None:
+    guard = OutputBudgetGuard(tmp_path, max_bytes=100)
+    temporary = tmp_path / ".output.tmp"
+
+    with temporary.open("x+b") as file:
+        guard.register_created(file, temporary)
+        guard.write(file, temporary, b"temporary")
+
+    with pytest.raises(ValueError, match="unique hidden temporary"):
+        guard.discard_temporary(temporary)
+
+    assert temporary.read_bytes() == b"temporary"
+    assert guard.used_bytes == 9
+
+
+def test_discard_temporary_preserves_identity_mismatched_replacement(
+    tmp_path: Path,
+) -> None:
+    guard = OutputBudgetGuard(tmp_path, max_bytes=100)
+    temporary = tmp_path / f".output.bin.{'1' * 32}.tmp"
+    replacement = tmp_path / "replacement.bin"
 
     with temporary.open("x+b") as file:
         guard.register_created(file, temporary)
         guard.write(file, temporary, b"old")
-    guard.publish(temporary, target)
     replacement.write_bytes(b"new-content")
-    os.replace(replacement, target)
+    os.replace(replacement, temporary)
 
-    guard.rollback_created(target)
+    guard.discard_temporary(temporary)
 
-    assert target.read_bytes() == b"new-content"
-    assert guard.used_bytes == 3
+    assert temporary.read_bytes() == b"new-content"
+    assert guard.used_bytes == 0
 
 
 def test_budgeted_publish_is_atomic_no_clobber_across_guards(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     publisher_count = 20
     ready = Barrier(publisher_count)
-    replace_race = Barrier(publisher_count)
-    original_replace = os.replace
     target = tmp_path / "output.bin"
     guards: list[OutputBudgetGuard] = []
     temporaries: list[Path] = []
 
-    def racing_replace(source: str | Path, destination: str | Path) -> None:
-        replace_race.wait(timeout=5)
-        original_replace(source, destination)
-
-    monkeypatch.setattr(output_limits.os, "replace", racing_replace)
     for index in range(publisher_count):
         guard = OutputBudgetGuard(tmp_path, max_bytes=100)
-        temporary = tmp_path / f".output.{index}.tmp"
+        temporary = tmp_path / f".output.bin.{index:032x}.tmp"
         with temporary.open("x+b") as file:
             guard.register_created(file, temporary)
             guard.write(file, temporary, str(index).encode("ascii"))
@@ -280,7 +261,7 @@ def test_budgeted_publish_preserves_preexisting_file_and_cleans_temporary(
     tmp_path: Path,
 ) -> None:
     guard = OutputBudgetGuard(tmp_path, max_bytes=100)
-    temporary = tmp_path / ".output.tmp"
+    temporary = tmp_path / f".output.bin.{'1' * 32}.tmp"
     target = tmp_path / "output.bin"
     target.write_bytes(b"preexisting")
     with temporary.open("x+b") as file:
@@ -299,7 +280,7 @@ def test_budgeted_publish_preserves_preexisting_hard_link_target(
     tmp_path: Path,
 ) -> None:
     guard = OutputBudgetGuard(tmp_path, max_bytes=100)
-    temporary = tmp_path / ".output.tmp"
+    temporary = tmp_path / f".output.bin.{'1' * 32}.tmp"
     target = tmp_path / "output.bin"
     with temporary.open("x+b") as file:
         guard.register_created(file, temporary)
@@ -318,7 +299,7 @@ def test_budgeted_publish_rejects_directory_target_and_cleans_temporary(
     tmp_path: Path,
 ) -> None:
     guard = OutputBudgetGuard(tmp_path, max_bytes=100)
-    temporary = tmp_path / ".output.tmp"
+    temporary = tmp_path / f".output.bin.{'1' * 32}.tmp"
     target = tmp_path / "output.bin"
     target.mkdir()
     with temporary.open("x+b") as file:
@@ -338,7 +319,7 @@ def test_budgeted_publish_fails_closed_when_hard_links_are_unavailable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     guard = OutputBudgetGuard(tmp_path, max_bytes=100)
-    temporary = tmp_path / ".output.tmp"
+    temporary = tmp_path / f".output.bin.{'1' * 32}.tmp"
     target = tmp_path / "output.bin"
     with temporary.open("x+b") as file:
         guard.register_created(file, temporary)
@@ -480,6 +461,26 @@ def test_check_tree_finds_unaccounted_nested_output(tmp_path: Path) -> None:
         guard.check_tree()
 
     assert guard.used_bytes == 5
+
+
+def test_check_tree_recomputes_budget_after_task_root_cleanup(
+    tmp_path: Path,
+) -> None:
+    task_root = tmp_path / "task"
+    task_root.mkdir()
+    temporary = task_root / f".output.bin.{'1' * 32}.tmp"
+    guard = OutputBudgetGuard(task_root, max_bytes=100)
+    with temporary.open("x+b") as file:
+        guard.register_created(file, temporary)
+        guard.write(file, temporary, b"partial")
+    assert guard.used_bytes == 7
+
+    temporary.unlink()
+    task_root.rmdir()
+    guard.check_tree()
+
+    assert guard.used_bytes == 0
+    assert guard.remaining_bytes == 99
 
 
 def test_hard_links_are_not_double_counted(tmp_path: Path) -> None:

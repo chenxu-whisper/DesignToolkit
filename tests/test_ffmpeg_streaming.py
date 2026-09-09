@@ -349,6 +349,9 @@ def test_guarded_sequence_publishes_numbered_frames_with_escaped_percent(
         _pam(1, 1, b"\x01\x02\x03\x04")
         + _pam(1, 1, b"\x05\x06\x07\x08")
     )
+    assert not list(tmp_path.glob("clip%take_*.png"))
+    assert len(list(tmp_path.glob(".*.tmp"))) == 2
+
     session.finish()
 
     first = tmp_path / "clip%take_001.png"
@@ -526,6 +529,8 @@ def test_guarded_image_rollback_removes_only_this_run_outputs(
     )
     session.consume(_pam(1, 1, b"abcd") + _pam(1, 1, b"efgh"))
     assert guard.used_bytes > 0
+    assert not list(tmp_path.glob("frame_*.jpg"))
+    assert len(list(tmp_path.glob(".*.tmp"))) == 2
 
     session.rollback()
 
@@ -580,15 +585,43 @@ def test_guarded_publish_race_does_not_delete_preexisting_target_on_rollback(
     assert target.read_bytes() == b"preexisting"
 
 
-def test_guarded_publish_interruption_after_link_is_fully_rolled_back(
+def test_guarded_sequence_publish_conflict_leaves_own_partial_for_task_cleanup(
+    tmp_path: Path,
+) -> None:
+    from designtoolkit.video_frames.ffmpeg_streaming import GuardedFfmpegOutput
+
+    task_root = tmp_path / "task"
+    guard = OutputBudgetGuard(task_root, 1_000_000)
+    session = GuardedFfmpegOutput(
+        ["ffmpeg", str(task_root / "frame_%02d.png")],
+        guard,
+        output_kind="sequence",
+    )
+    session.consume(_pam(1, 1, b"abcd") + _pam(1, 1, b"efgh"))
+    conflict = task_root / "frame_02.png"
+    conflict.write_bytes(b"concurrent")
+
+    with pytest.raises(FileExistsError):
+        session.finish()
+    session.rollback()
+
+    first = task_root / "frame_01.png"
+    assert first.is_file()
+    assert conflict.read_bytes() == b"concurrent"
+    assert not list(task_root.glob(".*.tmp"))
+    assert guard.used_bytes == first.stat().st_size
+
+
+def test_guarded_publish_interruption_leaves_final_for_task_cleanup(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class PublishInterrupted(BaseException):
         pass
 
-    target = tmp_path / "output.png"
-    guard = OutputBudgetGuard(tmp_path, 1_000_000)
+    task_root = tmp_path / "task"
+    target = task_root / "output.png"
+    guard = OutputBudgetGuard(task_root, 1_000_000)
 
     def interrupt_after_link(_parent: Path) -> None:
         raise PublishInterrupted
@@ -610,7 +643,14 @@ def test_guarded_publish_interruption_after_link_is_fully_rolled_back(
     with pytest.raises(PublishInterrupted):
         backend.run(["ffmpeg", str(target)])
 
-    assert not list(tmp_path.iterdir())
+    assert target.is_file()
+    assert not list(task_root.glob(".*.tmp"))
+    assert guard.used_bytes == target.stat().st_size
+
+    target.unlink()
+    task_root.rmdir()
+    guard.check_tree()
+
     assert guard.used_bytes == 0
 
 
@@ -676,6 +716,29 @@ def test_guarded_video_uses_explicit_pipe_muxer_and_atomic_publish(
     assert target.read_bytes() == b"container"
     assert not list(tmp_path.glob(".*.tmp"))
     assert guard.used_bytes == 9
+
+
+@pytest.mark.parametrize("suffix", [".png", ".mp4"])
+def test_guarded_rollback_never_deletes_published_single_output(
+    tmp_path: Path,
+    suffix: str,
+) -> None:
+    from designtoolkit.video_frames.ffmpeg_streaming import GuardedFfmpegOutput
+
+    target = tmp_path / f"output{suffix}"
+    session = GuardedFfmpegOutput(
+        ["ffmpeg", str(target)],
+        OutputBudgetGuard(tmp_path, 1_000_000),
+    )
+    session.consume(
+        _pam(1, 1, b"abcd") if suffix == ".png" else b"container"
+    )
+    session.finish()
+
+    session.rollback()
+
+    assert target.is_file()
+    assert not list(tmp_path.glob(".*.tmp"))
 
 
 def test_guarded_video_rejects_chunk_before_any_over_budget_growth(
@@ -988,10 +1051,19 @@ def test_webm_decoder_fallback_recovers_full_budget_after_failed_first_run(
     second = _StreamingPopen([_pam(1, 1, b"\x01\x02\x03\x04")])
     calls: list[tuple[list[str], dict[str, Any]]] = []
     guard = OutputBudgetGuard(output_dir, 1_000_000)
+
+    def popen(command: list[str], **kwargs: Any) -> _StreamingPopen:
+        if calls:
+            assert not list(output_dir.glob("input%take_*.png"))
+            assert not list(output_dir.glob(".*.tmp"))
+            assert guard.remaining_bytes == 999_999
+        calls.append((command, kwargs))
+        return [first, second][len(calls) - 1]
+
     monkeypatch.setattr(ffmpeg_backend, "os_name", "other")
     backend = FfmpegBackend(
         output_guard=guard,
-        popen=_streaming_popen_factory([first, second], calls),
+        popen=popen,
     )
 
     result = export_video_frames(
