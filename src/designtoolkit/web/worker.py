@@ -508,21 +508,45 @@ def run_task(task_id: str, job_kind: str, payload: dict[str, object]) -> None:
             executor._discard_partial_output()
             state._finalize_external_failure(task_id, str(exc))
     finally:
+        cleanup_steps: list[tuple[str, Callable[[], object]]] = []
         if periodic_heartbeat is not None and not heartbeat_stopped:
-            periodic_heartbeat.stop()
+            cleanup_steps.append(("heartbeat stop", periodic_heartbeat.stop))
         if output is not None:
-            output.release()
+            cleanup_steps.append(("output release", output.release))
         if lease is not None:
-            lease.release()
-        resources.release_task_pin(
-            task_id,
-            expected_session_id=task.owner_id,
-            expected_asset_identities=(
-                task.asset_identities
-                if task.has_canonical_asset_identities
-                else None
-            ),
-        )
+            cleanup_steps.append(("lease release", lease.release))
+        if task.has_canonical_asset_identities:
+            cleanup_steps.append(
+                (
+                    "task pin release",
+                    lambda: resources.release_task_pin(
+                        task_id,
+                        expected_session_id=task.owner_id,
+                        expected_asset_identities=task.asset_identities,
+                    ),
+                )
+            )
+        else:
+            cleanup_steps.append(
+                ("legacy task pin release", lambda: state.release_task_pin(task_id))
+            )
+        _run_cleanup_steps(cleanup_steps)
+
+
+def _run_cleanup_steps(
+    steps: list[tuple[str, Callable[[], object]]],
+) -> None:
+    first_error: BaseException | None = None
+    for name, cleanup in steps:
+        try:
+            cleanup()
+        except BaseException as exc:
+            if first_error is None:
+                first_error = exc
+            else:
+                first_error.add_note(f"{name} also failed: {exc}")
+    if first_error is not None:
+        raise first_error
 
 
 def _task_request(

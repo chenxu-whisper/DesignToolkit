@@ -127,6 +127,9 @@ class TrackingHandle:
 class TrackingTaskResources:
     def __init__(self) -> None:
         self.events: list[str] = []
+        self.task_pin_releases: list[
+            tuple[str, str | None, tuple[tuple[str, str | None], ...] | None]
+        ] = []
         self.lease = TrackingHandle("lease", self.events)
         self.output = TrackingHandle("output", self.events)
         self.session_lease_heartbeat_interval = 5.0
@@ -166,7 +169,7 @@ class TrackingTaskResources:
 
     def release_task_pin(
         self,
-        _task_id: str,
+        task_id: str,
         *,
         expected_session_id: str | None = None,
         expected_asset_identities: (
@@ -175,6 +178,9 @@ class TrackingTaskResources:
     ) -> None:
         assert expected_session_id is not None
         assert expected_asset_identities is not None
+        self.task_pin_releases.append(
+            (task_id, expected_session_id, expected_asset_identities)
+        )
 
 
 def _manager(
@@ -213,6 +219,31 @@ def _hosted_settings(
         min_free_bytes=5,
         task_timeout_seconds=task_timeout_seconds,
         retention_seconds=retention_seconds,
+    )
+
+
+def _patch_worker_dependencies(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    settings: HostedSettings,
+    redis_connection,
+    resources,
+) -> None:
+    monkeypatch.setattr(worker_module.HostedSettings, "from_env", lambda: settings)
+    monkeypatch.setattr(
+        worker_module.Redis,
+        "from_url",
+        lambda _url, **_kwargs: redis_connection,
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "_build_resource_coordinator",
+        lambda _settings, _connection: resources,
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "disk_usage",
+        lambda _path: type("Usage", (), {"free": 20})(),
     )
 
 
@@ -2840,22 +2871,19 @@ def test_run_task_reserves_refreshes_and_releases_worker_resources(
         manager_options.update(kwargs)
         return manager_type(**kwargs)
 
-    monkeypatch.setattr(worker_module.HostedSettings, "from_env", lambda: settings)
+    _patch_worker_dependencies(
+        monkeypatch,
+        settings=settings,
+        redis_connection=redis_connection,
+        resources=resources,
+    )
     monkeypatch.setattr(worker_module, "RedisTaskManager", create_manager)
     monkeypatch.setattr(
-        worker_module.Redis,
-        "from_url",
-        lambda _url, **_kwargs: redis_connection,
-    )
-    monkeypatch.setattr(
-        worker_module,
-        "_build_resource_coordinator",
-        lambda _settings, _connection: resources,
-    )
-    monkeypatch.setattr(
-        worker_module,
-        "disk_usage",
-        lambda _path: type("Usage", (), {"free": 20})(),
+        redis_connection,
+        "scan_iter",
+        lambda **_kwargs: pytest.fail(
+            "canonical worker pin cleanup must not scan"
+        ),
     )
 
     def execute(executor, reserved_task, _request) -> None:
@@ -2890,9 +2918,133 @@ def test_run_task_reserves_refreshes_and_releases_worker_resources(
     assert resources.events.count("refresh:output") >= 2
     assert resources.events.count("refresh:lease") >= 3
     assert resources.events[-2:] == ["release:output", "release:lease"]
+    assert resources.task_pin_releases == [
+        (task.task_id, "a" * 32, ()),
+    ]
     assert manager_options["task_timeout_seconds"] == 9000
     assert manager_options["retention_seconds"] == 300
     assert manager.get_task(task.task_id).status is TaskStatus.SUCCEEDED
+
+
+@pytest.mark.parametrize(
+    ("outcome", "expected_status", "expected_error", "cleanup_error"),
+    [
+        ("success", TaskStatus.SUCCEEDED, None, None),
+        ("failure", TaskStatus.FAILED, "worker failed", None),
+        (
+            "cleanup-failure",
+            TaskStatus.SUCCEEDED,
+            None,
+            "lease release failed",
+        ),
+    ],
+)
+def test_run_task_repairs_legacy_pin_after_terminal_outcome(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: str,
+    expected_status: TaskStatus,
+    expected_error: str | None,
+    cleanup_error: str | None,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    settings = _hosted_settings(tmp_path)
+    resources = TrackingTaskResources()
+    manager = _manager(redis_connection, tmp_path)
+    session_id = "a" * 32
+    asset_id = "1" * 32
+    orphan_asset_id = "2" * 32
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+        owner_id=session_id,
+        asset_identities=((asset_id, "3" * 32),),
+    )
+    task_key = f"dt:task:{task.task_id}"
+    task_data = json.loads(redis_connection.get(task_key))
+    task_data.pop("asset_identities")
+    redis_connection.set(task_key, json.dumps(task_data))
+    redis_connection.sadd(
+        f"dt:resource:asset-tasks:{session_id}:{orphan_asset_id}",
+        task.task_id,
+    )
+    _patch_worker_dependencies(
+        monkeypatch,
+        settings=settings,
+        redis_connection=redis_connection,
+        resources=resources,
+    )
+    manager_release_calls: list[str] = []
+    release_task_pin = RedisTaskManager.release_task_pin
+
+    def track_manager_release(
+        self: RedisTaskManager,
+        released_task_id: str,
+    ) -> bool:
+        manager_release_calls.append(released_task_id)
+        return release_task_pin(self, released_task_id)
+
+    monkeypatch.setattr(
+        RedisTaskManager,
+        "release_task_pin",
+        track_manager_release,
+    )
+    if cleanup_error is not None:
+        release_lease = resources.lease.release
+
+        def release_then_fail() -> None:
+            release_lease()
+            raise RedisConnectionError(cleanup_error)
+
+        monkeypatch.setattr(resources.lease, "release", release_then_fail)
+
+    def execute(executor, reserved_task, _request) -> None:
+        terminal = executor.get_task(reserved_task.task_id)
+        assert terminal is not None
+        if outcome == "failure":
+            terminal.status = TaskStatus.FAILED
+            terminal.error = "worker failed"
+        else:
+            terminal.status = TaskStatus.SUCCEEDED
+        terminal.finished_at = datetime.now(UTC)
+        executor._state._save_task(terminal)
+
+    monkeypatch.setattr(
+        worker_module.RedisTaskExecutor,
+        "execute_reserved_task",
+        execute,
+    )
+
+    def run() -> None:
+        worker_module.run_task(
+            task.task_id,
+            "video_frames",
+            VideoFramesTaskRequest(
+                input_path=str(tmp_path / "clip.mp4")
+            ).model_dump(mode="json"),
+        )
+
+    if cleanup_error is None:
+        run()
+    else:
+        with pytest.raises(RedisConnectionError, match=cleanup_error):
+            run()
+
+    assert manager_release_calls == [task.task_id]
+    assert resources.task_pin_releases == []
+    terminal = manager.get_task(task.task_id)
+    assert terminal is not None
+    assert terminal.status is expected_status
+    assert terminal.error == expected_error
+    assert not redis_connection.exists(f"dt:resource:task-pin:{task.task_id}")
+    assert not redis_connection.exists(
+        f"dt:resource:session:{session_id}:task-pins"
+    )
+    assert not redis_connection.exists(
+        f"dt:resource:asset-tasks:{session_id}:{asset_id}"
+    )
+    assert not redis_connection.exists(
+        f"dt:resource:asset-tasks:{session_id}:{orphan_asset_id}"
+    )
 
 
 def test_run_task_heartbeats_resources_during_slow_processing(
