@@ -8,7 +8,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Literal
-from urllib.parse import unquote, urlsplit
+from urllib.parse import urlsplit
 
 from designtoolkit.web.schemas import LogEventResponse
 
@@ -35,6 +35,19 @@ class _TaskPaths:
     inputs: frozenset[str]
     output_files: frozenset[str]
     output_roots: frozenset[str]
+
+
+@dataclass(frozen=True)
+class _DecodedText:
+    value: str
+    source_spans: tuple[tuple[int, int], ...]
+
+
+@dataclass(frozen=True)
+class _TextReplacement:
+    start: int
+    end: int
+    value: str
 
 
 @dataclass
@@ -118,18 +131,28 @@ class EventSanitizer:
         *,
         paths: _TaskPaths,
     ) -> str:
-        value = _decode_path(_truncate_public_string(value))
+        value = _truncate_public_string(value)
         if not self._managed_roots:
             return value
-        return _replace_path_candidates(
-            _replace_known_paths(
-                value,
-                paths=paths,
-                path_style=self._path_style,
-            ),
+        decoded = _decode_text(value)
+        known_replacements = _known_path_replacements(
+            decoded.value,
+            paths=paths,
+            path_style=self._path_style,
+        )
+        candidate_replacements = _path_candidate_replacements(
+            decoded.value,
             managed_roots=self._managed_roots,
             paths=paths,
             path_style=self._path_style,
+            blocked=known_replacements,
+        )
+        if candidate_replacements is None:
+            return MANAGED_PATH_PLACEHOLDER
+        return _apply_text_replacements(
+            value,
+            decoded=decoded,
+            replacements=(*known_replacements, *candidate_replacements),
         )
 
     def sanitize_details(
@@ -365,40 +388,67 @@ def _join_canonical(root: str, relative: str) -> str:
     return f"{root.rstrip('/')}/{relative}"
 
 
-def _replace_known_paths(
+def _known_path_replacements(
     value: str,
     *,
     paths: _TaskPaths,
     path_style: _PathStyle,
-) -> str:
+) -> tuple[_TextReplacement, ...]:
     replacements = {
         **{path: _basename(path) for path in paths.inputs},
         **{path: _safe_output_name(path) for path in paths.output_files},
         **{path: _safe_output_name(path) for path in paths.output_roots},
     }
-    result = value
+    matches: list[_TextReplacement] = []
     for path in sorted(replacements, key=len, reverse=True):
         expression = _known_path_expression(path, path_style=path_style)
-        result = re.sub(
+        for match in re.finditer(
             expression + r"(?![\\/])",
-            lambda _match, replacement=replacements[path]: replacement,
-            result,
             flags=_path_flags(path_style),
-        )
-    return result
+            string=value,
+        ):
+            matches.append(
+                _TextReplacement(
+                    start=match.start(),
+                    end=match.end(),
+                    value=replacements[path],
+                )
+            )
+
+    selected: list[_TextReplacement] = []
+    for replacement in sorted(
+        matches,
+        key=lambda item: (item.start, -(item.end - item.start)),
+    ):
+        if selected and replacement.start < selected[-1].end:
+            continue
+        selected.append(replacement)
+    return tuple(selected)
 
 
-def _replace_path_candidates(
+def _path_candidate_replacements(
     value: str,
     *,
     managed_roots: tuple[str, ...],
     paths: _TaskPaths,
     path_style: _PathStyle,
-) -> str:
-    result: list[str] = []
-    copied_through = 0
+    blocked: tuple[_TextReplacement, ...],
+) -> tuple[_TextReplacement, ...] | None:
+    result: list[_TextReplacement] = []
+    blocked_index = 0
     index = 0
     while index < len(value):
+        while (
+            blocked_index < len(blocked)
+            and blocked[blocked_index].end <= index
+        ):
+            blocked_index += 1
+        if (
+            blocked_index < len(blocked)
+            and blocked[blocked_index].start <= index < blocked[blocked_index].end
+        ):
+            index = blocked[blocked_index].end
+            continue
         if not _looks_like_candidate_start(value, index):
             index += 1
             continue
@@ -414,14 +464,37 @@ def _replace_path_candidates(
             continue
         end, display, reliable = replacement
         if not reliable:
-            return MANAGED_PATH_PLACEHOLDER
-        result.append(value[copied_through:index])
-        result.append(display)
-        copied_through = end
+            return None
+        if (
+            blocked_index >= len(blocked)
+            or blocked[blocked_index].start >= end
+        ):
+            result.append(
+                _TextReplacement(start=index, end=end, value=display)
+            )
         index = end
-    if not result:
-        return value
-    result.append(value[copied_through:])
+    return tuple(result)
+
+
+def _apply_text_replacements(
+    source: str,
+    *,
+    decoded: _DecodedText,
+    replacements: tuple[_TextReplacement, ...],
+) -> str:
+    if not replacements:
+        return source
+    result: list[str] = []
+    copied_through = 0
+    for replacement in sorted(replacements, key=lambda item: item.start):
+        source_start = decoded.source_spans[replacement.start][0]
+        source_end = decoded.source_spans[replacement.end - 1][1]
+        if source_start < copied_through:
+            continue
+        result.append(source[copied_through:source_start])
+        result.append(replacement.value)
+        copied_through = source_end
+    result.append(source[copied_through:])
     return "".join(result)
 
 
@@ -460,8 +533,7 @@ def _candidate_replacement(
     if display is None:
         return None
     if (
-        display == MANAGED_PATH_PLACEHOLDER
-        and end < len(value)
+        end < len(value)
         and value[end].isspace()
         and not _looks_like_file_path(candidate)
     ):
@@ -572,17 +644,93 @@ def _display_path_value(
 
 
 def _decode_path(value: str) -> str:
-    decoded = value
-    remaining_rounds = len(decoded) // 2 + 1
-    while remaining_rounds > 0:
-        next_value = unquote(decoded)
-        if next_value == decoded:
-            break
-        if len(next_value) >= len(decoded):
-            break
-        decoded = next_value
-        remaining_rounds -= 1
-    return decoded
+    return _decode_text(value).value
+
+
+def _decode_text(value: str) -> _DecodedText:
+    byte_values = bytearray()
+    byte_starts: list[int] = []
+    byte_ends: list[int] = []
+    for source_index, character in enumerate(value):
+        for byte_value in character.encode("utf-8", errors="replace"):
+            byte_values.append(byte_value)
+            byte_starts.append(source_index)
+            byte_ends.append(source_index + 1)
+            while (
+                len(byte_values) >= 3
+                and byte_values[-3] == ord("%")
+                and _is_hex_byte(byte_values[-2])
+                and _is_hex_byte(byte_values[-1])
+            ):
+                decoded_byte = (
+                    _hex_byte_value(byte_values[-2]) * 16
+                    + _hex_byte_value(byte_values[-1])
+                )
+                decoded_start = byte_starts[-3]
+                decoded_end = byte_ends[-1]
+                del byte_values[-3:]
+                del byte_starts[-3:]
+                del byte_ends[-3:]
+                byte_values.append(decoded_byte)
+                byte_starts.append(decoded_start)
+                byte_ends.append(decoded_end)
+
+    characters: list[str] = []
+    source_spans: list[tuple[int, int]] = []
+    byte_index = 0
+    while byte_index < len(byte_values):
+        width = _utf8_sequence_width(byte_values, byte_index)
+        chunk = bytes(byte_values[byte_index : byte_index + width])
+        try:
+            character = chunk.decode("utf-8")
+        except UnicodeDecodeError:
+            character = "\ufffd"
+            width = 1
+        characters.append(character)
+        source_spans.append(
+            (
+                byte_starts[byte_index],
+                byte_ends[byte_index + width - 1],
+            )
+        )
+        byte_index += width
+    return _DecodedText("".join(characters), tuple(source_spans))
+
+
+def _is_hex_byte(value: int) -> bool:
+    return (
+        ord("0") <= value <= ord("9")
+        or ord("A") <= value <= ord("F")
+        or ord("a") <= value <= ord("f")
+    )
+
+
+def _hex_byte_value(value: int) -> int:
+    if value <= ord("9"):
+        return value - ord("0")
+    return (value | 0x20) - ord("a") + 10
+
+
+def _utf8_sequence_width(values: bytearray, index: int) -> int:
+    leading = values[index]
+    if leading < 0x80:
+        return 1
+    if 0xC2 <= leading <= 0xDF:
+        width = 2
+    elif 0xE0 <= leading <= 0xEF:
+        width = 3
+    elif 0xF0 <= leading <= 0xF4:
+        width = 4
+    else:
+        return 1
+    if index + width > len(values):
+        return 1
+    if any(
+        not 0x80 <= continuation <= 0xBF
+        for continuation in values[index + 1 : index + width]
+    ):
+        return 1
+    return width
 
 
 def _canonical_path(

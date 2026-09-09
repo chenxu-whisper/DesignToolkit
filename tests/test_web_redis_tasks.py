@@ -5124,6 +5124,92 @@ def test_hosted_event_sanitizer_decodes_paths_to_fixed_point(
     assert asset_id not in sanitized
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        "source%20clip.mov",
+        "https://example.invalid/a%2Fb?x=one%26two#frag%2Fpart",
+        "literal % text %2 %GG trailing%",
+    ],
+    ids=["encoded-filename", "external-url", "malformed-percent"],
+)
+def test_hosted_event_sanitizer_preserves_unmanaged_encoded_text(
+    value: str,
+) -> None:
+    sanitized = event_sanitization_module.sanitize_event_text(
+        value,
+        data_dir=PurePosixPath("/srv/资料"),
+        task_payload=None,
+    )
+
+    assert sanitized == value
+
+
+def test_hosted_event_sanitizer_replaces_only_encoded_managed_path_token() -> None:
+    data_dir = PurePosixPath("/srv/资料")
+    input_path = (
+        data_dir
+        / "sessions"
+        / ("1" * 32)
+        / "assets"
+        / ("2" * 32)
+        / "source clip.mov"
+    )
+    encoded_path = quote(input_path.as_uri(), safe="").replace(
+        "%2F",
+        "%25%32%46",
+    )
+    suffix = "?next=%2Fkeep%26this&bad=%GG%2#frag%20keep trailing"
+    value = f"processing {encoded_path}{suffix}"
+
+    sanitized = event_sanitization_module.sanitize_event_text(
+        value,
+        data_dir=data_dir,
+        task_payload={"input_path": str(input_path)},
+    )
+
+    assert sanitized == f"processing source clip.mov{suffix}"
+
+
+def test_hosted_event_sanitizer_percent_decoding_scales_linearly() -> None:
+    data_dir = PurePosixPath("/srv/data")
+
+    def nested_percent_encoded_slash(size: int) -> str:
+        return "%" + ("25" * ((size - 3) // 2)) + "2F"
+
+    def elapsed(size: int) -> float:
+        value = nested_percent_encoded_slash(size)
+        started = perf_counter()
+        for _ in range(20):
+            event_sanitization_module.sanitize_event_text(
+                value,
+                data_dir=data_dir,
+                task_payload=None,
+            )
+        return perf_counter() - started
+
+    elapsed_4k = elapsed(4095)
+    elapsed_8k = elapsed(8191)
+
+    assert elapsed_8k < 0.5
+    assert elapsed_8k / elapsed_4k < 3
+
+
+def test_hosted_event_sanitizer_handles_510_fields_in_under_half_second() -> None:
+    details = {f"field-{index}": "source%20clip.mov" for index in range(510)}
+
+    started = perf_counter()
+    sanitized = event_sanitization_module.sanitize_event_details(
+        details,
+        data_dir=PurePosixPath("/srv/data"),
+        task_payload=None,
+    )
+    elapsed = perf_counter() - started
+
+    assert sanitized == details
+    assert elapsed < 0.5
+
+
 def test_hosted_event_sanitizer_bounds_every_public_string(
     tmp_path: Path,
 ) -> None:
