@@ -139,30 +139,32 @@ class OutputBudgetGuard:
                 raise OSError("Output writer returned an invalid byte count")
             return written
 
-    def rename(self, source: str | Path, target: str | Path) -> None:
+    def publish(self, source: str | Path, target: str | Path) -> None:
         with self._lock:
             resolved_source = self._contained_path(Path(source))
             resolved_target = self._contained_path(Path(target))
-            if resolved_target.exists():
-                raise FileExistsError(f"Output path already exists: {resolved_target}")
             identity = self._path_identities.get(resolved_source)
-            try:
-                os.replace(resolved_source, resolved_target)
-            except BaseException:
-                if not resolved_source.exists() and resolved_target.exists():
-                    self._path_identities.pop(resolved_source, None)
-                    if identity is not None:
-                        self._path_identities[resolved_target] = identity
-                raise
             if identity is None:
-                stat_result = resolved_target.stat()
+                stat_result = resolved_source.stat()
                 identity = self._identity(
-                    resolved_target,
+                    resolved_source,
                     stat_result.st_dev,
                     stat_result.st_ino,
                 )
-            self._path_identities.pop(resolved_source, None)
+            try:
+                os.link(resolved_source, resolved_target)
+            except BaseException:
+                self._discard_publication_source(resolved_source)
+                raise
             self._path_identities[resolved_target] = identity
+            try:
+                resolved_source.unlink()
+                self._path_identities.pop(resolved_source, None)
+                _fsync_parent_directory(resolved_target.parent)
+            except BaseException:
+                self.rollback_created(resolved_target)
+                self._discard_publication_source(resolved_source)
+                raise
 
     def truncate(
         self,
@@ -265,6 +267,10 @@ class OutputBudgetGuard:
         self._sizes[identity] = max(previous_size, actual_extent)
         self._path_identities[resolved] = identity
 
+    def _discard_publication_source(self, source: Path) -> None:
+        self.rollback_created(source)
+        source.unlink(missing_ok=True)
+
     def _contained_path(self, path: Path) -> Path:
         resolved = Path(path).resolve()
         try:
@@ -286,6 +292,17 @@ class OutputBudgetGuard:
             raise OutputLimitExceeded(
                 f"Task output exceeds the configured {self.max_bytes}-byte limit"
             )
+
+
+def _fsync_parent_directory(parent: Path) -> None:
+    if os.name == "nt":
+        return
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(parent, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 class OutputTargetMonitor:

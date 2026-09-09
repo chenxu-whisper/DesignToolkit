@@ -189,11 +189,16 @@ class GuardedFfmpegOutput:
                     f"FFmpeg guarded output target is unsupported: "
                     f"{self._original_target}"
                 )
-        self._target = Path(self._original_target)
+        if self._sequence is None:
+            self._target = Path(self._original_target)
+        else:
+            prefix, width, suffix = self._sequence
+            self._target = Path(f"{prefix}%0{width}d{suffix}")
         guard.validate_path(self._target)
         self._parser: PamStreamParser | None = None
         self._image_format: str | None = None
         self._single_image = False
+        self._single_frame: PamFrame | None = None
         self._frame_index = _sequence_start_number(command)
         self._frame_count = 0
         self._temporary_paths: list[Path] = []
@@ -250,8 +255,8 @@ class GuardedFfmpegOutput:
             self._image_format = _SINGLE_IMAGE_FORMATS[suffix]
             self._single_image = True
             output_args = [
-                "-frames:v",
-                "1",
+                "-fps_mode",
+                "passthrough",
                 "-f",
                 "image2pipe",
                 "-vcodec",
@@ -299,10 +304,14 @@ class GuardedFfmpegOutput:
         if self._parser is None:
             raise RuntimeError("Guarded output sink is unavailable")
         for frame in self._parser.feed(data):
-            if self._single_image and self._frame_count:
-                raise FfmpegOutputError(
-                    "FFmpeg produced multiple frames for a single image target"
-                )
+            if self._single_image:
+                if self._single_frame is not None:
+                    raise FfmpegOutputError(
+                        "FFmpeg produced multiple frames for a single image target"
+                    )
+                self._single_frame = frame
+                self._frame_count += 1
+                continue
             target = self._frame_target()
             self._write_image(frame, target)
             self._frame_count += 1
@@ -319,7 +328,7 @@ class GuardedFfmpegOutput:
             self._video_file.close()
             self._video_file = None
             self._published_paths.append(self._target)
-            self._guard.rename(temporary, self._target)
+            self._guard.publish(temporary, self._target)
             self._temporary_paths.remove(temporary)
             self._video_temporary = None
             return
@@ -330,6 +339,12 @@ class GuardedFfmpegOutput:
             raise FfmpegOutputError(
                 "FFmpeg produced no frame for a single image target"
             )
+        if self._single_image:
+            frame = self._single_frame
+            if frame is None:
+                raise RuntimeError("Guarded single image frame is unavailable")
+            self._write_image(frame, self._target)
+            self._single_frame = None
 
     def rollback(self) -> None:
         errors: list[BaseException] = []
@@ -407,7 +422,7 @@ class GuardedFfmpegOutput:
                 file.flush()
                 os.fsync(raw_file.fileno())
             self._published_paths.append(target)
-            self._guard.rename(temporary, target)
+            self._guard.publish(temporary, target)
             self._temporary_paths.remove(temporary)
         except BaseException:
             self._rollback_path(temporary)

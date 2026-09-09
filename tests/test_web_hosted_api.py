@@ -6873,6 +6873,29 @@ def test_hosted_animated_image_rejected_before_video_probe(tmp_path: Path) -> No
     assert decoder.decode_calls == 0
 
 
+def test_hosted_media_resize_rejects_animated_image_before_enqueue(
+    tmp_path: Path,
+) -> None:
+    with _client(tmp_path) as client:
+        reference = _upload(
+            client,
+            "animated.gif",
+            _animated_gif_bytes(),
+        ).json()["reference"]
+        response = client.post(
+            "/api/tasks/media-resize",
+            json={"input_path": reference, "size": "100x100"},
+        )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "error": {
+            "code": "media_limit_exceeded",
+            "message": "Animated images are unsupported",
+        }
+    }
+
+
 def test_hosted_repeated_video_preview_reuses_validation_probe(
     tmp_path: Path,
 ) -> None:

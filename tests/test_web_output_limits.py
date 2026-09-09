@@ -10,7 +10,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from threading import Event, Thread, Timer
+from threading import Barrier, Event, Thread, Timer
 from typing import Any
 
 import pytest
@@ -21,6 +21,7 @@ from designtoolkit.video_frames.ffmpeg_backend import (
     BackendUnavailableError,
     FfmpegBackend,
 )
+from designtoolkit.web import output_limits
 from designtoolkit.web.output_limits import (
     OutputBudgetGuard,
     OutputLimitExceeded,
@@ -119,7 +120,7 @@ def test_budgeted_write_accounts_partial_growth_and_not_seek_rewrites(
     assert guard.used_bytes == 2
 
 
-def test_budgeted_rename_preserves_identity_and_rollback_releases_extent(
+def test_budgeted_publish_preserves_identity_and_rollback_releases_extent(
     tmp_path: Path,
 ) -> None:
     guard = OutputBudgetGuard(tmp_path, max_bytes=100)
@@ -129,7 +130,7 @@ def test_budgeted_rename_preserves_identity_and_rollback_releases_extent(
     with temporary.open("w+b") as file:
         guard.register_created(file, temporary)
         guard.write(file, temporary, b"1234")
-    guard.rename(temporary, target)
+    guard.publish(temporary, target)
     guard.account(target)
 
     assert guard.used_bytes == 4
@@ -141,6 +142,131 @@ def test_budgeted_rename_preserves_identity_and_rollback_releases_extent(
     assert not target.exists()
     assert guard.used_bytes == 0
     assert guard.remaining_bytes == 99
+
+
+def test_budgeted_publish_is_atomic_no_clobber_across_guards(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    publisher_count = 20
+    ready = Barrier(publisher_count)
+    replace_race = Barrier(publisher_count)
+    original_replace = os.replace
+    target = tmp_path / "output.bin"
+    guards: list[OutputBudgetGuard] = []
+    temporaries: list[Path] = []
+
+    def racing_replace(source: str | Path, destination: str | Path) -> None:
+        replace_race.wait(timeout=5)
+        original_replace(source, destination)
+
+    monkeypatch.setattr(output_limits.os, "replace", racing_replace)
+    for index in range(publisher_count):
+        guard = OutputBudgetGuard(tmp_path, max_bytes=100)
+        temporary = tmp_path / f".output.{index}.tmp"
+        with temporary.open("x+b") as file:
+            guard.register_created(file, temporary)
+            guard.write(file, temporary, str(index).encode("ascii"))
+        guards.append(guard)
+        temporaries.append(temporary)
+
+    def publish(index: int) -> tuple[int, bool]:
+        ready.wait(timeout=5)
+        try:
+            guards[index].publish(temporaries[index], target)
+        except FileExistsError:
+            return index, False
+        return index, True
+
+    with ThreadPoolExecutor(max_workers=publisher_count) as executor:
+        results = list(executor.map(publish, range(publisher_count)))
+
+    winners = [index for index, succeeded in results if succeeded]
+    assert len(winners) == 1
+    assert target.read_bytes() == str(winners[0]).encode("ascii")
+    assert not any(path.exists() for path in temporaries)
+    assert [guard.used_bytes for guard in guards].count(0) == publisher_count - 1
+    assert guards[winners[0]].used_bytes == len(target.read_bytes())
+
+
+def test_budgeted_publish_preserves_preexisting_file_and_cleans_temporary(
+    tmp_path: Path,
+) -> None:
+    guard = OutputBudgetGuard(tmp_path, max_bytes=100)
+    temporary = tmp_path / ".output.tmp"
+    target = tmp_path / "output.bin"
+    target.write_bytes(b"preexisting")
+    with temporary.open("x+b") as file:
+        guard.register_created(file, temporary)
+        guard.write(file, temporary, b"replacement")
+
+    with pytest.raises(FileExistsError):
+        guard.publish(temporary, target)
+
+    assert target.read_bytes() == b"preexisting"
+    assert not temporary.exists()
+    assert guard.used_bytes == 0
+
+
+def test_budgeted_publish_preserves_preexisting_hard_link_target(
+    tmp_path: Path,
+) -> None:
+    guard = OutputBudgetGuard(tmp_path, max_bytes=100)
+    temporary = tmp_path / ".output.tmp"
+    target = tmp_path / "output.bin"
+    with temporary.open("x+b") as file:
+        guard.register_created(file, temporary)
+        guard.write(file, temporary, b"preexisting")
+    os.link(temporary, target)
+
+    with pytest.raises(FileExistsError):
+        guard.publish(temporary, target)
+
+    assert target.read_bytes() == b"preexisting"
+    assert not temporary.exists()
+    assert guard.used_bytes == 0
+
+
+def test_budgeted_publish_rejects_directory_target_and_cleans_temporary(
+    tmp_path: Path,
+) -> None:
+    guard = OutputBudgetGuard(tmp_path, max_bytes=100)
+    temporary = tmp_path / ".output.tmp"
+    target = tmp_path / "output.bin"
+    target.mkdir()
+    with temporary.open("x+b") as file:
+        guard.register_created(file, temporary)
+        guard.write(file, temporary, b"replacement")
+
+    with pytest.raises(OSError):
+        guard.publish(temporary, target)
+
+    assert target.is_dir()
+    assert not temporary.exists()
+    assert guard.used_bytes == 0
+
+
+def test_budgeted_publish_fails_closed_when_hard_links_are_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    guard = OutputBudgetGuard(tmp_path, max_bytes=100)
+    temporary = tmp_path / ".output.tmp"
+    target = tmp_path / "output.bin"
+    with temporary.open("x+b") as file:
+        guard.register_created(file, temporary)
+        guard.write(file, temporary, b"replacement")
+
+    def reject_link(_source: str | Path, _target: str | Path) -> None:
+        raise OSError("hard links are unavailable")
+
+    monkeypatch.setattr(output_limits.os, "link", reject_link)
+    with pytest.raises(OSError, match="hard links are unavailable"):
+        guard.publish(temporary, target)
+
+    assert not target.exists()
+    assert not temporary.exists()
+    assert guard.used_bytes == 0
 
 
 def test_budgeted_truncate_rejects_growth_before_file_expands(

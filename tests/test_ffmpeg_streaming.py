@@ -246,8 +246,8 @@ def test_guarded_single_image_rewrites_to_rgba_pam_and_pillow_decodes(
 
     assert session.command == [
         *original[:-1],
-        "-frames:v",
-        "1",
+        "-fps_mode",
+        "passthrough",
         "-f",
         "image2pipe",
         "-vcodec",
@@ -277,6 +277,30 @@ def test_guarded_single_image_rewrites_to_rgba_pam_and_pillow_decodes(
             assert image.convert("RGBA").getchannel("A").tobytes() == b"\x00\xff"
         else:
             assert image.mode == "RGB"
+
+
+def test_guarded_single_image_rejects_multiple_frames_without_publishing(
+    tmp_path: Path,
+) -> None:
+    from designtoolkit.video_frames.ffmpeg_streaming import (
+        FfmpegOutputError,
+        GuardedFfmpegOutput,
+    )
+
+    target = tmp_path / "output.gif"
+    guard = OutputBudgetGuard(tmp_path, 1_000_000)
+    session = GuardedFfmpegOutput(["ffmpeg", str(target)], guard)
+
+    assert "-frames:v" not in session.command
+    with pytest.raises(FfmpegOutputError, match="multiple frames"):
+        session.consume(
+            _pam(1, 1, b"\x01\x02\x03\x04")
+            + _pam(1, 1, b"\x05\x06\x07\x08")
+        )
+
+    assert not target.exists()
+    assert not list(tmp_path.glob(".*.tmp"))
+    assert guard.used_bytes == 0
 
 
 def test_guarded_sequence_publishes_numbered_frames_with_escaped_percent(
@@ -314,6 +338,28 @@ def test_guarded_sequence_publishes_numbered_frames_with_escaped_percent(
         image.load()
         assert image.getpixel((0, 0)) == (1, 2, 3, 4)
     assert not list(tmp_path.glob(".*.tmp"))
+
+
+def test_guarded_sequence_unescapes_percent_in_directory_and_stem(
+    tmp_path: Path,
+) -> None:
+    from designtoolkit.video_frames.ffmpeg_streaming import GuardedFfmpegOutput
+
+    output_dir = tmp_path / "real%temp"
+    output_dir.mkdir()
+    escaped_dir = str(output_dir).replace("%", "%%")
+    pattern = Path(escaped_dir) / "clip%%take_%03d.png"
+    session = GuardedFfmpegOutput(
+        ["ffmpeg", str(pattern)],
+        OutputBudgetGuard(output_dir, 1_000_000),
+        output_kind="sequence",
+    )
+
+    session.consume(_pam(1, 1, b"\x01\x02\x03\x04"))
+    session.finish()
+
+    assert (output_dir / "clip%take_001.png").exists()
+    assert not Path(escaped_dir).exists()
 
 
 def test_guarded_single_image_allows_literal_percent(tmp_path: Path) -> None:
@@ -489,7 +535,7 @@ def test_guarded_output_refuses_to_replace_preexisting_target(
     assert target.read_bytes() == b"preexisting"
 
 
-def test_guarded_rename_race_does_not_delete_preexisting_target_on_rollback(
+def test_guarded_publish_race_does_not_delete_preexisting_target_on_rollback(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -498,37 +544,40 @@ def test_guarded_rename_race_does_not_delete_preexisting_target_on_rollback(
     target = tmp_path / "output.png"
     guard = OutputBudgetGuard(tmp_path, 1_000_000)
     session = GuardedFfmpegOutput(["ffmpeg", str(target)], guard)
-    original_rename = guard.rename
+    original_publish = guard.publish
 
     def race(source: str | Path, destination: str | Path) -> None:
         target.write_bytes(b"preexisting")
-        original_rename(source, destination)
+        original_publish(source, destination)
 
-    monkeypatch.setattr(guard, "rename", race)
+    monkeypatch.setattr(guard, "publish", race)
 
+    session.consume(_pam(1, 1, b"abcd"))
     with pytest.raises(FileExistsError):
-        session.consume(_pam(1, 1, b"abcd"))
+        session.finish()
     session.rollback()
 
     assert target.read_bytes() == b"preexisting"
 
 
-def test_guarded_rename_interruption_after_move_is_fully_rolled_back(
+def test_guarded_publish_interruption_after_link_is_fully_rolled_back(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    class RenameInterrupted(BaseException):
+    class PublishInterrupted(BaseException):
         pass
 
     target = tmp_path / "output.png"
     guard = OutputBudgetGuard(tmp_path, 1_000_000)
-    original_replace = output_limits.os.replace
 
-    def move_then_interrupt(source: str | Path, destination: str | Path) -> None:
-        original_replace(source, destination)
-        raise RenameInterrupted
+    def interrupt_after_link(_parent: Path) -> None:
+        raise PublishInterrupted
 
-    monkeypatch.setattr(output_limits.os, "replace", move_then_interrupt)
+    monkeypatch.setattr(
+        output_limits,
+        "_fsync_parent_directory",
+        interrupt_after_link,
+    )
     backend = FfmpegBackend(
         output_guard=guard,
         popen=_streaming_popen_factory(
@@ -538,7 +587,7 @@ def test_guarded_rename_interruption_after_move_is_fully_rolled_back(
     )
     monkeypatch.setattr(ffmpeg_backend, "os_name", "other")
 
-    with pytest.raises(RenameInterrupted):
+    with pytest.raises(PublishInterrupted):
         backend.run(["ffmpeg", str(target)])
 
     assert not list(tmp_path.iterdir())
@@ -1119,6 +1168,66 @@ def test_bundled_ffmpeg_guarded_gif_resize_preserves_basic_transparency(
         assert image.format == "GIF"
         assert image.size == (4, 2)
         assert set(alpha.tobytes()) == {0, 255}
+
+
+def test_bundled_ffmpeg_guarded_static_gif_resize_succeeds(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "static.gif"
+    Image.new("RGB", (8, 4), "red").save(source, format="GIF")
+    target = tmp_path / "resized.gif"
+
+    result = resize_media(
+        MediaResizeOptions(
+            input_path=source,
+            output_path=target,
+            size=(4, 4),
+        ),
+        FfmpegBackend(
+            output_guard=OutputBudgetGuard(tmp_path, 10_000_000)
+        ),
+    )
+
+    assert result.output_path == target
+    with Image.open(target) as image:
+        image.load()
+        assert image.format == "GIF"
+        assert image.size == (4, 2)
+
+
+def test_bundled_ffmpeg_guarded_animated_gif_resize_fails_without_output(
+    tmp_path: Path,
+) -> None:
+    from designtoolkit.video_frames.ffmpeg_streaming import FfmpegOutputError
+
+    source = tmp_path / "animated.gif"
+    frames = [
+        Image.new("RGB", (8, 4), color)
+        for color in ("red", "blue")
+    ]
+    frames[0].save(
+        source,
+        format="GIF",
+        save_all=True,
+        append_images=frames[1:],
+        duration=10,
+    )
+    target = tmp_path / "resized.gif"
+    guard = OutputBudgetGuard(tmp_path, 10_000_000)
+
+    with pytest.raises(FfmpegOutputError, match="multiple frames"):
+        resize_media(
+            MediaResizeOptions(
+                input_path=source,
+                output_path=target,
+                size=(4, 4),
+            ),
+            FfmpegBackend(output_guard=guard),
+        )
+
+    assert not target.exists()
+    assert not list(tmp_path.glob(".*.tmp"))
+    assert guard.used_bytes == 0
 
 
 def test_bundled_ffmpeg_guarded_transparent_png_resize_preserves_alpha(
