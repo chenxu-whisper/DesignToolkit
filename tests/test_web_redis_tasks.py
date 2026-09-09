@@ -5346,6 +5346,69 @@ def test_hosted_event_sanitizer_does_not_skip_later_managed_path(
     assert sanitized == "/outside/path [managed path]"
 
 
+@pytest.mark.parametrize(
+    "value_factory",
+    [
+        lambda path: f"https://example.invalid/inspect:{path}",
+        lambda path: f"/outside:{path}",
+        lambda path: quote(f"/outside:{path}", safe=""),
+        lambda path: f"/outside:/nested:{path}",
+    ],
+    ids=[
+        "external-url",
+        "non-managed-prefix",
+        "percent-encoded-prefix",
+        "multiple-non-managed-prefixes",
+    ],
+)
+def test_hosted_event_sanitizer_finds_managed_path_later_in_same_token(
+    value_factory,
+) -> None:
+    data_dir = PurePosixPath("/srv/data")
+    private_path = (
+        data_dir / "sessions" / ("8" * 32) / "private" / "failure.log"
+    )
+    value = value_factory(private_path)
+
+    sanitized = event_sanitization_module.sanitize_event_text(
+        value,
+        data_dir=data_dir,
+        task_payload=None,
+    )
+
+    assert sanitized.endswith(
+        event_sanitization_module.MANAGED_PATH_PLACEHOLDER
+    )
+    assert str(private_path) not in sanitized
+    assert "8" * 32 not in sanitized
+
+
+def test_hosted_event_sanitizer_same_token_scan_scales_linearly() -> None:
+    data_dir = PurePosixPath("/srv/data")
+    private_path = (
+        data_dir / "sessions" / ("8" * 32) / "private" / "failure.log"
+    )
+
+    def elapsed(prefix_size: int) -> float:
+        prefix = ("/outside:" * ((prefix_size // 9) + 1))[:prefix_size]
+        value = f"{prefix}{private_path}"
+        started = perf_counter()
+        for _ in range(20):
+            sanitized = event_sanitization_module.sanitize_event_text(
+                value,
+                data_dir=data_dir,
+                task_payload=None,
+            )
+            assert str(private_path) not in sanitized
+        return perf_counter() - started
+
+    elapsed_4k = elapsed(4 * 1024)
+    elapsed_8k = elapsed(8 * 1024)
+
+    assert elapsed_8k < 0.5
+    assert elapsed_8k / elapsed_4k < 3
+
+
 def test_hosted_event_sanitizer_preserves_file_uri_suffixes(
     tmp_path: Path,
 ) -> None:

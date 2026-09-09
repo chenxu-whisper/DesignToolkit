@@ -710,6 +710,109 @@ def test_hosted_old_redis_task_is_sanitized_only_at_get_and_sse_boundaries(
     assert internal_task.error == f"failed at {private_path}"
 
 
+def test_hosted_event_stream_sanitizes_injected_memory_history_and_live_events(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    log_store = LogStore()
+    manager = TaskManager(log_store=log_store, run_async=False)
+    subscribed = Event()
+    original_subscribe = log_store.history_and_subscribe
+
+    def tracked_subscribe(task_id: str):
+        result = original_subscribe(task_id)
+        subscribed.set()
+        return result
+
+    monkeypatch.setattr(log_store, "history_and_subscribe", tracked_subscribe)
+    private_path = tmp_path / "sessions" / ("3" * 32) / "private.log"
+    with _client(tmp_path, task_manager=manager) as client:
+        client.get("/api/config")
+        task = manager.reserve_task(
+            kind=TaskKind.VIDEO_FRAMES,
+            input_path=str(private_path),
+            output_path=None,
+            owner_id=client.cookies["dt_session"],
+        )
+        log_store.append(
+            task_id=task.task_id,
+            level=LogLevel.INFO,
+            phase=LogPhase.RUNNING,
+            message=f"History {private_path}",
+            details={"history_path": str(private_path)},
+        )
+
+        def publish_live_event() -> None:
+            assert subscribed.wait(timeout=1)
+            log_store.append(
+                task_id=task.task_id,
+                level=LogLevel.SUCCESS,
+                phase=LogPhase.COMPLETED,
+                message=f"Live [managed path] {private_path}",
+                details={"live_path": private_path.as_uri()},
+            )
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            publisher = executor.submit(publish_live_event)
+            response = client.get(f"/api/tasks/{task.task_id}/events")
+            publisher.result(timeout=2)
+
+    payloads = [
+        json.loads(line.removeprefix("data: "))
+        for line in response.text.splitlines()
+        if line.startswith("data: ")
+    ]
+    history = next(
+        payload for payload in payloads if payload["phase"] == "running"
+    )
+    live = next(
+        payload for payload in payloads if payload["phase"] == "completed"
+    )
+    assert history["message"] == "History private.log"
+    assert history["details"] == {"history_path": "private.log"}
+    assert live["message"] == "Live [managed path] private.log"
+    assert live["details"] == {"live_path": "private.log"}
+    assert str(private_path) not in response.text
+    assert "3" * 32 not in response.text
+
+
+def test_local_event_stream_preserves_injected_memory_store_paths(
+    tmp_path: Path,
+) -> None:
+    log_store = LogStore()
+    manager = TaskManager(log_store=log_store, run_async=False)
+    private_path = tmp_path / "sessions" / ("4" * 32) / "private.log"
+    task = manager.reserve_task(
+        kind=TaskKind.VIDEO_FRAMES,
+        input_path=str(private_path),
+        output_path=None,
+    )
+    log_store.append(
+        task_id=task.task_id,
+        level=LogLevel.ERROR,
+        phase=LogPhase.FAILED,
+        message=f"Failed at {private_path}",
+        details={"path": str(private_path)},
+    )
+
+    with TestClient(
+        create_app(
+            task_manager=manager,
+            hosted_settings=HostedSettings.from_env({}),
+            hosted_storage=None,
+        )
+    ) as client:
+        response = client.get(f"/api/tasks/{task.task_id}/events")
+
+    payloads = [
+        json.loads(line.removeprefix("data: "))
+        for line in response.text.splitlines()
+        if line.startswith("data: ")
+    ]
+    assert payloads[-1]["message"] == f"Failed at {private_path}"
+    assert payloads[-1]["details"] == {"path": str(private_path)}
+
+
 def test_task_event_stream_slow_subscriber_has_no_duplicates_or_lost_terminal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -436,8 +436,14 @@ def _path_candidate_replacements(
 ) -> tuple[_TextReplacement, ...] | None:
     result: list[_TextReplacement] = []
     blocked_index = 0
-    index = 0
-    while index < len(value):
+    candidate_starts = _managed_candidate_starts(
+        value,
+        managed_roots=managed_roots,
+        path_style=path_style,
+    )
+    candidate_index = 0
+    while candidate_index < len(candidate_starts):
+        index = candidate_starts[candidate_index]
         while (
             blocked_index < len(blocked)
             and blocked[blocked_index].end <= index
@@ -447,10 +453,7 @@ def _path_candidate_replacements(
             blocked_index < len(blocked)
             and blocked[blocked_index].start <= index < blocked[blocked_index].end
         ):
-            index = blocked[blocked_index].end
-            continue
-        if not _looks_like_candidate_start(value, index):
-            index += 1
+            candidate_index += 1
             continue
         replacement = _candidate_replacement(
             value,
@@ -460,7 +463,13 @@ def _path_candidate_replacements(
             path_style=path_style,
         )
         if replacement is None:
-            index = _candidate_end(value, index)
+            token_end = _candidate_end(value, index)
+            candidate_index += 1
+            if (
+                candidate_index < len(candidate_starts)
+                and candidate_starts[candidate_index] < token_end
+            ):
+                return None
             continue
         end, display, reliable = replacement
         if not reliable:
@@ -472,8 +481,31 @@ def _path_candidate_replacements(
             result.append(
                 _TextReplacement(start=index, end=end, value=display)
             )
-        index = end
+        candidate_index += 1
+        while (
+            candidate_index < len(candidate_starts)
+            and candidate_starts[candidate_index] < end
+        ):
+            candidate_index += 1
     return tuple(result)
+
+
+def _managed_candidate_starts(
+    value: str,
+    *,
+    managed_roots: tuple[str, ...],
+    path_style: _PathStyle,
+) -> tuple[int, ...]:
+    starts: set[int] = set()
+    for root in managed_roots:
+        expression = _known_path_expression(root, path_style=path_style)
+        for match in re.finditer(
+            expression + r"(?=$|[\\/])",
+            value,
+            flags=_path_flags(path_style),
+        ):
+            starts.add(match.start())
+    return tuple(sorted(starts))
 
 
 def _apply_text_replacements(
@@ -496,17 +528,6 @@ def _apply_text_replacements(
         copied_through = source_end
     result.append(source[copied_through:])
     return "".join(result)
-
-
-def _looks_like_candidate_start(value: str, index: int) -> bool:
-    if index > 0 and value[index - 1].isalnum():
-        return False
-    prefix = value[index : index + 8].replace("\\", "/")
-    return bool(
-        prefix.startswith("/")
-        or prefix.casefold().startswith("file:")
-        or re.match(r"^[A-Za-z]:/", prefix)
-    )
 
 
 def _candidate_replacement(

@@ -858,6 +858,20 @@ def _public_task_response(
     )
 
 
+def _public_event(
+    event: LogEventResponse,
+    *,
+    task: TaskRecord,
+    sanitizer: EventSanitizer | None,
+) -> LogEventResponse:
+    if sanitizer is None:
+        return event
+    return sanitizer.sanitize_event(
+        event,
+        task_payload=_task_public_payload(task),
+    )
+
+
 def _terminal_event_from_task(
     task: TaskRecord | None,
     sanitizer: EventSanitizer | None = None,
@@ -2344,8 +2358,13 @@ def create_router(
             try:
                 terminal_event_seen = False
                 for event in history:
-                    yield _sse_line(event)
-                    terminal_event_seen = _is_terminal_event(event)
+                    public_event = _public_event(
+                        event,
+                        task=task,
+                        sanitizer=public_sanitizer,
+                    )
+                    yield _sse_line(public_event)
+                    terminal_event_seen = _is_terminal_event(public_event)
                     if terminal_event_seen:
                         break
 
@@ -2358,12 +2377,23 @@ def create_router(
                             public_sanitizer,
                         )
                         if terminal_event is not None:
-                            yield _sse_line(terminal_event)
+                            yield _sse_line(
+                                _public_event(
+                                    terminal_event,
+                                    task=task,
+                                    sanitizer=public_sanitizer,
+                                )
+                            )
                             terminal_event_seen = True
                         continue
 
-                    yield _sse_line(event)
-                    terminal_event_seen = _is_terminal_event(event)
+                    public_event = _public_event(
+                        event,
+                        task=task,
+                        sanitizer=public_sanitizer,
+                    )
+                    yield _sse_line(public_event)
+                    terminal_event_seen = _is_terminal_event(public_event)
             except RedisError as exc:
                 if not is_redis_unavailable(exc):
                     raise
