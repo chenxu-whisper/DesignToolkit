@@ -56,7 +56,7 @@ class FfmpegOutputError(RuntimeError):
 class PamFrame:
     width: int
     height: int
-    pixels: bytes
+    pixels: bytearray
 
 
 @dataclass(frozen=True)
@@ -74,58 +74,83 @@ class PamStreamParser:
         if max_frame_bytes < 0:
             raise ValueError("max_frame_bytes must not be negative")
         self._max_frame_bytes = max_frame_bytes
-        self._buffer = bytearray()
+        self._header_buffer = bytearray()
         self._frame_width: int | None = None
         self._frame_height: int | None = None
-        self._frame_bytes: int | None = None
+        self._frame_buffer: bytearray | None = None
+        self._frame_offset = 0
 
     def feed(self, data: bytes) -> list[PamFrame]:
         frames: list[PamFrame] = []
         view = memoryview(data)
-        while view:
-            chunk = view[:_PAM_FEED_CHUNK_BYTES]
-            view = view[len(chunk) :]
-            self._buffer.extend(chunk)
-            frames.extend(self._drain())
-        return frames
-
-    def _drain(self) -> list[PamFrame]:
-        frames: list[PamFrame] = []
-        while True:
-            if self._frame_bytes is None:
+        while view or (
+            self._frame_buffer is None and self._header_buffer
+        ):
+            if self._frame_buffer is None:
                 header = _parse_pam_header(
-                    self._buffer,
+                    self._header_buffer,
                     max_frame_bytes=self._max_frame_bytes,
                 )
-                if header is None:
-                    if len(self._buffer) > _MAX_PAM_HEADER_BYTES:
-                        raise FfmpegOutputError(
-                            "FFmpeg PAM header exceeds its size limit"
-                        )
-                    return frames
-                header_bytes, width, height, frame_bytes = header
-                del self._buffer[:header_bytes]
-                self._frame_width = width
-                self._frame_height = height
-                self._frame_bytes = frame_bytes
-
-            if len(self._buffer) < self._frame_bytes:
-                return frames
-            pixels = bytes(self._buffer[: self._frame_bytes])
-            del self._buffer[: self._frame_bytes]
-            frames.append(
-                PamFrame(
-                    width=self._required_dimension(self._frame_width),
-                    height=self._required_dimension(self._frame_height),
-                    pixels=pixels,
+                if header is not None:
+                    header_bytes, width, height, frame_bytes = header
+                    buffered = self._header_buffer[header_bytes:]
+                    self._header_buffer.clear()
+                    self._frame_width = width
+                    self._frame_height = height
+                    self._frame_buffer = bytearray(frame_bytes)
+                    buffered_pixels = min(len(buffered), frame_bytes)
+                    if buffered_pixels:
+                        self._frame_buffer[:buffered_pixels] = buffered[
+                            :buffered_pixels
+                        ]
+                    self._header_buffer.extend(buffered[buffered_pixels:])
+                    self._frame_offset = buffered_pixels
+                    if self._frame_offset == frame_bytes:
+                        frames.append(self._detach_frame())
+                    continue
+                if not view:
+                    break
+                header_capacity = (
+                    _MAX_PAM_HEADER_BYTES + 1 - len(self._header_buffer)
                 )
-            )
-            self._frame_width = None
-            self._frame_height = None
-            self._frame_bytes = None
+                chunk = view[: min(_PAM_FEED_CHUNK_BYTES, header_capacity)]
+                view = view[len(chunk) :]
+                self._header_buffer.extend(chunk)
+                if len(self._header_buffer) > _MAX_PAM_HEADER_BYTES:
+                    raise FfmpegOutputError(
+                        "FFmpeg PAM header exceeds its size limit"
+                    )
+                continue
+
+            if not view:
+                break
+            remaining = len(self._frame_buffer) - self._frame_offset
+            chunk = view[: min(_PAM_FEED_CHUNK_BYTES, remaining)]
+            view = view[len(chunk) :]
+            next_offset = self._frame_offset + len(chunk)
+            self._frame_buffer[self._frame_offset : next_offset] = chunk
+            self._frame_offset = next_offset
+            if self._frame_offset == len(self._frame_buffer):
+                frames.append(self._detach_frame())
+        return frames
+
+    def _detach_frame(self) -> PamFrame:
+        pixels = self._frame_buffer
+        if pixels is None:
+            raise RuntimeError("PAM parser frame buffer is unavailable")
+        frame = PamFrame(
+            width=self._required_dimension(self._frame_width),
+            height=self._required_dimension(self._frame_height),
+            pixels=pixels,
+        )
+        self._frame_width = None
+        self._frame_height = None
+        self._frame_buffer = None
+        self._frame_offset = 0
+        return frame
 
     def finish(self) -> None:
-        if self._buffer or self._frame_bytes is not None:
+        if self._header_buffer or self._frame_buffer is not None:
             raise FfmpegOutputError("FFmpeg produced a truncated PAM stream")
 
     @staticmethod
@@ -405,10 +430,14 @@ class GuardedFfmpegOutput:
             with temporary.open("x+b") as raw_file:
                 self._guard.register_created(raw_file, temporary)
                 file = _BudgetedFile(raw_file, temporary, self._guard)
-                with Image.frombytes(
+                with Image.frombuffer(
                     "RGBA",
                     (frame.width, frame.height),
                     frame.pixels,
+                    "raw",
+                    "RGBA",
+                    0,
+                    1,
                 ) as image:
                     if self._image_format in _RGB_ONLY_IMAGE_FORMATS:
                         with image.convert("RGB") as rgb_image:

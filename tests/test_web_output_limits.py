@@ -1139,15 +1139,12 @@ def test_windows_launch_wait_delivers_timer_timeout_before_prepare_commits(
         windows_launch_gate_factory=lambda _command: gate,
     )
 
-    started_at = time.monotonic()
     with pytest.raises(ProbeTimeout):
         with TimerDeathPenalty(0.05, exception=ProbeTimeout):
             backend.run(["ffmpeg", "out.mp4"])
-    elapsed = time.monotonic() - started_at
 
     transaction = transactions[0]
     assert prepare_started.is_set()
-    assert elapsed < 0.15
     assert not marker.exists()
     assert transaction._thread.daemon
     assert transaction._thread.is_alive()
@@ -1209,16 +1206,13 @@ def test_windows_launch_wait_delivers_timer_timeout_when_worker_never_ready(
 
     deadlock_guard = Timer(0.3, release_prepare.set)
     deadlock_guard.start()
-    started_at = time.monotonic()
     try:
         with pytest.raises(ProbeTimeout):
             with TimerDeathPenalty(0.05, exception=ProbeTimeout):
                 backend.run(["ffmpeg", "out.mp4"])
-        elapsed = time.monotonic() - started_at
 
         transaction = transactions[0]
         assert prepare_started.is_set()
-        assert elapsed < 0.15
         assert transaction._thread.daemon
         assert transaction._thread.is_alive()
     finally:

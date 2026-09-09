@@ -5,7 +5,7 @@ import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import Protocol
 
 SUPPORTED_FORMATS = {"png", "jpg", "jpeg"}
 
@@ -56,8 +56,6 @@ class FrameExportBackend(Protocol):
     def run(
         self,
         command: Sequence[str],
-        *,
-        output_kind: Literal["single", "sequence"] = "sequence",
     ) -> BackendResult:
         raise NotImplementedError
 
@@ -131,7 +129,7 @@ def export_video_frames(
         image_format=image_format,
     )
 
-    result = backend.run(command, output_kind="sequence")
+    result = _run_backend(backend, command)
     if result.returncode != 0 and _should_retry_with_automatic_decoder(
         input_path=input_path,
         image_format=image_format,
@@ -146,7 +144,7 @@ def export_video_frames(
             image_format=image_format,
             use_input_decoder_args=False,
         )
-        result = backend.run(fallback_command, output_kind="sequence")
+        result = _run_backend(backend, fallback_command)
         command = fallback_command
 
     if result.returncode != 0:
@@ -161,6 +159,16 @@ def export_video_frames(
         output_pattern=output_pattern,
         command=tuple(command),
     )
+
+
+def _run_backend(
+    backend: FrameExportBackend,
+    command: Sequence[str],
+) -> BackendResult:
+    guarded_run = getattr(backend, "run_guarded", None)
+    if callable(guarded_run):
+        return guarded_run(command, output_kind="sequence")
+    return backend.run(command)
 
 
 def _validate_input_path(input_path: Path) -> None:

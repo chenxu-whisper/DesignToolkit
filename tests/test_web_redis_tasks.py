@@ -4044,6 +4044,95 @@ def test_run_task_heartbeats_resources_during_slow_processing(
     assert resources.events[-2:] == ["release:output", "release:lease"]
 
 
+def test_heartbeat_output_guard_refresh_count_scales_with_duration_not_chunks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [0.0]
+    refresh_calls = 0
+    health_checks = 0
+
+    def refresh() -> None:
+        nonlocal refresh_calls
+        refresh_calls += 1
+
+    def raise_if_failed() -> None:
+        nonlocal health_checks
+        health_checks += 1
+
+    monkeypatch.setattr(worker_module, "monotonic", lambda: now[0])
+    guard = worker_module._HeartbeatOutputBudgetGuard(
+        tmp_path,
+        5 * 1024 * 1024 * 1024,
+        refresh=refresh,
+        raise_if_failed=raise_if_failed,
+    )
+
+    chunks = 730_000
+    for chunk in range(chunks):
+        now[0] = (chunk // 7_300) / 100
+        guard.check_health()
+        guard.refresh_health()
+
+    assert refresh_calls == 4
+    assert health_checks >= chunks
+
+
+def test_heartbeat_output_guard_serializes_concurrent_refreshes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [10.0]
+    refresh_calls = 0
+
+    def refresh() -> None:
+        nonlocal refresh_calls
+        refresh_calls += 1
+
+    monkeypatch.setattr(worker_module, "monotonic", lambda: now[0])
+    guard = worker_module._HeartbeatOutputBudgetGuard(
+        tmp_path,
+        100,
+        refresh=refresh,
+        raise_if_failed=lambda: None,
+    )
+
+    with ThreadPoolExecutor(max_workers=16) as executor:
+        list(executor.map(lambda _index: guard.refresh_health(), range(64)))
+
+    assert refresh_calls == 1
+
+
+def test_heartbeat_output_guard_raises_background_failure_without_refresh(
+    tmp_path: Path,
+) -> None:
+    failure = RuntimeError("periodic heartbeat failed")
+    failed = False
+    refresh_calls = 0
+
+    def raise_if_failed() -> None:
+        if failed:
+            raise failure
+
+    def refresh() -> None:
+        nonlocal refresh_calls
+        refresh_calls += 1
+
+    guard = worker_module._HeartbeatOutputBudgetGuard(
+        tmp_path,
+        100,
+        refresh=refresh,
+        raise_if_failed=raise_if_failed,
+    )
+    failed = True
+
+    with pytest.raises(RuntimeError, match="periodic heartbeat failed") as exc_info:
+        guard.check_health()
+
+    assert exc_info.value is failure
+    assert refresh_calls == 0
+
+
 @pytest.mark.timeout(10)
 def test_real_redis_guarded_stream_prevents_duplicate_output_reservation(
     tmp_path: Path,
@@ -4058,7 +4147,7 @@ def test_real_redis_guarded_stream_prevents_duplicate_output_reservation(
         max_upload_concurrency=1,
         max_session_bytes=100,
         min_free_bytes=0,
-        reservation_ttl=0.08,
+        reservation_ttl=0.3,
         lease_ttl=1,
         reservation_heartbeat_interval=0.01,
         lease_heartbeat_interval=0.1,
@@ -4083,7 +4172,8 @@ def test_real_redis_guarded_stream_prevents_duplicate_output_reservation(
     guard = worker_module._HeartbeatOutputBudgetGuard(
         tmp_path,
         10,
-        heartbeat=reservation.refresh,
+        refresh=reservation.refresh,
+        raise_if_failed=lambda: None,
     )
     backend = FfmpegBackend(
         output_guard=guard,
@@ -4099,14 +4189,14 @@ def test_real_redis_guarded_stream_prevents_duplicate_output_reservation(
                 [
                     sys.executable,
                     "-c",
-                    "import time; time.sleep(0.25)",
+                    "import time; time.sleep(0.5)",
                     str(target),
                 ],
             )
             assert process_started.wait(timeout=1), (
                 run.exception(timeout=0) if run.done() else "process did not start"
             )
-            time.sleep(0.12)
+            time.sleep(0.35)
 
             assert resources.reconcile_reservations() == 0
             with pytest.raises(ResourceUnavailableError, match="disk"):

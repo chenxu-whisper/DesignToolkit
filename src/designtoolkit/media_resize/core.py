@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import Protocol
 
 from designtoolkit.video_frames import BackendUnavailableError
 
@@ -47,8 +47,6 @@ class ResizeBackend(Protocol):
     def run(
         self,
         command: Sequence[str],
-        *,
-        output_kind: Literal["single", "sequence"] = "single",
     ) -> ResizeBackendResult:
         raise NotImplementedError
 
@@ -77,7 +75,7 @@ def resize_media(
         output_path=output_path,
         size=options.size,
     )
-    result = backend.run(command, output_kind="single")
+    result = _run_backend(backend, command)
     if result.returncode != 0:
         detail = f": {result.stderr.strip()}" if result.stderr.strip() else ""
         raise MediaResizeError(
@@ -86,6 +84,16 @@ def resize_media(
         )
 
     return MediaResizeResult(output_path=output_path, command=tuple(command))
+
+
+def _run_backend(
+    backend: ResizeBackend,
+    command: Sequence[str],
+) -> ResizeBackendResult:
+    guarded_run = getattr(backend, "run_guarded", None)
+    if callable(guarded_run):
+        return guarded_run(command, output_kind="single")
+    return backend.run(command)
 
 
 def _validate_input_path(input_path: Path) -> None:

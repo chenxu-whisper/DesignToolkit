@@ -75,6 +75,79 @@ def test_pam_parser_emits_multiple_frames_from_arbitrary_chunks() -> None:
     assert [frame.pixels for frame in frames] == [b"abcd", b"efghijkl"]
 
 
+def test_pam_parser_preallocates_and_detaches_one_real_4k_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from designtoolkit.video_frames import ffmpeg_streaming
+
+    width = 3840
+    height = 2160
+    frame_bytes = width * height * 4
+    allocations: list[tuple[int, bytearray]] = []
+    builtin_bytearray = bytearray
+
+    def tracked_bytearray(size: int = 0) -> bytearray:
+        allocation = builtin_bytearray(size)
+        allocations.append((size, allocation))
+        return allocation
+
+    monkeypatch.setattr(
+        ffmpeg_streaming,
+        "bytearray",
+        tracked_bytearray,
+        raising=False,
+    )
+    parser = ffmpeg_streaming.PamStreamParser(max_frame_bytes=frame_bytes)
+    payload = _pam(width, height, b"\x7f" * frame_bytes)
+
+    frames = parser.feed(payload)
+    parser.finish()
+
+    frame_allocations = [
+        allocation for size, allocation in allocations if size == frame_bytes
+    ]
+    assert len(frame_allocations) == 1
+    assert len(frames) == 1
+    assert frames[0].pixels is frame_allocations[0]
+    assert isinstance(frames[0].pixels, builtin_bytearray)
+    assert frames[0].pixels[:4] == b"\x7f" * 4
+
+
+def test_guarded_image_uses_pillow_frombuffer_without_copying_rgba(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from designtoolkit.video_frames.ffmpeg_streaming import GuardedFfmpegOutput
+
+    observed_buffers: list[object] = []
+    original_frombuffer = Image.frombuffer
+
+    def recording_frombuffer(
+        mode: str,
+        size: tuple[int, int],
+        data: object,
+        *args: object,
+        **kwargs: object,
+    ) -> Image.Image:
+        observed_buffers.append(data)
+        return original_frombuffer(mode, size, data, *args, **kwargs)
+
+    monkeypatch.setattr(Image, "frombuffer", recording_frombuffer)
+    target = tmp_path / "output.png"
+    session = GuardedFfmpegOutput(
+        ["ffmpeg", str(target)],
+        OutputBudgetGuard(tmp_path, 1_000_000),
+    )
+
+    session.consume(_pam(1, 1, b"\x01\x02\x03\x04"))
+    buffered_frame = session._single_frame
+    assert buffered_frame is not None
+    session.finish()
+
+    assert observed_buffers == [buffered_frame.pixels]
+    assert observed_buffers[0] is buffered_frame.pixels
+
+
 @pytest.mark.parametrize(
     ("payload", "message"),
     [
@@ -197,17 +270,38 @@ def test_pam_parser_accepts_hosted_raw_media_limits(
     width: int,
     height: int,
     max_frame_bytes: int,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from designtoolkit.video_frames.ffmpeg_streaming import (
-        FfmpegOutputError,
-        PamStreamParser,
-    )
+    from designtoolkit.video_frames import ffmpeg_streaming
 
-    parser = PamStreamParser(max_frame_bytes=max_frame_bytes)
+    class SparseFrameBuffer:
+        def __init__(self, size: int) -> None:
+            self._size = size
+
+        def __len__(self) -> int:
+            return self._size
+
+    builtin_bytearray = bytearray
+    requested_sizes: list[int] = []
+
+    def sparse_bytearray(size: int = 0) -> bytearray | SparseFrameBuffer:
+        requested_sizes.append(size)
+        if size == 0:
+            return builtin_bytearray()
+        return SparseFrameBuffer(size)
+
+    monkeypatch.setattr(
+        ffmpeg_streaming,
+        "bytearray",
+        sparse_bytearray,
+        raising=False,
+    )
+    parser = ffmpeg_streaming.PamStreamParser(max_frame_bytes=max_frame_bytes)
 
     parser.feed(_pam(width, height, b""))
 
-    with pytest.raises(FfmpegOutputError, match="truncated"):
+    assert requested_sizes == [0, width * height * 4]
+    with pytest.raises(ffmpeg_streaming.FfmpegOutputError, match="truncated"):
         parser.finish()
 
 
@@ -836,12 +930,13 @@ class _DelayedEofPipe:
         self._delay = delay
         self._released = Event()
         self.read_started = Event()
+        self.released_before_natural_eof = False
         self.done = False
         self.closed = False
 
     def read(self, _size: int = -1) -> bytes:
         self.read_started.set()
-        self._released.wait(self._delay)
+        self.released_before_natural_eof = self._released.wait(self._delay)
         self.done = True
         return b""
 
@@ -950,13 +1045,11 @@ def test_guarded_backend_stops_idle_process_on_health_failure_before_ttl(
         poll_interval=0.01,
     )
 
-    started_at = time.monotonic()
     with pytest.raises(RuntimeError, match="resource heartbeat failed") as exc_info:
         backend.run(["ffmpeg", str(target)])
-    elapsed = time.monotonic() - started_at
 
     assert exc_info.value is guard.failure
-    assert elapsed < 0.15
+    assert stdout.released_before_natural_eof
     assert process.terminate_called
     assert not target.exists()
     assert not list(tmp_path.glob(".*.tmp"))
@@ -1152,7 +1245,7 @@ def test_guarded_backend_rolls_back_nonzero_output(
         popen=_streaming_popen_factory([process], []),
     )
 
-    result = backend.run(
+    result = backend.run_guarded(
         ["ffmpeg", str(tmp_path / "frame_%06d.png")],
         output_kind="sequence",
     )
@@ -1249,7 +1342,7 @@ def test_guarded_backend_sequence_stops_at_exact_aggregate_budget(
     )
 
     with pytest.raises(OutputLimitExceeded):
-        backend.run(
+        backend.run_guarded(
             ["ffmpeg", str(tmp_path / "frame_%06d.png")],
             output_kind="sequence",
         )
@@ -1311,7 +1404,7 @@ def test_webm_decoder_fallback_recovers_full_budget_after_failed_first_run(
     assert result.output_pattern == output_dir / "input%%take_%06d.png"
 
 
-def test_video_frame_export_declares_sequence_for_primary_and_fallback(
+def test_video_frame_export_uses_guarded_extension_for_primary_and_fallback(
     tmp_path: Path,
 ) -> None:
     from designtoolkit.video_frames.core import BackendResult
@@ -1326,7 +1419,10 @@ def test_video_frame_export_declares_sequence_for_primary_and_fallback(
         def get_duration_seconds(self, _video_path: Path) -> float | None:
             return None
 
-        def run(
+        def run(self, _command: list[str]) -> BackendResult:
+            pytest.fail("guarded extension should handle the command")
+
+        def run_guarded(
             self,
             _command: list[str],
             *,
@@ -1358,7 +1454,39 @@ def test_video_frame_export_declares_sequence_for_primary_and_fallback(
     assert backend.output_kinds == ["sequence", "sequence"]
 
 
-def test_media_resize_declares_single_output_contract(tmp_path: Path) -> None:
+def test_video_frame_export_supports_legacy_run_backend(tmp_path: Path) -> None:
+    from designtoolkit.video_frames.core import BackendResult
+
+    class LegacyBackend:
+        def __init__(self) -> None:
+            self.commands: list[list[str]] = []
+
+        def get_ffmpeg_exe(self) -> str:
+            return "ffmpeg"
+
+        def get_duration_seconds(self, _video_path: Path) -> float | None:
+            return None
+
+        def run(self, command: list[str]) -> BackendResult:
+            self.commands.append(command)
+            return BackendResult(returncode=0)
+
+    input_path = tmp_path / "input.mp4"
+    input_path.write_bytes(b"input")
+    backend = LegacyBackend()
+
+    export_video_frames(
+        VideoFrameOptions(
+            input_path=input_path,
+            output_dir=tmp_path / "frames",
+        ),
+        backend,
+    )
+
+    assert len(backend.commands) == 1
+
+
+def test_media_resize_uses_guarded_extension(tmp_path: Path) -> None:
     from designtoolkit.media_resize.core import ResizeBackendResult
 
     class RecordingBackend:
@@ -1368,7 +1496,10 @@ def test_media_resize_declares_single_output_contract(tmp_path: Path) -> None:
         def get_ffmpeg_exe(self) -> str:
             return "ffmpeg"
 
-        def run(
+        def run(self, _command: list[str]) -> ResizeBackendResult:
+            pytest.fail("guarded extension should handle the command")
+
+        def run_guarded(
             self,
             _command: list[str],
             *,
@@ -1391,6 +1522,36 @@ def test_media_resize_declares_single_output_contract(tmp_path: Path) -> None:
     )
 
     assert backend.output_kinds == ["single"]
+
+
+def test_media_resize_supports_legacy_run_backend(tmp_path: Path) -> None:
+    from designtoolkit.media_resize.core import ResizeBackendResult
+
+    class LegacyBackend:
+        def __init__(self) -> None:
+            self.commands: list[list[str]] = []
+
+        def get_ffmpeg_exe(self) -> str:
+            return "ffmpeg"
+
+        def run(self, command: list[str]) -> ResizeBackendResult:
+            self.commands.append(command)
+            return ResizeBackendResult(returncode=0)
+
+    input_path = tmp_path / "input.png"
+    input_path.write_bytes(b"input")
+    backend = LegacyBackend()
+
+    resize_media(
+        MediaResizeOptions(
+            input_path=input_path,
+            output_path=tmp_path / "output.png",
+            size=(10, 10),
+        ),
+        backend,
+    )
+
+    assert len(backend.commands) == 1
 
 
 def test_guarded_backend_never_uses_prlimit(
@@ -1678,7 +1839,7 @@ def test_bundled_ffmpeg_guarded_image_sequences(
         output_guard=OutputBudgetGuard(tmp_path, 10_000_000)
     )
 
-    result = backend.run(
+    result = backend.run_guarded(
         [
             plain_backend.get_ffmpeg_exe(),
             "-hide_banner",

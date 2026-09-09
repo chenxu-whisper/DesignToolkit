@@ -1157,15 +1157,9 @@ class FfmpegBackend:
     def run(
         self,
         command: Sequence[str],
-        *,
-        output_kind: Literal["single", "sequence"] = "single",
     ) -> BackendResult:
         if isinstance(self._output_guard, OutputBudgetGuard):
-            return self._run_guarded(
-                command,
-                self._output_guard,
-                output_kind=output_kind,
-            )
+            return self.run_guarded(command)
         popen_kwargs: dict[str, object] = {
             "stdout": subprocess.PIPE,
             "stderr": subprocess.PIPE,
@@ -1285,6 +1279,20 @@ class FfmpegBackend:
                     except BaseException:
                         pass
 
+    def run_guarded(
+        self,
+        command: Sequence[str],
+        *,
+        output_kind: Literal["single", "sequence"] = "single",
+    ) -> BackendResult:
+        if isinstance(self._output_guard, OutputBudgetGuard):
+            return self._run_guarded(
+                command,
+                self._output_guard,
+                output_kind=output_kind,
+            )
+        return self.run(command)
+
     def _run_guarded(
         self,
         command: Sequence[str],
@@ -1381,32 +1389,32 @@ class FfmpegBackend:
                 try:
                     item = stdout_queue.get(timeout=self._poll_interval)
                 except Empty:
-                    guard.check_health()
+                    guard.refresh_health()
                     if captured_stderr.exception is not None:
                         raise captured_stderr.exception from None
                     continue
                 if item is None:
-                    guard.check_health()
+                    guard.refresh_health(force=True)
                     break
                 if isinstance(item, BaseException):
                     raise item
                 guard.check_health()
                 output.consume(item)
                 guard.check_health()
+                guard.refresh_health()
 
             while True:
-                guard.check_health()
                 try:
                     returncode = process.wait(timeout=self._poll_interval)
                 except subprocess.TimeoutExpired:
-                    guard.check_health()
+                    guard.refresh_health()
                     continue
-                guard.check_health()
+                guard.refresh_health(force=True)
                 break
             while stderr_thread.is_alive():
                 guard.check_health()
                 stderr_thread.join(timeout=self._poll_interval)
-                guard.check_health()
+                guard.refresh_health()
             if captured_stderr.exception is not None:
                 raise captured_stderr.exception
             if process_tree_owner is not None:
@@ -1419,7 +1427,7 @@ class FfmpegBackend:
             if returncode != 0:
                 output.rollback()
                 return BackendResult(returncode=returncode, stderr=stderr)
-            guard.check_health()
+            guard.refresh_health(force=True)
             output.finish()
             return BackendResult(returncode=returncode, stderr=stderr)
         except BaseException:

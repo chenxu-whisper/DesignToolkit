@@ -52,6 +52,10 @@ class OutputBudgetGuard:
     def check_health(self) -> None:
         pass
 
+    def refresh_health(self, *, force: bool = False) -> None:
+        del force
+        self.check_health()
+
     def validate_path(self, path: str | Path) -> Path:
         with self._lock:
             return self._contained_path(Path(path))

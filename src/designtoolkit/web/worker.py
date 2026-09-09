@@ -4,7 +4,8 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from shutil import disk_usage, rmtree
-from threading import Event, Thread
+from threading import Event, Lock, Thread
+from time import monotonic
 
 from redis import Redis
 from rq import Queue
@@ -52,6 +53,7 @@ class RedisTaskExecutor(TaskManager):
         *,
         max_output_bytes: int = 5 * 1024 * 1024 * 1024,
         resource_heartbeat: Callable[[], None] | None = None,
+        resource_health_check: Callable[[], None] | None = None,
         before_success_publish: Callable[[], None] | None = None,
         task_already_running: bool = False,
     ) -> None:
@@ -62,6 +64,7 @@ class RedisTaskExecutor(TaskManager):
         self._output_root: Path | None = None
         self._input_paths: set[Path] = set()
         self._resource_heartbeat = resource_heartbeat
+        self._resource_health_check = resource_health_check
         self._before_success_publish = before_success_publish
         self._task_already_running = task_already_running
         self._backend_factory = self._guarded_backend
@@ -83,7 +86,8 @@ class RedisTaskExecutor(TaskManager):
             _HeartbeatOutputBudgetGuard(
                 self._output_root,
                 self._max_output_bytes,
-                heartbeat=self._heartbeat_resources,
+                refresh=self._heartbeat_resources,
+                raise_if_failed=self._raise_if_resource_failed,
             )
             if self._output_root is not None
             else None
@@ -231,8 +235,14 @@ class RedisTaskExecutor(TaskManager):
             return
 
     def _heartbeat_resources(self) -> None:
+        self._raise_if_resource_failed()
         if self._resource_heartbeat is not None:
             self._resource_heartbeat()
+        self._raise_if_resource_failed()
+
+    def _raise_if_resource_failed(self) -> None:
+        if self._resource_health_check is not None:
+            self._resource_health_check()
 
     def _guarded_backend(self):
         from designtoolkit.video_frames.ffmpeg_backend import FfmpegBackend
@@ -310,13 +320,31 @@ class _HeartbeatOutputBudgetGuard(OutputBudgetGuard):
         root: Path,
         max_bytes: int,
         *,
-        heartbeat: Callable[[], None],
+        refresh: Callable[[], None],
+        raise_if_failed: Callable[[], None],
+        refresh_interval: float = 0.25,
     ) -> None:
+        if refresh_interval <= 0:
+            raise ValueError("refresh_interval must be positive")
         super().__init__(root, max_bytes)
-        self._heartbeat = heartbeat
+        self._refresh = refresh
+        self._raise_if_failed = raise_if_failed
+        self._refresh_interval = refresh_interval
+        self._last_refresh_at = float("-inf")
+        self._refresh_lock = Lock()
 
     def check_health(self) -> None:
-        self._heartbeat()
+        self._raise_if_failed()
+
+    def refresh_health(self, *, force: bool = False) -> None:
+        self._raise_if_failed()
+        with self._refresh_lock:
+            now = monotonic()
+            if not force and now - self._last_refresh_at < self._refresh_interval:
+                return
+            self._last_refresh_at = now
+            self._refresh()
+        self._raise_if_failed()
 
 
 class _PeriodicResourceHeartbeat:
@@ -454,10 +482,14 @@ def run_task(task_id: str, job_kind: str, payload: dict[str, object]) -> None:
             lease.refresh()
         state.record_heartbeat(task_id)
 
-    def checked_heartbeat() -> None:
+    def raise_if_heartbeat_failed() -> None:
         if periodic_heartbeat is not None:
             periodic_heartbeat.raise_if_failed()
+
+    def checked_heartbeat() -> None:
+        raise_if_heartbeat_failed()
         heartbeat()
+        raise_if_heartbeat_failed()
 
     def stop_heartbeat_before_success() -> None:
         nonlocal heartbeat_stopped
@@ -471,7 +503,8 @@ def run_task(task_id: str, job_kind: str, payload: dict[str, object]) -> None:
     executor = RedisTaskExecutor(
         state,
         max_output_bytes=settings.max_output_bytes,
-        resource_heartbeat=checked_heartbeat,
+        resource_heartbeat=heartbeat,
+        resource_health_check=raise_if_heartbeat_failed,
         before_success_publish=stop_heartbeat_before_success,
         task_already_running=True,
     )
