@@ -326,6 +326,7 @@ def _parse_sequential_pattern(
 ) -> tuple[str, int, str] | None:
     literal: list[str] = []
     marker: tuple[str, int] | None = None
+    invalid_sequence_percent = False
     index = 0
     while index < len(value):
         if value[index] != "%":
@@ -336,24 +337,42 @@ def _parse_sequential_pattern(
             literal.append("%")
             index += 2
             continue
-        width_start = index + 1
-        if width_start < len(value) and value[width_start] == "0":
-            width_start += 1
-            width_end = width_start
-            while width_end < len(value) and value[width_end].isdigit():
-                width_end += 1
-            if (
-                width_end > width_start
-                and width_end < len(value)
-                and value[width_end] == "d"
-                and marker is None
-            ):
-                marker = ("".join(literal), int(value[width_start:width_end]))
+        marker_end, width = _sequential_marker_at(value, index)
+        if marker_end is not None and width is not None and width > 0:
+            if marker is None:
+                marker = ("".join(literal), width)
                 literal = []
-                index = width_end + 1
+                index = marker_end
                 continue
-        return None
+            invalid_sequence_percent = True
+            index = marker_end
+            continue
+        invalid_sequence_percent = True
+        literal.append("%")
+        index += 1
     if marker is None:
         return None
+    if invalid_sequence_percent:
+        raise ValueError("Sequential output pattern contains invalid percent markers")
     prefix, width = marker
     return prefix, width, "".join(literal)
+
+
+def _sequential_marker_at(
+    value: str,
+    index: int,
+) -> tuple[int | None, int | None]:
+    zero_index = index + 1
+    if zero_index >= len(value) or value[zero_index] != "0":
+        return None, None
+    width_start = zero_index + 1
+    width_end = width_start
+    while width_end < len(value) and value[width_end].isdigit():
+        width_end += 1
+    if (
+        width_end == width_start
+        or width_end >= len(value)
+        or value[width_end] != "d"
+    ):
+        return None, None
+    return width_end + 1, int(value[width_start:width_end])

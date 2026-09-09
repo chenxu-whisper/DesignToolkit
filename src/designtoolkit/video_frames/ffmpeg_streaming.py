@@ -14,10 +14,14 @@ from designtoolkit.web.output_limits import (
     _parse_sequential_pattern,
 )
 
-_MAX_PPM_HEADER_BYTES = 64 * 1024
-_MAX_PPM_DIMENSION = 16_384
-_MAX_PPM_FRAME_BYTES = 25 * 1024 * 1024
-_PPM_WHITESPACE = b" \t\r\n\v\f"
+_MAX_PAM_HEADER_BYTES = 64 * 1024
+_MAX_PAM_DIMENSION = 16_384
+_MAX_PAM_PIXELS = 100_000_000
+_MAX_PAM_FRAME_BYTES = 25 * 1024 * 1024
+_PAM_FEED_CHUNK_BYTES = 64 * 1024
+_PAM_HEADER_KEYS = frozenset(
+    {b"WIDTH", b"HEIGHT", b"DEPTH", b"MAXVAL", b"TUPLTYPE"}
+)
 _SEQUENCE_IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg"})
 _SINGLE_IMAGE_FORMATS = {
     ".png": "PNG",
@@ -28,6 +32,7 @@ _SINGLE_IMAGE_FORMATS = {
     ".tif": "TIFF",
     ".tiff": "TIFF",
 }
+_RGB_ONLY_IMAGE_FORMATS = frozenset({"JPEG", "BMP"})
 _VIDEO_MUXERS = {
     ".mp4": "mp4",
     ".mov": "mov",
@@ -44,43 +49,52 @@ class FfmpegOutputError(RuntimeError):
 
 
 @dataclass(frozen=True)
-class PpmFrame:
+class PamFrame:
     width: int
     height: int
     pixels: bytes
 
 
-class PpmStreamParser:
+class PamStreamParser:
     def __init__(self) -> None:
         self._buffer = bytearray()
         self._frame_width: int | None = None
         self._frame_height: int | None = None
         self._frame_bytes: int | None = None
 
-    def feed(self, data: bytes) -> list[PpmFrame]:
-        self._buffer.extend(data)
-        frames: list[PpmFrame] = []
+    def feed(self, data: bytes) -> list[PamFrame]:
+        frames: list[PamFrame] = []
+        view = memoryview(data)
+        while view:
+            chunk = view[:_PAM_FEED_CHUNK_BYTES]
+            view = view[len(chunk) :]
+            self._buffer.extend(chunk)
+            frames.extend(self._drain())
+        return frames
+
+    def _drain(self) -> list[PamFrame]:
+        frames: list[PamFrame] = []
         while True:
             if self._frame_bytes is None:
-                header = _parse_ppm_header(self._buffer)
+                header = _parse_pam_header(self._buffer)
                 if header is None:
-                    if len(self._buffer) > _MAX_PPM_HEADER_BYTES:
+                    if len(self._buffer) > _MAX_PAM_HEADER_BYTES:
                         raise FfmpegOutputError(
-                            "FFmpeg PPM header exceeds its size limit"
+                            "FFmpeg PAM header exceeds its size limit"
                         )
                     return frames
-                header_bytes, width, height = header
+                header_bytes, width, height, frame_bytes = header
                 del self._buffer[:header_bytes]
                 self._frame_width = width
                 self._frame_height = height
-                self._frame_bytes = width * height * 3
+                self._frame_bytes = frame_bytes
 
             if len(self._buffer) < self._frame_bytes:
                 return frames
             pixels = bytes(self._buffer[: self._frame_bytes])
             del self._buffer[: self._frame_bytes]
             frames.append(
-                PpmFrame(
+                PamFrame(
                     width=self._required_dimension(self._frame_width),
                     height=self._required_dimension(self._frame_height),
                     pixels=pixels,
@@ -92,12 +106,12 @@ class PpmStreamParser:
 
     def finish(self) -> None:
         if self._buffer or self._frame_bytes is not None:
-            raise FfmpegOutputError("FFmpeg produced a truncated PPM stream")
+            raise FfmpegOutputError("FFmpeg produced a truncated PAM stream")
 
     @staticmethod
     def _required_dimension(value: int | None) -> int:
         if value is None:
-            raise RuntimeError("PPM parser frame dimensions are unavailable")
+            raise RuntimeError("PAM parser frame dimensions are unavailable")
         return value
 
 
@@ -138,10 +152,16 @@ class GuardedFfmpegOutput:
             raise FfmpegOutputError("FFmpeg command has no output target")
         self._guard = guard
         self._original_target = str(command[-1])
-        self._sequence = _parse_sequential_pattern(self._original_target)
+        try:
+            self._sequence = _parse_sequential_pattern(self._original_target)
+        except ValueError as exc:
+            raise FfmpegOutputError(
+                f"FFmpeg guarded output target is unsupported: "
+                f"{self._original_target}"
+            ) from exc
         self._target = Path(self._original_target)
         guard.validate_path(self._target)
-        self._parser: PpmStreamParser | None = None
+        self._parser: PamStreamParser | None = None
         self._image_format: str | None = None
         self._single_image = False
         self._frame_index = _sequence_start_number(command)
@@ -160,20 +180,23 @@ class GuardedFfmpegOutput:
                     f"FFmpeg guarded output target is unsupported: "
                     f"{self._original_target}"
                 )
-            self._parser = PpmStreamParser()
+            self._parser = PamStreamParser()
             self._image_format = _SINGLE_IMAGE_FORMATS[suffix]
-            output_args = ["-f", "image2pipe", "-vcodec", "ppm", "pipe:1"]
+            output_args = [
+                "-f",
+                "image2pipe",
+                "-vcodec",
+                "pam",
+                "-pix_fmt",
+                "rgba",
+                "pipe:1",
+            ]
         elif suffix in _SINGLE_IMAGE_FORMATS:
-            if "%" in self._original_target:
-                raise FfmpegOutputError(
-                    f"FFmpeg guarded output target is unsupported: "
-                    f"{self._original_target}"
-                )
             if self._target.exists():
                 raise FfmpegOutputError(
                     f"FFmpeg output target already exists: {self._target}"
                 )
-            self._parser = PpmStreamParser()
+            self._parser = PamStreamParser()
             self._image_format = _SINGLE_IMAGE_FORMATS[suffix]
             self._single_image = True
             output_args = [
@@ -182,15 +205,12 @@ class GuardedFfmpegOutput:
                 "-f",
                 "image2pipe",
                 "-vcodec",
-                "ppm",
+                "pam",
+                "-pix_fmt",
+                "rgba",
                 "pipe:1",
             ]
         elif suffix in _VIDEO_MUXERS:
-            if "%" in self._original_target:
-                raise FfmpegOutputError(
-                    f"FFmpeg guarded output target is unsupported: "
-                    f"{self._original_target}"
-                )
             if self._target.exists():
                 raise FfmpegOutputError(
                     f"FFmpeg output target already exists: {self._target}"
@@ -308,7 +328,7 @@ class GuardedFfmpegOutput:
         frame_number = self._frame_index + self._frame_count
         return Path(f"{prefix}{frame_number:0{width}d}{suffix}")
 
-    def _write_image(self, frame: PpmFrame, target: Path) -> None:
+    def _write_image(self, frame: PamFrame, target: Path) -> None:
         if target.exists():
             raise FfmpegOutputError(
                 f"FFmpeg output target already exists: {target}"
@@ -323,11 +343,15 @@ class GuardedFfmpegOutput:
                 self._guard.register_created(raw_file, temporary)
                 file = _BudgetedFile(raw_file, temporary, self._guard)
                 with Image.frombytes(
-                    "RGB",
+                    "RGBA",
                     (frame.width, frame.height),
                     frame.pixels,
                 ) as image:
-                    image.save(file, format=self._image_format)
+                    if self._image_format in _RGB_ONLY_IMAGE_FORMATS:
+                        with image.convert("RGB") as rgb_image:
+                            rgb_image.save(file, format=self._image_format)
+                    else:
+                        image.save(file, format=self._image_format)
                 file.flush()
                 os.fsync(raw_file.fileno())
             self._published_paths.append(target)
@@ -364,84 +388,107 @@ def _sequence_start_number(command: Sequence[str]) -> int:
     return 1
 
 
-def _parse_ppm_header(
+def _parse_pam_header(
     buffer: bytearray,
-) -> tuple[int, int, int] | None:
+) -> tuple[int, int, int, int] | None:
     if not buffer:
         return None
-    if buffer[0] != ord("P"):
-        raise FfmpegOutputError("FFmpeg output must use binary PPM P6")
-    if len(buffer) < 2:
+    first_newline = buffer.find(b"\n")
+    if first_newline < 0:
+        if not b"P7".startswith(buffer):
+            raise FfmpegOutputError("FFmpeg output must use PAM P7")
         return None
-    if buffer[1] != ord("6"):
-        raise FfmpegOutputError("FFmpeg output must use binary PPM P6")
-    if len(buffer) < 3:
-        return None
-    if buffer[2] not in _PPM_WHITESPACE:
-        raise FfmpegOutputError("FFmpeg output must use binary PPM P6")
+    if _pam_header_line(buffer, 0, first_newline) != b"P7":
+        raise FfmpegOutputError("FFmpeg output must use PAM P7")
 
-    tokens: list[bytes] = [b"P6"]
-    index = 2
-    while len(tokens) < 4:
-        index = _skip_ppm_separators(buffer, index)
-        if index >= len(buffer):
-            return None
-        token_start = index
-        while (
-            index < len(buffer)
-            and buffer[index] not in _PPM_WHITESPACE
-            and buffer[index] != ord("#")
-        ):
-            index += 1
-        if index == len(buffer):
-            return None
-        if index == token_start:
-            raise FfmpegOutputError("FFmpeg produced a malformed PPM header")
-        tokens.append(bytes(buffer[token_start:index]))
-
-    if buffer[index] not in _PPM_WHITESPACE:
-        raise FfmpegOutputError("FFmpeg PPM maxval requires a separator")
-    header_bytes = index + 1
-    if buffer[index] == ord("\r"):
-        if header_bytes == len(buffer):
-            return None
-        if buffer[header_bytes] == ord("\n"):
-            header_bytes += 1
-
-    if tokens[0] != b"P6":
-        raise FfmpegOutputError("FFmpeg output must use binary PPM P6")
-    width = _parse_ppm_integer(tokens[1], "width")
-    height = _parse_ppm_integer(tokens[2], "height")
-    maxval = _parse_ppm_integer(tokens[3], "maxval")
-    if width <= 0 or height <= 0:
-        raise FfmpegOutputError("FFmpeg PPM dimensions must be positive")
-    frame_bytes = width * height * 3
-    if frame_bytes > _MAX_PPM_FRAME_BYTES:
-        raise FfmpegOutputError("FFmpeg PPM frame size exceeds its hard limit")
-    if width > _MAX_PPM_DIMENSION or height > _MAX_PPM_DIMENSION:
-        raise FfmpegOutputError("FFmpeg PPM dimensions exceed their hard limit")
-    if maxval != 255:
-        raise FfmpegOutputError("FFmpeg PPM maxval must be 255")
-    return header_bytes, width, height
-
-
-def _skip_ppm_separators(buffer: bytearray, index: int) -> int:
+    fields: dict[bytes, bytes] = {}
+    index = first_newline + 1
     while True:
-        while index < len(buffer) and buffer[index] in _PPM_WHITESPACE:
-            index += 1
-        if index >= len(buffer) or buffer[index] != ord("#"):
-            return index
-        newline = buffer.find(b"\n", index + 1)
+        newline = buffer.find(b"\n", index)
         if newline < 0:
-            return len(buffer)
+            return None
+        if newline + 1 > _MAX_PAM_HEADER_BYTES:
+            raise FfmpegOutputError(
+                "FFmpeg PAM header exceeds its size limit"
+            )
+        line = _pam_header_line(buffer, index, newline)
         index = newline + 1
+        if line == b"ENDHDR":
+            break
+        parts = line.split()
+        if len(parts) != 2:
+            raise FfmpegOutputError("FFmpeg produced a malformed PAM header")
+        key, value = parts
+        if key not in _PAM_HEADER_KEYS:
+            raise FfmpegOutputError(f"FFmpeg PAM header key is unsupported: {key!r}")
+        if key in fields:
+            raise FfmpegOutputError(
+                f"FFmpeg PAM header contains duplicate {key.decode('ascii')}"
+            )
+        fields[key] = value
+
+    missing = _PAM_HEADER_KEYS.difference(fields)
+    if missing:
+        missing_names = ", ".join(
+            key.decode("ascii") for key in sorted(missing)
+        )
+        raise FfmpegOutputError(
+            f"FFmpeg PAM header is missing {missing_names}"
+        )
+
+    width = _parse_pam_integer(fields[b"WIDTH"], "WIDTH")
+    height = _parse_pam_integer(fields[b"HEIGHT"], "HEIGHT")
+    depth = _parse_pam_integer(fields[b"DEPTH"], "DEPTH")
+    maxval = _parse_pam_integer(fields[b"MAXVAL"], "MAXVAL")
+    if (
+        width <= 0
+        or height <= 0
+        or width > _MAX_PAM_DIMENSION
+        or height > _MAX_PAM_DIMENSION
+    ):
+        raise FfmpegOutputError("FFmpeg PAM dimensions exceed their hard limit")
+    if depth != 4:
+        raise FfmpegOutputError("FFmpeg PAM DEPTH must be 4")
+    if maxval != 255:
+        raise FfmpegOutputError("FFmpeg PAM MAXVAL must be 255")
+    if fields[b"TUPLTYPE"] != b"RGB_ALPHA":
+        raise FfmpegOutputError("FFmpeg PAM TUPLTYPE must be RGB_ALPHA")
+    pixels = _checked_pam_product(
+        width,
+        height,
+        _MAX_PAM_PIXELS,
+        "pixel count",
+    )
+    frame_bytes = _checked_pam_product(
+        pixels,
+        depth,
+        _MAX_PAM_FRAME_BYTES,
+        "frame size",
+    )
+    return index, width, height, frame_bytes
 
 
-def _parse_ppm_integer(token: bytes, name: str) -> int:
+def _pam_header_line(buffer: bytearray, start: int, end: int) -> bytes:
+    line = bytes(buffer[start:end])
+    return line[:-1] if line.endswith(b"\r") else line
+
+
+def _parse_pam_integer(token: bytes, name: str) -> int:
     if (
         not token
         or len(token) > 10
         or any(byte < ord("0") or byte > ord("9") for byte in token)
     ):
-        raise FfmpegOutputError(f"FFmpeg PPM {name} is not a decimal integer")
+        raise FfmpegOutputError(f"FFmpeg PAM {name} is not a decimal integer")
     return int(token)
+
+
+def _checked_pam_product(
+    left: int,
+    right: int,
+    limit: int,
+    name: str,
+) -> int:
+    if left > limit // right:
+        raise FfmpegOutputError(f"FFmpeg PAM {name} exceeds its hard limit")
+    return left * right
