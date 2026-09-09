@@ -2226,10 +2226,14 @@ class RedisResourceCoordinator:
         self,
         session_id: str,
         upload_id: str,
+        *,
+        generation_token: str | None = None,
     ) -> RedisUploadRegistration:
         _validate_session_id(session_id)
         _validate_asset_id(upload_id)
-        token = uuid4().hex
+        if generation_token is not None:
+            _validate_token(generation_token)
+        token = generation_token or uuid4().hex
         registration = RedisUploadRegistration(
             coordinator=self,
             session_id=session_id,

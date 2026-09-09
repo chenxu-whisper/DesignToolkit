@@ -316,7 +316,7 @@ describe('hosted replacement uploads', () => {
       replacements: [oldImageReference, newImageReference],
     },
   ])(
-    'retries failed old asset cleanup on the next $inputLabel upload',
+    'leaves failed old asset retry ownership outside the $inputLabel component',
     async ({ filenames, inputLabel, page, replacements }) => {
       const finalReference = `asset:${'e'.repeat(32)}:${'5'.repeat(32)}:final.bin`
       apiMocks.uploadFiles
@@ -337,10 +337,9 @@ describe('hosted replacement uploads', () => {
       upload(container, new File(['final'], 'final.bin'))
 
       await waitFor(() => {
-        expect(apiMocks.deleteUploadedAsset).toHaveBeenCalledTimes(3)
+        expect(apiMocks.deleteUploadedAsset).toHaveBeenCalledTimes(2)
       })
       expect(apiMocks.deleteUploadedAsset.mock.calls).toEqual([
-        [replacements[0]],
         [replacements[0]],
         [replacements[1]],
       ])

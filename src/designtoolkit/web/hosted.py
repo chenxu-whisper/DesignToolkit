@@ -556,6 +556,13 @@ class UploadDeletionInspection:
             and compare_digest(expected_generation, self.generation_id)
         )
 
+    def matches_upload(self, other: UploadDeletionInspection) -> bool:
+        if self.asset_id != other.asset_id:
+            return False
+        if self.generation_id is None or other.generation_id is None:
+            return self.generation_id is other.generation_id
+        return compare_digest(self.generation_id, other.generation_id)
+
 
 class HostedStorage:
     def __init__(
@@ -823,7 +830,7 @@ class HostedStorage:
             )
             if (
                 expected_identity is not None
-                and current_identity != expected_identity
+                and not current_identity.matches_upload(expected_identity)
             ):
                 return None
             if not self._asset_generation_matches_deletion(

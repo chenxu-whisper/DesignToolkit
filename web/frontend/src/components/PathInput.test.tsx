@@ -1,8 +1,19 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { useState } from 'react'
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import {
+  deleteUploadedAsset as deleteUploadedAssetWithQueue,
+  resetUploadCleanupQueueForTests,
+  uploadFiles as uploadFilesWithQueue,
+} from '../services/apiClient'
 import { PathInput } from './PathInput'
+
+afterEach(() => {
+  resetUploadCleanupQueueForTests()
+  vi.restoreAllMocks()
+  vi.unstubAllGlobals()
+})
 
 function deferred<T>() {
   let reject!: (reason?: unknown) => void
@@ -1107,7 +1118,102 @@ describe('PathInput', () => {
     expect(screen.getByLabelText('输入媒体路径')).toHaveValue('new.png')
   })
 
-  it('retries retained replacement cleanup after the next successful upload', async () => {
+  it('retains rejected cleanup after unmount and retries it on the next upload', async () => {
+    const previous = `asset:${'1'.repeat(32)}:${'2'.repeat(32)}:old.png`
+    const replacement = `asset:${'3'.repeat(32)}:${'4'.repeat(32)}:new.png`
+    const firstCleanup = deferred<Response>()
+    const cleanupError = new Error('旧文件清理失败')
+    const cleanup = vi
+      .spyOn(globalThis, 'fetch')
+      .mockReturnValueOnce(firstCleanup.promise)
+      .mockRejectedValueOnce(cleanupError)
+      .mockRejectedValueOnce(cleanupError)
+      .mockResolvedValue(new Response(null, { status: 204 }))
+    const firstUpload = vi.fn().mockResolvedValue([replacement])
+    const firstRender = render(
+      <ControlledUploadPathInput
+        deleteUploadedAsset={deleteUploadedAssetWithQueue}
+        initialValue={previous}
+        uploadFiles={firstUpload}
+      />,
+    )
+    const firstFileInput = firstRender.container.querySelector<HTMLInputElement>(
+      'input[type="file"]',
+    )
+    if (!firstFileInput) {
+      throw new Error('upload input missing')
+    }
+
+    fireEvent.change(firstFileInput, {
+      target: { files: [new File(['new'], 'new.png', { type: 'image/png' })] },
+    })
+    await waitFor(() => expect(cleanup).toHaveBeenCalledOnce())
+    firstRender.unmount()
+    await act(async () => {
+      firstCleanup.reject(cleanupError)
+      await firstCleanup.promise.catch(() => undefined)
+    })
+    await waitFor(() => expect(cleanup).toHaveBeenCalledTimes(3))
+
+    const requests: MockUploadRequest[] = []
+    class MockUploadRequest {
+      status = 201
+      response: unknown = null
+      listeners = new Map<string, () => void>()
+      upload = {
+        addEventListener: () => undefined,
+      }
+
+      constructor() {
+        requests.push(this)
+      }
+
+      open() {}
+
+      setRequestHeader() {}
+
+      addEventListener(type: string, listener: () => void) {
+        this.listeners.set(type, listener)
+      }
+
+      send() {}
+    }
+    vi.stubGlobal('XMLHttpRequest', MockUploadRequest)
+    vi.spyOn(globalThis.crypto, 'randomUUID')
+      .mockReturnValueOnce('55555555-5555-5555-5555-555555555555')
+      .mockReturnValueOnce('66666666-6666-6666-6666-666666666666')
+    const secondRender = render(
+      <ControlledUploadPathInput uploadFiles={uploadFilesWithQueue} />,
+    )
+    const secondFileInput =
+      secondRender.container.querySelector<HTMLInputElement>('input[type="file"]')
+    if (!secondFileInput) {
+      throw new Error('upload input missing')
+    }
+
+    fireEvent.change(secondFileInput, {
+      target: { files: [new File(['next'], 'next.png', { type: 'image/png' })] },
+    })
+    await waitFor(() => expect(requests).toHaveLength(1))
+    await act(async () => {
+      requests[0].response = {
+        filename: 'next.png',
+        reference: `asset:${'5'.repeat(32)}:${'6'.repeat(32)}:next.png`,
+        size: 4,
+      }
+      requests[0].listeners.get('load')?.()
+    })
+
+    await waitFor(() =>
+      expect(screen.getByLabelText('输入媒体路径')).toHaveValue('next.png'),
+    )
+    expect(cleanup).toHaveBeenLastCalledWith(
+      `/api/uploads/${'1'.repeat(32)}?generation=${'2'.repeat(32)}`,
+      { method: 'DELETE' },
+    )
+  })
+
+  it('leaves failed cleanup retry ownership outside the component', async () => {
     const previous = `asset:${'1'.repeat(32)}:${'2'.repeat(32)}:old.png`
     const firstReplacement = `asset:${'3'.repeat(32)}:${'4'.repeat(32)}:first.png`
     const secondReplacement = `asset:${'5'.repeat(32)}:${'6'.repeat(32)}:second.png`
@@ -1141,10 +1247,9 @@ describe('PathInput', () => {
     })
 
     await waitFor(() => {
-      expect(deleteUploadedAsset).toHaveBeenCalledTimes(3)
+      expect(deleteUploadedAsset).toHaveBeenCalledTimes(2)
     })
     expect(deleteUploadedAsset.mock.calls).toEqual([
-      [previous],
       [previous],
       [firstReplacement],
     ])

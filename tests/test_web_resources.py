@@ -1699,6 +1699,22 @@ def test_upload_registration_acknowledgement_loss_reuses_one_token() -> None:
     registration.finish()
 
 
+def test_upload_registration_uses_supplied_generation_across_ack_loss() -> None:
+    redis_connection = ExecuteThenRaiseRedis("register_upload")
+    resources = coordinator(redis_connection)
+    generation = "2" * 32
+
+    registration = resources.register_upload(
+        SESSION_A,
+        "1" * 32,
+        generation_token=generation,
+    )
+
+    assert registration.token == generation
+    assert redis_connection.attempt_tokens == [generation, generation]
+    registration.finish()
+
+
 def test_upload_registration_recovers_after_all_attempt_ack_losses() -> None:
     redis_connection = ExecuteThenRaiseRedis(
         "register_upload",

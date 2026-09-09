@@ -150,11 +150,12 @@ class StubUploadRegistration:
         coordinator: StubCoordinator,
         session_id: str,
         upload_id: str,
+        token: str | None = None,
     ) -> None:
         self.coordinator = coordinator
         self.session_id = session_id
         self.upload_id = upload_id
-        self.token = uuid4().hex
+        self.token = token or uuid4().hex
 
     def refresh(self) -> bool:
         if (self.session_id, self.upload_id) not in self.coordinator.inflight:
@@ -204,6 +205,8 @@ class StubCoordinator:
         self,
         session_id: str,
         upload_id: str,
+        *,
+        generation_token: str | None = None,
     ) -> StubUploadRegistration:
         key = (session_id, upload_id)
         if key in self.inflight:
@@ -216,7 +219,12 @@ class StubCoordinator:
             self.finalized_assets.discard(key)
         if key in self.pending_release_generations:
             raise ResourceUnavailableError("Upload deletion is still pending")
-        registration = StubUploadRegistration(self, session_id, upload_id)
+        registration = StubUploadRegistration(
+            self,
+            session_id,
+            upload_id,
+            generation_token,
+        )
         self.inflight[key] = False
         self.inflight_generations[key] = registration.token
         return registration
@@ -522,19 +530,23 @@ def _upload(
     content: bytes,
     *,
     content_length: int | None = None,
+    generation_token: str | None = None,
     upload_id: str | None = None,
 ):
+    headers = {
+        "content-length": str(
+            len(content) if content_length is None else content_length
+        ),
+        "content-type": "application/octet-stream",
+        "x-upload-filename": quote(filename, safe=""),
+        "x-upload-id": upload_id or uuid4().hex,
+    }
+    if generation_token is not None:
+        headers["x-upload-generation"] = generation_token
     return client.post(
         "/api/uploads",
         content=content,
-        headers={
-            "content-length": str(
-                len(content) if content_length is None else content_length
-            ),
-            "content-type": "application/octet-stream",
-            "x-upload-filename": quote(filename, safe=""),
-            "x-upload-id": upload_id or uuid4().hex,
-        },
+        headers=headers,
     )
 
 
@@ -946,6 +958,49 @@ def test_duplicate_upload_id_does_not_overwrite_or_double_charge(
     assert coordinator.reserve_calls == 2
     assert len(list(tmp_path.rglob("first.png"))) == 1
     assert list(tmp_path.rglob("second.png")) == []
+
+
+def test_hosted_upload_uses_client_supplied_generation_without_exposing_it(
+    tmp_path: Path,
+) -> None:
+    upload_id = "1" * 32
+    generation = "2" * 32
+
+    with _client(tmp_path) as client:
+        response = _upload(
+            client,
+            "screen.png",
+            b"image",
+            upload_id=upload_id,
+            generation_token=generation,
+        )
+
+    assert response.status_code == 201
+    assert response.json() == {
+        "reference": f"asset:{upload_id}:{generation}:screen.png",
+        "filename": "screen.png",
+        "size": 5,
+    }
+
+
+@pytest.mark.parametrize(
+    "generation",
+    ["2" * 31, "2" * 31 + "G", "2" * 33],
+)
+def test_hosted_upload_rejects_invalid_client_generation(
+    tmp_path: Path,
+    generation: str,
+) -> None:
+    with _client(tmp_path) as client:
+        response = _upload(
+            client,
+            "screen.png",
+            b"image",
+            generation_token=generation,
+        )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_upload"
 
 
 def test_known_upload_id_recovers_committed_upload_after_response_loss(
@@ -2733,6 +2788,67 @@ class InspectBarrierStorage(HostedStorage):
         self.inspected.set()
         assert self.resume.wait(timeout=5)
         return inspection
+
+
+def test_delete_snapshot_accepts_same_generation_published_at_barrier(
+    tmp_path: Path,
+) -> None:
+    session_id = "a" * 32
+    upload_id = "1" * 32
+    generation_id = "2" * 32
+    coordinator = StubCoordinator(
+        max_upload_concurrency=4,
+        max_session_bytes=5,
+        min_free_bytes=0,
+    )
+    coordinator.inflight[(session_id, upload_id)] = False
+    coordinator.inflight_generations[(session_id, upload_id)] = generation_id
+    coordinator.committed[session_id] = 4
+    coordinator.committed_generations[
+        (session_id, upload_id, generation_id)
+    ] = 4
+    storage = InspectBarrierStorage(tmp_path, max_upload_bytes=5)
+    asset_dir = tmp_path / "sessions" / session_id / "assets" / upload_id
+    asset_dir.mkdir(parents=True)
+    uploading = asset_dir / ".uploading"
+    uploading.write_bytes(b"data")
+    (asset_dir / ".asset.json").write_text(
+        json.dumps(
+            {
+                "asset_id": upload_id,
+                "bytes": 4,
+                "generation_id": generation_id,
+            }
+        ),
+        encoding="utf-8",
+    )
+    generation = (
+        tmp_path / "sessions" / session_id / ".upload-generations" / upload_id
+    )
+    generation.parent.mkdir()
+    generation.write_text(generation_id, encoding="ascii")
+
+    with _client(
+        tmp_path,
+        resource_coordinator=coordinator,
+        hosted_storage=storage,
+    ) as client:
+        client.cookies.set("dt_session", session_id)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            delete_future = executor.submit(
+                client.delete,
+                f"/api/uploads/{upload_id}?generation={generation_id}",
+            )
+            assert storage.inspected.wait(timeout=2)
+            uploading.replace(asset_dir / "screen.png")
+            coordinator.inflight.pop((session_id, upload_id))
+            coordinator.inflight_generations.pop((session_id, upload_id))
+            storage.resume.set()
+            deleted = delete_future.result(timeout=2)
+
+    assert deleted.status_code == 204
+    assert not asset_dir.exists()
+    assert coordinator.committed.get(session_id, 0) == 0
 
 
 def test_real_redis_empty_delete_snapshot_does_not_cancel_new_registration(

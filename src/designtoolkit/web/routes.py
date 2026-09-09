@@ -1301,6 +1301,9 @@ def create_router(
         encoded_filename = http_request.headers.get("x-upload-filename")
         filename = _upload_filename(encoded_filename)
         upload_id = _upload_id(http_request.headers.get("x-upload-id"))
+        upload_generation = _upload_generation(
+            http_request.headers.get("x-upload-generation")
+        )
         if content_length > settings.max_upload_bytes:
             raise ApiError(
                 "upload_too_large",
@@ -1317,6 +1320,7 @@ def create_router(
                 registration = resources.register_upload(
                     http_request.state.session_id,
                     upload_id,
+                    generation_token=upload_generation,
                 )
             except ResourceUnavailableError as exc:
                 if str(exc) in {
@@ -2349,6 +2353,18 @@ def _upload_id(value: str | None) -> str:
         raise ApiError(
             "invalid_upload",
             "X-Upload-Id must be 32 lowercase hexadecimal characters",
+            400,
+        )
+    return value
+
+
+def _upload_generation(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if _HOSTED_ID_PATTERN.fullmatch(value) is None:
+        raise ApiError(
+            "invalid_upload",
+            "X-Upload-Generation must be 32 lowercase hexadecimal characters",
             400,
         )
     return value

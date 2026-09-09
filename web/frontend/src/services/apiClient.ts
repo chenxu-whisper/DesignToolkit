@@ -176,8 +176,16 @@ export type UploadResponse = {
   size: number
 }
 
+type UploadedAssetDeletionTarget = {
+  assetId: string
+  generation?: string
+}
+
 export type LocalFileKind = 'video' | 'media' | 'image' | 'any'
 type LocalSaveFileKind = 'media' | 'image' | 'any'
+
+const pendingUploadCleanups = new Map<string, UploadedAssetDeletionTarget>()
+let pendingCleanupDrain: Promise<void> | null = null
 
 async function readJson<T>(response: Response): Promise<ApiErrorResponse | T | null> {
   try {
@@ -229,28 +237,43 @@ export async function uploadFiles(
   onProgress: (percentage: number) => void,
   signal?: AbortSignal,
 ): Promise<readonly string[]> {
+  if (pendingUploadCleanups.size > 0) {
+    await drainPendingUploadCleanups()
+  }
   const uploaded: UploadResponse[] = []
-  const cleanupTargets: string[] = []
+  const cleanupTargets: UploadedAssetDeletionTarget[] = []
   try {
     for (let index = 0; index < files.length; index += 1) {
       throwIfUploadAborted(signal)
       const file = files[index]
       const uploadId = createUploadId()
-      const cleanupIndex = cleanupTargets.push(uploadId) - 1
-      const response = await uploadFile(file, uploadId, (fileProgress) => {
+      const generation = createUploadGeneration()
+      cleanupTargets.push({ assetId: uploadId, generation })
+      const response = await uploadFile(file, uploadId, generation, (fileProgress) => {
         onProgress(Math.round(((index + fileProgress) / files.length) * 100))
       }, signal)
       uploaded.push(response)
-      cleanupTargets[cleanupIndex] = response.reference
       throwIfUploadAborted(signal)
     }
+    if (pendingUploadCleanups.size > 0) {
+      await drainPendingUploadCleanups()
+    }
+    return uploaded.map(({ reference }) => reference)
   } catch (error) {
     const cleanupResults = await Promise.allSettled(
-      cleanupTargets.map((target) => deleteUploadedAsset(target)),
+      cleanupTargets.map((target) => deleteUploadedAssetTarget(target)),
     )
-    const cleanupErrors = cleanupResults.flatMap((result) =>
-      result.status === 'rejected' ? [result.reason] : [],
-    )
+    const cleanupErrors: unknown[] = []
+    cleanupResults.forEach((result, index) => {
+      const target = cleanupTargets[index]
+      const key = uploadedAssetDeletionTargetKey(target)
+      if (result.status === 'fulfilled') {
+        pendingUploadCleanups.delete(key)
+      } else {
+        pendingUploadCleanups.set(key, target)
+        cleanupErrors.push(result.reason)
+      }
+    })
     if (cleanupErrors.length > 0) {
       const uploadMessage =
         error instanceof Error && error.message ? error.message : '文件上传失败'
@@ -262,13 +285,26 @@ export async function uploadFiles(
     }
     throw error
   }
-  return uploaded.map(({ reference }) => reference)
 }
 
 export async function deleteUploadedAsset(
   assetIdOrReference: string,
 ): Promise<void> {
-  const { assetId, generation } = uploadedAssetDeletionTarget(assetIdOrReference)
+  const target = uploadedAssetDeletionTarget(assetIdOrReference)
+  const key = uploadedAssetDeletionTargetKey(target)
+  try {
+    await deleteUploadedAssetTarget(target)
+    pendingUploadCleanups.delete(key)
+  } catch (error) {
+    pendingUploadCleanups.set(key, target)
+    throw error
+  }
+}
+
+async function deleteUploadedAssetTarget({
+  assetId,
+  generation,
+}: UploadedAssetDeletionTarget): Promise<void> {
   const generationQuery = generation === undefined
     ? ''
     : `?generation=${encodeURIComponent(generation)}`
@@ -302,10 +338,37 @@ export async function deleteUploadedAsset(
   }
 }
 
-function uploadedAssetDeletionTarget(value: string): {
-  assetId: string
-  generation?: string
-} {
+async function drainPendingUploadCleanups(): Promise<void> {
+  if (pendingCleanupDrain) {
+    await pendingCleanupDrain
+    return
+  }
+  const targets = Array.from(pendingUploadCleanups.entries())
+  if (targets.length === 0) {
+    return
+  }
+  pendingCleanupDrain = (async () => {
+    const results = await Promise.allSettled(
+      targets.map(([, target]) => deleteUploadedAssetTarget(target)),
+    )
+    results.forEach((result, index) => {
+      if (result.status !== 'fulfilled') {
+        return
+      }
+      const [key, target] = targets[index]
+      if (pendingUploadCleanups.get(key) === target) {
+        pendingUploadCleanups.delete(key)
+      }
+    })
+  })()
+  try {
+    await pendingCleanupDrain
+  } finally {
+    pendingCleanupDrain = null
+  }
+}
+
+function uploadedAssetDeletionTarget(value: string): UploadedAssetDeletionTarget {
   const parts = value.split(':')
   if (
     parts[0] === 'asset'
@@ -320,9 +383,17 @@ function uploadedAssetDeletionTarget(value: string): {
   return { assetId: value }
 }
 
+function uploadedAssetDeletionTargetKey({
+  assetId,
+  generation,
+}: UploadedAssetDeletionTarget): string {
+  return `${assetId}:${generation ?? ''}`
+}
+
 function uploadFile(
   file: File,
   uploadId: string,
+  generation: string,
   onProgress: (fraction: number) => void,
   signal?: AbortSignal,
 ): Promise<UploadResponse> {
@@ -349,6 +420,7 @@ function uploadFile(
     request.setRequestHeader('Content-Type', file.type || 'application/octet-stream')
     request.setRequestHeader('X-Upload-Filename', encodeURIComponent(file.name))
     request.setRequestHeader('X-Upload-Id', uploadId)
+    request.setRequestHeader('X-Upload-Generation', generation)
     signal?.addEventListener('abort', abortRequest, { once: true })
     request.upload.addEventListener('progress', (event) => {
       if (event.lengthComputable && event.total > 0) {
@@ -380,6 +452,15 @@ function uploadFile(
 
 function createUploadId(): string {
   return crypto.randomUUID().replaceAll('-', '')
+}
+
+function createUploadGeneration(): string {
+  return crypto.randomUUID().replaceAll('-', '')
+}
+
+export function resetUploadCleanupQueueForTests(): void {
+  pendingUploadCleanups.clear()
+  pendingCleanupDrain = null
 }
 
 function throwIfUploadAborted(signal?: AbortSignal): void {

@@ -22,6 +22,7 @@ from designtoolkit.web.hosted import (
     HostedSettings,
     HostedStorage,
     UploadConflictError,
+    UploadDeletionState,
     UploadRejectedError,
     _CleanupClaimHeartbeat,
     parse_asset_reference,
@@ -1020,6 +1021,53 @@ async def test_published_asset_deletion_carries_manifest_generation(
 
     assert deletion is not None
     assert deletion.generation_id == registration.token
+
+
+def test_deletion_snapshot_survives_active_to_published_barrier(
+    tmp_path: Path,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    session_id = "a" * 32
+    asset_id = "1" * 32
+    generation_id = "2" * 32
+    asset_dir = tmp_path / "sessions" / session_id / "assets" / asset_id
+    asset_dir.mkdir(parents=True)
+    uploading = asset_dir / ".uploading"
+    uploading.write_bytes(b"data")
+    (asset_dir / ".asset.json").write_text(
+        json.dumps(
+            {
+                "asset_id": asset_id,
+                "bytes": 4,
+                "generation_id": generation_id,
+            }
+        ),
+        encoding="utf-8",
+    )
+    generation = (
+        tmp_path / "sessions" / session_id / ".upload-generations" / asset_id
+    )
+    generation.parent.mkdir()
+    generation.write_text(generation_id, encoding="ascii")
+
+    deletion_snapshot = storage.inspect_upload_for_deletion(
+        session_id,
+        asset_id,
+    )
+    uploading.replace(asset_dir / "screen.png")
+    published = storage.inspect_upload_for_deletion(session_id, asset_id)
+    deletion = storage.delete_asset(
+        session_id,
+        f"asset:{asset_id}",
+        expected_generation=generation_id,
+        expected_identity=deletion_snapshot,
+    )
+
+    assert deletion_snapshot.state is UploadDeletionState.ACTIVE
+    assert published.state is UploadDeletionState.PUBLISHED
+    assert published.generation_id == deletion_snapshot.generation_id
+    assert deletion is not None
+    assert deletion.generation_id == generation_id
 
 
 @pytest.mark.anyio

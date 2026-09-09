@@ -62,11 +62,9 @@ export function PathInput({
   const [pickerError, setPickerError] = useState<string | null>(null)
   const [uploadProgress, setUploadProgress] = useState<number | null>(null)
   const cleanupOperationRef = useRef(0)
-  const cleanupQueueRef = useRef(Promise.resolve())
   const currentValueRef = useRef(value)
   const latestIntentRef = useRef(0)
   const mountedRef = useRef(true)
-  const pendingCleanupReferencesRef = useRef(new Set<string>())
   const pickerPointerSequenceRef = useRef(0)
   const suppressPickerBlurRef = useRef(false)
   const skipNextBlurRef = useRef(false)
@@ -127,28 +125,20 @@ export function PathInput({
 
   const isLatestIntent = (intent: number) => latestIntentRef.current === intent
 
-  const schedulePendingCleanup = (operation: number) => {
-    if (!deleteUploadedAsset) {
+  const schedulePendingCleanup = (
+    references: readonly string[],
+    operation: number,
+  ) => {
+    if (!deleteUploadedAsset || references.length === 0) {
       return
     }
-    const cleanup = async () => {
-      const retainedReferences = new Set(
-        assetReferences(currentValueRef.current),
-      )
-      const references = Array.from(
-        pendingCleanupReferencesRef.current,
-      ).filter((reference) => !retainedReferences.has(reference))
+    void (async () => {
       const cleanupResults = await Promise.allSettled(
         references.map((reference) => deleteUploadedAsset(reference)),
       )
-      const cleanupErrors: unknown[] = []
-      cleanupResults.forEach((result, index) => {
-        if (result.status === 'fulfilled') {
-          pendingCleanupReferencesRef.current.delete(references[index])
-        } else {
-          cleanupErrors.push(result.reason)
-        }
-      })
+      const cleanupErrors = cleanupResults.flatMap((result) =>
+        result.status === 'rejected' ? [result.reason] : [],
+      )
       if (
         cleanupErrors.length > 0
         && mountedRef.current
@@ -161,8 +151,7 @@ export function PathInput({
             : `${cleanupErrors.length} 个旧文件清理失败`,
         )
       }
-    }
-    cleanupQueueRef.current = cleanupQueueRef.current.then(cleanup, cleanup)
+    })()
   }
 
   const updateValue = (nextValue: string) => {
@@ -280,13 +269,11 @@ export function PathInput({
         const previousValue = currentValueRef.current
         const nextValue = valueWithDroppedPaths('', references, multiline)
         const retainedReferences = new Set(assetReferences(nextValue))
-        assetReferences(previousValue)
-          .filter((reference) => !retainedReferences.has(reference))
-          .forEach((reference) => {
-            pendingCleanupReferencesRef.current.add(reference)
-          })
+        const removedReferences = assetReferences(previousValue).filter(
+          (reference) => !retainedReferences.has(reference),
+        )
         commitValue(nextValue)
-        schedulePendingCleanup(cleanupOperation)
+        schedulePendingCleanup(removedReferences, cleanupOperation)
       }
     } catch (error) {
       if (isLatestIntent(intent)) {

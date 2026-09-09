@@ -14,6 +14,7 @@ import {
   pickLocalDirectory,
   pickLocalFiles,
   pickLocalSaveFile,
+  resetUploadCleanupQueueForTests,
   resolveDroppedFilePaths,
   sampleChromaImage,
   sampleChromaVideo,
@@ -30,6 +31,7 @@ import {
 } from './apiClient'
 
 afterEach(() => {
+  resetUploadCleanupQueueForTests()
   vi.restoreAllMocks()
   vi.unstubAllGlobals()
 })
@@ -56,7 +58,9 @@ describe('apiClient', () => {
     const requests: MockUploadRequest[] = []
     vi.spyOn(globalThis.crypto, 'randomUUID')
       .mockReturnValueOnce('11111111-1111-1111-1111-111111111111')
+      .mockReturnValueOnce('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa')
       .mockReturnValueOnce('22222222-2222-2222-2222-222222222222')
+      .mockReturnValueOnce('bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb')
 
     class MockUploadRequest {
       method = ''
@@ -111,6 +115,7 @@ describe('apiClient', () => {
       encodeURIComponent(first.name),
     )
     expect(requests[0].headers.get('X-Upload-Id')).toBe('1'.repeat(32))
+    expect(requests[0].headers.get('X-Upload-Generation')).toBe('a'.repeat(32))
     expect(requests[0].sentBody).toBe(first)
 
     requests[0].uploadListeners.get('progress')?.(
@@ -132,6 +137,7 @@ describe('apiClient', () => {
       encodeURIComponent(second.name),
     )
     expect(requests[1].headers.get('X-Upload-Id')).toBe('2'.repeat(32))
+    expect(requests[1].headers.get('X-Upload-Generation')).toBe('b'.repeat(32))
     expect(requests[1].sentBody).toBe(second)
 
     requests[1].response = {
@@ -149,6 +155,8 @@ describe('apiClient', () => {
     const requests: MockUploadRequest[] = []
     const uploadUuid = '11111111-1111-1111-1111-111111111111'
     const uploadId = uploadUuid.replaceAll('-', '')
+    const generationUuid = '22222222-2222-2222-2222-222222222222'
+    const generation = generationUuid.replaceAll('-', '')
 
     class MockUploadRequest {
       response: unknown = null
@@ -178,7 +186,9 @@ describe('apiClient', () => {
     }
 
     vi.stubGlobal('XMLHttpRequest', MockUploadRequest)
-    vi.spyOn(globalThis.crypto, 'randomUUID').mockReturnValue(uploadUuid)
+    vi.spyOn(globalThis.crypto, 'randomUUID')
+      .mockReturnValueOnce(uploadUuid)
+      .mockReturnValueOnce(generationUuid)
     const cleanup = vi
       .spyOn(globalThis, 'fetch')
       .mockResolvedValue(new Response(null, { status: 404 }))
@@ -194,17 +204,20 @@ describe('apiClient', () => {
     await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
     expect(requests[0].abort).toHaveBeenCalledOnce()
     expect(requests[0].headers.get('X-Upload-Id')).toBe(uploadId)
+    expect(requests[0].headers.get('X-Upload-Generation')).toBe(generation)
     expect(cleanup).toHaveBeenCalledOnce()
-    expect(cleanup).toHaveBeenCalledWith(`/api/uploads/${uploadId}`, {
-      method: 'DELETE',
-    })
+    expect(cleanup).toHaveBeenCalledWith(
+      `/api/uploads/${uploadId}?generation=${generation}`,
+      { method: 'DELETE' },
+    )
   })
 
   it('deletes a committed upload when cancellation wins the response race', async () => {
     const requests: MockUploadRequest[] = []
     const uploadUuid = '11111111-1111-1111-1111-111111111111'
     const assetId = uploadUuid.replaceAll('-', '')
-    const generation = '2'.repeat(32)
+    const generationUuid = '22222222-2222-2222-2222-222222222222'
+    const generation = generationUuid.replaceAll('-', '')
 
     class MockUploadRequest {
       response: unknown = null
@@ -234,7 +247,9 @@ describe('apiClient', () => {
     }
 
     vi.stubGlobal('XMLHttpRequest', MockUploadRequest)
-    vi.spyOn(globalThis.crypto, 'randomUUID').mockReturnValue(uploadUuid)
+    vi.spyOn(globalThis.crypto, 'randomUUID')
+      .mockReturnValueOnce(uploadUuid)
+      .mockReturnValueOnce(generationUuid)
     const cleanup = vi
       .spyOn(globalThis, 'fetch')
       .mockResolvedValue(new Response(null, { status: 204 }))
@@ -255,9 +270,249 @@ describe('apiClient', () => {
 
     await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
     expect(requests[0].headers.get('X-Upload-Id')).toBe(assetId)
+    expect(requests[0].headers.get('X-Upload-Generation')).toBe(generation)
     expect(cleanup).toHaveBeenCalledOnce()
     expect(cleanup).toHaveBeenCalledWith(
       `/api/uploads/${assetId}?generation=${generation}`,
+      { method: 'DELETE' },
+    )
+  })
+
+  it('deletes the exact upload generation after the POST response is lost', async () => {
+    const requests: MockUploadRequest[] = []
+    const uploadId = '1'.repeat(32)
+    const generation = '2'.repeat(32)
+    let postSideEffect = false
+
+    class MockUploadRequest {
+      status = 0
+      response: unknown = null
+      headers = new Map<string, string>()
+      listeners = new Map<string, () => void>()
+      upload = {
+        addEventListener: () => undefined,
+      }
+
+      constructor() {
+        requests.push(this)
+      }
+
+      open() {}
+
+      setRequestHeader(name: string, value: string) {
+        this.headers.set(name, value)
+      }
+
+      addEventListener(type: string, listener: () => void) {
+        this.listeners.set(type, listener)
+      }
+
+      send() {
+        postSideEffect = true
+      }
+    }
+
+    vi.stubGlobal('XMLHttpRequest', MockUploadRequest)
+    vi.spyOn(globalThis.crypto, 'randomUUID')
+      .mockReturnValueOnce('11111111-1111-1111-1111-111111111111')
+      .mockReturnValueOnce('22222222-2222-2222-2222-222222222222')
+    const cleanup = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(new Response(null, { status: 204 }))
+    const pending = uploadFiles(
+      [new File(['image'], 'image.png')],
+      () => undefined,
+    )
+
+    expect(postSideEffect).toBe(true)
+    expect(requests[0].headers.get('X-Upload-Id')).toBe(uploadId)
+    expect(requests[0].headers.get('X-Upload-Generation')).toBe(generation)
+    requests[0].listeners.get('error')?.()
+
+    await expect(pending).rejects.toThrow('文件上传失败')
+    expect(cleanup).toHaveBeenCalledWith(
+      `/api/uploads/${uploadId}?generation=${generation}`,
+      { method: 'DELETE' },
+    )
+  })
+
+  it('deletes the exact upload generation when a successful response cannot be parsed', async () => {
+    const requests: MockUploadRequest[] = []
+    const uploadId = '1'.repeat(32)
+    const generation = '2'.repeat(32)
+
+    class MockUploadRequest {
+      status = 201
+      response: unknown = null
+      headers = new Map<string, string>()
+      listeners = new Map<string, () => void>()
+      upload = {
+        addEventListener: () => undefined,
+      }
+
+      constructor() {
+        requests.push(this)
+      }
+
+      open() {}
+
+      setRequestHeader(name: string, value: string) {
+        this.headers.set(name, value)
+      }
+
+      addEventListener(type: string, listener: () => void) {
+        this.listeners.set(type, listener)
+      }
+
+      send() {}
+    }
+
+    vi.stubGlobal('XMLHttpRequest', MockUploadRequest)
+    vi.spyOn(globalThis.crypto, 'randomUUID')
+      .mockReturnValueOnce('11111111-1111-1111-1111-111111111111')
+      .mockReturnValueOnce('22222222-2222-2222-2222-222222222222')
+    const cleanup = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(new Response(null, { status: 204 }))
+    const pending = uploadFiles(
+      [new File(['image'], 'image.png')],
+      () => undefined,
+    )
+
+    requests[0].listeners.get('load')?.()
+
+    await expect(pending).rejects.toBeInstanceOf(Error)
+    expect(cleanup).toHaveBeenCalledWith(
+      `/api/uploads/${uploadId}?generation=${generation}`,
+      { method: 'DELETE' },
+    )
+  })
+
+  it('retains failed cleanup across callers and cannot delete a later same-ID generation', async () => {
+    const requests: MockUploadRequest[] = []
+    const uploadId = '1'.repeat(32)
+    const firstGeneration = '2'.repeat(32)
+    const secondGeneration = '3'.repeat(32)
+
+    class MockUploadRequest {
+      status = 201
+      response: unknown = null
+      listeners = new Map<string, () => void>()
+      upload = {
+        addEventListener: () => undefined,
+      }
+
+      constructor() {
+        requests.push(this)
+      }
+
+      open() {}
+
+      setRequestHeader() {}
+
+      addEventListener(type: string, listener: () => void) {
+        this.listeners.set(type, listener)
+      }
+
+      send() {}
+    }
+
+    vi.stubGlobal('XMLHttpRequest', MockUploadRequest)
+    vi.spyOn(globalThis.crypto, 'randomUUID')
+      .mockReturnValueOnce('11111111-1111-1111-1111-111111111111')
+      .mockReturnValueOnce('22222222-2222-2222-2222-222222222222')
+      .mockReturnValueOnce('11111111-1111-1111-1111-111111111111')
+      .mockReturnValueOnce('33333333-3333-3333-3333-333333333333')
+    const cleanup = vi
+      .spyOn(globalThis, 'fetch')
+      .mockRejectedValue(new Error('cleanup offline'))
+    const first = uploadFiles(
+      [new File(['first'], 'first.png')],
+      () => undefined,
+    )
+    requests[0].listeners.get('error')?.()
+    await expect(first).rejects.toBeInstanceOf(AggregateError)
+
+    cleanup.mockResolvedValue(new Response(null, { status: 404 }))
+    const second = uploadFiles(
+      [new File(['second'], 'second.png')],
+      () => undefined,
+    )
+    await vi.waitFor(() => expect(requests).toHaveLength(2))
+    requests[1].response = {
+      filename: 'second.png',
+      reference: `asset:${uploadId}:${secondGeneration}:second.png`,
+      size: 6,
+    }
+    requests[1].listeners.get('load')?.()
+
+    await expect(second).resolves.toEqual([
+      `asset:${uploadId}:${secondGeneration}:second.png`,
+    ])
+    const cleanupUrls = cleanup.mock.calls.map(([url]) => String(url))
+    expect(cleanupUrls).toContain(
+      `/api/uploads/${uploadId}?generation=${firstGeneration}`,
+    )
+    expect(cleanupUrls).not.toContain(
+      `/api/uploads/${uploadId}?generation=${secondGeneration}`,
+    )
+  })
+
+  it('drains cleanup queued during an upload after that upload succeeds', async () => {
+    const requests: MockUploadRequest[] = []
+    const staleReference = `asset:${'1'.repeat(32)}:${'2'.repeat(32)}:old.png`
+
+    class MockUploadRequest {
+      status = 201
+      response: unknown = null
+      listeners = new Map<string, () => void>()
+      upload = {
+        addEventListener: () => undefined,
+      }
+
+      constructor() {
+        requests.push(this)
+      }
+
+      open() {}
+
+      setRequestHeader() {}
+
+      addEventListener(type: string, listener: () => void) {
+        this.listeners.set(type, listener)
+      }
+
+      send() {}
+    }
+
+    vi.stubGlobal('XMLHttpRequest', MockUploadRequest)
+    vi.spyOn(globalThis.crypto, 'randomUUID')
+      .mockReturnValueOnce('33333333-3333-3333-3333-333333333333')
+      .mockReturnValueOnce('44444444-4444-4444-4444-444444444444')
+    const cleanup = vi
+      .spyOn(globalThis, 'fetch')
+      .mockRejectedValue(new Error('cleanup offline'))
+    const pending = uploadFiles(
+      [new File(['new'], 'new.png')],
+      () => undefined,
+    )
+
+    await expect(deleteUploadedAsset(staleReference)).rejects.toThrow(
+      'network error',
+    )
+    cleanup.mockResolvedValue(new Response(null, { status: 204 }))
+    requests[0].response = {
+      filename: 'new.png',
+      reference: `asset:${'3'.repeat(32)}:${'4'.repeat(32)}:new.png`,
+      size: 3,
+    }
+    requests[0].listeners.get('load')?.()
+
+    await expect(pending).resolves.toEqual([
+      `asset:${'3'.repeat(32)}:${'4'.repeat(32)}:new.png`,
+    ])
+    expect(cleanup).toHaveBeenLastCalledWith(
+      `/api/uploads/${'1'.repeat(32)}?generation=${'2'.repeat(32)}`,
       { method: 'DELETE' },
     )
   })
@@ -294,7 +549,9 @@ describe('apiClient', () => {
     vi.stubGlobal('XMLHttpRequest', MockUploadRequest)
     vi.spyOn(globalThis.crypto, 'randomUUID')
       .mockReturnValueOnce('11111111-1111-1111-1111-111111111111')
+      .mockReturnValueOnce('33333333-3333-3333-3333-333333333333')
       .mockReturnValueOnce('22222222-2222-2222-2222-222222222222')
+      .mockReturnValueOnce('44444444-4444-4444-4444-444444444444')
     const cleanupAttempts = new Map<string, number>()
     const cleanup = vi
       .spyOn(globalThis, 'fetch')
@@ -338,9 +595,10 @@ describe('apiClient', () => {
       `/api/uploads/${firstId}?generation=${firstGeneration}`,
       { method: 'DELETE' },
     )
-    expect(cleanup).toHaveBeenCalledWith(`/api/uploads/${secondId}`, {
-      method: 'DELETE',
-    })
+    expect(cleanup).toHaveBeenCalledWith(
+      `/api/uploads/${secondId}?generation=${'4'.repeat(32)}`,
+      { method: 'DELETE' },
+    )
   })
 
   it('reports a persistent cleanup failure while preserving the upload error as cause', async () => {
@@ -375,8 +633,11 @@ describe('apiClient', () => {
     vi.stubGlobal('XMLHttpRequest', MockUploadRequest)
     vi.spyOn(globalThis.crypto, 'randomUUID')
       .mockReturnValueOnce('11111111-1111-1111-1111-111111111111')
+      .mockReturnValueOnce('44444444-4444-4444-4444-444444444444')
       .mockReturnValueOnce('22222222-2222-2222-2222-222222222222')
+      .mockReturnValueOnce('55555555-5555-5555-5555-555555555555')
       .mockReturnValueOnce('33333333-3333-3333-3333-333333333333')
+      .mockReturnValueOnce('66666666-6666-6666-6666-666666666666')
     const cleanup = vi
       .spyOn(globalThis, 'fetch')
       .mockResolvedValue(new Response(null, { status: 503 }))
@@ -391,14 +652,14 @@ describe('apiClient', () => {
 
     requests[0].response = {
       filename: 'first.png',
-      reference: `asset:${firstId}:first.png`,
+      reference: `asset:${firstId}:${'4'.repeat(32)}:first.png`,
       size: 5,
     }
     requests[0].listeners.get('load')?.()
     await Promise.resolve()
     requests[1].response = {
       filename: 'second.png',
-      reference: `asset:${secondId}:second.png`,
+      reference: `asset:${secondId}:${'5'.repeat(32)}:second.png`,
       size: 6,
     }
     requests[1].listeners.get('load')?.()
@@ -434,7 +695,9 @@ describe('apiClient', () => {
     const requests: MockUploadRequest[] = []
     vi.spyOn(globalThis.crypto, 'randomUUID')
       .mockReturnValueOnce('11111111-1111-1111-1111-111111111111')
+      .mockReturnValueOnce('33333333-3333-3333-3333-333333333333')
       .mockReturnValueOnce('22222222-2222-2222-2222-222222222222')
+      .mockReturnValueOnce('44444444-4444-4444-4444-444444444444')
 
     class MockUploadRequest {
       status = 201
@@ -470,7 +733,7 @@ describe('apiClient', () => {
 
     requests[0].response = {
       filename: 'first.png',
-      reference: `asset:${'1'.repeat(32)}:first.png`,
+      reference: `asset:${'1'.repeat(32)}:${'3'.repeat(32)}:first.png`,
       size: 5,
     }
     requests[0].listeners.get('load')?.()
