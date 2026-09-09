@@ -3112,6 +3112,14 @@ class RedisResourceCoordinator:
             tuple[tuple[str, str | None], ...] | None
         ) = None,
     ) -> None:
+        self.release_task_runtime_resources(task_id)
+        self.release_task_pin(
+            task_id,
+            expected_session_id=expected_session_id,
+            expected_asset_identities=expected_asset_identities,
+        )
+
+    def release_task_runtime_resources(self, task_id: str) -> None:
         metadata = self._redis.hgetall(_task_resource_key(task_id))
         session_id = _decoded_hash_value(metadata, "session_id")
         output_token = _decoded_hash_value(metadata, "output_token")
@@ -3126,11 +3134,6 @@ class RedisResourceCoordinator:
                 task_id=task_id,
             )
         self.reconcile_reservations()
-        self.release_task_pin(
-            task_id,
-            expected_session_id=expected_session_id,
-            expected_asset_identities=expected_asset_identities,
-        )
 
     def release_task_pin(
         self,

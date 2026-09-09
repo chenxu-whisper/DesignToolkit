@@ -3603,7 +3603,6 @@ class RedisTaskManager:
         cleanup_key = _failure_cleanup_key(task_id)
         if self._redis.exists(cleanup_key):
             return False
-        task = self.get_task(task_id)
         self._release_queue_slot(task_id)
         from designtoolkit.web.worker import discard_failed_task_output
 
@@ -3611,20 +3610,7 @@ class RedisTaskManager:
             discard_failed_task_output(task_id, self)
         finally:
             if self.resource_coordinator is not None:
-                self.resource_coordinator.release_task_resources(
-                    task_id,
-                    expected_session_id=(
-                        task.owner_id if task is not None else None
-                    ),
-                    expected_asset_identities=(
-                        task.asset_identities
-                        if (
-                            task is not None
-                            and task.has_canonical_asset_identities
-                        )
-                        else None
-                    ),
-                )
+                self.resource_coordinator.release_task_runtime_resources(task_id)
         self._redis.set(cleanup_key, "1", ex=self.retention_seconds)
         return True
 

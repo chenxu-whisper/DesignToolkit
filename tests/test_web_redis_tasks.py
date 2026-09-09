@@ -98,6 +98,9 @@ class StubTaskResources:
     def __init__(self) -> None:
         self.released: list[str] = []
 
+    def release_task_runtime_resources(self, task_id: str) -> None:
+        self.released.append(task_id)
+
     def release_task_resources(
         self,
         task_id: str,
@@ -167,6 +170,9 @@ class TrackingTaskResources:
         assert expected_asset_identities is not None
         self.events.append(f"release-task:{task_id}")
 
+    def release_task_runtime_resources(self, task_id: str) -> None:
+        self.events.append(f"release-task:{task_id}")
+
     def release_task_pin(
         self,
         task_id: str,
@@ -196,6 +202,57 @@ class LegacyTrackingTaskResources(TrackingTaskResources):
         assert expected_session_id is not None
         assert expected_asset_identities is None
         self.events.append(f"release-task:{task_id}")
+
+
+class ReleaseShapeResourceCoordinatorSpy(RedisResourceCoordinator):
+    def __init__(self, redis_connection) -> None:
+        self._redis = redis_connection
+        self.events: list[str] = []
+        self.runtime_releases: list[str] = []
+        self.pin_releases: list[str] = []
+        self.lease = TrackingHandle("lease", self.events)
+        self.output = TrackingHandle("output", self.events)
+        self.session_lease_heartbeat_interval = 5.0
+        self.reservation_heartbeat_interval = 5.0
+
+    def acquire_session(self, session_id: str, *, task_id: str):
+        self.events.append(f"acquire:{task_id}:{session_id}")
+        return self.lease
+
+    def reserve_output(
+        self,
+        task_id: str,
+        session_id: str,
+        requested_bytes: int,
+        *,
+        free_bytes: int,
+        min_free_bytes: int,
+    ):
+        self.events.append(
+            f"reserve:{task_id}:{session_id}:{requested_bytes}:"
+            f"{free_bytes}:{min_free_bytes}"
+        )
+        return self.output
+
+    def release_task_runtime_resources(self, task_id: str) -> None:
+        self.runtime_releases.append(task_id)
+
+    def reconcile_reservations(self) -> int:
+        return 0
+
+    def release_task_pin(
+        self,
+        task_id: str,
+        *,
+        expected_session_id: str | None = None,
+        expected_asset_identities: (
+            tuple[tuple[str, str | None], ...] | None
+        ) = None,
+    ) -> bool:
+        assert expected_session_id is not None
+        assert expected_asset_identities is not None
+        self.pin_releases.append(task_id)
+        return False
 
 
 def _manager(
@@ -3715,6 +3772,182 @@ def test_run_task_failure_cleans_output_terminalizes_and_releases_resources(
     assert resources.events[-2:] == ["release:output", "release:lease"]
 
 
+@pytest.mark.parametrize(
+    ("outcome", "expected_status"),
+    [
+        ("success", TaskStatus.SUCCEEDED),
+        ("failure", TaskStatus.FAILED),
+        ("setup-failure", TaskStatus.FAILED),
+    ],
+)
+def test_run_task_terminal_outcome_logically_releases_pin_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: str,
+    expected_status: TaskStatus,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    settings = _hosted_settings(tmp_path)
+    manager = _manager(redis_connection, tmp_path)
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+        owner_id="a" * 32,
+        asset_identities=(("1" * 32, "2" * 32),),
+    )
+    resources = ReleaseShapeResourceCoordinatorSpy(redis_connection)
+    _patch_worker_dependencies(
+        monkeypatch,
+        settings=settings,
+        redis_connection=redis_connection,
+        resources=resources,
+    )
+    manager_pin_releases: list[str] = []
+    release_task_pin = RedisTaskManager.release_task_pin
+
+    def track_manager_pin_release(
+        self: RedisTaskManager,
+        released_task_id: str,
+    ) -> bool:
+        manager_pin_releases.append(released_task_id)
+        return release_task_pin(self, released_task_id)
+
+    monkeypatch.setattr(
+        RedisTaskManager,
+        "release_task_pin",
+        track_manager_pin_release,
+    )
+    output_file = tmp_path / "frame.png"
+
+    def export(_options, _backend) -> ExportResult:
+        if outcome == "failure":
+            raise RuntimeError("worker failed")
+        output_file.write_bytes(b"png")
+        return ExportResult(
+            output_dir=output_file,
+            output_pattern=output_file,
+            command=("ffmpeg",),
+        )
+
+    executor_init = worker_module.RedisTaskExecutor.__init__
+
+    def initialize_executor(executor, *args, **kwargs) -> None:
+        executor_init(executor, *args, **kwargs)
+        executor._exporter = export
+
+    monkeypatch.setattr(
+        worker_module.RedisTaskExecutor,
+        "__init__",
+        initialize_executor,
+    )
+    if outcome == "setup-failure":
+        monkeypatch.setattr(
+            resources,
+            "acquire_session",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("setup failed")
+            ),
+        )
+
+    worker_module.run_task(
+        task.task_id,
+        "video_frames",
+        VideoFramesTaskRequest(
+            input_path=str(tmp_path / "clip.mp4")
+        ).model_dump(mode="json"),
+    )
+
+    terminal = manager.get_task(task.task_id)
+    assert terminal is not None
+    assert terminal.status is expected_status
+    assert manager_pin_releases + resources.pin_releases == [task.task_id]
+    assert resources.runtime_releases == (
+        [] if outcome == "success" else [task.task_id]
+    )
+
+
+def test_reconcile_historical_failed_task_logically_releases_pin_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    resources = ReleaseShapeResourceCoordinatorSpy(redis_connection)
+    manager = _manager(
+        redis_connection,
+        tmp_path,
+        resource_coordinator=resources,
+    )
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+        owner_id="a" * 32,
+        asset_identities=(("1" * 32, "2" * 32),),
+    )
+    task.status = TaskStatus.FAILED
+    task.error = "historical failure"
+    task.finished_at = datetime.now(UTC)
+    manager._save_task(task)
+    manager_pin_releases: list[str] = []
+    release_task_pin = manager.release_task_pin
+
+    def track_manager_pin_release(released_task_id: str) -> bool:
+        manager_pin_releases.append(released_task_id)
+        return release_task_pin(released_task_id)
+
+    monkeypatch.setattr(manager, "release_task_pin", track_manager_pin_release)
+
+    assert manager.reconcile_tasks(grace_seconds=60) == 1
+
+    assert manager_pin_releases + resources.pin_releases == [task.task_id]
+    assert resources.runtime_releases == [task.task_id]
+    assert not redis_connection.exists(f"dt:resource:task-pin:{task.task_id}")
+
+
+@pytest.mark.parametrize("failure_mode", ["transport", "ack-loss"])
+def test_failed_cleanup_retries_uncertain_pin_release_without_coordinator_release(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_mode: str,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    resources = ReleaseShapeResourceCoordinatorSpy(redis_connection)
+    manager = _manager(
+        redis_connection,
+        tmp_path,
+        resource_coordinator=resources,
+    )
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+        owner_id="a" * 32,
+        asset_identities=(("1" * 32, "2" * 32),),
+    )
+    release_task_pin = manager.release_task_pin
+    manager_pin_releases: list[str] = []
+
+    def unreliable_pin_release(released_task_id: str) -> bool:
+        manager_pin_releases.append(released_task_id)
+        if len(manager_pin_releases) == 1:
+            if failure_mode == "ack-loss":
+                release_task_pin(released_task_id)
+            raise RedisConnectionError(f"pin release {failure_mode}")
+        return release_task_pin(released_task_id)
+
+    monkeypatch.setattr(manager, "release_task_pin", unreliable_pin_release)
+
+    with pytest.raises(RedisConnectionError, match=failure_mode):
+        manager._finalize_external_failure(task.task_id, "worker failed")
+
+    failed = manager.get_task(task.task_id)
+    assert failed is not None
+    assert failed.status is TaskStatus.FAILED
+    assert not redis_connection.exists(f"dt:failure-cleanup:{task.task_id}")
+
+    assert manager._finalize_external_failure(task.task_id, "worker failed")
+
+    assert manager_pin_releases == [task.task_id, task.task_id]
+    assert resources.pin_releases == []
+    assert resources.runtime_releases == [task.task_id]
+    assert not redis_connection.exists(f"dt:resource:task-pin:{task.task_id}")
+
+
 def test_redis_log_store_persists_events_for_other_processes() -> None:
     redis_connection = fakeredis.FakeRedis(decode_responses=False)
     writer = RedisLogStore(redis_connection, retention_seconds=7200)
@@ -5066,6 +5299,9 @@ def test_external_failure_discards_output_before_releasing_task_lease(
     events: list[str] = []
 
     class OrderedResources:
+        def release_task_runtime_resources(self, _task_id: str) -> None:
+            events.append("release")
+
         def release_task_resources(
             self,
             _task_id: str,

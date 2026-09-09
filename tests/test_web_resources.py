@@ -1336,7 +1336,7 @@ class DeterministicRedis(fakeredis.FakeRedis):
 
     def _eval_release_task_pin(self, keys, args):  # noqa: ANN001, ANN202
         pin_key, task_pins_key = keys
-        session_id, task_id, asset_task_prefix = args
+        session_id, task_id, asset_task_prefix, _identities, _asset_ids = args
         if not self.exists(pin_key):
             return 0
         if self._text(self.hget(pin_key, "session_id")) != session_id:
@@ -3194,6 +3194,61 @@ def test_task_resources_can_be_released_by_task_idempotently(
         is None
     )
     assert not redis_connection.exists("dt:resource:task:task-1")
+
+
+def test_runtime_task_resource_release_preserves_pin_until_full_release(
+    redis_connection: DeterministicRedis,
+) -> None:
+    resources = coordinator(redis_connection)
+    task_id = "task-1"
+    asset_id = "1" * 32
+    identities = ((asset_id, "2" * 32),)
+    identities_json = json.dumps(identities, separators=(",", ":"))
+    asset_ids_json = json.dumps((asset_id,), separators=(",", ":"))
+    resources.acquire_session(SESSION_A, task_id=task_id)
+    resources.reserve_output(
+        task_id,
+        SESSION_A,
+        5,
+        free_bytes=100,
+    )
+    redis_connection.hset(
+        f"dt:resource:task-pin:{task_id}",
+        mapping={
+            "session_id": SESSION_A,
+            "task_id": task_id,
+            "asset_identities": identities_json,
+            "asset_ids": asset_ids_json,
+        },
+    )
+    redis_connection.sadd(
+        f"dt:resource:session:{SESSION_A}:task-pins",
+        task_id,
+    )
+    redis_connection.sadd(
+        f"dt:resource:asset-tasks:{SESSION_A}:{asset_id}",
+        task_id,
+    )
+
+    resources.release_task_runtime_resources(task_id)
+
+    assert resources.output_reserved_bytes() == 0
+    assert not redis_connection.exists(f"dt:resource:task:{task_id}")
+    assert redis_connection.exists(f"dt:resource:task-pin:{task_id}")
+
+    resources.release_task_resources(
+        task_id,
+        expected_session_id=SESSION_A,
+        expected_asset_identities=identities,
+    )
+
+    assert not redis_connection.exists(f"dt:resource:task-pin:{task_id}")
+    assert not redis_connection.exists(
+        f"dt:resource:session:{SESSION_A}:task-pins"
+    )
+    assert not redis_connection.exists(
+        f"dt:resource:asset-tasks:{SESSION_A}:{asset_id}"
+    )
 
 
 def test_mixed_reservations_preserve_strictest_capacity_observation(
