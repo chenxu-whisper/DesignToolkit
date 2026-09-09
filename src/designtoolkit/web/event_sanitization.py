@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import codecs
 import ntpath
 import os
 import posixpath
@@ -34,14 +35,17 @@ _OPAQUE_DIRECTORY_NAME = re.compile(
     re.IGNORECASE,
 )
 _CANDIDATE_TERMINATORS = frozenset("\r\n'\"<>|,;)]}&#?")
+_PATH_BOUNDARY_PUNCTUATION = frozenset(
+    "!\"#$%&'()*+,-.:;<=>?@[\\]^`{|}~"
+)
+_MAX_PUBLIC_EVENT_BYTES = MAX_PUBLIC_EVENT_STRING_LENGTH * 4 + 4
 _PathStyle = Literal["posix", "windows"]
 
 
 @dataclass(frozen=True)
 class _TaskPaths:
-    inputs: frozenset[str]
-    output_files: frozenset[str]
-    output_roots: frozenset[str]
+    replacements: Mapping[str, str]
+    output_roots: Mapping[str, str]
 
 
 @dataclass(frozen=True)
@@ -143,25 +147,46 @@ class EventSanitizer:
         value = _truncate_public_string(value)
         if not self._managed_roots:
             return value
+        if not was_truncated and not any(
+            character in value for character in "\r\n?#"
+        ):
+            exact_candidate = _canonical_path(
+                value,
+                path_style=self._path_style,
+            )
+            exact = _display_path_value(
+                exact_candidate,
+                managed_roots=self._managed_roots,
+                paths=paths,
+                path_style=self._path_style,
+            )
+            if exact is not None:
+                return exact
         decoded = _decode_text(value)
-        known_replacements = _known_path_replacements(
-            decoded.value,
-            paths=paths,
-            path_style=self._path_style,
-        )
+        if decoded.value != value:
+            direct_root_starts = _managed_candidate_starts(
+                decoded.value,
+                managed_roots=self._managed_roots,
+                path_style=self._path_style,
+            )
+            if direct_root_starts or _contains_managed_root(
+                decoded.value,
+                managed_roots=self._managed_roots,
+                path_style=self._path_style,
+            ):
+                return _managed_path_placeholder(was_truncated=was_truncated)
         candidate_replacements = _path_candidate_replacements(
             decoded.value,
             managed_roots=self._managed_roots,
             paths=paths,
             path_style=self._path_style,
-            blocked=known_replacements,
         )
         if candidate_replacements is None:
             return _managed_path_placeholder(was_truncated=was_truncated)
         candidate = _apply_text_replacements(
             value,
             decoded=decoded,
-            replacements=(*known_replacements, *candidate_replacements),
+            replacements=candidate_replacements,
         )
         residual_source = bounded_source if was_truncated else candidate
         if _contains_managed_root(
@@ -203,10 +228,55 @@ class EventSanitizer:
         return sanitized
 
     def _sanitize_message(self, value: object, *, paths: _TaskPaths) -> str:
+        binary = _event_bytes(value)
+        if binary is not None:
+            return self._sanitize_bytes(binary, paths=paths)
         text = _event_text(value)
         if text is None:
             return UNSUPPORTED_PUBLIC_EVENT_VALUE
         return self._sanitize_text(text, paths=paths)
+
+    def _sanitize_bytes(self, value: bytes, *, paths: _TaskPaths) -> str:
+        bounded = value[:_MAX_PUBLIC_EVENT_BYTES]
+        utf8 = _decode_bytes(bounded, "utf-8")
+        cleaned_utf8 = (
+            utf8.removeprefix("\ufeff") if utf8 is not None else None
+        )
+        utf8_has_managed_root = (
+            cleaned_utf8 is not None
+            and _contains_managed_root(
+                cleaned_utf8,
+                managed_roots=self._managed_roots,
+                path_style=self._path_style,
+            )
+        )
+        requires_wide_scan = (
+            cleaned_utf8 is None
+            or "\x00" in cleaned_utf8
+            or cleaned_utf8 != utf8
+            or not utf8_has_managed_root
+        )
+        if utf8_has_managed_root and not requires_wide_scan:
+            return self._sanitize_text(cleaned_utf8, paths=paths)
+
+        decoded_candidates = (
+            _wide_text_candidates(bounded) if requires_wide_scan else ()
+        )
+        for candidate in decoded_candidates:
+            if _contains_managed_root(
+                candidate,
+                managed_roots=self._managed_roots,
+                path_style=self._path_style,
+            ):
+                return MANAGED_PATH_PLACEHOLDER
+
+        if utf8_has_managed_root and cleaned_utf8 is not None:
+            return self._sanitize_text(cleaned_utf8, paths=paths)
+        if cleaned_utf8 is not None and "\x00" not in cleaned_utf8:
+            return self._sanitize_text(cleaned_utf8, paths=paths)
+        if decoded_candidates:
+            return self._sanitize_text(decoded_candidates[0], paths=paths)
+        return UNSUPPORTED_PUBLIC_EVENT_VALUE
 
     def _sanitize_nested(
         self,
@@ -226,6 +296,9 @@ class EventSanitizer:
                 value,
                 paths=paths,
             )
+        binary = _event_bytes(value)
+        if binary is not None:
+            return self._sanitize_bytes(binary, paths=paths)
         text = _event_text(value)
         if text is not None:
             return self._sanitize_text(text, paths=paths)
@@ -330,6 +403,9 @@ class EventSanitizer:
     ) -> str:
         if not budget.consume():
             return PUBLIC_EVENT_TRUNCATED_MARKER
+        binary = _event_bytes(value)
+        if binary is not None:
+            return self._sanitize_bytes(binary, paths=paths)
         text = _json_key_text(
             value,
             budget=budget,
@@ -351,11 +427,6 @@ class EventSanitizer:
 def _event_text(value: object) -> str | None:
     if isinstance(value, str):
         return value
-    if isinstance(value, (bytes, bytearray, memoryview)):
-        try:
-            return bytes(value).decode("utf-8")
-        except (TypeError, UnicodeDecodeError, ValueError):
-            return None
     if isinstance(value, os.PathLike):
         try:
             raw_path = os.fspath(value)
@@ -363,10 +434,22 @@ def _event_text(value: object) -> str | None:
             return None
         if isinstance(raw_path, str):
             return raw_path
+    return None
+
+
+def _event_bytes(value: object) -> bytes | None:
+    if isinstance(value, (bytes, bytearray, memoryview)):
         try:
-            return raw_path.decode("utf-8")
-        except UnicodeDecodeError:
+            return bytes(value)
+        except (TypeError, ValueError):
             return None
+    if isinstance(value, os.PathLike):
+        try:
+            raw_path = os.fspath(value)
+        except Exception:
+            return None
+        if isinstance(raw_path, bytes):
+            return raw_path
     return None
 
 
@@ -442,66 +525,54 @@ def _task_paths(
     path_style: _PathStyle,
 ) -> _TaskPaths:
     if payload is None:
-        return _TaskPaths(frozenset(), frozenset(), frozenset())
-    return _TaskPaths(
-        inputs=_field_paths(
-            payload,
-            _INPUT_FIELDS,
-            managed_roots=managed_roots,
-            path_style=path_style,
-        ),
-        output_files=_field_paths(
-            payload,
-            _OUTPUT_FILE_FIELDS,
-            managed_roots=managed_roots,
-            path_style=path_style,
-        ),
-        output_roots=_field_paths(
-            payload,
-            _OUTPUT_ROOT_FIELDS,
-            managed_roots=managed_roots,
-            path_style=path_style,
-        ),
+        return _TaskPaths({}, {})
+    replacements: dict[str, str] = {}
+    output_roots: dict[str, str] = {}
+    field_groups = (
+        (_INPUT_FIELDS, False, _basename),
+        (_OUTPUT_FILE_FIELDS, False, _safe_output_name),
+        (_OUTPUT_ROOT_FIELDS, True, _safe_output_name),
     )
-
-
-def _field_paths(
-    payload: Mapping[str, object],
-    fields: tuple[str, ...],
-    *,
-    managed_roots: tuple[str, ...],
-    path_style: _PathStyle,
-) -> frozenset[str]:
-    paths: set[str] = set()
-    characters = 0
-    candidate_count = 0
-    for field in fields:
-        value = payload.get(field)
-        values = value if isinstance(value, list) else [value]
-        for candidate in values:
-            if candidate_count >= _MAX_TASK_PATH_CANDIDATES:
-                return frozenset(paths)
-            candidate_count += 1
-            if not isinstance(candidate, str):
-                continue
-            remaining = _MAX_TASK_PATH_CHARACTERS - characters
-            if remaining <= 0:
-                return frozenset(paths)
-            bounded_candidate = candidate[
-                : min(remaining, MAX_PUBLIC_EVENT_STRING_LENGTH)
-            ]
-            characters += len(bounded_candidate)
-            canonical = _canonical_path(
-                bounded_candidate,
-                path_style=path_style,
-            )
-            aliases = _managed_aliases(
-                canonical,
-                managed_roots,
-                path_style=path_style,
-            )
-            paths.update(aliases)
-    return frozenset(paths)
+    for fields, is_output_root, display_name in field_groups:
+        characters = 0
+        candidate_count = 0
+        exhausted = False
+        for field in fields:
+            value = payload.get(field)
+            values = value if isinstance(value, list) else [value]
+            for candidate in values:
+                if candidate_count >= _MAX_TASK_PATH_CANDIDATES:
+                    exhausted = True
+                    break
+                candidate_count += 1
+                if not isinstance(candidate, str):
+                    continue
+                remaining = _MAX_TASK_PATH_CHARACTERS - characters
+                if remaining <= 0:
+                    exhausted = True
+                    break
+                bounded_candidate = candidate[
+                    : min(remaining, MAX_PUBLIC_EVENT_STRING_LENGTH)
+                ]
+                characters += len(bounded_candidate)
+                canonical = _canonical_path(
+                    bounded_candidate,
+                    path_style=path_style,
+                )
+                aliases = _managed_aliases(
+                    canonical,
+                    managed_roots,
+                    path_style=path_style,
+                )
+                display = display_name(canonical)
+                for alias in aliases:
+                    key = _canonical_path_key(alias, path_style=path_style)
+                    replacements[key] = display
+                    if is_output_root:
+                        output_roots[key] = alias
+            if exhausted:
+                break
+    return _TaskPaths(replacements, output_roots)
 
 
 def _managed_aliases(
@@ -530,54 +601,14 @@ def _join_canonical(root: str, relative: str) -> str:
     return f"{root.rstrip('/')}/{relative}"
 
 
-def _known_path_replacements(
-    value: str,
-    *,
-    paths: _TaskPaths,
-    path_style: _PathStyle,
-) -> tuple[_TextReplacement, ...]:
-    replacements = {
-        **{path: _basename(path) for path in paths.inputs},
-        **{path: _safe_output_name(path) for path in paths.output_files},
-        **{path: _safe_output_name(path) for path in paths.output_roots},
-    }
-    matches: list[_TextReplacement] = []
-    for path in sorted(replacements, key=len, reverse=True):
-        expression = _known_path_expression(path, path_style=path_style)
-        for match in re.finditer(
-            expression + r"(?![\\/])",
-            flags=_path_flags(path_style),
-            string=value,
-        ):
-            matches.append(
-                _TextReplacement(
-                    start=match.start(),
-                    end=match.end(),
-                    value=replacements[path],
-                )
-            )
-
-    selected: list[_TextReplacement] = []
-    for replacement in sorted(
-        matches,
-        key=lambda item: (item.start, -(item.end - item.start)),
-    ):
-        if selected and replacement.start < selected[-1].end:
-            continue
-        selected.append(replacement)
-    return tuple(selected)
-
-
 def _path_candidate_replacements(
     value: str,
     *,
     managed_roots: tuple[str, ...],
     paths: _TaskPaths,
     path_style: _PathStyle,
-    blocked: tuple[_TextReplacement, ...],
 ) -> tuple[_TextReplacement, ...] | None:
     result: list[_TextReplacement] = []
-    blocked_index = 0
     candidate_starts = _managed_candidate_starts(
         value,
         managed_roots=managed_roots,
@@ -586,17 +617,6 @@ def _path_candidate_replacements(
     candidate_index = 0
     while candidate_index < len(candidate_starts):
         index = candidate_starts[candidate_index]
-        while (
-            blocked_index < len(blocked)
-            and blocked[blocked_index].end <= index
-        ):
-            blocked_index += 1
-        if (
-            blocked_index < len(blocked)
-            and blocked[blocked_index].start <= index < blocked[blocked_index].end
-        ):
-            candidate_index += 1
-            continue
         replacement = _candidate_replacement(
             value,
             index,
@@ -616,13 +636,7 @@ def _path_candidate_replacements(
         end, display, reliable = replacement
         if not reliable:
             return None
-        if (
-            blocked_index >= len(blocked)
-            or blocked[blocked_index].start >= end
-        ):
-            result.append(
-                _TextReplacement(start=index, end=end, value=display)
-            )
+        result.append(_TextReplacement(start=index, end=end, value=display))
         candidate_index += 1
         while (
             candidate_index < len(candidate_starts)
@@ -642,11 +656,12 @@ def _managed_candidate_starts(
     for root in managed_roots:
         expression = _known_path_expression(root, path_style=path_style)
         for match in re.finditer(
-            expression + r"(?=$|[\\/])",
+            expression,
             value,
             flags=_path_flags(path_style),
         ):
-            starts.add(match.start())
+            if _is_managed_root_boundary(value, match.start(), match.end()):
+                starts.add(match.start())
     return tuple(sorted(starts))
 
 
@@ -756,16 +771,9 @@ def _display_exact_path(
 ) -> str | None:
     if not _is_absolute_path(candidate, path_style=path_style):
         return None
-    for path in paths.inputs:
-        if _paths_equal(candidate, path, path_style=path_style):
-            return _basename(path)
-    for path in paths.output_files:
-        if _paths_equal(candidate, path, path_style=path_style):
-            return _safe_output_name(path)
-    for path in paths.output_roots:
-        if _paths_equal(candidate, path, path_style=path_style):
-            return _safe_output_name(path)
-    return None
+    return paths.replacements.get(
+        _canonical_path_key(candidate, path_style=path_style)
+    )
 
 
 def _display_path_value(
@@ -784,16 +792,17 @@ def _display_path_value(
         return exact
     if not _is_absolute_path(candidate, path_style=path_style):
         return None
-    for path in paths.output_roots:
-        relative = _relative_path(
-            candidate,
-            path,
-            path_style=path_style,
+    ancestor = candidate.rstrip("/")
+    while "/" in ancestor:
+        ancestor = ancestor.rsplit("/", 1)[0]
+        root = paths.output_roots.get(
+            _canonical_path_key(ancestor, path_style=path_style)
         )
-        if relative is None:
+        if root is None:
             continue
+        relative = candidate[len(root.rstrip("/")) :].lstrip("/")
         if not relative:
-            return _safe_output_name(path)
+            return _safe_output_name(root)
         parts = relative.split("/")
         if any(_OPAQUE_DIRECTORY_NAME.fullmatch(part) for part in parts):
             return MANAGED_PATH_PLACEHOLDER
@@ -816,15 +825,32 @@ def _contains_managed_root(
     managed_roots: tuple[str, ...],
     path_style: _PathStyle,
 ) -> bool:
-    shadow = _normalized_path_shadow(value, path_style=path_style)
-    return any(
-        _normalized_path_shadow(root, path_style=path_style) in shadow
-        for root in managed_roots
-    )
+    shadows = [_normalized_path_shadow(value, path_style=path_style)]
+    if "+" in value:
+        shadows.append(
+            _normalized_path_shadow(
+                value,
+                path_style=path_style,
+                plus_as_space=True,
+            )
+        )
+    for root in managed_roots:
+        root_shadow = _normalized_path_shadow(root, path_style=path_style)
+        if any(_shadow_contains_root(shadow, root_shadow) for shadow in shadows):
+            return True
+    return False
 
 
-def _normalized_path_shadow(value: str, *, path_style: _PathStyle) -> str:
-    decoded = _decode_text(value).value.replace("\\", "/")
+def _normalized_path_shadow(
+    value: str,
+    *,
+    path_style: _PathStyle,
+    plus_as_space: bool = False,
+) -> str:
+    decoded = _decode_text(value).value
+    if plus_as_space:
+        decoded = decoded.replace("+", " ")
+    decoded = decoded.replace("\\", "/")
     absolute = decoded.startswith("/")
     components: list[str] = []
     for component in decoded.split("/"):
@@ -841,6 +867,100 @@ def _normalized_path_shadow(value: str, *, path_style: _PathStyle) -> str:
     if absolute:
         shadow = "/" + shadow
     return shadow.casefold() if path_style == "windows" else shadow
+
+
+def _decode_bytes(value: bytes, encoding: str) -> str | None:
+    try:
+        return value.decode(encoding)
+    except (UnicodeDecodeError, ValueError):
+        return None
+
+
+def _wide_text_candidates(value: bytes) -> tuple[str, ...]:
+    encodings = ["utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be"]
+    bom_encoding: str | None = None
+    for bom, encoding in (
+        (codecs.BOM_UTF32_LE, "utf-32-le"),
+        (codecs.BOM_UTF32_BE, "utf-32-be"),
+        (codecs.BOM_UTF16_LE, "utf-16-le"),
+        (codecs.BOM_UTF16_BE, "utf-16-be"),
+    ):
+        if value.startswith(bom):
+            bom_encoding = encoding
+            encodings.remove(encoding)
+            encodings.insert(0, encoding)
+            break
+
+    candidates: dict[str, tuple[int, int, int]] = {}
+    for encoding in encodings:
+        width = 4 if encoding.startswith("utf-32") else 2
+        if len(value) % width:
+            continue
+        decoded = _decode_bytes(value, encoding)
+        if decoded is None:
+            continue
+        decoded = decoded.removeprefix("\ufeff")
+        if not _is_reasonable_text(decoded):
+            continue
+        ascii_characters = sum(
+            character.isascii() and character.isprintable()
+            for character in decoded
+        )
+        printable_characters = sum(
+            character.isprintable() or character in "\r\n\t"
+            for character in decoded
+        )
+        candidates[decoded] = (
+            int(encoding == bom_encoding),
+            ascii_characters,
+            printable_characters,
+        )
+    return tuple(
+        sorted(
+            candidates,
+            key=lambda candidate: candidates[candidate],
+            reverse=True,
+        )
+    )
+
+
+def _is_reasonable_text(value: str) -> bool:
+    if not value or "\x00" in value or "\ufffd" in value:
+        return False
+    return all(
+        character.isprintable() or character in "\r\n\t"
+        for character in value
+    )
+
+
+def _shadow_contains_root(shadow: str, root: str) -> bool:
+    start = 0
+    while True:
+        index = shadow.find(root, start)
+        if index < 0:
+            return False
+        if _is_managed_root_boundary(shadow, index, index + len(root)):
+            return True
+        start = index + 1
+
+
+def _is_managed_root_boundary(value: str, start: int, end: int) -> bool:
+    if start > 0:
+        previous = value[start - 1]
+        if (
+            not previous.isspace()
+            and previous not in "/\\"
+            and previous not in _PATH_BOUNDARY_PUNCTUATION
+        ):
+            return False
+    if end >= len(value):
+        return True
+    following = value[end]
+    return (
+        following.isspace()
+        or following in "/\\?#"
+        or following in _PATH_BOUNDARY_PUNCTUATION
+    )
 
 
 def _decode_text(value: str) -> _DecodedText:
@@ -960,15 +1080,8 @@ def _canonical_path(
     return normalized
 
 
-def _paths_equal(
-    left: str,
-    right: str,
-    *,
-    path_style: _PathStyle,
-) -> bool:
-    if path_style == "windows":
-        return left.casefold() == right.casefold()
-    return left == right
+def _canonical_path_key(value: str, *, path_style: _PathStyle) -> str:
+    return value.casefold() if path_style == "windows" else value
 
 
 def _relative_path(

@@ -11,7 +11,7 @@ from queue import Empty
 from random import Random
 from threading import Barrier, Event, Lock
 from time import perf_counter
-from urllib.parse import quote
+from urllib.parse import quote, quote_plus
 from zipfile import ZipFile
 
 import fakeredis
@@ -5069,21 +5069,12 @@ def test_hosted_event_sanitizer_handles_encoded_normalized_embedded_paths(
     twice = manager.log_store.sanitize_event(once)
 
     assert once == twice
-    assert once.message == (
-        "inputs 'source clip.mov', source clip.mov, and "
-        "https://example.invalid/inspect?"
-        "source=source clip.mov&mode=metadata"
-    )
+    assert once.message == "[managed path]"
     assert once.details == {
         "nested": [
             {"uri": "source clip.mov"},
             {"double_encoded": "source clip.mov"},
-            {
-                "query": (
-                    "https://example.invalid/inspect?"
-                    "source=source clip.mov&mode=metadata"
-                )
-            },
+            {"query": "[managed path]"},
         ],
         "ordinary": "100% complete; file format notes only",
         "external": r"D:\Customer Files\source clip.mov",
@@ -5168,7 +5159,7 @@ def test_hosted_event_sanitizer_replaces_only_encoded_managed_path_token() -> No
         task_payload={"input_path": str(input_path)},
     )
 
-    assert sanitized == f"processing source clip.mov{suffix}"
+    assert sanitized == event_sanitization_module.MANAGED_PATH_PLACEHOLDER
 
 
 def test_hosted_event_sanitizer_percent_decoding_scales_linearly() -> None:
@@ -5208,6 +5199,187 @@ def test_hosted_event_sanitizer_handles_510_fields_in_under_half_second() -> Non
 
     assert sanitized == details
     assert elapsed < 0.5
+
+
+def test_hosted_event_sanitizer_cost_is_independent_of_known_path_count() -> None:
+    data_dir = PurePosixPath("/srv/data")
+    known_paths = [
+        str(
+            data_dir
+            / "sessions"
+            / f"{index:032x}"
+            / "assets"
+            / f"{index + 100:032x}"
+            / f"source-{index}.mov"
+        )
+        for index in range(100)
+    ]
+    details = {f"field-{index}": "ordinary value" for index in range(510)}
+
+    started = perf_counter()
+    baseline = event_sanitization_module.sanitize_event_details(
+        details,
+        data_dir=data_dir,
+        task_payload=None,
+    )
+    baseline_elapsed = perf_counter() - started
+
+    started = perf_counter()
+    sanitized = event_sanitization_module.sanitize_event_details(
+        details,
+        data_dir=data_dir,
+        task_payload={"input_paths": known_paths},
+    )
+    elapsed = perf_counter() - started
+
+    assert baseline == details
+    assert sanitized == details
+    assert elapsed < 0.5
+    assert elapsed <= max(baseline_elapsed * 3, baseline_elapsed + 0.05)
+
+
+def test_hosted_event_sanitizer_uses_exact_map_and_keeps_plain_embedded_ux() -> None:
+    data_dir = PurePosixPath("/srv/data")
+    known_path = (
+        data_dir
+        / "sessions"
+        / ("1" * 32)
+        / "assets"
+        / ("2" * 32)
+        / "source clip.mov"
+    )
+    unknown_path = (
+        data_dir
+        / "sessions"
+        / ("3" * 32)
+        / "private"
+        / "failure.log"
+    )
+    sanitizer = event_sanitization_module.EventSanitizer(data_dir)
+    payload = {"input_path": str(known_path)}
+
+    assert sanitizer.sanitize_text(str(known_path), task_payload=payload) == (
+        "source clip.mov"
+    )
+    assert sanitizer.sanitize_text(
+        f"Processing {known_path}",
+        task_payload=payload,
+    ) == "Processing source clip.mov"
+    assert sanitizer.sanitize_text(
+        f"Failed at {unknown_path} after retry",
+        task_payload=payload,
+    ) == "Failed at [managed path] after retry"
+
+
+def test_hosted_event_sanitizer_requires_managed_root_component_boundary() -> None:
+    sanitizer = event_sanitization_module.EventSanitizer(
+        PurePosixPath("/srv/data")
+    )
+
+    assert sanitizer.sanitize_text(
+        "/srv/database/private/source.mov",
+        task_payload=None,
+    ) == "/srv/database/private/source.mov"
+    assert sanitizer.sanitize_text(
+        "prefix/srv/data/private/source.mov",
+        task_payload=None,
+    ) == "prefix/srv/data/private/source.mov"
+
+
+def test_hosted_event_sanitizer_detects_quote_plus_only_in_shadow() -> None:
+    data_dir = PurePosixPath("/srv/private data")
+    private_path = (
+        data_dir / "sessions" / ("4" * 32) / "private" / "failure.log"
+    )
+    encoded = quote_plus(str(private_path), safe="")
+    sanitizer = event_sanitization_module.EventSanitizer(data_dir)
+
+    assert sanitizer.sanitize_text(
+        f"failed={encoded}",
+        task_payload=None,
+    ) == event_sanitization_module.MANAGED_PATH_PLACEHOLDER
+    assert sanitizer.sanitize_text(
+        "ordinary+message",
+        task_payload=None,
+    ) == "ordinary+message"
+
+
+@pytest.mark.parametrize(
+    ("codec", "bom"),
+    [
+        ("utf-16-le", b""),
+        ("utf-16-be", b""),
+        ("utf-32-le", b""),
+        ("utf-32-be", b""),
+        ("utf-16-le", b"\xff\xfe"),
+        ("utf-16-be", b"\xfe\xff"),
+        ("utf-32-le", b"\xff\xfe\x00\x00"),
+        ("utf-32-be", b"\x00\x00\xfe\xff"),
+    ],
+    ids=[
+        "utf16-le",
+        "utf16-be",
+        "utf32-le",
+        "utf32-be",
+        "utf16-le-bom",
+        "utf16-be-bom",
+        "utf32-le-bom",
+        "utf32-be-bom",
+    ],
+)
+@pytest.mark.parametrize(
+    "wrapper",
+    [bytes, bytearray, memoryview],
+    ids=["bytes", "bytearray", "memoryview"],
+)
+def test_hosted_event_sanitizer_redacts_utf_encoded_binary_paths(
+    codec: str,
+    bom: bytes,
+    wrapper,
+) -> None:
+    data_dir = PurePosixPath("/srv/data")
+    private_path = (
+        data_dir / "sessions" / ("5" * 32) / "private" / "secret.txt"
+    )
+    encoded = bom + str(private_path).encode(codec)
+
+    sanitized = event_sanitization_module.sanitize_event_details(
+        {"path": wrapper(encoded)},
+        data_dir=data_dir,
+        task_payload={"input_path": str(private_path)},
+    )
+
+    assert sanitized == {
+        "path": event_sanitization_module.MANAGED_PATH_PLACEHOLDER
+    }
+    serialized = json.dumps(sanitized)
+    assert str(data_dir) not in serialized
+    assert "5" * 32 not in serialized
+
+
+@pytest.mark.parametrize(
+    ("encoded", "expected"),
+    [
+        (b"plain text", "plain text"),
+        (b"\xef\xbb\xbfutf8 bom text", "utf8 bom text"),
+        ("wide text".encode("utf-16-le"), "wide text"),
+        (b"\xff\xfe" + "bom text".encode("utf-16-le"), "bom text"),
+        ("wide32 text".encode("utf-32-be"), "wide32 text"),
+    ],
+    ids=["utf8", "utf8-bom", "utf16-no-bom", "utf16-bom", "utf32-no-bom"],
+)
+def test_hosted_event_sanitizer_emits_reasonable_safe_binary_text(
+    encoded: bytes,
+    expected: str,
+) -> None:
+    sanitized = event_sanitization_module.sanitize_event_details(
+        {"value": encoded},
+        data_dir=PurePosixPath("/srv/data"),
+        task_payload=None,
+    )
+
+    assert sanitized == {"value": expected}
+    assert json.loads(json.dumps(sanitized)) == sanitized
 
 
 def test_hosted_event_sanitizer_bounds_every_public_string(
@@ -5760,7 +5932,7 @@ def test_hosted_event_sanitizer_detects_path_across_truncation_marker() -> None:
     retained_length = (
         event_sanitization_module.MAX_PUBLIC_EVENT_STRING_LENGTH - len(marker)
     )
-    prefix = "x" * (retained_length - 3)
+    prefix = "x" * (retained_length - 4) + " "
     value = (
         f"{prefix}{data_dir}/sessions/{'7' * 32}/failure.log"
         + "y" * event_sanitization_module.MAX_PUBLIC_EVENT_STRING_LENGTH
@@ -5843,7 +6015,7 @@ def test_hosted_event_sanitizer_same_token_scan_scales_linearly() -> None:
     assert elapsed_8k / elapsed_4k < 3
 
 
-def test_hosted_event_sanitizer_preserves_file_uri_suffixes(
+def test_hosted_event_sanitizer_fails_closed_for_encoded_file_uri_suffixes(
     tmp_path: Path,
 ) -> None:
     input_path = tmp_path / "sessions" / ("3" * 32) / "source clip.mov"
@@ -5855,7 +6027,7 @@ def test_hosted_event_sanitizer_preserves_file_uri_suffixes(
         task_payload={"input_path": str(input_path)},
     )
 
-    assert sanitized == "source clip.mov?mode=metadata#preview trailing text"
+    assert sanitized == event_sanitization_module.MANAGED_PATH_PLACEHOLDER
 
 
 def test_posix_double_slash_root_is_not_treated_as_unc() -> None:
@@ -6053,7 +6225,7 @@ def test_hosted_redis_read_boundaries_sanitize_legacy_raw_events(
 
     exposed_live = subscriber.get(timeout=0.2)
 
-    assert exposed_live.message == "Live legacy.mov"
+    assert exposed_live.message == event_sanitization_module.MANAGED_PATH_PLACEHOLDER
     assert exposed_live.details == {"path": "legacy.mov"}
     assert session_id not in exposed_live.model_dump_json()
     assert asset_id not in exposed_live.model_dump_json()
