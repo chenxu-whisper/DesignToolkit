@@ -1,3 +1,4 @@
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from threading import Barrier, Event, Lock
 
@@ -135,3 +136,203 @@ def test_local_preview_operations_remain_ownerless() -> None:
 
     assert deduplicated_id == preview_id
     assert store.get(preview_id) == b"local"
+
+
+def test_repeated_attacker_inserts_preserve_each_resident_owner() -> None:
+    store = ChromaPreviewStore(max_entries=32)
+    victims: dict[str, list[str]] = {}
+    for owner_number in range(8):
+        owner_id = f"victim-{owner_number}"
+        victims[owner_id] = [
+            store.put(
+                f"{owner_id}-{entry_number}".encode(),
+                owner_id=owner_id,
+            )
+            for entry_number in range(4)
+        ]
+
+    attacker_ids = [
+        store.put(f"attack-{entry_number}".encode(), owner_id="attacker")
+        for entry_number in range(100)
+    ]
+
+    for owner_id, preview_ids in victims.items():
+        assert any(
+            store.get(preview_id, owner_id=owner_id) is not None
+            for preview_id in preview_ids
+        )
+    assert (
+        sum(
+            store.get(preview_id, owner_id="attacker") is not None
+            for preview_id in attacker_ids
+        )
+        <= 8
+    )
+
+
+def test_global_fairness_tie_evicts_oldest_entry_deterministically() -> None:
+    store = ChromaPreviewStore(max_entries=4, max_entries_per_owner=2)
+    oldest = store.put(b"a", owner_id="owner-a")
+    residents = [
+        store.put(owner_id.encode(), owner_id=owner_id)
+        for owner_id in ("owner-b", "owner-c", "owner-d")
+    ]
+
+    newcomer = store.put(b"e", owner_id="owner-e")
+
+    assert store.get(oldest, owner_id="owner-a") is None
+    assert all(
+        store.get(preview_id, owner_id=owner_id) is not None
+        for preview_id, owner_id in zip(
+            residents,
+            ("owner-b", "owner-c", "owner-d"),
+            strict=True,
+        )
+    )
+    assert store.get(newcomer, owner_id="owner-e") == b"e"
+
+
+def test_global_fairness_tie_prefers_current_owner_over_resident_victims() -> None:
+    store = ChromaPreviewStore(max_entries=4, max_entries_per_owner=2)
+    victims = {
+        owner_id: store.put(owner_id.encode(), owner_id=owner_id)
+        for owner_id in ("owner-a", "owner-b", "owner-c")
+    }
+    first_attacker = store.put(b"first", owner_id="attacker")
+
+    second_attacker = store.put(b"second", owner_id="attacker")
+
+    assert all(
+        store.get(preview_id, owner_id=owner_id) is not None
+        for owner_id, preview_id in victims.items()
+    )
+    assert store.get(first_attacker, owner_id="attacker") is None
+    assert store.get(second_attacker, owner_id="attacker") == b"second"
+
+
+def test_same_cache_key_does_not_consume_owner_budget_twice() -> None:
+    store = ChromaPreviewStore(max_entries=4, max_entries_per_owner=2)
+
+    first = store.put(b"first", cache_key="same", owner_id="owner-a")
+    duplicate = store.put(b"replacement", cache_key="same", owner_id="owner-a")
+    second = store.put(b"second", owner_id="owner-a")
+
+    assert duplicate == first
+    assert store.get(first, owner_id="owner-a") == b"first"
+    assert store.get(second, owner_id="owner-a") == b"second"
+    assert store._owner_counts == {"owner-a": 2}
+
+
+def test_expired_entries_are_purged_before_capacity_eviction() -> None:
+    now = [0.0]
+    store = ChromaPreviewStore(
+        max_entries=2,
+        ttl_seconds=10,
+        clock=lambda: now[0],
+    )
+    expired = store.put(
+        b"expired",
+        cache_key="expired",
+        owner_id="owner-a",
+    )
+    now[0] = 11.0
+
+    resident_b = store.put(b"b", owner_id="owner-b")
+    resident_c = store.put(b"c", owner_id="owner-c")
+
+    assert store.get(expired, owner_id="owner-a") is None
+    assert store.get(resident_b, owner_id="owner-b") == b"b"
+    assert store.get(resident_c, owner_id="owner-c") == b"c"
+    assert store._owner_counts == {"owner-b": 1, "owner-c": 1}
+    assert ("owner-a", "expired") not in store._preview_ids_by_cache_key
+    assert expired not in store._cache_keys_by_preview_id
+
+
+def test_delete_and_clear_release_owner_counts_and_cache_keys() -> None:
+    store = ChromaPreviewStore(max_entries=4, max_entries_per_owner=2)
+    deleted = store.put(b"a", cache_key="a", owner_id="owner-a")
+    retained = store.put(b"b", cache_key="b", owner_id="owner-b")
+
+    assert store.delete(deleted, owner_id="owner-a")
+    assert not store.delete(retained, owner_id="owner-a")
+    assert store._owner_counts == {"owner-b": 1}
+    replacement = store.put(b"new-a", cache_key="a", owner_id="owner-a")
+    assert replacement != deleted
+
+    store.clear()
+
+    assert store.get(retained, owner_id="owner-b") is None
+    assert store.get(replacement, owner_id="owner-a") is None
+    assert store._owner_counts == {}
+    assert store._preview_ids_by_cache_key == {}
+    assert store._cache_keys_by_preview_id == {}
+    assert store._expires_at_by_preview_id == {}
+
+
+def test_concurrent_inserts_preserve_capacity_and_owner_count_invariants() -> None:
+    store = ChromaPreviewStore(max_entries=32)
+
+    with ThreadPoolExecutor(max_workers=16) as executor:
+        preview_ids = list(
+            executor.map(
+                lambda item: store.put(
+                    f"{item[0]}-{item[1]}".encode(),
+                    owner_id=f"owner-{item[0]}",
+                ),
+                (
+                    (owner_number, entry_number)
+                    for owner_number in range(8)
+                    for entry_number in range(50)
+                ),
+            )
+        )
+
+    resident_entries = list(store._previews.values())
+    actual_counts = Counter(
+        entry.owner_id for entry in resident_entries if entry.owner_id is not None
+    )
+    assert len(preview_ids) == 400
+    assert len(resident_entries) <= 32
+    assert all(count <= 8 for count in actual_counts.values())
+    assert store._owner_counts == dict(actual_counts)
+    assert sum(store._owner_counts.values()) == len(resident_entries)
+
+
+@pytest.mark.parametrize("max_entries", [1, 2])
+def test_small_capacities_remain_bounded(max_entries: int) -> None:
+    store = ChromaPreviewStore(max_entries=max_entries)
+    victim_a = store.put(b"a", owner_id="owner-a")
+    victim_b = (
+        store.put(b"b", owner_id="owner-b") if max_entries == 2 else None
+    )
+
+    attacker_ids = [
+        store.put(f"attack-{index}".encode(), owner_id="attacker")
+        for index in range(20)
+    ]
+
+    assert len(store._previews) == max_entries
+    assert store._owner_counts["attacker"] == 1
+    assert (
+        sum(
+            store.get(preview_id, owner_id="attacker") is not None
+            for preview_id in attacker_ids
+        )
+        == 1
+    )
+    assert store.get(victim_a, owner_id="owner-a") is None
+    if victim_b is not None:
+        assert store.get(victim_b, owner_id="owner-b") == b"b"
+
+
+def test_local_capacity_keeps_global_fifo_semantics() -> None:
+    store = ChromaPreviewStore(max_entries=2)
+    oldest = store.put(b"oldest")
+    middle = store.put(b"middle")
+
+    newest = store.put(b"newest")
+
+    assert store.get(oldest) is None
+    assert store.get(middle) == b"middle"
+    assert store.get(newest) == b"newest"
+    assert store._owner_counts == {}
