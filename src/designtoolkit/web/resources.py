@@ -1709,6 +1709,10 @@ for _, asset_id in ipairs(asset_ids) do
         return 3
     end
 end
+local receipt_type = redis.call("TYPE", KEYS[3])["ok"]
+if receipt_type ~= "none" then
+    redis.call("DEL", KEYS[3])
+end
 for _, asset_id in ipairs(asset_ids) do
     local asset_tasks_key = ARGV[3] .. ARGV[1] .. ":" .. asset_id
     redis.call("SREM", asset_tasks_key, ARGV[2])
@@ -3641,6 +3645,7 @@ def _release_task_pin_without_lua(
                 if asset_task_keys:
                     pipeline.watch(*asset_task_keys)
                 pipeline.multi()
+                pipeline.delete(receipt_key)
                 for asset_task_key in asset_task_keys:
                     pipeline.srem(asset_task_key, task_id)
                 pipeline.delete(pin_key)
