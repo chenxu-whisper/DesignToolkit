@@ -9,6 +9,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from queue import Empty
 from threading import Barrier, Event, Lock
+from urllib.parse import quote
 from zipfile import ZipFile
 
 import fakeredis
@@ -29,6 +30,7 @@ from designtoolkit.media_resize import (
 )
 from designtoolkit.video_frames import ExportResult
 from designtoolkit.web import cleanup as cleanup_module
+from designtoolkit.web import event_sanitization as event_sanitization_module
 from designtoolkit.web import redis_errors as redis_errors_module
 from designtoolkit.web import redis_tasks as redis_tasks_module
 from designtoolkit.web import worker as worker_module
@@ -4919,6 +4921,351 @@ def test_hosted_redis_events_preserve_task_paths_outside_data_dir(
 
     assert event.message == f"Processing {external_input}"
     assert event.details == {"output_path": external_output}
+
+
+def test_hosted_event_sanitizer_resolves_relative_data_dir_like_storage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    data_dir = Path("managed")
+    data_dir.mkdir()
+    storage = HostedStorage(data_dir, max_upload_bytes=16)
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = _manager(redis_connection, data_dir)
+    task_id = "relative-data-dir"
+    session_id = "1" * 32
+    asset_id = "2" * 32
+    input_path = (
+        storage.root
+        / "sessions"
+        / session_id
+        / "assets"
+        / asset_id
+        / "source.mov"
+    )
+    manager._save_work(
+        task_id,
+        "video_frames",
+        {"input_path": str(input_path)},
+    )
+
+    event = manager.log_store.append(
+        task_id=task_id,
+        level=LogLevel.INFO,
+        phase=LogPhase.RUNNING,
+        message=f"Processing {input_path}",
+        details={"input": str(input_path)},
+    )
+
+    assert event.message == "Processing source.mov"
+    assert event.details == {"input": "source.mov"}
+    assert session_id not in event.model_dump_json()
+    assert asset_id not in event.model_dump_json()
+
+
+def test_hosted_event_sanitizer_maps_lexical_and_symlink_roots(
+    tmp_path: Path,
+) -> None:
+    real_root = tmp_path / "real-data"
+    real_root.mkdir()
+    lexical_root = tmp_path / "linked-data"
+    try:
+        lexical_root.symlink_to(real_root, target_is_directory=True)
+    except (NotImplementedError, OSError) as exc:
+        pytest.skip(f"directory symlinks unavailable: {exc}")
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = _manager(redis_connection, lexical_root)
+    task_id = "symlink-data-dir"
+    session_id = "3" * 32
+    asset_id = "4" * 32
+    relative_path = (
+        Path("sessions")
+        / session_id
+        / "assets"
+        / asset_id
+        / "source.mov"
+    )
+    real_path = real_root / relative_path
+    lexical_path = lexical_root / relative_path
+    manager._save_work(
+        task_id,
+        "video_frames",
+        {"input_path": str(real_path)},
+    )
+
+    event = manager.log_store.append(
+        task_id=task_id,
+        level=LogLevel.INFO,
+        phase=LogPhase.RUNNING,
+        message=f"Real {real_path}; lexical {lexical_path}",
+        details={"real": str(real_path), "lexical": str(lexical_path)},
+    )
+
+    assert event.message == "Real source.mov; lexical source.mov"
+    assert event.details == {"real": "source.mov", "lexical": "source.mov"}
+    assert session_id not in event.model_dump_json()
+    assert asset_id not in event.model_dump_json()
+
+
+def test_hosted_event_sanitizer_handles_encoded_normalized_embedded_paths(
+    tmp_path: Path,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = _manager(redis_connection, tmp_path)
+    task_id = "encoded-managed-paths"
+    session_id = "5" * 32
+    asset_id = "6" * 32
+    input_path = (
+        tmp_path
+        / "sessions"
+        / session_id
+        / "assets"
+        / asset_id
+        / "source clip.mov"
+    )
+    manager._save_work(
+        task_id,
+        "video_frames",
+        {"input_path": str(input_path)},
+    )
+    uri = input_path.as_uri()
+    encoded_uri = quote(uri, safe="")
+    double_encoded_uri = quote(encoded_uri, safe="")
+    normalized = str(input_path).replace("\\", "/")
+    root, relative = normalized.split("/sessions/", 1)
+    repeated_and_dotted = (
+        f"{root}//./sessions//{'f' * 32}/../{relative}"
+    )
+    escaped = f"{root}/../external/customer/source.mov"
+    query = (
+        "https://example.invalid/inspect?"
+        f"source={encoded_uri}&mode=metadata"
+    )
+    raw_event = redis_tasks_module.LogEventResponse(
+        task_id=task_id,
+        timestamp=datetime.now(UTC),
+        level=LogLevel.INFO,
+        phase=LogPhase.RUNNING,
+        message=(
+            f"inputs '{repeated_and_dotted}', {double_encoded_uri}, "
+            f"and {query}"
+        ),
+        details={
+            "nested": [
+                {"uri": uri},
+                {"double_encoded": double_encoded_uri},
+                {"query": query},
+            ],
+            "ordinary": "100% complete; file format notes only",
+            "external": r"D:\Customer Files\source clip.mov",
+            "escaped": escaped,
+        },
+    )
+
+    once = manager.log_store.sanitize_event(raw_event)
+    twice = manager.log_store.sanitize_event(once)
+
+    assert once == twice
+    assert once.message == (
+        "inputs 'source clip.mov', source clip.mov, and "
+        "https://example.invalid/inspect?"
+        "source=source clip.mov&mode=metadata"
+    )
+    assert once.details == {
+        "nested": [
+            {"uri": "source clip.mov"},
+            {"double_encoded": "source clip.mov"},
+            {
+                "query": (
+                    "https://example.invalid/inspect?"
+                    "source=source clip.mov&mode=metadata"
+                )
+            },
+        ],
+        "ordinary": "100% complete; file format notes only",
+        "external": r"D:\Customer Files\source clip.mov",
+        "escaped": escaped,
+    }
+    exposed = once.model_dump_json()
+    assert session_id not in exposed
+    assert asset_id not in exposed
+
+
+def test_hosted_event_sanitizer_preserves_text_after_unknown_managed_file(
+    tmp_path: Path,
+) -> None:
+    session_id = "b" * 32
+    task_directory_id = "c" * 32
+    unknown_path = (
+        tmp_path
+        / "sessions"
+        / session_id
+        / "private files"
+        / task_directory_id
+        / "failure.txt"
+    )
+
+    sanitized = event_sanitization_module.sanitize_event_text(
+        f"Failed at {unknown_path} after retry",
+        data_dir=tmp_path,
+        task_payload=None,
+    )
+
+    assert sanitized == "Failed at [managed path] after retry"
+    assert session_id not in sanitized
+    assert task_directory_id not in sanitized
+
+
+@pytest.mark.parametrize(
+    ("data_dir", "candidate"),
+    [
+        (
+            Path("C:/Hosted/Data"),
+            "FILE:///c:/hosted//data/./sessions/"
+            + "7" * 32
+            + "/assets/"
+            + "8" * 32
+            + "/source.mov",
+        ),
+        (
+            Path("//Server/Share/Data"),
+            "file://server/share/data/sessions/"
+            + "7" * 32
+            + "/assets/"
+            + "8" * 32
+            + "/source.mov",
+        ),
+    ],
+    ids=["windows-drive", "windows-unc"],
+)
+def test_hosted_event_sanitizer_normalizes_windows_managed_paths(
+    data_dir: Path,
+    candidate: str,
+) -> None:
+    payload_path = (
+        str(data_dir).replace("\\", "/")
+        + "/sessions/"
+        + "7" * 32
+        + "/assets/"
+        + "8" * 32
+        + "/source.mov"
+    )
+
+    sanitized = event_sanitization_module.sanitize_event_text(
+        f"Processing {candidate}",
+        data_dir=data_dir,
+        task_payload={"input_path": payload_path},
+    )
+
+    assert sanitized == "Processing source.mov"
+
+
+def test_hosted_redis_read_boundaries_sanitize_legacy_raw_events(
+    tmp_path: Path,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = _manager(redis_connection, tmp_path)
+    task_id = "legacy-raw-events"
+    session_id = "9" * 32
+    asset_id = "a" * 32
+    input_path = (
+        tmp_path
+        / "sessions"
+        / session_id
+        / "assets"
+        / asset_id
+        / "legacy.mov"
+    )
+    manager._save_work(
+        task_id,
+        "video_frames",
+        {"input_path": str(input_path)},
+    )
+    historical = redis_tasks_module.LogEventResponse(
+        task_id=task_id,
+        timestamp=datetime.now(UTC),
+        level=LogLevel.INFO,
+        phase=LogPhase.RUNNING,
+        message=f"Historical {input_path}",
+        details={"nested": [{"path": input_path.as_uri()}]},
+    )
+    event_key = f"dt:task:{task_id}:events"
+    event_index_key = f"dt:task:{task_id}:event-index"
+    generation_key = f"dt:event-generation:{task_id}"
+    redis_connection.rpush(event_key, historical.model_dump_json())
+    redis_connection.hset(
+        event_index_key,
+        mapping={
+            "next_sequence": 1,
+            "1": historical.model_dump_json(),
+        },
+    )
+    redis_connection.set(generation_key, "legacy-generation")
+
+    direct_history = manager.log_store.history(task_id)
+    history, subscriber = manager.log_store.history_and_subscribe(task_id)
+
+    assert direct_history[0].message == "Historical legacy.mov"
+    assert direct_history[0].details == {
+        "nested": [{"path": "legacy.mov"}]
+    }
+    assert history == direct_history
+
+    live = historical.model_copy(
+        update={
+            "message": f"Live {quote(input_path.as_uri(), safe='')}",
+            "details": {"path": str(input_path)},
+        }
+    )
+    redis_connection.rpush(event_key, live.model_dump_json())
+    redis_connection.hset(
+        event_index_key,
+        mapping={
+            "next_sequence": 2,
+            "2": live.model_dump_json(),
+        },
+    )
+
+    exposed_live = subscriber.get(timeout=0.2)
+
+    assert exposed_live.message == "Live legacy.mov"
+    assert exposed_live.details == {"path": "legacy.mov"}
+    assert session_id not in exposed_live.model_dump_json()
+    assert asset_id not in exposed_live.model_dump_json()
+
+
+def test_redis_read_boundaries_preserve_raw_events_without_sanitizer() -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    store = RedisLogStore(redis_connection, retention_seconds=60)
+    task_id = "unsanitized-legacy-events"
+    raw = redis_tasks_module.LogEventResponse(
+        task_id=task_id,
+        timestamp=datetime.now(UTC),
+        level=LogLevel.INFO,
+        phase=LogPhase.RUNNING,
+        message="Raw /managed/session/path",
+        details={"path": "/managed/session/path"},
+    )
+    event_key = f"dt:task:{task_id}:events"
+    event_index_key = f"dt:task:{task_id}:event-index"
+    generation_key = f"dt:event-generation:{task_id}"
+    redis_connection.rpush(event_key, raw.model_dump_json())
+    redis_connection.hset(
+        event_index_key,
+        mapping={"next_sequence": 1, "1": raw.model_dump_json()},
+    )
+    redis_connection.set(generation_key, "legacy-generation")
+
+    history, subscriber = store.history_and_subscribe(task_id)
+
+    assert history == [raw]
+    redis_connection.rpush(event_key, raw.model_dump_json())
+    redis_connection.hset(
+        event_index_key,
+        mapping={"next_sequence": 2, "2": raw.model_dump_json()},
+    )
+    assert subscriber.get(timeout=0.2) == raw
 
 
 def test_redis_subscriber_polls_only_the_event_at_its_cursor() -> None:

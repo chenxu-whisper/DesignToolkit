@@ -30,10 +30,7 @@ from designtoolkit.web.adapters import (
     media_resize_options_list_from_request,
     video_frame_options_list_from_request,
 )
-from designtoolkit.web.event_sanitization import (
-    sanitize_event_details,
-    sanitize_event_text,
-)
+from designtoolkit.web.event_sanitization import EventSanitizer
 from designtoolkit.web.heartbeat import (
     DEFAULT_HEARTBEAT_STOP_TIMEOUT_SECONDS,
     HeartbeatStopTimeoutError,
@@ -813,11 +810,13 @@ class RedisEventSubscriber:
         task_id: str,
         generation: str | None,
         next_sequence: int,
+        sanitizer: EventSanitizer | None = None,
     ) -> None:
         self._store = store
         self._task_id = task_id
         self._generation = generation
         self._next_sequence = next_sequence
+        self._sanitizer = sanitizer
 
     def get(self, timeout: float) -> LogEventResponse:
         deadline = monotonic() + timeout
@@ -830,6 +829,13 @@ class RedisEventSubscriber:
             self._generation = generation
             self._next_sequence = next_sequence
             if event is not None:
+                if self._sanitizer is not None:
+                    event = self._sanitizer.sanitize_event(
+                        event,
+                        task_payload=self._store._task_payload(
+                            self._task_id
+                        ),
+                    )
                 return event
             sleep(min(0.05, max(0.0, deadline - monotonic())))
         raise Empty
@@ -845,7 +851,9 @@ class RedisLogStore:
     ) -> None:
         self._redis = redis_connection
         self._retention_seconds = retention_seconds
-        self._data_dir = data_dir
+        self._sanitizer = (
+            EventSanitizer(data_dir) if data_dir is not None else None
+        )
         self._append_event_script = self._redis.register_script(
             _APPEND_EVENT_SCRIPT
         )
@@ -895,30 +903,19 @@ class RedisLogStore:
         return event
 
     def sanitize_event(self, event: LogEventResponse) -> LogEventResponse:
-        if self._data_dir is None:
+        if self._sanitizer is None:
             return event
         payload = self._task_payload(event.task_id)
-        return event.model_copy(
-            update={
-                "message": sanitize_event_text(
-                    event.message,
-                    data_dir=self._data_dir,
-                    task_payload=payload,
-                ),
-                "details": sanitize_event_details(
-                    event.details,
-                    data_dir=self._data_dir,
-                    task_payload=payload,
-                ),
-            }
+        return self._sanitizer.sanitize_event(
+            event,
+            task_payload=payload,
         )
 
     def sanitize_text(self, task_id: str, value: str) -> str:
-        if self._data_dir is None:
+        if self._sanitizer is None:
             return value
-        return sanitize_event_text(
+        return self._sanitizer.sanitize_text(
             value,
-            data_dir=self._data_dir,
             task_payload=self._task_payload(task_id),
         )
 
@@ -937,19 +934,36 @@ class RedisLogStore:
 
     def history(self, task_id: str) -> list[LogEventResponse]:
         _generation, events, _next_sequence = self._snapshot(task_id)
-        return events
+        return self._sanitize_events(task_id, events)
 
     def history_and_subscribe(
         self,
         task_id: str,
     ) -> tuple[list[LogEventResponse], RedisEventSubscriber]:
         generation, history, next_sequence = self._snapshot(task_id)
-        return history, RedisEventSubscriber(
-            self,
-            task_id,
-            generation,
-            next_sequence,
+        return self._sanitize_events(task_id, history), RedisEventSubscriber(
+            store=self,
+            task_id=task_id,
+            generation=generation,
+            next_sequence=next_sequence,
+            sanitizer=self._sanitizer,
         )
+
+    def _sanitize_events(
+        self,
+        task_id: str,
+        events: list[LogEventResponse],
+    ) -> list[LogEventResponse]:
+        if self._sanitizer is None:
+            return events
+        payload = self._task_payload(task_id)
+        return [
+            self._sanitizer.sanitize_event(
+                event,
+                task_payload=payload,
+            )
+            for event in events
+        ]
 
     def unsubscribe(
         self,
