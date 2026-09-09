@@ -18,6 +18,7 @@ from uuid import uuid4
 
 from redis import Redis
 from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import ResponseError, WatchError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 
 _STATE_KEY = "dt:resource:state"
@@ -35,6 +36,7 @@ _CLEANUP_GENERATION_PREFIX = "dt:resource:cleanup-generation:"
 _LEGACY_CLEANUP_PREFIX = "dt:resource:legacy-cleanup:"
 _TASK_RESOURCE_PREFIX = "dt:resource:task:"
 _TASK_PIN_PREFIX = "dt:resource:task-pin:"
+_TASK_PIN_RELEASE_RECEIPT_PREFIX = "dt:resource:task-pin-release-receipt:"
 _ASSET_TASK_PREFIX = "dt:resource:asset-tasks:"
 _UPLOAD_INFLIGHT_PREFIX = "dt:resource:upload-inflight:"
 _SESSION_PATTERN = re.compile(r"^[a-f0-9]{32}$")
@@ -1618,6 +1620,13 @@ return 1
 
 _RELEASE_TASK_PIN_SCRIPT = """-- release_task_pin
 if redis.call("EXISTS", KEYS[1]) == 0 then
+    if redis.call("TYPE", KEYS[3])["ok"] == "hash"
+        and redis.call("HGET", KEYS[3], "session_id") == ARGV[1]
+        and redis.call("HGET", KEYS[3], "task_id") == ARGV[2]
+        and redis.call("HGET", KEYS[3], "asset_identities") == ARGV[4]
+        and redis.call("HGET", KEYS[3], "asset_ids") == ARGV[5] then
+        return 5
+    end
     return 0
 end
 if redis.call("HGET", KEYS[1], "session_id") ~= ARGV[1] then
@@ -1712,6 +1721,19 @@ redis.call("SREM", KEYS[2], ARGV[2])
 if redis.call("SCARD", KEYS[2]) == 0 then
     redis.call("DEL", KEYS[2])
 end
+redis.call(
+    "HSET",
+    KEYS[3],
+    "task_id",
+    ARGV[2],
+    "session_id",
+    ARGV[1],
+    "asset_identities",
+    identities_json,
+    "asset_ids",
+    asset_ids_json
+)
+redis.call("PEXPIRE", KEYS[3], tonumber(ARGV[6]))
 return 1
 """
 
@@ -3145,8 +3167,34 @@ class RedisResourceCoordinator:
         ) = None,
     ) -> bool:
         pin_key = _task_pin_key(task_id)
+        receipt_key = _task_pin_release_receipt_key(task_id)
         metadata = self._redis.hgetall(pin_key)
         if not metadata:
+            if (
+                expected_session_id is None
+                or expected_asset_identities is None
+            ):
+                return False
+            identities_json = json.dumps(
+                expected_asset_identities,
+                separators=(",", ":"),
+            )
+            asset_ids_json = json.dumps(
+                tuple(
+                    asset_id
+                    for asset_id, _generation_id in expected_asset_identities
+                ),
+                separators=(",", ":"),
+            )
+            if _task_pin_release_receipt_matches(
+                self._redis,
+                receipt_key=receipt_key,
+                task_id=task_id,
+                session_id=expected_session_id,
+                identities_json=identities_json,
+                asset_ids_json=asset_ids_json,
+            ):
+                return False
             return False
         session_id = _decoded_hash_value(metadata, "session_id")
         if session_id is None or session_id != expected_session_id:
@@ -3170,21 +3218,39 @@ class RedisResourceCoordinator:
             or _decoded_hash_value(metadata, "asset_ids") != asset_ids_json
         ):
             raise CorruptTaskPinError("Task pin asset metadata is invalid")
-        result = int(
-            self._release_task_pin_script(
-                keys=[
-                    pin_key,
-                    _session_task_pins_key(session_id),
-                ],
-                args=[
-                    session_id,
-                    task_id,
-                    _ASSET_TASK_PREFIX,
-                    identities_json,
-                    asset_ids_json,
-                ],
+        session_task_pins_key = _session_task_pins_key(session_id)
+        try:
+            result = int(
+                self._release_task_pin_script(
+                    keys=[
+                        pin_key,
+                        session_task_pins_key,
+                        receipt_key,
+                    ],
+                    args=[
+                        session_id,
+                        task_id,
+                        _ASSET_TASK_PREFIX,
+                        identities_json,
+                        asset_ids_json,
+                        self._release_marker_ttl_ms,
+                    ],
+                )
             )
-        )
+        except ResponseError as error_response:
+            if "unknown command" not in str(error_response).lower():
+                raise
+            result = _release_task_pin_without_lua(
+                self._redis,
+                pin_key=pin_key,
+                session_task_pins_key=session_task_pins_key,
+                receipt_key=receipt_key,
+                session_id=session_id,
+                task_id=task_id,
+                identities_json=identities_json,
+                asset_ids_json=asset_ids_json,
+                receipt_ttl_ms=self._release_marker_ttl_ms,
+            )
         if result == 2:
             raise CorruptTaskPinError("Task pin ownership is invalid")
         if result in {3, 4}:
@@ -3474,6 +3540,125 @@ def _task_resource_key(task_id: str) -> str:
 
 def _task_pin_key(task_id: str) -> str:
     return f"{_TASK_PIN_PREFIX}{task_id}"
+
+
+def _task_pin_release_receipt_key(task_id: str) -> str:
+    return f"{_TASK_PIN_RELEASE_RECEIPT_PREFIX}{task_id}"
+
+
+def _task_pin_release_metadata_matches(
+    metadata: dict[bytes | str, bytes | str],
+    *,
+    task_id: str,
+    session_id: str,
+    identities_json: str,
+    asset_ids_json: str,
+) -> bool:
+    return (
+        _decoded_hash_value(metadata, "task_id") == task_id
+        and _decoded_hash_value(metadata, "session_id") == session_id
+        and _decoded_hash_value(metadata, "asset_identities")
+        == identities_json
+        and _decoded_hash_value(metadata, "asset_ids") == asset_ids_json
+    )
+
+
+def _task_pin_release_receipt_matches(
+    redis_connection: Redis,
+    *,
+    receipt_key: str,
+    task_id: str,
+    session_id: str,
+    identities_json: str,
+    asset_ids_json: str,
+) -> bool:
+    try:
+        metadata = redis_connection.hgetall(receipt_key)
+    except ResponseError:
+        return False
+    return _task_pin_release_metadata_matches(
+        metadata,
+        task_id=task_id,
+        session_id=session_id,
+        identities_json=identities_json,
+        asset_ids_json=asset_ids_json,
+    )
+
+
+def _release_task_pin_without_lua(
+    redis_connection: Redis,
+    *,
+    pin_key: str,
+    session_task_pins_key: str,
+    receipt_key: str,
+    session_id: str,
+    task_id: str,
+    identities_json: str,
+    asset_ids_json: str,
+    receipt_ttl_ms: int,
+) -> int:
+    while True:
+        with redis_connection.pipeline() as pipeline:
+            try:
+                pipeline.watch(
+                    pin_key,
+                    session_task_pins_key,
+                    receipt_key,
+                )
+                metadata = pipeline.hgetall(pin_key)
+                if not metadata:
+                    receipt_matches = False
+                    if pipeline.type(receipt_key) in {b"hash", "hash"}:
+                        receipt_matches = _task_pin_release_metadata_matches(
+                            pipeline.hgetall(receipt_key),
+                            task_id=task_id,
+                            session_id=session_id,
+                            identities_json=identities_json,
+                            asset_ids_json=asset_ids_json,
+                        )
+                    pipeline.unwatch()
+                    return 5 if receipt_matches else 0
+                if (
+                    _decoded_hash_value(metadata, "session_id") != session_id
+                    or _decoded_hash_value(metadata, "task_id") != task_id
+                ):
+                    pipeline.unwatch()
+                    return 2
+                if not _task_pin_release_metadata_matches(
+                    metadata,
+                    task_id=task_id,
+                    session_id=session_id,
+                    identities_json=identities_json,
+                    asset_ids_json=asset_ids_json,
+                ):
+                    pipeline.unwatch()
+                    return 4
+                asset_ids = json.loads(asset_ids_json)
+                asset_task_keys = [
+                    _asset_tasks_key(session_id, asset_id)
+                    for asset_id in asset_ids
+                ]
+                if asset_task_keys:
+                    pipeline.watch(*asset_task_keys)
+                pipeline.multi()
+                for asset_task_key in asset_task_keys:
+                    pipeline.srem(asset_task_key, task_id)
+                pipeline.delete(pin_key)
+                pipeline.srem(session_task_pins_key, task_id)
+                pipeline.hset(
+                    receipt_key,
+                    mapping={
+                        "task_id": task_id,
+                        "session_id": session_id,
+                        "asset_identities": identities_json,
+                        "asset_ids": asset_ids_json,
+                    },
+                )
+                pipeline.pexpire(receipt_key, receipt_ttl_ms)
+                pipeline.execute()
+                return 1
+            except WatchError:
+                continue
 
 
 def _asset_tasks_key(session_id: str, asset_id: str) -> str:

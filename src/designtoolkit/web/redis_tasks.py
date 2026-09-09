@@ -43,9 +43,12 @@ from designtoolkit.web.resources import (
     CorruptTaskPinError,
     SessionDeletingError,
     _asset_tasks_key,
+    _release_task_pin_without_lua,
     _session_state_key,
     _session_task_pins_key,
     _task_pin_key,
+    _task_pin_release_receipt_key,
+    _task_pin_release_receipt_matches,
     _validate_asset_id,
     _validate_session_id,
     _validate_token,
@@ -3157,10 +3160,25 @@ class RedisTaskManager:
         if task is None:
             return self._repair_task_reverse_indexes(task_id)
         pin_key = _task_pin_key(task_id)
+        receipt_key = _task_pin_release_receipt_key(task_id)
         metadata = self._redis.hgetall(pin_key)
         if not metadata:
             if task.owner_id is None:
                 return False
+            if task.has_canonical_asset_identities:
+                identities_json = _asset_identities_json(
+                    task.asset_identities
+                )
+                asset_ids_json = _asset_ids_json(task.asset_identities)
+                if _task_pin_release_receipt_matches(
+                    self._redis,
+                    receipt_key=receipt_key,
+                    task_id=task_id,
+                    session_id=task.owner_id,
+                    identities_json=identities_json,
+                    asset_ids_json=asset_ids_json,
+                ):
+                    return True
             return self._repair_task_reverse_indexes(task_id)
         session_id = _redis_hash_text(metadata, "session_id")
         if session_id is None or not _task_pin_metadata_matches(
@@ -3182,65 +3200,42 @@ class RedisTaskManager:
             return self._repair_task_reverse_indexes(task_id)
 
         session_task_pins_key = _session_task_pins_key(session_id)
+        identities_json = _asset_identities_json(task.asset_identities)
+        asset_ids_json = _asset_ids_json(task.asset_identities)
         try:
             result = int(
                 self._release_task_pin_script(
                     keys=[
                         pin_key,
                         session_task_pins_key,
+                        receipt_key,
                     ],
                     args=[
                         session_id,
                         task_id,
                         _ASSET_TASK_PREFIX,
-                        _asset_identities_json(task.asset_identities),
-                        _asset_ids_json(task.asset_identities),
+                        identities_json,
+                        asset_ids_json,
+                        self.retention_seconds * 1000,
                     ],
                 )
             )
         except ResponseError as error_response:
             if "unknown command" not in str(error_response).lower():
                 raise
-            while True:
-                with self._redis.pipeline() as pipeline:
-                    try:
-                        pipeline.watch(pin_key, session_task_pins_key)
-                        metadata = pipeline.hgetall(pin_key)
-                        if not metadata:
-                            pipeline.unwatch()
-                            result = 4
-                            break
-                        if (
-                            not _task_pin_metadata_matches(
-                                metadata,
-                                task_id=task_id,
-                                session_id=session_id,
-                                asset_identities=(
-                                    task.asset_identities
-                                    if task.has_canonical_asset_identities
-                                    else None
-                                ),
-                            )
-                        ):
-                            pipeline.unwatch()
-                            result = 4
-                            break
-                        asset_task_keys = [
-                            _asset_tasks_key(session_id, asset_id)
-                            for asset_id in _asset_ids_from_pin_metadata(metadata)
-                        ]
-                        if asset_task_keys:
-                            pipeline.watch(*asset_task_keys)
-                        pipeline.multi()
-                        for asset_task_key in asset_task_keys:
-                            pipeline.srem(asset_task_key, task_id)
-                        pipeline.delete(pin_key)
-                        pipeline.srem(session_task_pins_key, task_id)
-                        pipeline.execute()
-                        result = 1
-                        break
-                    except WatchError:
-                        continue
+            result = _release_task_pin_without_lua(
+                self._redis,
+                pin_key=pin_key,
+                session_task_pins_key=session_task_pins_key,
+                receipt_key=receipt_key,
+                session_id=session_id,
+                task_id=task_id,
+                identities_json=identities_json,
+                asset_ids_json=asset_ids_json,
+                receipt_ttl_ms=self.retention_seconds * 1000,
+            )
+        if result == 5:
+            return True
         if result in {0, 2, 3, 4}:
             return self._repair_task_reverse_indexes(task_id)
         return result == 1

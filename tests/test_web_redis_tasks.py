@@ -873,6 +873,7 @@ def test_real_redis_asset_identity_handoff_validates_and_persists_generations(
 def test_real_redis_old_worker_releases_new_generation_task_pin(
     real_redis_connection: Redis,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager = _manager(real_redis_connection, tmp_path)
     session_id = "a" * 32
@@ -906,6 +907,16 @@ def test_real_redis_old_worker_releases_new_generation_task_pin(
     assert list(
         real_redis_connection.scan_iter(match="dt:resource:asset-tasks:*")
     ) == []
+    repair = manager._repair_task_reverse_indexes
+    repair_calls: list[str] = []
+
+    def track_repair(released_task_id: str) -> bool:
+        repair_calls.append(released_task_id)
+        return repair(released_task_id)
+
+    monkeypatch.setattr(manager, "_repair_task_reverse_indexes", track_repair)
+    assert manager.release_task_pin(task.task_id)
+    assert repair_calls == [task.task_id]
     for asset_id, _generation_id in identities:
         claim = manager.claim_asset_deletion(session_id, asset_id)
         manager.release_asset_deletion(session_id, asset_id, claim)
@@ -1220,6 +1231,7 @@ def test_real_redis_corrupt_task_pin_uses_task_owner_when_session_is_missing(
 def test_real_redis_missing_task_pin_repairs_reverse_indexes(
     real_redis_connection: Redis,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager = _manager(real_redis_connection, tmp_path)
     session_id = "a" * 32
@@ -1231,10 +1243,19 @@ def test_real_redis_missing_task_pin_repairs_reverse_indexes(
     )
     pin_key = f"dt:resource:task-pin:{task.task_id}"
     real_redis_connection.delete(pin_key)
+    repair = manager._repair_task_reverse_indexes
+    repair_calls: list[str] = []
+
+    def track_repair(released_task_id: str) -> bool:
+        repair_calls.append(released_task_id)
+        return repair(released_task_id)
+
+    monkeypatch.setattr(manager, "_repair_task_reverse_indexes", track_repair)
 
     assert manager.release_task_pin(task.task_id)
     assert manager.release_task_pin(task.task_id)
 
+    assert repair_calls == [task.task_id, task.task_id]
     assert not real_redis_connection.exists(
         f"dt:resource:session:{session_id}:task-pins"
     )
@@ -1383,6 +1404,245 @@ def test_real_redis_task_pin_normal_release_does_not_scan(
     )
 
     assert manager.release_task_pin(task.task_id)
+    receipt_key = (
+        f"dt:resource:task-pin-release-receipt:{task.task_id}"
+    )
+    assert real_redis_connection.exists(receipt_key)
+    assert real_redis_connection.ttl(receipt_key) > 0
+    assert manager.release_task_pin(task.task_id)
+
+
+def test_real_redis_task_pin_release_ack_loss_retry_uses_receipt_without_scan(
+    real_redis_connection: Redis,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    retention_seconds = 300
+    manager = _manager(
+        real_redis_connection,
+        tmp_path,
+        retention_seconds=retention_seconds,
+    )
+    session_id = "a" * 32
+    identities = (("1" * 32, "2" * 32),)
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+        owner_id=session_id,
+        asset_identities=identities,
+    )
+    receipt_key = f"dt:resource:task-pin-release-receipt:{task.task_id}"
+    release = manager._release_task_pin_script
+
+    def release_then_lose_ack(*args, **kwargs):
+        release(*args, **kwargs)
+        raise RedisConnectionError("task pin release acknowledgement lost")
+
+    monkeypatch.setattr(
+        manager,
+        "_release_task_pin_script",
+        release_then_lose_ack,
+    )
+    with pytest.raises(RedisConnectionError, match="acknowledgement lost"):
+        manager.release_task_pin(task.task_id)
+
+    receipt = real_redis_connection.hgetall(receipt_key)
+    assert receipt == {
+        b"task_id": task.task_id.encode(),
+        b"session_id": session_id.encode(),
+        b"asset_identities": json.dumps(
+            identities,
+            separators=(",", ":"),
+        ).encode(),
+        b"asset_ids": json.dumps(
+            ("1" * 32,),
+            separators=(",", ":"),
+        ).encode(),
+    }
+    _assert_ttl_matches(
+        real_redis_connection,
+        receipt_key,
+        retention_seconds,
+    )
+
+    monkeypatch.setattr(manager, "_release_task_pin_script", release)
+    monkeypatch.setattr(
+        real_redis_connection,
+        "scan_iter",
+        lambda **_kwargs: pytest.fail("receipt-backed retry must not scan"),
+    )
+    assert manager.release_task_pin(task.task_id)
+
+
+def test_real_redis_historical_failed_cleanup_uses_release_receipt_without_scan(
+    real_redis_connection: Redis,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(real_redis_connection, tmp_path, retention_seconds=300)
+    session_id = "a" * 32
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+        owner_id=session_id,
+        asset_identities=(("1" * 32, "2" * 32),),
+    )
+    release = manager._release_task_pin_script
+
+    def release_then_lose_ack(*args, **kwargs):
+        release(*args, **kwargs)
+        raise RedisConnectionError("task pin release acknowledgement lost")
+
+    monkeypatch.setattr(
+        manager,
+        "_release_task_pin_script",
+        release_then_lose_ack,
+    )
+    with pytest.raises(RedisConnectionError, match="acknowledgement lost"):
+        manager._finalize_external_failure(task.task_id, "worker failed")
+
+    failed = manager.get_task(task.task_id)
+    assert failed is not None
+    assert failed.status is TaskStatus.FAILED
+    monkeypatch.setattr(manager, "_release_task_pin_script", release)
+    monkeypatch.setattr(
+        real_redis_connection,
+        "scan_iter",
+        lambda **_kwargs: pytest.fail(
+            "historical failure receipt retry must not scan"
+        ),
+    )
+
+    assert manager._finalize_external_failure(task.task_id, "worker failed")
+
+
+@pytest.mark.parametrize("wrong_field", ["owner", "identities"])
+def test_real_redis_wrong_task_pin_release_receipt_does_not_bypass_repair(
+    real_redis_connection: Redis,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    wrong_field: str,
+) -> None:
+    manager = _manager(real_redis_connection, tmp_path)
+    session_id = "a" * 32
+    asset_id = "1" * 32
+    identities = ((asset_id, "2" * 32),)
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+        owner_id=session_id,
+        asset_identities=identities,
+    )
+    real_redis_connection.delete(f"dt:resource:task-pin:{task.task_id}")
+    real_redis_connection.hset(
+        f"dt:resource:task-pin-release-receipt:{task.task_id}",
+        mapping={
+            "task_id": task.task_id,
+            "session_id": (
+                "b" * 32 if wrong_field == "owner" else session_id
+            ),
+            "asset_identities": json.dumps(
+                ((asset_id, "3" * 32),)
+                if wrong_field == "identities"
+                else identities,
+                separators=(",", ":"),
+            ),
+            "asset_ids": json.dumps((asset_id,), separators=(",", ":")),
+        },
+    )
+    repair = manager._repair_task_reverse_indexes
+    repair_calls: list[str] = []
+
+    def track_repair(released_task_id: str) -> bool:
+        repair_calls.append(released_task_id)
+        return repair(released_task_id)
+
+    monkeypatch.setattr(manager, "_repair_task_reverse_indexes", track_repair)
+
+    assert manager.release_task_pin(task.task_id)
+    assert repair_calls == [task.task_id]
+    assert not real_redis_connection.exists(
+        f"dt:resource:session:{session_id}:task-pins"
+    )
+    assert not real_redis_connection.exists(
+        f"dt:resource:asset-tasks:{session_id}:{asset_id}"
+    )
+
+
+@pytest.mark.parametrize(
+    "release_mode",
+    ["lua-ack-loss", "fallback"],
+)
+def test_real_redis_coordinator_task_pin_release_writes_idempotency_receipt(
+    real_redis_connection: Redis,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    release_mode: str,
+) -> None:
+    retention_seconds = 300
+    manager = _manager(
+        real_redis_connection,
+        tmp_path,
+        retention_seconds=retention_seconds,
+    )
+    resources = RedisResourceCoordinator(
+        redis_connection=real_redis_connection,
+        max_upload_concurrency=4,
+        max_session_bytes=2 * 1024 * 1024 * 1024,
+        min_free_bytes=0,
+        reservation_ttl=60,
+        lease_ttl=60,
+        release_marker_ttl=retention_seconds,
+    )
+    session_id = "a" * 32
+    identities = (("1" * 32, "2" * 32),)
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+        owner_id=session_id,
+        asset_identities=identities,
+    )
+    release = resources._release_task_pin_script
+    if release_mode == "lua-ack-loss":
+        def release_then_lose_ack(*args, **kwargs):
+            release(*args, **kwargs)
+            raise RedisConnectionError(
+                "coordinator pin release acknowledgement lost"
+            )
+
+        monkeypatch.setattr(
+            resources,
+            "_release_task_pin_script",
+            release_then_lose_ack,
+        )
+        with pytest.raises(RedisConnectionError, match="acknowledgement lost"):
+            resources.release_task_pin(
+                task.task_id,
+                expected_session_id=session_id,
+                expected_asset_identities=identities,
+            )
+        monkeypatch.setattr(resources, "_release_task_pin_script", release)
+    else:
+        monkeypatch.setattr(
+            resources,
+            "_release_task_pin_script",
+            lambda **_kwargs: (_ for _ in ()).throw(
+                ResponseError("unknown command 'evalsha'")
+            ),
+        )
+        assert resources.release_task_pin(
+            task.task_id,
+            expected_session_id=session_id,
+            expected_asset_identities=identities,
+        )
+
+    receipt_key = f"dt:resource:task-pin-release-receipt:{task.task_id}"
+    _assert_ttl_matches(
+        real_redis_connection,
+        receipt_key,
+        retention_seconds,
+    )
+    assert not resources.release_task_pin(
+        task.task_id,
+        expected_session_id=session_id,
+        expected_asset_identities=identities,
+    )
 
 
 @pytest.mark.parametrize("use_lua", [True, False], ids=["lua", "fallback"])

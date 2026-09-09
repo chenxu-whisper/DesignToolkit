@@ -1335,9 +1335,23 @@ class DeterministicRedis(fakeredis.FakeRedis):
         return 1
 
     def _eval_release_task_pin(self, keys, args):  # noqa: ANN001, ANN202
-        pin_key, task_pins_key = keys
-        session_id, task_id, asset_task_prefix, _identities, _asset_ids = args
+        pin_key, task_pins_key, receipt_key = keys
+        (
+            session_id,
+            task_id,
+            asset_task_prefix,
+            identities,
+            asset_ids_json,
+            receipt_ttl_ms,
+        ) = args
         if not self.exists(pin_key):
+            if self.hgetall(receipt_key) == {
+                b"task_id": str(task_id).encode(),
+                b"session_id": str(session_id).encode(),
+                b"asset_identities": str(identities).encode(),
+                b"asset_ids": str(asset_ids_json).encode(),
+            }:
+                return 5
             return 0
         if self._text(self.hget(pin_key, "session_id")) != session_id:
             return 2
@@ -1345,6 +1359,11 @@ class DeterministicRedis(fakeredis.FakeRedis):
             return 2
         raw_identities = self.hget(pin_key, "asset_identities")
         raw_asset_ids = self.hget(pin_key, "asset_ids")
+        if (
+            self._text(raw_identities) != identities
+            or self._text(raw_asset_ids) != asset_ids_json
+        ):
+            return 4
         if raw_identities is None and raw_asset_ids is None:
             return 4
         if raw_identities:
@@ -1367,6 +1386,16 @@ class DeterministicRedis(fakeredis.FakeRedis):
         self.srem(task_pins_key, task_id)
         if not self.scard(task_pins_key):
             self.delete(task_pins_key)
+        self.hset(
+            receipt_key,
+            mapping={
+                "task_id": task_id,
+                "session_id": session_id,
+                "asset_identities": identities,
+                "asset_ids": asset_ids_json,
+            },
+        )
+        self.pexpire(receipt_key, int(receipt_ttl_ms))
         return 1
 
     def _eval_claim_cleanup(self, keys, args):  # noqa: ANN001, ANN202
