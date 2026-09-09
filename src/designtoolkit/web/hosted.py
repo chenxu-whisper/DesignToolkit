@@ -564,6 +564,30 @@ class UploadDeletionInspection:
         return compare_digest(self.generation_id, other.generation_id)
 
 
+class _UploadWriter:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.owns_asset_dir = False
+        self._destination: BinaryIO | None = None
+
+    def open(self) -> None:
+        self._destination = self.path.open("xb")
+
+    def write(self, chunk: bytes) -> None:
+        if self._destination is None:
+            raise RuntimeError("Upload destination is not open")
+        self._destination.write(chunk)
+
+    def close(self) -> None:
+        destination = self._destination
+        if destination is None:
+            return
+        try:
+            destination.close()
+        finally:
+            self._destination = None
+
+
 class HostedStorage:
     def __init__(
         self,
@@ -623,9 +647,9 @@ class HostedStorage:
         asset_dir = session_dir / "assets" / asset_id
         temporary_path = asset_dir / ".uploading"
         final_path = asset_dir / filename
+        writer = _UploadWriter(temporary_path)
         size = 0
-        committed = False
-        owns_asset_dir = False
+        committed = Event()
         generation_id = (
             registration.token
             if registration is not None
@@ -647,26 +671,20 @@ class HostedStorage:
                 registration,
                 refresh_generation,
             ) as heartbeat:
-                with self._deletion_lock:
-                    self._raise_if_upload_cancelled(
+                try:
+                    await to_thread.run_sync(
+                        self._prepare_upload,
+                        writer,
                         session_id,
                         asset_id,
-                    )
-                    try:
-                        asset_dir.mkdir(parents=True, exist_ok=False)
-                    except FileExistsError as exc:
-                        raise UploadConflictError("Upload ID already exists") from exc
-                    owns_asset_dir = True
-                with temporary_path.open("xb") as destination:
-                    _write_asset_manifest(
                         asset_dir,
-                        asset_id=asset_id,
-                        generation_id=generation_id,
-                        size=content_length,
+                        generation_id,
+                        content_length,
                     )
                     async for chunk in chunks:
                         heartbeat.raise_if_failed()
-                        self._raise_if_upload_cancelled(
+                        await to_thread.run_sync(
+                            self._raise_if_upload_cancelled,
                             session_id,
                             asset_id,
                         )
@@ -681,17 +699,20 @@ class HostedStorage:
                             raise UploadRejectedError(
                                 "File exceeds the configured file limit"
                             )
-                        destination.write(chunk)
+                        await to_thread.run_sync(writer.write, chunk)
+                finally:
+                    await to_thread.run_sync(writer.close)
                 heartbeat.raise_if_failed()
                 if size != content_length:
                     raise UploadRejectedError(
                         "Upload size does not match declared Content-Length"
                     )
-                self._raise_if_upload_cancelled(
+                await to_thread.run_sync(
+                    self._raise_if_upload_cancelled,
                     session_id,
                     asset_id,
                 )
-                os.utime(self._session_dir(session_id), None)
+                await to_thread.run_sync(os.utime, session_dir, None)
                 await to_thread.run_sync(heartbeat.seal)
                 await to_thread.run_sync(
                     self._raise_if_upload_cancelled,
@@ -699,36 +720,48 @@ class HostedStorage:
                     asset_id,
                     registration,
                 )
-                await to_thread.run_sync(_commit_with_recovery, reservation)
-                committed = True
-                with self._deletion_lock:
-                    self._raise_if_upload_cancelled(
-                        session_id,
-                        asset_id,
-                    )
-                    temporary_path.replace(final_path)
-                    self._raise_if_upload_cancelled(
-                        session_id,
-                        asset_id,
-                    )
+                await to_thread.run_sync(
+                    _commit_upload,
+                    reservation,
+                    committed,
+                )
+                await to_thread.run_sync(
+                    self._publish_upload,
+                    session_id,
+                    asset_id,
+                    temporary_path,
+                    final_path,
+                )
         except HeartbeatStopTimeoutError:
-            if owns_asset_dir:
-                self._discard_asset(session_id, asset_dir)
+            if writer.owns_asset_dir:
+                await to_thread.run_sync(
+                    self._discard_upload,
+                    session_id,
+                    asset_dir,
+                )
             raise
         except _AmbiguousCommitError:
             raise
-        except Exception:
-            if committed:
+        except BaseException:
+            if committed.is_set():
                 if await to_thread.run_sync(
                     _rollback_with_recovery,
                     reservation,
                 ):
-                    if owns_asset_dir:
-                        self._discard_asset(session_id, asset_dir)
+                    if writer.owns_asset_dir:
+                        await to_thread.run_sync(
+                            self._discard_upload,
+                            session_id,
+                            asset_dir,
+                        )
             else:
                 await to_thread.run_sync(_release_best_effort, reservation)
-                if owns_asset_dir:
-                    self._discard_asset(session_id, asset_dir)
+                if writer.owns_asset_dir:
+                    await to_thread.run_sync(
+                        self._discard_upload,
+                        session_id,
+                        asset_dir,
+                    )
             raise
 
         await to_thread.run_sync(_finalize_best_effort, reservation)
@@ -741,6 +774,45 @@ class HostedStorage:
             filename=filename,
             size=size,
         )
+
+    def _prepare_upload(
+        self,
+        writer: _UploadWriter,
+        session_id: str,
+        asset_id: str,
+        asset_dir: Path,
+        generation_id: str | None,
+        content_length: int,
+    ) -> None:
+        with self._deletion_lock:
+            self._raise_if_upload_cancelled(session_id, asset_id)
+            try:
+                asset_dir.mkdir(parents=True, exist_ok=False)
+            except FileExistsError as exc:
+                raise UploadConflictError("Upload ID already exists") from exc
+            writer.owns_asset_dir = True
+        writer.open()
+        _write_asset_manifest(
+            asset_dir,
+            asset_id=asset_id,
+            generation_id=generation_id,
+            size=content_length,
+        )
+
+    def _publish_upload(
+        self,
+        session_id: str,
+        asset_id: str,
+        temporary_path: Path,
+        final_path: Path,
+    ) -> None:
+        with self._deletion_lock:
+            self._raise_if_upload_cancelled(session_id, asset_id)
+            temporary_path.replace(final_path)
+            self._raise_if_upload_cancelled(session_id, asset_id)
+
+    def _discard_upload(self, session_id: str, asset_dir: Path) -> None:
+        self._discard_asset(session_id, asset_dir)
 
     def claim_upload_generation(
         self,
@@ -2369,6 +2441,11 @@ def _commit_with_recovery(reservation: RedisReservation) -> None:
     raise _AmbiguousCommitError(
         "Upload commit state could not be confirmed; hidden data was quarantined"
     ) from last_error
+
+
+def _commit_upload(reservation: RedisReservation, committed: Event) -> None:
+    _commit_with_recovery(reservation)
+    committed.set()
 
 
 def _rollback_with_recovery(reservation: RedisReservation) -> bool:

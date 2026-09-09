@@ -9,7 +9,7 @@ from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from random import Random
-from threading import Event
+from threading import Event, get_ident
 from time import sleep
 from types import SimpleNamespace
 from urllib.parse import quote
@@ -18,6 +18,7 @@ from zipfile import ZipFile
 import pytest
 from redis.exceptions import ConnectionError as RedisConnectionError
 
+import designtoolkit.web.hosted as hosted_module
 from designtoolkit.web.hosted import (
     HostedSettings,
     HostedStorage,
@@ -536,6 +537,235 @@ async def test_upload_is_streamed_to_an_opaque_session_asset(
     assert reservation.released is False
     with pytest.raises(UploadRejectedError, match="not available"):
         storage.resolve("b" * 32, asset.reference)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("stage", "owner_name", "attribute"),
+    [
+        ("prepare", "storage", "_prepare_upload"),
+        ("manifest", "module", "_write_asset_manifest"),
+        ("write", "writer", "write"),
+        ("publish", "storage", "_publish_upload"),
+        ("discard", "storage", "_discard_upload"),
+    ],
+)
+async def test_upload_filesystem_stages_do_not_block_event_loop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    owner_name: str,
+    attribute: str,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    reservation = RecordingReservation()
+    event_loop_thread = get_ident()
+    stage_threads: list[int] = []
+    progress_during_stage: list[int] = []
+    ticks = 0
+    stopped = False
+    if owner_name == "writer":
+        owner = getattr(hosted_module, "_UploadWriter", None)
+        assert owner is not None, "upload writer helper is required"
+    elif owner_name == "storage":
+        owner = HostedStorage
+    else:
+        owner = hosted_module
+    assert hasattr(owner, attribute), f"{stage} filesystem helper is required"
+    original = getattr(owner, attribute)
+
+    def slow_stage(*args: object, **kwargs: object) -> object:
+        before = ticks
+        stage_threads.append(get_ident())
+        sleep(0.04)
+        progress_during_stage.append(ticks - before)
+        return original(*args, **kwargs)
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while not stopped:
+            ticks += 1
+            await asyncio.sleep(0)
+
+    monkeypatch.setattr(owner, attribute, slow_stage)
+    ticker_task = asyncio.create_task(ticker())
+    await asyncio.sleep(0)
+    try:
+        if stage == "discard":
+            with pytest.raises(UploadRejectedError, match="stream failed"):
+                await storage.store_stream(
+                    "a" * 32,
+                    filename="screen.png",
+                    content_length=4,
+                    chunks=_failing_chunks(),
+                    reservation=reservation,
+                )
+        else:
+            await storage.store_stream(
+                "a" * 32,
+                filename="screen.png",
+                content_length=4,
+                chunks=_chunks(b"data"),
+                reservation=reservation,
+            )
+    finally:
+        stopped = True
+        await ticker_task
+
+    assert stage_threads
+    assert all(thread_id != event_loop_thread for thread_id in stage_threads)
+    assert all(progress > 0 for progress in progress_during_stage)
+
+
+@pytest.mark.anyio
+async def test_upload_cancellation_waits_for_write_before_close_and_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    reservation = RecordingReservation()
+    write_started = Event()
+    release_write = Event()
+    write_active = Event()
+    close_threads: list[int] = []
+    event_loop_thread = get_ident()
+    writer_type = getattr(hosted_module, "_UploadWriter", None)
+    assert writer_type is not None, "upload writer helper is required"
+    original_write = writer_type.write
+    original_close = writer_type.close
+
+    def blocked_write(writer: object, chunk: bytes) -> None:
+        write_active.set()
+        write_started.set()
+        try:
+            assert release_write.wait(timeout=1)
+            original_write(writer, chunk)
+        finally:
+            write_active.clear()
+
+    def checked_close(writer: object) -> None:
+        assert not write_active.is_set()
+        close_threads.append(get_ident())
+        original_close(writer)
+
+    monkeypatch.setattr(writer_type, "write", blocked_write)
+    monkeypatch.setattr(writer_type, "close", checked_close)
+
+    upload = asyncio.create_task(
+        storage.store_stream(
+            "a" * 32,
+            filename="screen.png",
+            content_length=4,
+            chunks=_chunks(b"data"),
+            reservation=reservation,
+        )
+    )
+    while not write_started.is_set():
+        await asyncio.sleep(0)
+
+    upload.cancel()
+    await asyncio.sleep(0.01)
+    assert not upload.done()
+    release_write.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await upload
+
+    assert close_threads
+    assert all(thread_id != event_loop_thread for thread_id in close_threads)
+    assert reservation.operations.count("release") == 1
+    assert list(tmp_path.rglob("*")) == []
+
+
+@pytest.mark.anyio
+async def test_upload_cancellation_during_commit_rolls_back_committed_quota(
+    tmp_path: Path,
+) -> None:
+    commit_started = Event()
+    release_commit = Event()
+
+    class BlockingCommitReservation(RecordingReservation):
+        def commit(self) -> None:
+            commit_started.set()
+            assert release_commit.wait(timeout=1)
+            super().commit()
+
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    reservation = BlockingCommitReservation()
+    upload = asyncio.create_task(
+        storage.store_stream(
+            "a" * 32,
+            filename="screen.png",
+            content_length=4,
+            chunks=_chunks(b"data"),
+            reservation=reservation,
+        )
+    )
+    while not commit_started.is_set():
+        await asyncio.sleep(0)
+
+    upload.cancel()
+    await asyncio.sleep(0.01)
+    assert not upload.done()
+    release_commit.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await upload
+
+    assert reservation.operations == ["commit", "rollback"]
+    assert reservation.charge_count == 1
+    assert reservation.rolled_back is True
+    assert reservation.released is False
+    assert list(tmp_path.rglob("*")) == []
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("failure", ["write", "stream", "oversize", "short"])
+async def test_failed_upload_cleans_up_and_releases_quota_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    reservation = RecordingReservation()
+    content_length = 4
+    chunks: AsyncIterator[bytes]
+
+    if failure == "write":
+        writer_type = getattr(hosted_module, "_UploadWriter", None)
+        assert writer_type is not None, "upload writer helper is required"
+
+        def fail_write(_writer: object, _chunk: bytes) -> None:
+            raise OSError("write failed")
+
+        monkeypatch.setattr(writer_type, "write", fail_write)
+        chunks = _chunks(b"data")
+        expected_error = OSError
+        match = "write failed"
+    elif failure == "stream":
+        chunks = _failing_chunks()
+        expected_error = UploadRejectedError
+        match = "stream failed"
+    elif failure == "oversize":
+        chunks = _chunks(b"123", b"45")
+        expected_error = UploadRejectedError
+        match = "declared Content-Length"
+    else:
+        chunks = _chunks(b"123")
+        expected_error = UploadRejectedError
+        match = "does not match"
+
+    with pytest.raises(expected_error, match=match):
+        await storage.store_stream(
+            "a" * 32,
+            filename="screen.png",
+            content_length=content_length,
+            chunks=chunks,
+            reservation=reservation,
+        )
+
+    assert reservation.operations.count("release") == 1
+    assert list(tmp_path.rglob("*")) == []
 
 
 @pytest.mark.anyio
