@@ -7,7 +7,12 @@ import {
   PanelsTopLeft,
   Sun,
 } from 'lucide-react'
-import { useState } from 'react'
+import {
+  type KeyboardEvent,
+  useEffect,
+  useRef,
+  useState,
+} from 'react'
 import type { ToolModule } from '../app/types'
 import {
   type ThemePreference,
@@ -40,11 +45,53 @@ export function HeaderBar({
   const status = useTaskStore((state) => state.status)
   const { preference, resolvedTheme, setPreference } = useTheme()
   const [themeMenuOpen, setThemeMenuOpen] = useState(false)
+  const themeMenuItemRefs = useRef<Array<HTMLButtonElement | null>>([])
+  const themeTriggerRef = useRef<HTMLButtonElement>(null)
   const ThemeIcon = resolvedTheme === 'dark' ? Moon : Sun
+
+  useEffect(() => {
+    if (!themeMenuOpen) {
+      return
+    }
+    const selectedIndex = themeOptions.findIndex((option) => option.value === preference)
+    themeMenuItemRefs.current[selectedIndex]?.focus()
+  }, [preference, themeMenuOpen])
+
+  const closeThemeMenu = () => {
+    setThemeMenuOpen(false)
+    themeTriggerRef.current?.focus()
+  }
 
   const selectTheme = (nextPreference: ThemePreference) => {
     setPreference(nextPreference)
-    setThemeMenuOpen(false)
+    closeThemeMenu()
+  }
+
+  const handleThemeMenuKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    const items = themeMenuItemRefs.current.filter(
+      (item): item is HTMLButtonElement => item !== null,
+    )
+    const currentIndex = items.indexOf(document.activeElement as HTMLButtonElement)
+    let nextIndex: number | null = null
+
+    if (event.key === 'ArrowDown') {
+      nextIndex = (currentIndex + 1) % items.length
+    } else if (event.key === 'ArrowUp') {
+      nextIndex = (currentIndex - 1 + items.length) % items.length
+    } else if (event.key === 'Home') {
+      nextIndex = 0
+    } else if (event.key === 'End') {
+      nextIndex = items.length - 1
+    } else if (event.key === 'Escape') {
+      event.preventDefault()
+      closeThemeMenu()
+      return
+    }
+
+    if (nextIndex !== null) {
+      event.preventDefault()
+      items[nextIndex]?.focus()
+    }
   }
 
   return (
@@ -68,14 +115,20 @@ export function HeaderBar({
             aria-label="主题设置"
             className="icon-button command-icon-button"
             onClick={() => setThemeMenuOpen((current) => !current)}
+            ref={themeTriggerRef}
             title="主题设置"
             type="button"
           >
             <ThemeIcon aria-hidden="true" size={17} />
           </button>
           {themeMenuOpen ? (
-            <div aria-label="主题设置" className="theme-menu-panel" role="menu">
-              {themeOptions.map((option) => {
+            <div
+              aria-label="主题设置"
+              className="theme-menu-panel"
+              onKeyDown={handleThemeMenuKeyDown}
+              role="menu"
+            >
+              {themeOptions.map((option, index) => {
                 const Icon = option.icon
                 const selected = preference === option.value
                 return (
@@ -84,6 +137,9 @@ export function HeaderBar({
                     className="theme-menu-item"
                     key={option.value}
                     onClick={() => selectTheme(option.value)}
+                    ref={(element) => {
+                      themeMenuItemRefs.current[index] = element
+                    }}
                     role="menuitemradio"
                     type="button"
                   >

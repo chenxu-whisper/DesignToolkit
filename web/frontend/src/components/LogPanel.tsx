@@ -47,6 +47,7 @@ export function LogPanel({
   const autoScroll = useLogStore((state) => state.autoScroll)
   const clearEvents = useLogStore((state) => state.clearEvents)
   const endRef = useRef<HTMLDivElement | null>(null)
+  const resizeCleanupRef = useRef<(() => void) | null>(null)
   const latestEvent = events.at(-1)
   const resolvedHeight = clampHeight(height)
 
@@ -55,6 +56,8 @@ export function LogPanel({
       endRef.current?.scrollIntoView?.({ block: 'end' })
     }
   }, [autoScroll, collapsed, events.length])
+
+  useEffect(() => () => resizeCleanupRef.current?.(), [])
 
   const handleResizeKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
     let nextHeight: number | null = null
@@ -76,19 +79,27 @@ export function LogPanel({
 
   const handleResizePointerDown = (event: PointerEvent<HTMLDivElement>) => {
     event.preventDefault()
+    resizeCleanupRef.current?.()
     const startY = event.clientY
     const startHeight = resolvedHeight
 
     const handlePointerMove = (moveEvent: globalThis.PointerEvent) => {
       onHeightChange(clampHeight(startHeight + startY - moveEvent.clientY))
     }
-    const handlePointerUp = () => {
+    const cleanup = () => {
       window.removeEventListener('pointermove', handlePointerMove)
       window.removeEventListener('pointerup', handlePointerUp)
+      window.removeEventListener('pointercancel', handlePointerUp)
+      if (resizeCleanupRef.current === cleanup) {
+        resizeCleanupRef.current = null
+      }
     }
+    const handlePointerUp = () => cleanup()
 
     window.addEventListener('pointermove', handlePointerMove)
-    window.addEventListener('pointerup', handlePointerUp, { once: true })
+    window.addEventListener('pointerup', handlePointerUp)
+    window.addEventListener('pointercancel', handlePointerUp)
+    resizeCleanupRef.current = cleanup
   }
 
   return (

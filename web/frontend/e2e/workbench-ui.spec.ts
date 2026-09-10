@@ -40,6 +40,18 @@ test('expands the compact task log', async ({ page }) => {
   await expect(page.getByRole('separator', { name: '调整任务日志高度' })).toBeVisible()
 })
 
+test('clamps a persisted log height to the current viewport', async ({ page }) => {
+  await page.setViewportSize({ width: 1000, height: 600 })
+  await page.addInitScript(() => {
+    localStorage.setItem('designtoolkit-log-collapsed', 'false')
+    localStorage.setItem('designtoolkit-log-height', '5000')
+  })
+  await page.goto('/')
+
+  const panel = page.getByRole('region', { name: '任务日志' })
+  await expect(panel).toHaveCSS('height', '270px')
+})
+
 for (const viewport of [
   { name: 'desktop', width: 1440, height: 900 },
   { name: 'tablet', width: 900, height: 900 },
@@ -65,6 +77,20 @@ test('opens the chroma inspector as a dialog on compact screens', async ({ page 
   await page.getByRole('button', { name: '打开参数检查器' }).click()
 
   await expect(page.getByRole('dialog', { name: '色键参数' })).toBeVisible()
+})
+
+test('does not reopen the chroma inspector after a breakpoint round-trip', async ({ page }) => {
+  await page.setViewportSize({ width: 900, height: 900 })
+  await page.goto('/')
+  await page.getByRole('button', { name: '色键抠图' }).click()
+  await page.getByRole('button', { name: '打开参数检查器' }).click()
+  await expect(page.getByRole('dialog', { name: '色键参数' })).toBeVisible()
+
+  await page.setViewportSize({ width: 1440, height: 900 })
+  await expect(page.getByRole('complementary', { name: '色键参数' })).toBeVisible()
+  await page.setViewportSize({ width: 900, height: 900 })
+
+  await expect(page.getByRole('dialog', { name: '色键参数' })).toHaveCount(0)
 })
 
 test('keeps the chroma inspector visible beside the canvas on wide screens', async ({ page }) => {

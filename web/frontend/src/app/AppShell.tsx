@@ -9,6 +9,15 @@ import type { ModuleId } from './types'
 const LOG_COLLAPSED_KEY = 'designtoolkit-log-collapsed'
 const LOG_HEIGHT_KEY = 'designtoolkit-log-height'
 const DEFAULT_LOG_HEIGHT = 180
+const MIN_LOG_HEIGHT = 120
+
+function maximumLogHeight() {
+  return Math.max(MIN_LOG_HEIGHT, Math.floor(window.innerHeight * 0.45))
+}
+
+function clampLogHeight(height: number) {
+  return Math.min(maximumLogHeight(), Math.max(MIN_LOG_HEIGHT, height))
+}
 
 function readLogCollapsed() {
   const stored = window.localStorage.getItem(LOG_COLLAPSED_KEY)
@@ -17,7 +26,11 @@ function readLogCollapsed() {
 
 function readLogHeight() {
   const stored = Number(window.localStorage.getItem(LOG_HEIGHT_KEY))
-  return Number.isFinite(stored) && stored >= 120 ? stored : DEFAULT_LOG_HEIGHT
+  return clampLogHeight(
+    Number.isFinite(stored) && stored >= MIN_LOG_HEIGHT
+      ? stored
+      : DEFAULT_LOG_HEIGHT,
+  )
 }
 
 export function AppShell() {
@@ -34,6 +47,14 @@ export function AppShell() {
   useEffect(() => {
     window.localStorage.setItem(LOG_HEIGHT_KEY, String(logHeight))
   }, [logHeight])
+
+  useEffect(() => {
+    const clampToViewport = () => {
+      setLogHeight((current) => clampLogHeight(current))
+    }
+    window.addEventListener('resize', clampToViewport)
+    return () => window.removeEventListener('resize', clampToViewport)
+  }, [])
 
   return (
     <div

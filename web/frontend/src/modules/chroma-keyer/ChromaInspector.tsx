@@ -25,6 +25,9 @@ export function ChromaInspector({
 
   useEffect(() => {
     if (!compact) {
+      if (open) {
+        onOpenChange(false)
+      }
       wasOpenRef.current = false
       return
     }
@@ -74,6 +77,11 @@ export function ChromaInspector({
       onCancel={(event) => {
         event.preventDefault()
         onOpenChange(false)
+      }}
+      onClick={(event) => {
+        if (event.target === event.currentTarget) {
+          onOpenChange(false)
+        }
       }}
       onClose={() => onOpenChange(false)}
       ref={dialogRef}

@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react'
+import { fireEvent, render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { useState } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -138,5 +138,22 @@ describe('LogPanel', () => {
       'aria-valuenow',
       String(Math.floor(window.innerHeight * 0.45)),
     )
+  })
+
+  it('removes active pointer listeners when unmounted during a drag', () => {
+    const addListener = vi.spyOn(window, 'addEventListener')
+    const removeListener = vi.spyOn(window, 'removeEventListener')
+    const { unmount } = render(<LogHarness />)
+    const separator = screen.getByRole('separator', { name: '调整任务日志高度' })
+
+    fireEvent.pointerDown(separator, { clientY: 500 })
+    const pointerMove = addListener.mock.calls.find(([type]) => type === 'pointermove')?.[1]
+    const pointerUp = addListener.mock.calls.find(([type]) => type === 'pointerup')?.[1]
+    const pointerCancel = addListener.mock.calls.find(([type]) => type === 'pointercancel')?.[1]
+    unmount()
+
+    expect(removeListener).toHaveBeenCalledWith('pointermove', pointerMove)
+    expect(removeListener).toHaveBeenCalledWith('pointerup', pointerUp)
+    expect(removeListener).toHaveBeenCalledWith('pointercancel', pointerCancel)
   })
 })

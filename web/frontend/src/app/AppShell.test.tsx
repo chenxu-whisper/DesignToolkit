@@ -1,6 +1,6 @@
 import { act, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { TaskEvent } from '../services/taskTypes'
 import { useLogStore } from '../state/useLogStore'
 import { useTaskStore } from '../state/useTaskStore'
@@ -57,6 +57,8 @@ const serviceMocks = vi.hoisted(() => {
   }
 })
 
+const originalInnerHeight = window.innerHeight
+
 vi.mock('../services/apiClient', () => ({
   createMediaResizeTask: serviceMocks.createMediaResizeTask,
   createVideoFramesTask: serviceMocks.createVideoFramesTask,
@@ -94,6 +96,13 @@ beforeEach(() => {
   serviceMocks.subscriptions.length = 0
   useTaskStore.getState().resetTask()
   useLogStore.getState().clearEvents()
+})
+
+afterEach(() => {
+  Object.defineProperty(window, 'innerHeight', {
+    configurable: true,
+    value: originalInnerHeight,
+  })
 })
 
 function renderShell() {
@@ -161,6 +170,43 @@ describe('AppShell', () => {
     await user.click(screen.getByRole('menuitemradio', { name: '深色' }))
 
     expect(document.documentElement).toHaveAttribute('data-theme', 'dark')
+  })
+
+  it('supports keyboard navigation and dismissal in the theme menu', async () => {
+    const user = userEvent.setup()
+
+    renderShell()
+
+    const trigger = screen.getByRole('button', { name: '主题设置' })
+    await user.click(trigger)
+    expect(screen.getByRole('menuitemradio', { name: '跟随系统' })).toHaveFocus()
+
+    await user.keyboard('{ArrowDown}')
+    expect(screen.getByRole('menuitemradio', { name: '浅色' })).toHaveFocus()
+
+    await user.keyboard('{Escape}')
+    expect(screen.queryByRole('menu', { name: '主题设置' })).not.toBeInTheDocument()
+    expect(trigger).toHaveFocus()
+  })
+
+  it('clamps a persisted log height and reclamps after viewport resize', async () => {
+    localStorage.setItem('designtoolkit-log-collapsed', 'false')
+    localStorage.setItem('designtoolkit-log-height', '5000')
+    Object.defineProperty(window, 'innerHeight', { configurable: true, value: 600 })
+
+    renderShell()
+
+    const shell = document.querySelector<HTMLElement>('.app-shell')
+    expect(shell?.style.getPropertyValue('--log-panel-height')).toBe('270px')
+
+    Object.defineProperty(window, 'innerHeight', { configurable: true, value: 400 })
+    act(() => {
+      window.dispatchEvent(new Event('resize'))
+    })
+
+    await waitFor(() => {
+      expect(shell?.style.getPropertyValue('--log-panel-height')).toBe('180px')
+    })
   })
 
   it('renders an icon and tooltip for every tool', () => {
