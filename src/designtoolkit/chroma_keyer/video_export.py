@@ -12,6 +12,8 @@ from shutil import rmtree
 from time import sleep
 from uuid import uuid4
 
+from designtoolkit.output_names import bounded_derived_name
+
 from . import core
 from .image_io import write_rgba_png
 from .models import KeyerError, KeyerParams, ScreenColorModel
@@ -52,11 +54,9 @@ def _validate_screen_color_model(model: ScreenColorModel) -> None:
         raise KeyerError("mean_rgb must match the sole screen color sample")
 
 
-def _create_temporary_directory(output_root: Path, input_stem: str) -> Path:
+def _create_temporary_directory(output_root: Path) -> Path:
     while True:
-        temporary_dir = output_root / (
-            f".{input_stem}_keyed_frames.{uuid4().hex}.tmp"
-        )
+        temporary_dir = output_root / f".out.{uuid4().hex}.tmp"
         try:
             temporary_dir.mkdir()
         except FileExistsError:
@@ -149,7 +149,7 @@ def _manifest(
         "fps": metadata.fps,
         "duration_seconds": metadata.duration_seconds,
         "frame_count": frame_count,
-        "pattern": f"{input_path.stem}_keyed_%06d.png",
+        "pattern": _keyed_frame_name(input_path.stem, "%06d"),
         "screen_color": list(model.samples[0]),
         "params": {
             "screen_gain": float(params.screen_gain),
@@ -161,6 +161,15 @@ def _manifest(
             "despill_amount": float(params.despill_amount),
         },
     }
+
+
+def _keyed_frame_name(input_stem: str, frame: str) -> str:
+    return bounded_derived_name(
+        prefix="",
+        stem=input_stem,
+        suffix=f"_keyed_{frame}",
+        extension=".png",
+    )
 
 
 def key_video_to_png_sequence(
@@ -182,11 +191,15 @@ def key_video_to_png_sequence(
         if not output_root.exists() or not output_root.is_dir():
             raise KeyerError("Output root must exist and be a directory")
 
-        final_dir = output_root / f"{input_path.stem}_keyed_frames"
+        final_dir = output_root / bounded_derived_name(
+            prefix="",
+            stem=input_path.stem,
+            suffix="_keyed_frames",
+        )
         if final_dir.exists():
             raise KeyerError("Final output directory already exists")
 
-        temporary_dir = _create_temporary_directory(output_root, input_path.stem)
+        temporary_dir = _create_temporary_directory(output_root)
         metadata, frame_stream = decoder.iter_frames(input_path)
         processed_frames = 0
 
@@ -195,8 +208,9 @@ def key_video_to_png_sequence(
                 keyed_rgb = alpha = None
                 try:
                     processed_frames += 1
-                    output_path = temporary_dir / (
-                        f"{input_path.stem}_keyed_{processed_frames:06d}.png"
+                    output_path = temporary_dir / _keyed_frame_name(
+                        input_path.stem,
+                        f"{processed_frames:06d}",
                     )
                     keyed_rgb, alpha = core.key_rgb(frame, model, params)
                     write_rgba_png(output_path, keyed_rgb, alpha)

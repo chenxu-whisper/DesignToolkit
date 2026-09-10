@@ -24,6 +24,7 @@ from designtoolkit.chroma_keyer.image_io import (
     validate_output_path,
 )
 from designtoolkit.chroma_keyer.models import KeyerError
+from designtoolkit.output_names import bounded_derived_name
 from designtoolkit.video_frames import VideoFrameOptions
 from designtoolkit.web.adapters import (
     chroma_keyer_options_from_request,
@@ -1554,7 +1555,11 @@ class RedisTaskManager:
         output_root = options.output_root or options.input_path.parent
         if not output_root.exists() or not output_root.is_dir():
             raise KeyerError("Output root must exist and be a directory")
-        output_path = output_root / f"{options.input_path.stem}_keyed_frames"
+        output_path = output_root / bounded_derived_name(
+            prefix="",
+            stem=options.input_path.stem,
+            suffix="_keyed_frames",
+        )
         if output_path.exists():
             raise KeyerError("Final output directory already exists")
         return self._enqueue(

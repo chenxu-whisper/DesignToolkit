@@ -79,6 +79,16 @@ def _ffmpeg_output_stem(input_stem: str) -> str:
     return input_stem.replace("%", "%%")
 
 
+def _bounded_output_stem(input_stem: str, image_format: str) -> str:
+    example_name = bounded_derived_name(
+        prefix="",
+        stem=input_stem,
+        suffix="_000000",
+        extension=f".{image_format}",
+    )
+    return example_name.removesuffix(f"_000000.{image_format}")
+
+
 def _ffmpeg_output_pattern(
     output_dir: Path,
     *,
@@ -86,13 +96,7 @@ def _ffmpeg_output_pattern(
     image_format: str,
 ) -> Path:
     escaped_output_dir = str(output_dir).replace("%", "%%")
-    example_name = bounded_derived_name(
-        prefix="",
-        stem=input_stem,
-        suffix="_000000",
-        extension=f".{image_format}",
-    )
-    bounded_stem = example_name.removesuffix(f"_000000.{image_format}")
+    bounded_stem = _bounded_output_stem(input_stem, image_format)
     return (
         Path(escaped_output_dir)
         / f"{_ffmpeg_output_stem(bounded_stem)}_%06d.{image_format}"
@@ -226,7 +230,8 @@ def _remove_existing_output_frames(
     image_format: str,
 ) -> None:
     output_name_pattern = re.compile(
-        rf"{re.escape(input_stem)}_[0-9]{{6}}\.{re.escape(image_format)}"
+        rf"{re.escape(_bounded_output_stem(input_stem, image_format))}"
+        rf"_[0-9]{{6}}\.{re.escape(image_format)}"
     )
     for path in output_dir.iterdir():
         if path.is_file() and output_name_pattern.fullmatch(path.name):
