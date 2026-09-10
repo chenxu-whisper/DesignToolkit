@@ -478,12 +478,40 @@ def test_hosted_settings_read_redis_socket_timeouts(tmp_path: Path) -> None:
             "DESIGNTOOLKIT_RESERVATION_HEARTBEAT_SECONDS": "1",
             "DESIGNTOOLKIT_REDIS_SOCKET_TIMEOUT_SECONDS": "5",
         },
+        {
+            "DESIGNTOOLKIT_RESERVATION_TTL_SECONDS": "10",
+            "DESIGNTOOLKIT_RESERVATION_HEARTBEAT_SECONDS": "1",
+            "DESIGNTOOLKIT_REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS": "5",
+            "DESIGNTOOLKIT_REDIS_SOCKET_TIMEOUT_SECONDS": "5",
+        },
     ],
 )
 def test_hosted_settings_reject_unsafe_reservation_timing(
     env: dict[str, str],
 ) -> None:
     with pytest.raises(ValueError, match="Reservation TTL"):
+        HostedSettings.from_env(env)
+
+
+@pytest.mark.parametrize(
+    "env",
+    [
+        {
+            "DESIGNTOOLKIT_LEASE_TTL_SECONDS": "5",
+            "DESIGNTOOLKIT_LEASE_HEARTBEAT_SECONDS": "5",
+        },
+        {
+            "DESIGNTOOLKIT_LEASE_TTL_SECONDS": "6",
+            "DESIGNTOOLKIT_LEASE_HEARTBEAT_SECONDS": "1",
+            "DESIGNTOOLKIT_REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS": "2",
+            "DESIGNTOOLKIT_REDIS_SOCKET_TIMEOUT_SECONDS": "3",
+        },
+    ],
+)
+def test_hosted_settings_reject_unsafe_lease_timing(
+    env: dict[str, str],
+) -> None:
+    with pytest.raises(ValueError, match="Lease TTL"):
         HostedSettings.from_env(env)
 
 

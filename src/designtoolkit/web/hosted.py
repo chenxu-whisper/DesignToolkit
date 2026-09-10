@@ -482,19 +482,23 @@ class HostedSettings:
                 True,
             ),
         )
-        if (
-            settings.reservation_ttl_seconds
-            <= settings.reservation_heartbeat_seconds
+        redis_failure_window = (
+            settings.redis_socket_connect_timeout_seconds
+            + settings.redis_socket_timeout_seconds
+        )
+        if settings.reservation_ttl_seconds <= (
+            settings.reservation_heartbeat_seconds + redis_failure_window
         ):
             raise ValueError(
-                "Reservation TTL must be greater than the reservation heartbeat"
+                "Reservation TTL must be greater than the reservation heartbeat "
+                "plus the Redis connection failure window"
             )
-        if (
-            settings.reservation_ttl_seconds
-            <= settings.redis_socket_timeout_seconds
+        if settings.lease_ttl_seconds <= (
+            settings.lease_heartbeat_seconds + redis_failure_window
         ):
             raise ValueError(
-                "Reservation TTL must be greater than the Redis socket timeout"
+                "Lease TTL must be greater than the lease heartbeat plus the "
+                "Redis connection failure window"
             )
         return settings
 
