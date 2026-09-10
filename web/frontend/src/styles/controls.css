@@ -403,8 +403,10 @@ textarea:focus-visible,
 }
 
 .submit-button:disabled {
+  background: var(--surface-subtle);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-muted);
   cursor: not-allowed;
-  opacity: 0.48;
 }
 
 .task-result,

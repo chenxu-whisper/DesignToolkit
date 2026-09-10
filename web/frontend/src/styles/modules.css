@@ -34,7 +34,7 @@
 .chroma-inspector {
   background: var(--surface-panel);
   border-left: 1px solid var(--border-subtle);
-  max-height: calc(100dvh - 52px - var(--log-panel-height) - 48px);
+  max-height: calc(100dvh - 52px - var(--log-panel-height) - 72px);
   min-height: 0;
   overflow-y: auto;
 }
@@ -79,8 +79,9 @@
   background: var(--surface-panel);
   bottom: 0;
   margin-top: auto;
-  padding-top: var(--space-2);
+  padding: var(--space-3) 0 var(--space-4);
   position: sticky;
+  z-index: var(--z-sticky);
 }
 
 .chroma-inspector-footer .submit-button {
@@ -100,7 +101,6 @@
 .chroma-preview-canvas {
   align-self: center;
   background: oklch(14% 0.012 230);
-  border: 1px solid var(--border-subtle);
   border-radius: var(--radius-md);
   box-shadow: var(--shadow-sm);
   line-height: 0;

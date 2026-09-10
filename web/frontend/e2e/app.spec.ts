@@ -76,6 +76,7 @@ test('contains a loaded Chroma sample in the mobile workspace', async ({ page })
 
   await page.goto('/')
   await page.getByRole('button', { exact: true, name: '色键抠图' }).click()
+  await page.getByRole('button', { name: '打开参数检查器' }).click()
   const inputPath = page.getByRole('textbox', { name: '输入图片或视频路径' })
   const picker = page.getByRole('button', { name: '指定输入图片或视频路径' })
   await inputPath.fill('E:\\media\\screen.png')
@@ -89,20 +90,20 @@ test('contains a loaded Chroma sample in the mobile workspace', async ({ page })
   expect(pickerRequestCount).toBe(0)
 
   releaseInspectResponse()
+  await page.getByRole('button', { name: '关闭参数检查器' }).click()
   await expect(page.getByRole('button', { name: '抠像预览' })).toBeVisible()
   await page.getByRole('button', { name: '抠像预览' }).click({ position: { x: 27, y: 27 } })
   await expect(page.locator('.chroma-sample-item span', { hasText: /^27, 27$/ })).toBeVisible()
 
   const layout = await page.locator('.chroma-editor').evaluate((editor) => {
     const main = editor.querySelector<HTMLElement>('.chroma-editor-main')
-    const form = editor.querySelector<HTMLElement>('.chroma-keyer-form')
     const sample = Array.from(editor.querySelectorAll<HTMLElement>('.chroma-sample-item span')).find(
       (element) => element.textContent === '27, 27',
     )
     const sampleItem = sample?.closest<HTMLElement>('.chroma-sample-item')
     const deleteButton = sampleItem?.querySelector<HTMLElement>('button')
 
-    if (!main || !form || !sample || !sampleItem || !deleteButton) {
+    if (!main || !sample || !sampleItem || !deleteButton) {
       throw new Error('Expected Chroma editor layout, sample coordinate, and delete button')
     }
 
@@ -113,7 +114,6 @@ test('contains a loaded Chroma sample in the mobile workspace', async ({ page })
 
     return {
       deleteButton: toBox(deleteButton),
-      form: toBox(form),
       main: toBox(main),
       sample: toBox(sample),
       sampleItem: toBox(sampleItem),
@@ -128,7 +128,8 @@ test('contains a loaded Chroma sample in the mobile workspace', async ({ page })
     }
   })
 
-  expect(layout.main.bottom).toBeLessThanOrEqual(layout.form.top)
+  expect(layout.main.left).toBeGreaterThanOrEqual(0)
+  expect(layout.main.right).toBeLessThanOrEqual(layout.viewport.width)
   expect(layout.sample.left).toBeGreaterThanOrEqual(layout.sampleItem.left)
   expect(layout.sample.right).toBeLessThanOrEqual(layout.sampleItem.right)
   expect(layout.sampleScrollWidth).toBeLessThanOrEqual(layout.sampleClientWidth)
@@ -412,6 +413,9 @@ test('contains every slider and value pair at desktop and mobile viewport widths
     )
     await expect(page.locator('html')).toHaveAttribute('lang', 'zh-CN')
     await page.getByRole('button', { exact: true, name: '色键抠图' }).click()
+    if (viewport.width < 1180) {
+      await page.getByRole('button', { name: '打开参数检查器' }).click()
+    }
 
     const viewportLayout = await page.evaluate(() => ({
       bodyClientWidth: document.body.clientWidth,
@@ -751,8 +755,8 @@ test('runs the complete chroma video timeline and PNG sequence export workflow',
   expect(sampleBodies[0]).toEqual({
     input_path: videoInputPath,
     timestamp_seconds: 0,
-    x: 99,
-    y: 49,
+    x: 100,
+    y: 50,
     preview_width: 400,
     preview_height: 200,
   })
@@ -911,6 +915,7 @@ test('runs the complete chroma video timeline and PNG sequence export workflow',
     },
   })
   expect(taskBodies[0]).not.toHaveProperty('output_path')
+  await page.getByRole('button', { name: '展开任务日志' }).first().click()
   await expect(page.getByText('Processed video frame 2/4')).toBeVisible()
   await expect(page.getByLabel('任务状态：完成')).toBeVisible()
   await expect(page.getByText(`输出：${videoOutputRoot}\\moving-screen_keyed_frames`)).toBeVisible()
@@ -926,29 +931,65 @@ test('keeps the loaded video editor within desktop and 390px mobile layouts', as
     await page.setViewportSize(viewport)
     await page.goto('/')
     await page.getByRole('button', { exact: true, name: '色键抠图' }).click()
+    await page.getByRole('button', { name: '打开参数检查器' }).click()
     const input = page.getByRole('textbox', { name: '输入图片或视频路径' })
     await input.fill(videoInputPath)
     await input.press('Enter')
+    await expect(page.getByRole('slider', { name: '视频时间轴' })).toHaveCount(1)
+
+    const inspectorLayout = await page.locator('.chroma-keyer-form').evaluate((form) => {
+      const parameterHeaders = Array.from(
+        form.querySelectorAll<HTMLElement>('.chroma-parameter-header'),
+      )
+      const toBox = (element: HTMLElement) => {
+        const { bottom, height, left, right, top, width } = element.getBoundingClientRect()
+        return { bottom, height, left, right, top, width }
+      }
+      return {
+        form: toBox(form as HTMLElement),
+        parameters: parameterHeaders.map((header) => {
+          const field = header.closest<HTMLElement>('.chroma-parameter-field')
+          const label = header.querySelector<HTMLElement>('.field-label')
+          const number = header.querySelector<HTMLElement>('.chroma-parameter-number')
+          if (!field || !label || !number) {
+            throw new Error('Expected Chroma parameter label and numeric input')
+          }
+          const style = getComputedStyle(label)
+          return {
+            card: toBox(field),
+            header: toBox(header),
+            label: toBox(label),
+            labelClientHeight: label.clientHeight,
+            labelClientWidth: label.clientWidth,
+            labelScrollHeight: label.scrollHeight,
+            labelScrollWidth: label.scrollWidth,
+            name: label.textContent?.trim() ?? '',
+            number: toBox(number),
+            overflowWrap: style.overflowWrap,
+            textOverflow: style.textOverflow,
+            whiteSpace: style.whiteSpace,
+          }
+        }),
+        viewportWidth: window.innerWidth,
+      }
+    })
+
+    await page.getByRole('button', { name: '关闭参数检查器' }).click()
     await expect(page.getByRole('slider', { name: '视频时间轴' })).toBeVisible()
 
     const layout = await page.locator('.chroma-editor').evaluate((editor) => {
       const main = editor.querySelector<HTMLElement>('.chroma-editor-main')
-      const form = editor.querySelector<HTMLElement>('.chroma-keyer-form')
       const timeline = editor.querySelector<HTMLElement>('.chroma-video-timeline')
       const controls = editor.querySelector<HTMLElement>('.chroma-video-timeline-controls')
       const transport = editor.querySelector<HTMLElement>('.chroma-video-transport')
       const range = editor.querySelector<HTMLElement>('.chroma-video-timeline-range')
       const timecode = editor.querySelector<HTMLElement>('.chroma-video-timecode')
       const metadata = editor.querySelector<HTMLElement>('.chroma-video-metadata')
-      const parameterHeaders = Array.from(
-        editor.querySelectorAll<HTMLElement>('.chroma-parameter-header'),
-      )
       const transportButtons = Array.from(
         transport?.querySelectorAll<HTMLElement>('button') ?? [],
       )
       if (
         !main
-        || !form
         || !timeline
         || !controls
         || !transport
@@ -956,7 +997,6 @@ test('keeps the loaded video editor within desktop and 390px mobile layouts', as
         || !timecode
         || !metadata
         || transportButtons.length !== 4
-        || parameterHeaders.length !== 7
       ) {
         throw new Error('Expected loaded video editor geometry')
       }
@@ -971,32 +1011,8 @@ test('keeps the loaded video editor within desktop and 390px mobile layouts', as
         controls: toBox(controls),
         documentClientWidth: document.documentElement.clientWidth,
         documentScrollWidth: document.documentElement.scrollWidth,
-        form: toBox(form),
         main: toBox(main),
         metadata: toBox(metadata),
-        parameters: parameterHeaders.map((header) => {
-          const card = header.closest<HTMLElement>('.chroma-parameter-field')
-          const label = header.querySelector<HTMLElement>('.field-label')
-          const number = header.querySelector<HTMLElement>('.chroma-parameter-number')
-          if (!card || !label || !number) {
-            throw new Error('Expected Chroma parameter label and numeric input')
-          }
-          const style = getComputedStyle(label)
-          return {
-            card: toBox(card),
-            header: toBox(header),
-            label: toBox(label),
-            labelClientHeight: label.clientHeight,
-            labelClientWidth: label.clientWidth,
-            labelScrollHeight: label.scrollHeight,
-            labelScrollWidth: label.scrollWidth,
-            name: label.textContent?.trim() ?? '',
-            number: toBox(number),
-            overflowWrap: style.overflowWrap,
-            textOverflow: style.textOverflow,
-            whiteSpace: style.whiteSpace,
-          }
-        }),
         range: toBox(range),
         timecode: toBox(timecode),
         timeline: toBox(timeline),
@@ -1042,8 +1058,10 @@ test('keeps the loaded video editor within desktop and 390px mobile layouts', as
     }
     expect(layout.metadata.left).toBeGreaterThanOrEqual(layout.main.left - 0.5)
     expect(layout.metadata.right).toBeLessThanOrEqual(layout.main.right + 0.5)
-    expect(layout.parameters.map(({ name }) => name)).toEqual(chromaParameterNames)
-    for (const parameter of layout.parameters) {
+    expect(inspectorLayout.form.left).toBeGreaterThanOrEqual(0)
+    expect(inspectorLayout.form.right).toBeLessThanOrEqual(inspectorLayout.viewportWidth)
+    expect(inspectorLayout.parameters.map(({ name }) => name)).toEqual(chromaParameterNames)
+    for (const parameter of inspectorLayout.parameters) {
       expect(parameter.labelScrollHeight).toBeLessThanOrEqual(parameter.labelClientHeight + 1)
       expect(parameter.labelScrollWidth).toBeLessThanOrEqual(parameter.labelClientWidth + 1)
       expect(parameter.overflowWrap).toBe('normal')
@@ -1071,11 +1089,6 @@ test('keeps the loaded video editor within desktop and 390px mobile layouts', as
       expect(parameter.label.right).toBeLessThanOrEqual(parameter.card.right + 0.5)
       expect(parameter.label.top).toBeGreaterThanOrEqual(parameter.card.top - 0.5)
       expect(parameter.label.bottom).toBeLessThanOrEqual(parameter.card.bottom + 0.5)
-    }
-    if (viewport.width === 390) {
-      expect(layout.main.bottom).toBeLessThanOrEqual(layout.form.top + 0.5)
-    } else {
-      expect(layout.main.right).toBeLessThanOrEqual(layout.form.left + 0.5)
     }
   }
 })
