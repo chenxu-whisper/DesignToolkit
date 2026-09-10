@@ -8529,6 +8529,38 @@ def test_batch_resize_disambiguates_duplicate_input_names(tmp_path: Path) -> Non
     assert options[1].output_path == tmp_path / "002_photo_resized.png"
 
 
+def test_batch_derived_output_names_fit_portable_component_limit(
+    tmp_path: Path,
+) -> None:
+    long_stem = "image-" + ("a" * 240)
+    resize_options = media_resize_options_list_from_request(
+        MediaResizeTaskRequest(
+            input_paths=[
+                str(tmp_path / f"{long_stem}.png"),
+                str(tmp_path / f"{long_stem}b.png"),
+            ],
+            output_dir=str(tmp_path / "output"),
+            size="10x10",
+        )
+    )
+    frame_options = video_frame_options_list_from_request(
+        VideoFramesTaskRequest(
+            input_paths=[
+                str(tmp_path / f"{long_stem}.mp4"),
+                str(tmp_path / f"{long_stem}b.mp4"),
+            ],
+            output_dir=str(tmp_path / "frames"),
+        )
+    )
+
+    names = [
+        *(option.output_path.name for option in resize_options if option.output_path),
+        *(option.output_dir.name for option in frame_options if option.output_dir),
+    ]
+    assert all(len(name.encode("utf-8")) <= 255 for name in names)
+    assert len(set(names)) == len(names)
+
+
 def test_batch_video_frames_disambiguates_duplicate_input_names(
     tmp_path: Path,
 ) -> None:

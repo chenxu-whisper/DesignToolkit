@@ -6409,6 +6409,58 @@ def test_hosted_batch_resize_uses_unique_managed_output_directory(
     assert payload["output_path"] is None
 
 
+def test_hosted_resize_rejects_oversized_output_before_enqueue(
+    tmp_path: Path,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = RedisTaskManager(
+        redis_connection=redis_connection,
+        queue=Queue("designtoolkit", connection=redis_connection),
+        data_dir=tmp_path,
+        max_queued_tasks=20,
+        retention_seconds=7200,
+    )
+    with _client(
+        tmp_path,
+        task_manager=manager,
+        max_image_pixels=4,
+    ) as client:
+        reference = _upload(client, "small.png", _png_bytes((1, 1))).json()[
+            "reference"
+        ]
+        response = client.post(
+            "/api/tasks/media-resize",
+            json={"input_path": reference, "size": "3x2"},
+        )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "media_limit_exceeded"
+    assert manager.queue.count == 0
+
+
+def test_hosted_video_frames_rejects_excessive_frame_count_before_enqueue(
+    tmp_path: Path,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = RedisTaskManager(
+        redis_connection=redis_connection,
+        queue=Queue("designtoolkit", connection=redis_connection),
+        data_dir=tmp_path,
+        max_queued_tasks=20,
+        retention_seconds=7200,
+    )
+    with _client(tmp_path, task_manager=manager) as client:
+        reference = _upload(client, "clip.mp4", b"video").json()["reference"]
+        response = client.post(
+            "/api/tasks/video-frames",
+            json={"input_path": reference, "frames": 100_001},
+        )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "media_limit_exceeded"
+    assert manager.queue.count == 0
+
+
 @pytest.mark.parametrize(
     ("route", "extra_payload"),
     [
@@ -6871,6 +6923,26 @@ def test_hosted_animated_image_rejected_before_video_probe(tmp_path: Path) -> No
     assert response.json()["error"]["code"] == "media_limit_exceeded"
     assert decoder.probe_calls == 0
     assert decoder.decode_calls == 0
+
+
+def test_hosted_image_inspect_rejects_video_before_reading_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        routes_module,
+        "_read_rgb_snapshot",
+        Mock(side_effect=AssertionError("video must not be read as an image")),
+    )
+    with _client(tmp_path) as client:
+        reference = _upload(client, "clip.mp4", b"video").json()["reference"]
+        response = client.post(
+            "/api/chroma-keyer/images/inspect",
+            json={"input_path": reference},
+        )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_request"
 
 
 def test_hosted_media_resize_rejects_animated_image_before_enqueue(

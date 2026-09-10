@@ -256,7 +256,7 @@ class VideoFramesTaskRequest(BaseModel):
     )
     output_dir: str | None = None
     image_format: Literal["png", "jpg", "jpeg"] = "png"
-    size: str | None = None
+    size: str | None = Field(default=None, min_length=1, max_length=64)
     fps: float | None = None
     frames: int | None = None
     overwrite: bool = False
@@ -292,7 +292,7 @@ class MediaResizeTaskRequest(BaseModel):
     )
     output_path: str | None = None
     output_dir: str | None = None
-    size: str = Field(min_length=1)
+    size: str = Field(min_length=1, max_length=64)
 
     @field_validator("input_paths")
     @classmethod

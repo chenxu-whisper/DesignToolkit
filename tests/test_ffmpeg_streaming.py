@@ -317,21 +317,20 @@ def test_pam_parser_rejects_frame_above_configured_limit_before_pixels() -> None
         parser.feed(_pam(2, 2, b""))
 
 
-def test_guarded_pam_rejects_frame_above_remaining_budget_before_pixels(
+def test_guarded_pam_applies_encoded_budget_after_parsing_raw_frame(
     tmp_path: Path,
 ) -> None:
-    from designtoolkit.video_frames.ffmpeg_streaming import (
-        FfmpegOutputError,
-        GuardedFfmpegOutput,
-    )
+    from designtoolkit.video_frames.ffmpeg_streaming import GuardedFfmpegOutput
+    from designtoolkit.web.output_limits import OutputLimitExceeded
 
     session = GuardedFfmpegOutput(
         ["ffmpeg", str(tmp_path / "output.png")],
         OutputBudgetGuard(tmp_path, max_bytes=16, safety_bytes=1),
     )
+    session.consume(_pam(2, 2, b"\x00" * 16))
 
-    with pytest.raises(FfmpegOutputError, match="frame size"):
-        session.consume(_pam(2, 2, b""))
+    with pytest.raises(OutputLimitExceeded):
+        session.finish()
 
     assert not list(tmp_path.iterdir())
 
@@ -1351,6 +1350,51 @@ def test_guarded_backend_sequence_stops_at_exact_aggregate_budget(
     assert process.terminate_called
     assert not list(tmp_path.iterdir())
     assert guard.used_bytes == 0
+
+
+def test_guarded_png_uses_encoded_budget_not_raw_rgba_size(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pixels = b"\x00\x80\xff\xff" * 10_000
+    process = _StreamingPopen([_pam(100, 100, pixels)])
+    guard = OutputBudgetGuard(tmp_path, max_bytes=1_000)
+    monkeypatch.setattr(ffmpeg_backend, "os_name", "other")
+    backend = FfmpegBackend(
+        output_guard=guard,
+        popen=_streaming_popen_factory([process], []),
+    )
+
+    result = backend.run_guarded(["ffmpeg", str(tmp_path / "output.png")])
+
+    assert result.returncode == 0
+    assert (tmp_path / "output.png").stat().st_size < 1_000
+
+
+def test_guarded_sequence_has_a_hard_file_count_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from designtoolkit.video_frames import ffmpeg_streaming
+    from designtoolkit.video_frames.ffmpeg_streaming import FfmpegOutputError
+
+    monkeypatch.setattr(ffmpeg_streaming, "HOSTED_MAX_FRAME_OUTPUTS", 2)
+    process = _StreamingPopen([_pam(1, 1, b"abcd") * 3])
+    guard = OutputBudgetGuard(tmp_path, max_bytes=1_000_000)
+    monkeypatch.setattr(ffmpeg_backend, "os_name", "other")
+    backend = FfmpegBackend(
+        output_guard=guard,
+        popen=_streaming_popen_factory([process], []),
+    )
+
+    with pytest.raises(FfmpegOutputError, match="more than 2"):
+        backend.run_guarded(
+            ["ffmpeg", str(tmp_path / "frame_%06d.png")],
+            output_kind="sequence",
+        )
+
+    assert process.terminate_called
+    assert not list(tmp_path.iterdir())
 
 
 def test_webm_decoder_fallback_recovers_full_budget_after_failed_first_run(

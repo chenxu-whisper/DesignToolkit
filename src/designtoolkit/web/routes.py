@@ -46,8 +46,10 @@ from designtoolkit.chroma_keyer.video_models import (
     clamp_timeline_timestamp,
     validate_timestamp,
 )
+from designtoolkit.media_constraints import HOSTED_MAX_FRAME_OUTPUTS
 from designtoolkit.media_resize import MediaResizeError
-from designtoolkit.video_frames import VideoFrameError
+from designtoolkit.output_names import bounded_derived_name
+from designtoolkit.video_frames import VideoFrameError, parse_size
 from designtoolkit.web.chroma_previews import ChromaPreviewEntry, ChromaPreviewStore
 from designtoolkit.web.event_sanitization import EventSanitizer
 from designtoolkit.web.heartbeat import (
@@ -411,6 +413,19 @@ def _chroma_video_error_response(exc: KeyerError) -> ApiError:
 
 def _media_limit_error_response(exc: MediaLimitError) -> ApiError:
     return ApiError("media_limit_exceeded", str(exc), 422)
+
+
+def _validate_hosted_output_pixels(size: str, max_pixels: int) -> None:
+    try:
+        width, height = parse_size(size)
+    except VideoFrameError as exc:
+        raise ApiError("invalid_request", str(exc), 400) from exc
+    if width * height > max_pixels:
+        raise ApiError(
+            "media_limit_exceeded",
+            f"Requested output exceeds the {max_pixels} pixels limit",
+            422,
+        )
 
 
 def _chroma_preview_url(preview_id: str) -> str:
@@ -1048,13 +1063,38 @@ def create_router(
         validate_hosted_paths(http_request, [path])
         return path
 
+    def resolve_typed_input_path(
+        http_request: Request,
+        reference: str,
+        media_type: str,
+    ) -> Path:
+        path = resolve_hosted_asset(http_request, reference)
+        if media_type == "video" and media_validator is not None:
+            try:
+                media_validator.validate_video(path)
+            except MediaLimitError as exc:
+                raise _media_limit_error_response(exc) from exc
+            return path
+        validate_hosted_paths(
+            http_request,
+            [path],
+            allowed_media_types=frozenset({media_type}),
+        )
+        return path
+
     @contextmanager
     def pinned_hosted_input_path(
         http_request: Request,
         reference: str,
+        *,
+        media_type: str | None = None,
     ) -> Iterator[Path]:
         if storage is None or not isinstance(task_manager, RedisTaskManager):
-            yield resolve_input_path(http_request, reference)
+            yield (
+                resolve_typed_input_path(http_request, reference, media_type)
+                if media_type is not None
+                else resolve_input_path(http_request, reference)
+            )
             return
         try:
             parsed = parse_asset_reference(reference)
@@ -1076,7 +1116,11 @@ def create_router(
         )
         heartbeat.start()
         try:
-            yield resolve_input_path(http_request, reference)
+            yield (
+                resolve_typed_input_path(http_request, reference, media_type)
+                if media_type is not None
+                else resolve_input_path(http_request, reference)
+            )
         except BaseException:
             _stop_asset_read_pin_heartbeat(
                 heartbeat,
@@ -1308,6 +1352,32 @@ def create_router(
             references,
             allowed_media_types=frozenset({"video"}),
         )
+        if payload.size is not None:
+            _validate_hosted_output_pixels(
+                payload.size,
+                settings.max_video_width * settings.max_video_height,
+            )
+        if payload.frames is not None and payload.frames > HOSTED_MAX_FRAME_OUTPUTS:
+            raise ApiError(
+                "media_limit_exceeded",
+                f"Frame export exceeds the {HOSTED_MAX_FRAME_OUTPUTS} frame limit",
+                422,
+            )
+        if payload.fps is not None and media_validator is not None:
+            validated = media_validator.validate_media_many(
+                [Path(path) for path in paths]
+            )
+            if any(
+                media.video_metadata is not None
+                and media.video_metadata.duration_seconds * payload.fps
+                > HOSTED_MAX_FRAME_OUTPUTS
+                for media in validated
+            ):
+                raise ApiError(
+                    "media_limit_exceeded",
+                    f"Frame export exceeds the {HOSTED_MAX_FRAME_OUTPUTS} frame limit",
+                    422,
+                )
         output_dir = storage.create_task_dir(http_request.state.session_id) / "frames"
         return payload.model_copy(
             update={
@@ -1330,12 +1400,34 @@ def create_router(
             else list(payload.input_paths or [])
         )
         paths = resolve_input_references(http_request, references)
+        if media_validator is not None:
+            try:
+                validated = media_validator.validate_media_many(
+                    [Path(path) for path in paths]
+                )
+            except MediaLimitError as exc:
+                raise _media_limit_error_response(exc) from exc
+            output_pixel_limit = min(
+                (
+                    settings.max_image_pixels
+                    if media.media_type == "image"
+                    else settings.max_video_width * settings.max_video_height
+                )
+                for media in validated
+            )
+            _validate_hosted_output_pixels(payload.size, output_pixel_limit)
         task_dir = storage.create_task_dir(http_request.state.session_id)
         output_path = None
         if payload.input_path is not None:
             input_path = Path(paths[0])
             output_path = str(
-                task_dir / f"{input_path.stem}_resized{input_path.suffix}"
+                task_dir
+                / bounded_derived_name(
+                    prefix="",
+                    stem=input_path.stem,
+                    suffix="_resized",
+                    extension=input_path.suffix,
+                )
             )
         return payload.model_copy(
             update={
@@ -1364,7 +1456,15 @@ def create_router(
         return payload.model_copy(
             update={
                 "input_path": str(input_path),
-                "output_path": str(task_dir / f"{input_path.stem}_keyed.png"),
+                "output_path": str(
+                    task_dir
+                    / bounded_derived_name(
+                        prefix="",
+                        stem=input_path.stem,
+                        suffix="_keyed",
+                        extension=".png",
+                    )
+                ),
             }
         )
 
@@ -1932,6 +2032,7 @@ def create_router(
             with pinned_hosted_input_path(
                 http_request,
                 payload.input_path,
+                media_type="image",
             ) as input_path:
                 rgb, source_fingerprint = _read_rgb_snapshot(input_path)
                 cache_key = _chroma_preview_cache_key(
@@ -1978,6 +2079,7 @@ def create_router(
             with pinned_hosted_input_path(
                 http_request,
                 payload.input_path,
+                media_type="video",
             ) as input_path:
                 metadata, timestamp_seconds, preview_entry = (
                     _get_stable_video_preview_entry(
@@ -2029,6 +2131,7 @@ def create_router(
             with pinned_hosted_input_path(
                 http_request,
                 payload.input_path,
+                media_type="video",
             ) as input_path:
                 _metadata, timestamp_seconds, preview_entry = (
                     _get_stable_video_preview_entry(
@@ -2070,6 +2173,7 @@ def create_router(
             with pinned_hosted_input_path(
                 http_request,
                 payload.input_path,
+                media_type="video",
             ) as input_path:
                 metadata, timestamp_seconds, rgb = _read_stable_video_frame(
                     input_path,
@@ -2124,6 +2228,7 @@ def create_router(
             with pinned_hosted_input_path(
                 http_request,
                 payload.input_path,
+                media_type="video",
             ) as input_path:
                 model = screen_model_from_samples(payload.samples)
                 params_data = payload.params.model_dump(mode="json")
@@ -2179,6 +2284,7 @@ def create_router(
             with pinned_hosted_input_path(
                 http_request,
                 payload.input_path,
+                media_type="image",
             ) as input_path:
                 rgb = read_rgb_image(input_path)
         except KeyerError as exc:
@@ -2238,6 +2344,7 @@ def create_router(
             with pinned_hosted_input_path(
                 http_request,
                 payload.input_path,
+                media_type="image",
             ) as input_path:
                 rgb, source_fingerprint = _read_rgb_snapshot(input_path)
                 params_data = payload.params.model_dump(mode="json")

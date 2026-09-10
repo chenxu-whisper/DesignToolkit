@@ -12,13 +12,10 @@ from designtoolkit.chroma_keyer.video_models import VideoKeyOptions
 from designtoolkit.media_resize import (
     MediaResizeOptions,
 )
-from designtoolkit.media_resize import (
-    default_output_path as default_resize_output_path,
-)
+from designtoolkit.output_names import bounded_derived_name
 from designtoolkit.video_frames import (
     VideoFrameError,
     VideoFrameOptions,
-    default_output_dir,
     parse_size,
 )
 from designtoolkit.web.schemas import (
@@ -109,7 +106,11 @@ def video_frame_options_list_from_request(
                 input_path=input_path_obj,
                 output_dir=(
                     (output_root or input_path_obj.parent)
-                    / f"{index:03d}_{default_output_dir(input_path_obj).name}"
+                    / bounded_derived_name(
+                        prefix=f"{index:03d}_",
+                        stem=input_path_obj.stem,
+                        suffix="_frames",
+                    )
                     if is_batch
                     else output_root
                 ),
@@ -149,8 +150,12 @@ def media_resize_options_list_from_request(
         input_path_object = Path(input_path)
         output_path = Path(request.output_path) if request.output_path else None
         if output_root is not None:
-            default_name = default_resize_output_path(input_path_object).name
-            output_path = output_root / f"{index:03d}_{default_name}"
+            output_path = output_root / bounded_derived_name(
+                prefix=f"{index:03d}_",
+                stem=input_path_object.stem,
+                suffix="_resized",
+                extension=input_path_object.suffix,
+            )
         options.append(
             MediaResizeOptions(
                 input_path=input_path_object,

@@ -10,6 +10,7 @@ from typing import BinaryIO, Literal
 from PIL import Image
 
 from designtoolkit.media_constraints import (
+    HOSTED_MAX_FRAME_OUTPUTS,
     HOSTED_MAX_IMAGE_PIXELS,
     HOSTED_MAX_IMAGE_RGBA_BYTES,
     HOSTED_MAX_VIDEO_RGBA_FRAME_BYTES,
@@ -245,7 +246,6 @@ class GuardedFfmpegOutput:
         )
         parser_frame_limit = min(
             raw_media_limit,
-            guard.remaining_bytes,
             (
                 max_frame_bytes
                 if max_frame_bytes is not None
@@ -342,6 +342,11 @@ class GuardedFfmpegOutput:
                 self._single_frame = frame
                 self._frame_count += 1
                 continue
+            if self._frame_count >= HOSTED_MAX_FRAME_OUTPUTS:
+                raise FfmpegOutputError(
+                    "FFmpeg produced more than "
+                    f"{HOSTED_MAX_FRAME_OUTPUTS} output frames"
+                )
             target = self._frame_target()
             self._write_image(frame, target)
             self._frame_count += 1
