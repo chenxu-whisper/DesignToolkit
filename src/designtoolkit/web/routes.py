@@ -463,12 +463,22 @@ def _media_limit_error_response(exc: MediaLimitError) -> ApiError:
     return ApiError("media_limit_exceeded", str(exc), 422)
 
 
-def _validate_hosted_output_pixels(size: str, max_pixels: int) -> None:
+def _validate_hosted_output_pixels(
+    size: str,
+    max_pixels: int,
+    *,
+    max_width: int | None = None,
+    max_height: int | None = None,
+) -> None:
     try:
         width, height = parse_size(size)
     except VideoFrameError as exc:
         raise ApiError("invalid_request", str(exc), 400) from exc
-    if width * height > max_pixels:
+    if (
+        width * height > max_pixels
+        or (max_width is not None and width > max_width)
+        or (max_height is not None and height > max_height)
+    ):
         raise ApiError(
             "media_limit_exceeded",
             f"Requested output exceeds the {max_pixels} pixels limit",
@@ -1404,6 +1414,8 @@ def create_router(
             _validate_hosted_output_pixels(
                 payload.size,
                 settings.max_video_width * settings.max_video_height,
+                max_width=settings.max_video_width,
+                max_height=settings.max_video_height,
             )
         if media_validator is not None:
             validated = media_validator.validate_media_many(
@@ -1466,7 +1478,15 @@ def create_router(
                 )
                 for media in validated
             )
-            _validate_hosted_output_pixels(payload.size, output_pixel_limit)
+            contains_video = any(
+                media.media_type == "video" for media in validated
+            )
+            _validate_hosted_output_pixels(
+                payload.size,
+                output_pixel_limit,
+                max_width=settings.max_video_width if contains_video else None,
+                max_height=settings.max_video_height if contains_video else None,
+            )
         task_dir = storage.create_task_dir(http_request.state.session_id)
         output_path = None
         if payload.input_path is not None:
@@ -1793,6 +1813,8 @@ def create_router(
             if deletion is not None:
                 release_generation = deletion.generation_id
             if deletion is not None and deletion.size > 0:
+                if deletion_heartbeat is not None:
+                    deletion_heartbeat.raise_if_failed()
                 if release_generation is not None:
                     operation.commit(
                         lambda: resources.release_committed_asset(
@@ -1820,6 +1842,8 @@ def create_router(
                             ),
                         )
                     )
+            if deletion_heartbeat is not None:
+                deletion_heartbeat.raise_if_failed()
             operation.commit(
                 lambda: storage.finalize_asset_deletion(
                     session_id,
@@ -1829,6 +1853,8 @@ def create_router(
                 )
             )
             if release_generation is None:
+                if deletion_heartbeat is not None:
+                    deletion_heartbeat.raise_if_failed()
                 operation.commit(
                     lambda: resources.finalize_asset_release(
                         session_id,
@@ -1836,6 +1862,8 @@ def create_router(
                     )
                 )
             else:
+                if deletion_heartbeat is not None:
+                    deletion_heartbeat.raise_if_failed()
                 operation.commit(
                     lambda: resources.finalize_asset_release(
                         session_id,
@@ -1845,7 +1873,6 @@ def create_router(
                 )
             if deletion_heartbeat is not None:
                 deletion_heartbeat.stop()
-                deletion_heartbeat.raise_if_failed()
         except UploadRejectedError as exc:
             raise ApiError("asset_not_found", str(exc), 404) from exc
         except AssetReleaseMismatchError as exc:

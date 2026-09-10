@@ -6438,6 +6438,29 @@ def test_hosted_resize_rejects_oversized_output_before_enqueue(
     assert manager.queue.count == 0
 
 
+def test_hosted_video_resize_enforces_each_output_dimension(
+    tmp_path: Path,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = RedisTaskManager(
+        redis_connection=redis_connection,
+        queue=Queue("designtoolkit", connection=redis_connection),
+        data_dir=tmp_path,
+        max_queued_tasks=20,
+        retention_seconds=7200,
+    )
+    with _client(tmp_path, task_manager=manager) as client:
+        reference = _upload(client, "clip.mp4", b"video").json()["reference"]
+        response = client.post(
+            "/api/tasks/media-resize",
+            json={"input_path": reference, "size": "7680x1080"},
+        )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "media_limit_exceeded"
+    assert manager.queue.count == 0
+
+
 def test_hosted_video_frames_rejects_excessive_frame_count_before_enqueue(
     tmp_path: Path,
 ) -> None:

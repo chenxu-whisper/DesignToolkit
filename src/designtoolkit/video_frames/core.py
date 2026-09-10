@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from designtoolkit.output_names import bounded_derived_name
+
 SUPPORTED_FORMATS = {"png", "jpg", "jpeg"}
 
 
@@ -84,9 +86,16 @@ def _ffmpeg_output_pattern(
     image_format: str,
 ) -> Path:
     escaped_output_dir = str(output_dir).replace("%", "%%")
+    example_name = bounded_derived_name(
+        prefix="",
+        stem=input_stem,
+        suffix="_000000",
+        extension=f".{image_format}",
+    )
+    bounded_stem = example_name.removesuffix(f"_000000.{image_format}")
     return (
         Path(escaped_output_dir)
-        / f"{_ffmpeg_output_stem(input_stem)}_%06d.{image_format}"
+        / f"{_ffmpeg_output_stem(bounded_stem)}_%06d.{image_format}"
     )
 
 

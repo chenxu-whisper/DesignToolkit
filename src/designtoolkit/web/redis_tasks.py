@@ -1757,7 +1757,14 @@ class RedisTaskManager:
     def reconcile_queue_slots(self) -> int:
         for value in self._redis.lrange(_queue_reservations_key(), 0, -1):
             task_id = value.decode() if isinstance(value, bytes) else value
-            task = self.get_task(task_id)
+            try:
+                task = self.get_task(task_id)
+            except (IndexError, KeyError, TypeError, UnicodeDecodeError, ValueError):
+                _LOGGER.warning(
+                    "Preserving queue slot for corrupt task record: %s",
+                    task_id,
+                )
+                continue
             intent_exists = self._enqueue_intent_exists(task_id)
             if task is None:
                 if intent_exists:
@@ -3257,7 +3264,14 @@ class RedisTaskManager:
         for key, task_id in pin_keys:
             if self._enqueue_intent_exists(task_id):
                 continue
-            task = self.get_task(task_id)
+            try:
+                task = self.get_task(task_id)
+            except (IndexError, KeyError, TypeError, UnicodeDecodeError, ValueError):
+                _LOGGER.warning(
+                    "Preserving pin for corrupt task record: %s",
+                    task_id,
+                )
+                continue
             if task is not None and task.status in {
                 TaskStatus.QUEUED,
                 TaskStatus.RUNNING,

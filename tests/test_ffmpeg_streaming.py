@@ -1464,6 +1464,21 @@ def test_webm_decoder_fallback_recovers_full_budget_after_failed_first_run(
     assert result.output_pattern == output_dir / "input%%take_%06d.png"
 
 
+def test_video_frame_pattern_bounds_final_component_for_long_stem(
+    tmp_path: Path,
+) -> None:
+    from designtoolkit.video_frames.core import _ffmpeg_output_pattern
+
+    pattern = _ffmpeg_output_pattern(
+        tmp_path,
+        input_stem="a" * 250,
+        image_format="png",
+    )
+    first_frame_name = pattern.name.replace("%06d", "000001")
+
+    assert len(first_frame_name.encode("utf-8")) <= 255
+
+
 def test_video_frame_export_uses_guarded_extension_for_primary_and_fallback(
     tmp_path: Path,
 ) -> None:
