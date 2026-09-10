@@ -1,5 +1,10 @@
 import { AppShell } from './AppShell'
+import { ThemeProvider } from './theme/ThemeProvider'
 
 export function App() {
-  return <AppShell />
+  return (
+    <ThemeProvider>
+      <AppShell />
+    </ThemeProvider>
+  )
 }
