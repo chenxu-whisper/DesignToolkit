@@ -72,7 +72,11 @@ def parse_size(value: str) -> tuple[int, int]:
 
 
 def default_output_dir(video_path: Path) -> Path:
-    return video_path.parent / f"{video_path.stem}_frames"
+    return video_path.parent / bounded_derived_name(
+        prefix="",
+        stem=video_path.stem,
+        suffix="_frames",
+    )
 
 
 def _ffmpeg_output_stem(input_stem: str) -> str:

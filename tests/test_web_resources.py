@@ -415,10 +415,6 @@ class DeterministicRedis(fakeredis.FakeRedis):
         state_key, index_key, token_key, task_key, receipt_key = keys
         token = token_key.rsplit(":", 1)[-1]
         receipt_ttl_ms = int(args[1])
-        if self.hget(task_key, "output_token") == token.encode():
-            self.hdel(task_key, "output_token")
-            if not self.hexists(task_key, "lease_token"):
-                self.delete(task_key)
         metadata_key = token_key
         if self.exists(receipt_key):
             if self.hget(receipt_key, "state") != b"reserved":
@@ -459,6 +455,10 @@ class DeterministicRedis(fakeredis.FakeRedis):
                 for field in fields
             ):
                 return 2
+        if self.hget(task_key, "output_token") == token.encode():
+            self.hdel(task_key, "output_token")
+            if not self.hexists(task_key, "lease_token"):
+                self.delete(task_key)
         self.delete(token_key)
         self.hdel(index_key, token_key.rsplit(":", 1)[-1])
         if self.exists(receipt_key):
@@ -3369,6 +3369,10 @@ def test_runtime_cleanup_does_not_release_another_tasks_output_reservation(
     assert redis_connection.exists(
         f"dt:resource:reservation:{reservation.token}"
     )
+    assert redis_connection.hget(
+        "dt:resource:task:task-a",
+        "output_token",
+    ) == reservation.token.encode()
     assert resources.output_reserved_bytes() == 5
     reservation.release()
 

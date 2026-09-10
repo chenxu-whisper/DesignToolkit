@@ -21,7 +21,10 @@ from designtoolkit.chroma_keyer.models import (
     KeyImageResult,
     ScreenColorModel,
 )
-from designtoolkit.chroma_keyer.video_export import key_video_to_png_sequence
+from designtoolkit.chroma_keyer.video_export import (
+    key_video_to_png_sequence,
+    keyed_frame_name,
+)
 from designtoolkit.chroma_keyer.video_io import ImageioVideoDecoder
 from designtoolkit.chroma_keyer.video_models import (
     ProgressCallback,
@@ -569,7 +572,7 @@ class TaskManager:
                     1,
                     estimated_total,
                     result.output_dir
-                    / f"{options.input_path.stem}_keyed_{1:06d}.png",
+                    / keyed_frame_name(options.input_path.stem, "000001"),
                     force=True,
                 )
             if last_reported_frames != result.frame_count:
@@ -577,9 +580,9 @@ class TaskManager:
                     result.frame_count,
                     estimated_total,
                     result.output_dir
-                    / (
-                        f"{options.input_path.stem}_keyed_"
-                        f"{result.frame_count:06d}.png"
+                    / keyed_frame_name(
+                        options.input_path.stem,
+                        f"{result.frame_count:06d}",
                     ),
                     force=True,
                 )

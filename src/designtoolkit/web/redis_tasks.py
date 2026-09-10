@@ -45,6 +45,7 @@ from designtoolkit.web.resources import (
     _RELEASE_TASK_PIN_SCRIPT,
     _TASK_PIN_PREFIX,
     CorruptTaskPinError,
+    ResourceUnavailableError,
     SessionDeletingError,
     _asset_tasks_key,
     _release_task_pin_without_lua,
@@ -1681,8 +1682,15 @@ class RedisTaskManager:
         reconciled = self._reconcile_asset_read_pins()
         for task in self._tasks_requiring_failure_cleanup():
             message = task.error or "Task failed"
-            if self._finalize_external_failure(task.task_id, message):
-                reconciled += 1
+            try:
+                if self._finalize_external_failure(task.task_id, message):
+                    reconciled += 1
+            except ResourceUnavailableError:
+                _LOGGER.warning(
+                    "Deferred cleanup for task with inconsistent resources: %s",
+                    task.task_id,
+                    exc_info=True,
+                )
         for task_id in self._enqueue_intent_task_ids():
             if self._reconcile_enqueue_intent(task_id):
                 reconciled += 1
@@ -1735,8 +1743,15 @@ class RedisTaskManager:
                     if status is JobStatus.FINISHED
                     else "Running task was abandoned by its worker"
                 )
-            if self._finalize_external_failure(task.task_id, message):
-                reconciled += 1
+            try:
+                if self._finalize_external_failure(task.task_id, message):
+                    reconciled += 1
+            except ResourceUnavailableError:
+                _LOGGER.warning(
+                    "Deferred cleanup for task with inconsistent resources: %s",
+                    task.task_id,
+                    exc_info=True,
+                )
         reconciled += self._reconcile_stale_task_pins(started_ids)
         return reconciled
 

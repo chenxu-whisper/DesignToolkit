@@ -149,7 +149,7 @@ def _manifest(
         "fps": metadata.fps,
         "duration_seconds": metadata.duration_seconds,
         "frame_count": frame_count,
-        "pattern": _keyed_frame_name(input_path.stem, "%06d"),
+        "pattern": keyed_frame_name(input_path.stem, "%06d"),
         "screen_color": list(model.samples[0]),
         "params": {
             "screen_gain": float(params.screen_gain),
@@ -163,13 +163,18 @@ def _manifest(
     }
 
 
-def _keyed_frame_name(input_stem: str, frame: str) -> str:
-    return bounded_derived_name(
+def _keyed_output_stem(input_stem: str) -> str:
+    example_name = bounded_derived_name(
         prefix="",
         stem=input_stem,
-        suffix=f"_keyed_{frame}",
+        suffix="_keyed_000000",
         extension=".png",
     )
+    return example_name.removesuffix("_keyed_000000.png")
+
+
+def keyed_frame_name(input_stem: str, frame: str) -> str:
+    return f"{_keyed_output_stem(input_stem)}_keyed_{frame}.png"
 
 
 def key_video_to_png_sequence(
@@ -208,7 +213,7 @@ def key_video_to_png_sequence(
                 keyed_rgb = alpha = None
                 try:
                     processed_frames += 1
-                    output_path = temporary_dir / _keyed_frame_name(
+                    output_path = temporary_dir / keyed_frame_name(
                         input_path.stem,
                         f"{processed_frames:06d}",
                     )

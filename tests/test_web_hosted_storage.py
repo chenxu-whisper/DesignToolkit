@@ -1697,6 +1697,45 @@ def test_zero_byte_partial_deletion_metadata_is_recoverable(
     assert deletion.generation_id == generation_id
 
 
+@pytest.mark.anyio
+async def test_asset_deletion_checks_fence_inside_rename_lock(
+    tmp_path: Path,
+) -> None:
+    storage = HostedStorage(tmp_path, max_upload_bytes=16)
+    session_id = "a" * 32
+    asset_id = "1" * 32
+    registration = RecordingUploadRegistration()
+    storage.claim_upload_generation(
+        session_id,
+        asset_id,
+        token=registration.token,
+    )
+    asset = await storage.store_stream(
+        session_id,
+        asset_id=asset_id,
+        filename="screen.png",
+        content_length=4,
+        chunks=_chunks(b"data"),
+        reservation=RecordingReservation(),
+        registration=registration,
+    )
+
+    with pytest.raises(ResourceUnavailableError, match="claim expired"):
+        storage.delete_asset(
+            session_id,
+            asset.reference,
+            expected_generation=registration.token,
+            before_rename=lambda: (_ for _ in ()).throw(
+                ResourceUnavailableError("claim expired")
+            ),
+        )
+
+    assert storage.resolve(session_id, asset.reference).read_bytes() == b"data"
+    assert not (
+        tmp_path / "sessions" / session_id / ".trash" / asset_id
+    ).exists()
+
+
 def test_legacy_v1_asset_deletion_without_generation_remains_supported(
     tmp_path: Path,
 ) -> None:

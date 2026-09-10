@@ -1776,6 +1776,17 @@ def create_router(
                         orphan_stale_after_seconds=(
                             resources.upload_registration_ttl_seconds
                         ),
+                        before_rename=(
+                            (
+                                lambda: task_manager.refresh_asset_deletion(
+                                    session_id,
+                                    asset_id,
+                                    claim_token,
+                                )
+                            )
+                            if deletion_heartbeat is not None
+                            else None
+                        ),
                     )
                 )
                 if deletion_heartbeat is not None:

@@ -501,12 +501,6 @@ local token_key = KEYS[3]
 local task_key = KEYS[4]
 local receipt_key = KEYS[5]
 local receipt_ttl_ms = tonumber(ARGV[2])
-if redis.call("HGET", task_key, "output_token") == ARGV[1] then
-    redis.call("HDEL", task_key, "output_token")
-    if redis.call("HEXISTS", task_key, "lease_token") == 0 then
-        redis.call("DEL", task_key)
-    end
-end
 
 local metadata_key = token_key
 if redis.call("EXISTS", receipt_key) == 1 then
@@ -552,6 +546,12 @@ if redis.call("EXISTS", token_key) == 1 then
             ~= redis.call("HGET", metadata_key, field) then
             return 2
         end
+    end
+end
+if redis.call("HGET", task_key, "output_token") == ARGV[1] then
+    redis.call("HDEL", task_key, "output_token")
+    if redis.call("HEXISTS", task_key, "lease_token") == 0 then
+        redis.call("DEL", task_key)
     end
 end
 

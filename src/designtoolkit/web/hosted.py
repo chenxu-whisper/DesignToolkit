@@ -1020,6 +1020,7 @@ class HostedStorage:
         expected_identity: UploadDeletionInspection | None = None,
         cancel_inflight: bool = False,
         orphan_stale_after_seconds: float | None = None,
+        before_rename: Callable[[], None] | None = None,
     ) -> AssetDeletion | None:
         session_id = _validate_session_id(session_id)
         asset_id = _asset_id(reference)
@@ -1122,6 +1123,8 @@ class HostedStorage:
                     )
                     try:
                         _write_asset_deletion(asset_dir, deletion)
+                        if before_rename is not None:
+                            before_rename()
                         asset_dir.replace(tombstone)
                     except OSError:
                         if tombstone.is_dir():
@@ -1162,6 +1165,8 @@ class HostedStorage:
             )
             try:
                 _write_asset_deletion(asset_dir, deletion)
+                if before_rename is not None:
+                    before_rename()
                 asset_dir.replace(tombstone)
             except OSError:
                 if tombstone.is_dir():

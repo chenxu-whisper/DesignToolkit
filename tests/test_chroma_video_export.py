@@ -56,4 +56,5 @@ def test_long_video_stem_uses_portable_output_and_temporary_names(
     assert len(result.output_dir.name.encode("utf-8")) <= 255
     assert len(frame.name.encode("utf-8")) <= 255
     assert len(manifest["pattern"].replace("%06d", "000001").encode("utf-8")) <= 255
+    assert manifest["pattern"].replace("%06d", "000001") == frame.name
     assert not list(tmp_path.glob(".*.tmp"))

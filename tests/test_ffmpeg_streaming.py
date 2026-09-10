@@ -1479,6 +1479,14 @@ def test_video_frame_pattern_bounds_final_component_for_long_stem(
     assert len(first_frame_name.encode("utf-8")) <= 255
 
 
+def test_default_video_frame_directory_bounds_long_stem(tmp_path: Path) -> None:
+    from designtoolkit.video_frames.core import default_output_dir
+
+    output_dir = default_output_dir(tmp_path / f"{'a' * 251}.mp4")
+
+    assert len(output_dir.name.encode("utf-8")) <= 255
+
+
 def test_video_frame_export_uses_guarded_extension_for_primary_and_fallback(
     tmp_path: Path,
 ) -> None:
