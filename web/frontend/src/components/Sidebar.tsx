@@ -8,7 +8,7 @@ type SidebarProps = {
 
 export function Sidebar({ activeModuleId, modules, onModuleSelect }: SidebarProps) {
   return (
-    <nav className="sidebar" aria-label="工具模块">
+    <nav className="sidebar tool-rail" aria-label="工具模块">
       {modules.map((module) => {
         const isActive = module.id === activeModuleId
         const Icon = module.icon

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { type CSSProperties, useEffect, useState } from 'react'
 import { HeaderBar } from '../components/HeaderBar'
 import { LogPanel } from '../components/LogPanel'
 import { Sidebar } from '../components/Sidebar'
@@ -39,8 +39,8 @@ export function AppShell() {
     <div
       className="app-shell"
       style={{
-        gridTemplateRows: `56px minmax(0, 1fr) ${logsCollapsed ? 44 : logHeight}px`,
-      }}
+        '--log-panel-height': `${logsCollapsed ? 44 : logHeight}px`,
+      } as CSSProperties}
     >
       <HeaderBar
         activeModule={activeModule}

@@ -224,7 +224,7 @@ describe('ChromaVideoTimeline', () => {
 
   it('uses explicit overflow-safe containment constraints', () => {
     const stylesheet = document.createElement('style')
-    stylesheet.textContent = readFileSync(resolve('src/styles/app.css'), 'utf8')
+    stylesheet.textContent = readFileSync(resolve('src/styles/modules.css'), 'utf8')
     document.head.append(stylesheet)
     render(<ChromaVideoTimeline {...defaultProps} />)
 
@@ -258,7 +258,7 @@ describe('ChromaVideoTimeline', () => {
     expect(metadata.overflowWrap).toBe('anywhere')
 
     const mobileMediaRule = Array.from(stylesheet.sheet?.cssRules ?? []).find(
-      (rule) => 'conditionText' in rule && rule.conditionText === '(max-width: 760px)',
+      (rule) => 'conditionText' in rule && rule.conditionText === '(max-width: 759px)',
     ) as CSSMediaRule | undefined
     expect(mobileMediaRule).toBeDefined()
     const mobileRules = Array.from(mobileMediaRule?.cssRules ?? [])
