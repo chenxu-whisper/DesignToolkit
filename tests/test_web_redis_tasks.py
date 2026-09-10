@@ -763,6 +763,12 @@ def test_reconcile_preserves_missing_pin_index_for_active_task(
         asset_identities=((asset_id, "2" * 32),),
     )
     redis_connection.delete(f"dt:resource:task-pin:{task.task_id}")
+    task_key = f"dt:task:{task.task_id}"
+    raw_task = redis_connection.get(task_key)
+    assert isinstance(raw_task, bytes)
+    corrupt_task = json.loads(raw_task)
+    corrupt_task["asset_identities"] = [[]]
+    redis_connection.set(task_key, json.dumps(corrupt_task))
 
     manager.reconcile_tasks()
 

@@ -3375,7 +3375,7 @@ class RedisTaskManager:
             return True
         try:
             task = self.get_task(task_id)
-        except (KeyError, TypeError, UnicodeDecodeError, ValueError):
+        except (IndexError, KeyError, TypeError, UnicodeDecodeError, ValueError):
             return True
         if task is not None:
             return task.status in {
