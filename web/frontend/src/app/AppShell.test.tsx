@@ -5,6 +5,7 @@ import type { TaskEvent } from '../services/taskTypes'
 import { useLogStore } from '../state/useLogStore'
 import { useTaskStore } from '../state/useTaskStore'
 import { AppShell } from './AppShell'
+import { ThemeProvider } from './theme/ThemeProvider'
 
 type TaskCreateResponse = {
   task_id: string
@@ -85,6 +86,7 @@ function emitIfOpen(subscription: Subscription, event: TaskEvent): void {
 }
 
 beforeEach(() => {
+  localStorage.clear()
   serviceMocks.createMediaResizeTask.mockReset()
   serviceMocks.createVideoFramesTask.mockReset()
   serviceMocks.getTask.mockReset()
@@ -94,9 +96,17 @@ beforeEach(() => {
   useLogStore.getState().clearEvents()
 })
 
+function renderShell() {
+  return render(
+    <ThemeProvider>
+      <AppShell />
+    </ThemeProvider>,
+  )
+}
+
 describe('AppShell', () => {
   it('opens directly into the tool console shell', () => {
-    render(<AppShell />)
+    renderShell()
 
     expect(screen.getByText('DesignToolkit')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: '视频转序列' })).toBeInTheDocument()
@@ -107,7 +117,7 @@ describe('AppShell', () => {
   it('opens 色键抠图 from the navigation', async () => {
     const user = userEvent.setup()
 
-    render(<AppShell />)
+    renderShell()
 
     await user.click(screen.getByRole('button', { name: '色键抠图' }))
 
@@ -117,7 +127,7 @@ describe('AppShell', () => {
   it('marks the selected tool as current in the navigation', async () => {
     const user = userEvent.setup()
 
-    render(<AppShell />)
+    renderShell()
 
     const videoFramesButton = screen.getByRole('button', { name: '视频转序列' })
     const resizeMediaButton = screen.getByRole('button', { name: '媒体尺寸修改' })
@@ -132,11 +142,42 @@ describe('AppShell', () => {
     expect(screen.getByRole('navigation', { name: '工具模块' })).toContainElement(resizeMediaButton)
   })
 
+  it('shows the active module in the command bar', async () => {
+    const user = userEvent.setup()
+
+    renderShell()
+
+    expect(screen.getByRole('banner')).toHaveTextContent('视频转序列')
+    await user.click(screen.getByRole('button', { name: '媒体尺寸修改' }))
+    expect(screen.getByRole('banner')).toHaveTextContent('媒体尺寸修改')
+  })
+
+  it('changes theme from the command bar', async () => {
+    const user = userEvent.setup()
+
+    renderShell()
+
+    await user.click(screen.getByRole('button', { name: '主题设置' }))
+    await user.click(screen.getByRole('menuitemradio', { name: '深色' }))
+
+    expect(document.documentElement).toHaveAttribute('data-theme', 'dark')
+  })
+
+  it('renders an icon and tooltip for every tool', () => {
+    renderShell()
+
+    for (const name of ['视频转序列', '媒体尺寸修改', '色键抠图']) {
+      const button = screen.getByRole('button', { name })
+      expect(button).toHaveAttribute('title')
+      expect(button.querySelector('svg')).toBeInTheDocument()
+    }
+  })
+
   it('continues handling terminal task events after switching modules', async () => {
     const user = userEvent.setup()
     serviceMocks.createVideoFramesTask.mockResolvedValue({ task_id: 'task-1', status: 'queued' })
 
-    render(<AppShell />)
+    renderShell()
 
     await user.type(screen.getByLabelText('输入视频路径'), 'clip.webm')
     await user.click(screen.getByRole('button', { name: '开始导出' }))
@@ -160,7 +201,7 @@ describe('AppShell', () => {
     const videoFramesRequest = createDeferred<TaskCreateResponse>()
     serviceMocks.createVideoFramesTask.mockReturnValue(videoFramesRequest.promise)
 
-    render(<AppShell />)
+    renderShell()
 
     await user.type(screen.getByLabelText('输入视频路径'), 'clip.webm')
     const videoSubmitButton = screen.getByRole('button', { name: '开始导出' })
@@ -189,7 +230,7 @@ describe('AppShell', () => {
     serviceMocks.createVideoFramesTask.mockResolvedValue({ task_id: 'task-1', status: 'queued' })
     serviceMocks.getTask.mockResolvedValue(makeTaskResponse({ status: 'running' }))
 
-    render(<AppShell />)
+    renderShell()
 
     await user.type(screen.getByLabelText('输入视频路径'), 'clip.webm')
     await user.click(screen.getByRole('button', { name: '开始导出' }))
@@ -216,7 +257,7 @@ describe('AppShell', () => {
       }),
     )
 
-    render(<AppShell />)
+    renderShell()
 
     await user.type(screen.getByLabelText('输入视频路径'), 'clip.webm')
     await user.click(screen.getByRole('button', { name: '开始导出' }))

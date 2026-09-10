@@ -26,6 +26,9 @@ function readPreference(): ThemePreference {
 }
 
 function resolveSystemTheme(): ResolvedTheme {
+  if (typeof window.matchMedia !== 'function') {
+    return 'light'
+  }
   return window.matchMedia(DARK_QUERY).matches ? 'dark' : 'light'
 }
 
@@ -36,6 +39,9 @@ export function ThemeProvider({ children }: PropsWithChildren) {
 
   useEffect(() => {
     if (preference !== 'system') {
+      return
+    }
+    if (typeof window.matchMedia !== 'function') {
       return
     }
 

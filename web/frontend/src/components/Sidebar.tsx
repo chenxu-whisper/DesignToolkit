@@ -11,6 +11,7 @@ export function Sidebar({ activeModuleId, modules, onModuleSelect }: SidebarProp
     <nav className="sidebar" aria-label="工具模块">
       {modules.map((module) => {
         const isActive = module.id === activeModuleId
+        const Icon = module.icon
 
         return (
           <button
@@ -18,9 +19,11 @@ export function Sidebar({ activeModuleId, modules, onModuleSelect }: SidebarProp
             className={isActive ? 'nav-item nav-item-active' : 'nav-item'}
             key={module.id}
             onClick={() => onModuleSelect(module.id)}
+            title={module.description}
             type="button"
           >
-            {module.label}
+            <Icon aria-hidden="true" className="nav-item-icon" size={19} />
+            <span className="nav-item-label">{module.label}</span>
           </button>
         )
       })}

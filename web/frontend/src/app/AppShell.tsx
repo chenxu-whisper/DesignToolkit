@@ -8,12 +8,17 @@ import type { ModuleId } from './types'
 
 export function AppShell() {
   const [activeModuleId, setActiveModuleId] = useState<ModuleId>('video_frames')
+  const [logsCollapsed, setLogsCollapsed] = useState(false)
   const activeModule = toolModules.find((item) => item.id === activeModuleId) ?? toolModules[0]
   const ActiveComponent = activeModule.component
 
   return (
     <div className="app-shell">
-      <HeaderBar />
+      <HeaderBar
+        activeModule={activeModule}
+        logsCollapsed={logsCollapsed}
+        onToggleLogs={() => setLogsCollapsed((current) => !current)}
+      />
       <TaskEventController />
       <Sidebar activeModuleId={activeModuleId} modules={toolModules} onModuleSelect={setActiveModuleId} />
       <main className="workspace">
