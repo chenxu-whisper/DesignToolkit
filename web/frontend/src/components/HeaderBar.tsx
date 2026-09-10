@@ -86,6 +86,9 @@ export function HeaderBar({
       event.preventDefault()
       closeThemeMenu()
       return
+    } else if (event.key === 'Tab') {
+      setThemeMenuOpen(false)
+      return
     }
 
     if (nextIndex !== null) {

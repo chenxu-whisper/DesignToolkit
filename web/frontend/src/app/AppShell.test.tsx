@@ -189,6 +189,19 @@ describe('AppShell', () => {
     expect(trigger).toHaveFocus()
   })
 
+  it('closes the theme menu when Tab moves focus away', async () => {
+    const user = userEvent.setup()
+
+    renderShell()
+
+    await user.click(screen.getByRole('button', { name: '主题设置' }))
+    expect(screen.getByRole('menu', { name: '主题设置' })).toBeInTheDocument()
+
+    await user.keyboard('{Tab}')
+
+    expect(screen.queryByRole('menu', { name: '主题设置' })).not.toBeInTheDocument()
+  })
+
   it('clamps a persisted log height and reclamps after viewport resize', async () => {
     localStorage.setItem('designtoolkit-log-collapsed', 'false')
     localStorage.setItem('designtoolkit-log-height', '5000')
