@@ -164,8 +164,12 @@ export function ChromaKeyerForm({
             )
           })}
         </div>
+      </div>
+
+      <div className="chroma-form-section">
+        <h2 className="chroma-section-title">预览</h2>
         <fieldset className="chroma-view-mode" disabled={disabled}>
-          <legend>预览</legend>
+          <legend>通道</legend>
           <label className="choice">
             <input
               checked={values.viewMode === 'final'}
@@ -189,45 +193,52 @@ export function ChromaKeyerForm({
         </fieldset>
       </div>
 
-      {hostedMode ? null : values.mediaKind === 'video' ? (
-        <PathInput
-          disabled={disabled}
-          error={errors.outputRoot}
-          id="chroma-keyer-output-root"
-          label="输出根目录（可选）"
-          onChange={(value) => updateValue('outputRoot', value)}
-          pickPaths={async () => {
-            const response = await pickLocalDirectory({ title: '选择 PNG 序列输出根目录' })
-            return response.paths
-          }}
-          placeholder="留空时在视频旁创建序列目录"
-          value={values.outputRoot}
-        />
-      ) : (
-        <PathInput
-          disabled={disabled}
-          error={errors.outputPath}
-          id="chroma-keyer-output-path"
-          label="输出路径（可选）"
-          onChange={(value) => updateValue('outputPath', value)}
-          pickPaths={async () => {
-            const response = await pickLocalSaveFile({
-              fileKind: 'image',
-              title: '选择 PNG 输出路径',
-            })
-            return response.paths
-          }}
-          placeholder="留空时自动生成 _keyed.png"
-          value={values.outputPath}
-        />
+      {hostedMode ? null : (
+        <div className="chroma-form-section">
+          <h2 className="chroma-section-title">输出</h2>
+          {values.mediaKind === 'video' ? (
+            <PathInput
+              disabled={disabled}
+              error={errors.outputRoot}
+              id="chroma-keyer-output-root"
+              label="输出根目录（可选）"
+              onChange={(value) => updateValue('outputRoot', value)}
+              pickPaths={async () => {
+                const response = await pickLocalDirectory({ title: '选择 PNG 序列输出根目录' })
+                return response.paths
+              }}
+              placeholder="留空时在视频旁创建序列目录"
+              value={values.outputRoot}
+            />
+          ) : (
+            <PathInput
+              disabled={disabled}
+              error={errors.outputPath}
+              id="chroma-keyer-output-path"
+              label="输出路径（可选）"
+              onChange={(value) => updateValue('outputPath', value)}
+              pickPaths={async () => {
+                const response = await pickLocalSaveFile({
+                  fileKind: 'image',
+                  title: '选择 PNG 输出路径',
+                })
+                return response.paths
+              }}
+              placeholder="留空时自动生成 _keyed.png"
+              value={values.outputPath}
+            />
+          )}
+        </div>
       )}
-      <button
-        className="submit-button"
-        disabled={disabled || isUploadPending || values.samples.length === 0}
-        type="submit"
-      >
-        {values.mediaKind === 'video' ? '导出 PNG 序列' : '导出 PNG'}
-      </button>
+      <div className="chroma-inspector-footer">
+        <button
+          className="submit-button"
+          disabled={disabled || isUploadPending || values.samples.length === 0}
+          type="submit"
+        >
+          {values.mediaKind === 'video' ? '导出 PNG 序列' : '导出 PNG'}
+        </button>
+      </div>
     </form>
   )
 }

@@ -4,6 +4,7 @@ import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { useLogStore } from '../../state/useLogStore'
 import { useTaskStore } from '../../state/useTaskStore'
+import { installMatchMedia } from '../../test/matchMedia'
 import { ChromaKeyerPage } from './ChromaKeyerPage'
 
 type PlaybackHook = typeof import('./useChromaVideoPlayback')['useChromaVideoPlayback']
@@ -120,6 +121,7 @@ async function inspectVideo() {
 }
 
 beforeEach(() => {
+  installMatchMedia(false)
   playbackHookControl.implementation = null
   pageMocks.createChromaKeyerTask.mockReset()
   pageMocks.createChromaPreview.mockReset()
@@ -175,6 +177,16 @@ afterEach(() => {
 })
 
 describe('ChromaKeyerPage', () => {
+  it('opens the parameter inspector on compact screens', async () => {
+    installMatchMedia(true)
+    const user = renderWithUser()
+
+    await user.click(screen.getByRole('button', { name: '打开参数检查器' }))
+
+    expect(screen.getByRole('dialog', { name: '色键参数' })).toHaveAttribute('open')
+    expect(screen.getByLabelText('Screen Gain 数值')).toBeInTheDocument()
+  })
+
   it('automatically inspects the exact path selected by the native picker', async () => {
     const user = renderWithUser()
 

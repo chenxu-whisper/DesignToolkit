@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
-import { Eraser, Pipette, Trash2 } from 'lucide-react'
+import { Eraser, Pipette, SlidersHorizontal, Trash2 } from 'lucide-react'
 import { hostedMode } from '../../app/runtimeConfig'
+import { useMediaQuery } from '../../app/useMediaQuery'
 import { TaskResult } from '../../components/TaskResult'
 import {
   createChromaKeyerTask,
@@ -22,6 +23,7 @@ import { useTaskStore } from '../../state/useTaskStore'
 import { ChromaKeyerCanvas, type ChromaCanvasSample } from './ChromaKeyerCanvas'
 import { createChromaKeyerDefaultValues } from './chromaKeyerDefaults'
 import { ChromaKeyerForm } from './ChromaKeyerForm'
+import { ChromaInspector } from './ChromaInspector'
 import { ChromaVideoTimeline, getLastVideoFrameTime } from './ChromaVideoTimeline'
 import { useChromaVideoPlayback } from './useChromaVideoPlayback'
 import {
@@ -119,7 +121,10 @@ export function ChromaKeyerPage() {
   const [exportError, setExportError] = useState<string | null>(null)
   const [isRequestPending, setIsRequestPending] = useState(false)
   const [isUploadPending, setIsUploadPending] = useState(false)
+  const [inspectorOpen, setInspectorOpen] = useState(false)
   const [renderedTimestampSeconds, setRenderedTimestampSeconds] = useState<number | null>(null)
+  const compactInspector = useMediaQuery('(max-width: 1179px)')
+  const inspectorTriggerRef = useRef<HTMLButtonElement>(null)
   const mountedRef = useRef(true)
   const inspectingPathRef = useRef<string | null>(null)
   const uploadPendingRef = useRef(false)
@@ -871,11 +876,23 @@ export function ChromaKeyerPage() {
 
   return (
     <section className="module-surface chroma-keyer-surface" aria-labelledby="chroma-keyer-title">
-      <div className="module-header">
+      <div className="module-header chroma-module-header">
         <h1 id="chroma-keyer-title">
           <Pipette aria-hidden="true" size={22} />
           色键抠图
         </h1>
+        {compactInspector ? (
+          <button
+            aria-haspopup="dialog"
+            className="secondary-action-button chroma-inspector-trigger"
+            onClick={() => setInspectorOpen(true)}
+            ref={inspectorTriggerRef}
+            type="button"
+          >
+            <SlidersHorizontal aria-hidden="true" size={17} />
+            打开参数检查器
+          </button>
+        ) : null}
         {showOutcome && status === 'succeeded' && resultPath ? (
           <TaskResult hosted={hostedMode} value={resultPath} />
         ) : null}
@@ -891,7 +908,7 @@ export function ChromaKeyerPage() {
         ) : null}
       </div>
 
-      <div className="chroma-editor">
+      <div className="chroma-editor chroma-workbench">
         <div className="chroma-editor-main">
           {media && previewUrl ? (
             <ChromaKeyerCanvas
@@ -975,16 +992,23 @@ export function ChromaKeyerPage() {
             ))}
           </ol>
         </div>
-        <ChromaKeyerForm
-          disabled={disabled}
-          errors={errors}
-          isUploadPending={isUploadPending}
-          onChange={updateValues}
-          onInputPathCommit={(path) => void handleInspect(path)}
-          onSubmit={() => void handleSubmit()}
-          onUploadPendingChange={handleUploadPendingChange}
-          values={values}
-        />
+        <ChromaInspector
+          compact={compactInspector}
+          onOpenChange={setInspectorOpen}
+          open={inspectorOpen}
+          triggerRef={inspectorTriggerRef}
+        >
+          <ChromaKeyerForm
+            disabled={disabled}
+            errors={errors}
+            isUploadPending={isUploadPending}
+            onChange={updateValues}
+            onInputPathCommit={(path) => void handleInspect(path)}
+            onSubmit={() => void handleSubmit()}
+            onUploadPendingChange={handleUploadPendingChange}
+            values={values}
+          />
+        </ChromaInspector>
       </div>
     </section>
   )

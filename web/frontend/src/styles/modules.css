@@ -8,6 +8,16 @@
   max-width: none;
 }
 
+.chroma-module-header {
+  align-items: center;
+  flex-direction: row;
+  justify-content: space-between;
+}
+
+.chroma-inspector-trigger {
+  display: none;
+}
+
 .chroma-editor {
   align-items: start;
   display: grid;
@@ -16,8 +26,30 @@
 }
 
 .chroma-editor-main,
+.chroma-inspector,
 .chroma-keyer-form {
   min-width: 0;
+}
+
+.chroma-inspector {
+  background: var(--surface-panel);
+  border-left: 1px solid var(--border-subtle);
+  max-height: calc(100dvh - 52px - var(--log-panel-height) - 48px);
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.chroma-inspector-heading {
+  align-items: center;
+  border-bottom: 1px solid var(--border-subtle);
+  display: flex;
+  justify-content: space-between;
+  padding: var(--space-3) var(--space-4);
+}
+
+.chroma-inspector-heading h2 {
+  font-size: 14px;
+  margin: 0;
 }
 
 .chroma-editor-main {
@@ -27,14 +59,11 @@
 }
 
 .chroma-keyer-form {
-  background: var(--surface-panel);
-  border-left: 1px solid var(--border-subtle);
+  background: transparent;
   display: flex;
   flex-direction: column;
   gap: var(--space-4);
-  max-height: calc(100dvh - 52px - var(--log-panel-height) - 48px);
   min-height: 0;
-  overflow-y: auto;
   padding: 0 0 var(--space-5) var(--space-5);
 }
 
@@ -44,6 +73,18 @@
   flex-direction: column;
   gap: var(--space-3);
   padding-bottom: var(--space-4);
+}
+
+.chroma-inspector-footer {
+  background: var(--surface-panel);
+  bottom: 0;
+  margin-top: auto;
+  padding-top: var(--space-2);
+  position: sticky;
+}
+
+.chroma-inspector-footer .submit-button {
+  width: 100%;
 }
 
 .chroma-section-title {
@@ -322,10 +363,40 @@
     grid-template-columns: minmax(0, 1fr);
   }
 
+  .chroma-inspector-trigger {
+    display: inline-flex;
+  }
+
+  .chroma-inspector-dialog {
+    background: var(--surface-panel);
+    border: 0;
+    border-left: 1px solid var(--border-subtle);
+    box-shadow: var(--shadow-lg);
+    color: var(--text-primary);
+    height: 100dvh;
+    inset: 0 0 0 auto;
+    margin: 0;
+    max-height: 100dvh;
+    max-width: min(420px, 92vw);
+    padding: 0;
+    width: min(420px, 92vw);
+  }
+
+  .chroma-inspector-dialog[open] {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .chroma-inspector-dialog::backdrop {
+    background: var(--surface-overlay);
+  }
+
   .chroma-keyer-form {
     border-left: 0;
+    flex: 1;
     max-height: none;
-    padding-left: 0;
+    overflow-y: auto;
+    padding: var(--space-4);
   }
 }
 
@@ -341,6 +412,19 @@
 
   .chroma-empty-preview {
     min-height: 220px;
+  }
+
+  .chroma-inspector-dialog {
+    border: 0;
+    height: 100dvh;
+    inset: 0;
+    max-height: 100dvh;
+    max-width: none;
+    padding-bottom: env(safe-area-inset-bottom);
+    padding-left: env(safe-area-inset-left);
+    padding-right: env(safe-area-inset-right);
+    padding-top: env(safe-area-inset-top);
+    width: 100vw;
   }
 
   .chroma-video-timeline-controls {
