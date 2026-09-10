@@ -254,6 +254,54 @@ class _AssetReadPinHeartbeat:
                 return
 
 
+class _AssetDeletionHeartbeat:
+    def __init__(
+        self,
+        refresh: Callable[[], None],
+        interval: float,
+        stop_timeout: float,
+    ) -> None:
+        self._refresh = refresh
+        self._interval = interval
+        self._stop_timeout = stop_timeout
+        self._stopped = Event()
+        self._failure: BaseException | None = None
+        self._thread = Thread(target=self._run, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        try:
+            stop_heartbeat_thread(
+                self._stopped,
+                self._thread,
+                timeout=self._stop_timeout,
+                heartbeat_name="Asset deletion claim heartbeat",
+            )
+        except HeartbeatStopTimeoutError as exc:
+            self._failure = exc
+            raise
+
+    def raise_if_failed(self) -> None:
+        if self._failure is not None:
+            raise self._failure
+
+    @property
+    def quiesced(self) -> bool:
+        return not self._thread.is_alive()
+
+    def _run(self) -> None:
+        while not self._stopped.wait(self._interval):
+            if self._stopped.is_set():
+                return
+            try:
+                self._refresh()
+            except BaseException as exc:
+                self._failure = exc
+                return
+
+
 @dataclass
 class _HostedSessionOperation:
     lease: RedisSessionLease | None = None
@@ -1650,6 +1698,7 @@ def create_router(
         operation = http_request.state.hosted_session_operation
         session_id = http_request.state.session_id
         deletion_claim: str | None = None
+        deletion_heartbeat: _AssetDeletionHeartbeat | None = None
         release_generation: str | None = None
         try:
             deletion_identity = storage.inspect_upload_for_deletion(
@@ -1681,6 +1730,17 @@ def create_router(
                         asset_id,
                     )
                 )
+                claim_token = deletion_claim
+                deletion_heartbeat = _AssetDeletionHeartbeat(
+                    lambda: task_manager.refresh_asset_deletion(
+                        session_id,
+                        asset_id,
+                        claim_token,
+                    ),
+                    task_manager.asset_deletion_heartbeat_interval,
+                    task_manager.heartbeat_stop_timeout_seconds,
+                )
+                deletion_heartbeat.start()
             recovered_deletion = False
             try:
                 deletion = operation.commit(
@@ -1695,6 +1755,8 @@ def create_router(
                         ),
                     )
                 )
+                if deletion_heartbeat is not None:
+                    deletion_heartbeat.raise_if_failed()
             except AssetDeletionStateError as exc:
                 invalid_asset_id = exc.asset_id
                 if effective_generation is not None:
@@ -1778,6 +1840,9 @@ def create_router(
                         release_generation,
                     )
                 )
+            if deletion_heartbeat is not None:
+                deletion_heartbeat.stop()
+                deletion_heartbeat.raise_if_failed()
         except UploadRejectedError as exc:
             raise ApiError("asset_not_found", str(exc), 404) from exc
         except AssetReleaseMismatchError as exc:
@@ -1797,6 +1862,14 @@ def create_router(
                 503,
             ) from exc
         finally:
+            if deletion_heartbeat is not None and not deletion_heartbeat.quiesced:
+                try:
+                    deletion_heartbeat.stop()
+                except BaseException:
+                    _LOGGER.warning(
+                        "Failed to stop asset deletion claim heartbeat",
+                        exc_info=True,
+                    )
             if deletion_claim is not None and isinstance(
                 task_manager,
                 RedisTaskManager,

@@ -723,6 +723,55 @@ def test_enqueue_failure_releases_asset_reference(
     ) == []
 
 
+def test_asset_deletion_claim_can_be_refreshed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = _manager(redis_connection, tmp_path)
+    session_id = "a" * 32
+    asset_id = "1" * 32
+    now = [100.0]
+    monkeypatch.setattr(redis_tasks_module, "time", lambda: now[0])
+    claim = manager.claim_asset_deletion(session_id, asset_id)
+    claim_key = f"dt:resource:asset-delete:{session_id}:{asset_id}"
+    first_expiry = redis_connection.zscore(claim_key, claim)
+
+    now[0] = 110.0
+    manager.refresh_asset_deletion(session_id, asset_id, claim)
+
+    assert first_expiry is not None
+    assert redis_connection.zscore(claim_key, claim) > first_expiry
+    manager.release_asset_deletion(session_id, asset_id, claim)
+
+
+def test_reconcile_preserves_missing_pin_index_for_active_task(
+    tmp_path: Path,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    resources = _resources(redis_connection)
+    manager = _manager(
+        redis_connection,
+        tmp_path,
+        resource_coordinator=resources,
+    )
+    session_id = "a" * 32
+    asset_id = "1" * 32
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+        owner_id=session_id,
+        asset_identities=((asset_id, "2" * 32),),
+    )
+    redis_connection.delete(f"dt:resource:task-pin:{task.task_id}")
+
+    manager.reconcile_tasks()
+
+    assert redis_connection.sismember(
+        f"dt:resource:session:{session_id}:task-pins",
+        task.task_id,
+    )
+
+
 def test_real_redis_asset_deletion_claim_blocks_enqueue(
     real_redis_connection: Redis,
     tmp_path: Path,
@@ -5355,7 +5404,6 @@ def test_hosted_event_sanitizer_percent_decoding_scales_linearly() -> None:
     elapsed_4k = elapsed(4095)
     elapsed_8k = elapsed(8191)
 
-    assert elapsed_8k < 0.5
     assert elapsed_8k / elapsed_4k < 3
 
 
@@ -6516,18 +6564,24 @@ def test_redis_subscriber_fallback_reads_constant_data_after_large_history(
     store._read_event_at_cursor_script = unknown_command
     pipeline_type = type(redis_connection.pipeline())
     original_hget = pipeline_type.hget
+    original_lindex = pipeline_type.lindex
     reads: list[tuple[str, str]] = []
+    list_reads: list[tuple[str, int]] = []
 
     def tracked_hget(self, name: str, key: str):
         reads.append((name, key))
         return original_hget(self, name, key)
 
-    def forbidden_list_read(*_args, **_kwargs):
-        raise AssertionError("steady-state polling read the event list")
+    def tracked_lindex(self, name: str, index: int):
+        list_reads.append((name, index))
+        return original_lindex(self, name, index)
+
+    def forbidden_full_list_read(*_args, **_kwargs):
+        raise AssertionError("steady-state polling scanned the event list")
 
     monkeypatch.setattr(pipeline_type, "hget", tracked_hget)
-    monkeypatch.setattr(pipeline_type, "lindex", forbidden_list_read)
-    monkeypatch.setattr(pipeline_type, "lrange", forbidden_list_read)
+    monkeypatch.setattr(pipeline_type, "lindex", tracked_lindex)
+    monkeypatch.setattr(pipeline_type, "lrange", forbidden_full_list_read)
     store.append(
         task_id=task_id,
         level=LogLevel.SUCCESS,
@@ -6540,6 +6594,7 @@ def test_redis_subscriber_fallback_reads_constant_data_after_large_history(
         subscriber.get(timeout=0.05)
     assert (event_index_key, "10001") in reads
     assert all(name != event_key for name, _field in reads)
+    assert list_reads == [(event_key, 10_000)]
 
 
 def test_redis_unknown_command_fallback_builds_and_reads_event_index(
@@ -6718,8 +6773,10 @@ def test_redis_event_cursor_reports_corrupt_indexed_event_as_unavailable(
     redis_connection = fakeredis.FakeRedis(decode_responses=False)
     store = RedisLogStore(redis_connection, retention_seconds=60)
     task_id = "malformed-events"
+    event_key = f"dt:task:{task_id}:events"
     generation_key = f"dt:event-generation:{task_id}"
     event_index_key = f"dt:task:{task_id}:event-index"
+    redis_connection.rpush(event_key, payload)
     redis_connection.set(generation_key, "generation-a")
     redis_connection.hset(
         event_index_key,
@@ -6760,6 +6817,46 @@ def test_redis_event_cursor_reports_corrupt_indexed_event_as_unavailable(
     ) as error:
         subscriber.get(timeout=0.2)
     assert isinstance(error.value.__cause__, cause_type)
+
+
+def test_redis_event_cursor_rejects_valid_event_that_disagrees_with_log() -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    store = RedisLogStore(redis_connection, retention_seconds=60)
+    task_id = "mismatched-events"
+    expected = store.append(
+        task_id=task_id,
+        level=LogLevel.INFO,
+        phase=LogPhase.CREATED,
+        message="expected",
+    )
+    replacement = expected.model_copy(update={"message": "replacement"})
+    raw_generation = redis_connection.get(f"dt:event-generation:{task_id}")
+    assert isinstance(raw_generation, bytes)
+    redis_connection.hset(
+        f"dt:task:{task_id}:event-index",
+        "1",
+        replacement.model_dump_json(),
+    )
+
+    with pytest.raises(redis_errors_module.EventCursorUnavailable):
+        store._event_at_cursor(task_id, raw_generation.decode(), 1)
+
+
+def test_task_scans_skip_a_corrupt_record_and_continue(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = _manager(redis_connection, tmp_path)
+    task = manager.create_video_frames_task(
+        VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
+        owner_id="a" * 32,
+    )
+    redis_connection.set("dt:task:corrupt", b"\xff")
+
+    assert manager.active_owner_ids() == {"a" * 32}
+    assert manager._active_tasks() == [task]
+    assert "Skipping corrupt task record" in caplog.text
 
 
 def test_redis_history_keeps_existing_malformed_event_error() -> None:

@@ -47,6 +47,9 @@ _RESERVATION_RECOVERY_ATTEMPTS = 3
 _REDIS_TRANSPORT_ERRORS = (RedisConnectionError, RedisTimeoutError)
 
 _REGISTER_UPLOAD_SCRIPT = """-- register_upload
+if redis.call("EXISTS", KEYS[5]) == 1 then
+    return 5
+end
 if redis.call("EXISTS", KEYS[1]) == 1 then
     if redis.call("HGET", KEYS[1], "token") ~= ARGV[1] then
         return 1
@@ -515,6 +518,10 @@ if redis.call("EXISTS", receipt_key) == 1 then
 elseif redis.call("EXISTS", token_key) == 0 then
     return 0
 end
+if redis.call("HGET", metadata_key, "kind") ~= ARGV[3]
+    or redis.call("HGET", metadata_key, "owner_id") ~= ARGV[4] then
+    return 2
+end
 
 local kind = redis.call("HGET", metadata_key, "kind")
 local session_id = redis.call("HGET", metadata_key, "session_id")
@@ -957,30 +964,40 @@ for index = 1, #entries, 2 do
     local token = entries[index]
     local metadata = entries[index + 1]
     if redis.call("EXISTS", token_prefix .. token) == 0 then
-        local kind, session_id, byte_text = string.match(
-            metadata,
-            "^([^|]+)|([^|]+)|(%d+)"
-        )
-        if kind then
-            local reserved_bytes = tonumber(byte_text)
-            decrement("reserved_bytes", reserved_bytes)
-            if kind == "upload" then
-                decrement("upload_count", 1)
-                decrement(
-                    "session:" .. session_id .. ":reserved_bytes",
-                    reserved_bytes
-                )
-            elseif kind == "output" then
-                decrement("output_reserved_bytes", reserved_bytes)
-            end
-            local receipt_key = receipt_prefix .. token
-            if redis.call("HGET", receipt_key, "state") == "reserved" then
+        local receipt_key = receipt_prefix .. token
+        local receipt_state = redis.call("HGET", receipt_key, "state")
+        if receipt_state == "reserved" then
+            local kind = redis.call("HGET", receipt_key, "kind")
+            local session_id = redis.call("HGET", receipt_key, "session_id")
+            local byte_text = redis.call("HGET", receipt_key, "bytes")
+            local free_bytes = redis.call("HGET", receipt_key, "free_bytes")
+            local min_free_bytes = redis.call("HGET", receipt_key, "min_free_bytes")
+            if kind and session_id and byte_text and free_bytes
+                and min_free_bytes then
+                local expected_metadata = kind .. "|" .. session_id .. "|" ..
+                    byte_text .. "|" .. free_bytes .. "|" .. min_free_bytes
+                if metadata == expected_metadata then
+                local reserved_bytes = tonumber(byte_text)
+                decrement("reserved_bytes", reserved_bytes)
+                if kind == "upload" then
+                    decrement("upload_count", 1)
+                    decrement(
+                        "session:" .. session_id .. ":reserved_bytes",
+                        reserved_bytes
+                    )
+                elseif kind == "output" then
+                    decrement("output_reserved_bytes", reserved_bytes)
+                end
                 redis.call("HSET", receipt_key, "state", "expired")
                 redis.call("PEXPIRE", receipt_key, receipt_ttl_ms)
+                redis.call("HDEL", index_key, token)
+                removed = removed + 1
+                end
             end
+        elseif receipt_state then
+            redis.call("HDEL", index_key, token)
+            removed = removed + 1
         end
-        redis.call("HDEL", index_key, token)
-        removed = removed + 1
     end
 end
 
@@ -1793,15 +1810,6 @@ if tonumber(redis.call("HGET", state_key, "active_count") or "0") ~= 0 then
     return 1
 end
 
-local task_ids = redis.call("SMEMBERS", task_pins_key)
-for _, task_id in ipairs(task_ids) do
-    local pin_key = task_pin_prefix .. task_id
-    if redis.call("EXISTS", pin_key) == 0 then
-        redis.call("SREM", task_pins_key, task_id)
-    elseif redis.call("HGET", pin_key, "session_id") ~= session_id then
-        redis.call("SREM", task_pins_key, task_id)
-    end
-end
 if redis.call("SCARD", task_pins_key) ~= 0 then
     return 1
 end
@@ -2291,6 +2299,11 @@ class RedisResourceCoordinator:
                             _released_asset_key(session_id, upload_id),
                             _session_released_assets_key(session_id),
                             _pending_asset_release_key(session_id, upload_id),
+                            _released_upload_generation_key(
+                                session_id,
+                                upload_id,
+                                token,
+                            ),
                         ],
                         args=[
                             token,
@@ -2309,6 +2322,10 @@ class RedisResourceCoordinator:
                 raise ResourceUnavailableError("Upload deletion is still pending")
             if result == 4:
                 raise ResourceUnavailableError("Upload release marker is invalid")
+            if result == 5:
+                raise ResourceUnavailableError(
+                    "Upload generation has already been used"
+                )
             return registration
         if last_transport_error is None:
             raise RuntimeError("Upload registration recovery lost its error")
@@ -3317,6 +3334,8 @@ class RedisResourceCoordinator:
                 args=[
                     reservation.token,
                     self._reservation_receipt_ttl_ms,
+                    reservation.kind,
+                    reservation.owner_id,
                 ],
             )
         )
@@ -3595,15 +3614,15 @@ def _task_pin_release_receipt_matches(
 ) -> bool:
     try:
         metadata = redis_connection.hgetall(receipt_key)
-    except ResponseError:
+        return _task_pin_release_metadata_matches(
+            metadata,
+            task_id=task_id,
+            session_id=session_id,
+            identities_json=identities_json,
+            asset_ids_json=asset_ids_json,
+        )
+    except (ResponseError, UnicodeDecodeError):
         return False
-    return _task_pin_release_metadata_matches(
-        metadata,
-        task_id=task_id,
-        session_id=session_id,
-        identities_json=identities_json,
-        asset_ids_json=asset_ids_json,
-    )
 
 
 def _release_task_pin_without_lua(

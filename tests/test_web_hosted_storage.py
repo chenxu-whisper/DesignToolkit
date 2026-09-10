@@ -1671,6 +1671,32 @@ async def test_generation_bound_deletion_is_idempotent_for_same_tombstone(
     assert stale is None
 
 
+def test_zero_byte_partial_deletion_metadata_is_recoverable(
+    tmp_path: Path,
+) -> None:
+    asset_id = "1" * 32
+    generation_id = "2" * 32
+    tombstone = tmp_path / asset_id
+    tombstone.mkdir()
+    (tombstone / ".deletion.json").write_text(
+        json.dumps(
+            {
+                "asset_id": asset_id,
+                "reference": f"asset:{asset_id}",
+                "bytes": 0,
+                "generation_id": generation_id,
+                "generation_required": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    deletion = hosted_module._read_asset_deletion(tombstone, asset_id)
+
+    assert deletion.size == 0
+    assert deletion.generation_id == generation_id
+
+
 def test_legacy_v1_asset_deletion_without_generation_remains_supported(
     tmp_path: Path,
 ) -> None:

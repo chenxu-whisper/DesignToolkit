@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Callable, Iterable, Iterator
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -71,12 +72,14 @@ from designtoolkit.web.tasks import TaskConflictError, TaskRecord
 if TYPE_CHECKING:
     from designtoolkit.web.resources import RedisResourceCoordinator
 
+_LOGGER = logging.getLogger(__name__)
 _QUEUE_NAME = "designtoolkit"
 _UNCERTAIN_ENQUEUE_ERROR = "Task enqueue could not be confirmed"
 _ENQUEUE_INTENT_TTL_SECONDS = 60.0
 _ENQUEUE_INTENT_HEARTBEAT_SECONDS = 10.0
 _ASSET_DELETE_PREFIX = "dt:resource:asset-delete:"
 _ASSET_DELETE_TTL_MS = 60_000
+_ASSET_DELETE_HEARTBEAT_SECONDS = 10.0
 _ASSET_READ_PIN_PREFIX = "dt:resource:asset-read-pin:"
 _ASSET_READERS_PREFIX = "dt:resource:asset-readers:"
 _ASSET_READ_PIN_TTL_SECONDS = 60.0
@@ -189,6 +192,14 @@ local event = false
 if expected_sequence <= indexed_sequence then
     event = redis.call("HGET", KEYS[3], tostring(expected_sequence))
     if not event then
+        return {"unavailable", generation, false, ARGV[2]}
+    end
+    local authoritative_event = redis.call(
+        "LINDEX",
+        KEYS[1],
+        expected_sequence - 1
+    )
+    if not authoritative_event or authoritative_event ~= event then
         return {"unavailable", generation, false, ARGV[2]}
     end
 end
@@ -486,6 +497,17 @@ if redis.call("ZCARD", KEYS[1]) == 0 then
     redis.call("DEL", KEYS[1])
 end
 return removed
+"""
+_REFRESH_ASSET_DELETION_SCRIPT = """-- refresh_asset_deletion
+local redis_time = redis.call("TIME")
+local now_ms = redis_time[1] * 1000 + math.floor(redis_time[2] / 1000)
+local expires_at = redis.call("ZSCORE", KEYS[1], ARGV[1])
+if not expires_at or tonumber(expires_at) <= now_ms then
+    return 0
+end
+redis.call("ZADD", KEYS[1], now_ms + tonumber(ARGV[2]), ARGV[1])
+redis.call("PEXPIRE", KEYS[1], ARGV[2])
+return 1
 """
 _ACQUIRE_ASSET_READ_PIN_SCRIPT = """-- acquire_asset_read_pin
 local token = ARGV[1]
@@ -1173,9 +1195,17 @@ class RedisLogStore:
                         if expected_sequence <= indexed_sequence
                         else None
                     )
+                    authoritative_event = (
+                        pipeline.lindex(event_key, expected_sequence - 1)
+                        if expected_sequence <= indexed_sequence
+                        else None
+                    )
                     if (
                         indexed_event is None
                         and expected_sequence <= indexed_sequence
+                    ) or (
+                        indexed_event is not None
+                        and authoritative_event != indexed_event
                     ):
                         pipeline.unwatch()
                         return (
@@ -1420,6 +1450,9 @@ class RedisTaskManager:
         )
         self._release_asset_deletion_script = self._redis.register_script(
             _RELEASE_ASSET_DELETION_SCRIPT
+        )
+        self._refresh_asset_deletion_script = self._redis.register_script(
+            _REFRESH_ASSET_DELETION_SCRIPT
         )
         self._acquire_asset_read_pin_script = self._redis.register_script(
             _ACQUIRE_ASSET_READ_PIN_SCRIPT
@@ -1711,7 +1744,9 @@ class RedisTaskManager:
             value = self._redis.get(key)
             if value is None:
                 continue
-            task = _decode_task(value)
+            task = _decode_task_for_scan(value, key_text)
+            if task is None:
+                continue
             if (
                 task.owner_id is not None
                 and task.status in {TaskStatus.QUEUED, TaskStatus.RUNNING}
@@ -2180,6 +2215,54 @@ class RedisTaskManager:
                     return bool(results[0])
                 except WatchError:
                     continue
+
+    @property
+    def asset_deletion_heartbeat_interval(self) -> float:
+        return _ASSET_DELETE_HEARTBEAT_SECONDS
+
+    def refresh_asset_deletion(
+        self,
+        session_id: str,
+        asset_id: str,
+        token: str,
+    ) -> None:
+        session_id = _validate_session_id(session_id)
+        asset_id = _validate_asset_id(asset_id)
+        _validate_token(token)
+        claim_key = _asset_delete_key(session_id, asset_id)
+        try:
+            refreshed = bool(
+                self._refresh_asset_deletion_script(
+                    keys=[claim_key],
+                    args=[token, _ASSET_DELETE_TTL_MS],
+                )
+            )
+        except ResponseError as error_response:
+            if "unknown command" not in str(error_response).lower():
+                raise
+            while True:
+                with self._redis.pipeline() as pipeline:
+                    try:
+                        pipeline.watch(claim_key)
+                        now_ms = round(time() * 1000)
+                        expires_at = pipeline.zscore(claim_key, token)
+                        if expires_at is None or expires_at <= now_ms:
+                            pipeline.unwatch()
+                            refreshed = False
+                            break
+                        pipeline.multi()
+                        pipeline.zadd(
+                            claim_key,
+                            {token: now_ms + _ASSET_DELETE_TTL_MS},
+                        )
+                        pipeline.pexpire(claim_key, _ASSET_DELETE_TTL_MS)
+                        pipeline.execute()
+                        refreshed = True
+                        break
+                    except WatchError:
+                        continue
+        if not refreshed:
+            raise TaskConflictError("Asset deletion claim expired")
 
     def _enqueue(
         self,
@@ -3233,6 +3316,7 @@ class RedisTaskManager:
         self._reconcile_reverse_indexes(
             reverse_index_keys,
             repair_members,
+            started_ids,
         )
         return reconciled
 
@@ -3240,6 +3324,7 @@ class RedisTaskManager:
         self,
         keys: list[bytes | str],
         repair_members: set[bytes],
+        started_ids: set[str],
     ) -> None:
         for key in keys:
             for member in self._redis.smembers(key):
@@ -3249,12 +3334,42 @@ class RedisTaskManager:
                     else member
                 )
                 task_id = _valid_task_id_from_index_member(raw_member)
+                should_remove = raw_member in repair_members or task_id is None
                 if (
-                    raw_member in repair_members
-                    or task_id is None
-                    or not self._redis.exists(_task_pin_key(task_id))
+                    not should_remove
+                    and task_id is not None
+                    and not self._redis.exists(_task_pin_key(task_id))
                 ):
+                    should_remove = not self._task_may_still_be_active(
+                        task_id,
+                        started_ids,
+                    )
+                if should_remove:
                     self._remove_task_from_index(raw_member, key)
+
+    def _task_may_still_be_active(
+        self,
+        task_id: str,
+        started_ids: set[str],
+    ) -> bool:
+        if task_id in started_ids or self._enqueue_intent_exists(task_id):
+            return True
+        try:
+            task = self.get_task(task_id)
+        except (KeyError, TypeError, UnicodeDecodeError, ValueError):
+            return True
+        if task is not None and task.status in {
+            TaskStatus.QUEUED,
+            TaskStatus.RUNNING,
+        }:
+            return True
+        job = self.queue.fetch_job(task_id)
+        if job is None:
+            return False
+        return job.get_status(refresh=True) in {
+            JobStatus.QUEUED,
+            JobStatus.STARTED,
+        }
 
     def release_task_pin(self, task_id: str) -> bool:
         released = self._release_task_pin(task_id)
@@ -3729,7 +3844,9 @@ class RedisTaskManager:
             value = self._redis.get(key)
             if value is None:
                 continue
-            task = _decode_task(value)
+            task = _decode_task_for_scan(value, key_text)
+            if task is None:
+                continue
             if (
                 task.status is TaskStatus.FAILED
                 and not self._redis.exists(_failure_cleanup_key(task.task_id))
@@ -3746,7 +3863,9 @@ class RedisTaskManager:
             value = self._redis.get(key)
             if value is None:
                 continue
-            task = _decode_task(value)
+            task = _decode_task_for_scan(value, key_text)
+            if task is None:
+                continue
             if task.status in {TaskStatus.QUEUED, TaskStatus.RUNNING}:
                 tasks.append(task)
         return tasks
@@ -4248,3 +4367,14 @@ def _decode_task(value: bytes | str) -> TaskRecord:
         ),
         has_canonical_asset_identities=has_canonical_asset_identities,
     )
+
+
+def _decode_task_for_scan(
+    value: bytes | str,
+    key: str,
+) -> TaskRecord | None:
+    try:
+        return _decode_task(value)
+    except (KeyError, TypeError, UnicodeDecodeError, ValueError):
+        _LOGGER.warning("Skipping corrupt task record during scan: %s", key)
+        return None

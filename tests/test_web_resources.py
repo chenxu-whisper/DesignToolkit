@@ -22,6 +22,7 @@ from designtoolkit.web.resources import (
     ReservationState,
     ResourceUnavailableError,
     SessionDeletingError,
+    _task_pin_release_receipt_matches,
 )
 
 SESSION_A = "a" * 32
@@ -50,8 +51,16 @@ class DeterministicRedis(fakeredis.FakeRedis):
         return execute
 
     def _eval_register_upload(self, keys, args):  # noqa: ANN001, ANN202
-        key, marker_key, marker_index_key, pending_release_key = keys
+        (
+            key,
+            marker_key,
+            marker_index_key,
+            pending_release_key,
+            generation_marker_key,
+        ) = keys
         token, ttl_ms, session_id, asset_id = args
+        if self.exists(generation_marker_key):
+            return 5
         if self.exists(key):
             if self.hget(key, "token") != str(token).encode():
                 return 1
@@ -417,6 +426,11 @@ class DeterministicRedis(fakeredis.FakeRedis):
             metadata_key = receipt_key
         elif not self.exists(token_key):
             return 0
+        if (
+            self.hget(metadata_key, "kind") != str(args[2]).encode()
+            or self.hget(metadata_key, "owner_id") != str(args[3]).encode()
+        ):
+            return 2
         kind = self._text(self.hget(metadata_key, "kind"))
         session_id = self._text(self.hget(metadata_key, "session_id"))
         reserved_bytes = int(self.hget(metadata_key, "bytes"))
@@ -727,9 +741,28 @@ class DeterministicRedis(fakeredis.FakeRedis):
             token = self._text(raw_token)
             if self.exists(f"{token_prefix}{token}"):
                 continue
-            kind, session_id, byte_count, *_capacity = self._text(raw_metadata).split(
-                "|"
+            receipt_key = f"{receipt_prefix}{token}"
+            receipt_state = self.hget(receipt_key, "state")
+            if receipt_state is None:
+                continue
+            if receipt_state != b"reserved":
+                self.hdel(index_key, token)
+                removed += 1
+                continue
+            receipt = self.hgetall(receipt_key)
+            expected_metadata = "|".join(
+                self._text(receipt.get(field))
+                for field in (
+                    b"kind",
+                    b"session_id",
+                    b"bytes",
+                    b"free_bytes",
+                    b"min_free_bytes",
+                )
             )
+            if self._text(raw_metadata) != expected_metadata:
+                continue
+            kind, session_id, byte_count, *_capacity = expected_metadata.split("|")
             reserved_bytes = int(byte_count)
             self.hdel(index_key, token)
             self._decrement(state_key, "reserved_bytes", reserved_bytes)
@@ -746,13 +779,22 @@ class DeterministicRedis(fakeredis.FakeRedis):
                     "output_reserved_bytes",
                     reserved_bytes,
                 )
-            receipt_key = f"{receipt_prefix}{token}"
-            if self.hget(receipt_key, "state") == b"reserved":
-                self.hset(receipt_key, "state", "expired")
-                self.pexpire(receipt_key, receipt_ttl_ms)
+            self.hset(receipt_key, "state", "expired")
+            self.pexpire(receipt_key, receipt_ttl_ms)
             removed += 1
         self._recompute_capacity(state_key, index_key)
         return removed
+
+    def _eval_refresh_asset_deletion(self, keys, args):  # noqa: ANN001, ANN202
+        claim_key = keys[0]
+        token, ttl_ms = args
+        expires_at = self.zscore(claim_key, token)
+        now_ms = round(self._clock() * 1000)
+        if expires_at is None or expires_at <= now_ms:
+            return 0
+        self.zadd(claim_key, {token: now_ms + int(ttl_ms)})
+        self.pexpire(claim_key, int(ttl_ms))
+        return 1
 
     def _eval_clear_session_usage(self, keys, args):  # noqa: ANN001, ANN202
         (
@@ -1405,8 +1447,8 @@ class DeterministicRedis(fakeredis.FakeRedis):
             ttl_ms,
             lease_prefix,
             cleanup_prefix,
-            task_pin_prefix,
-            session_id,
+            _task_pin_prefix,
+            _session_id,
         ) = args
         self._reconcile_leases(state_key, leases_key, str(lease_prefix))
         deleting = self.hget(state_key, "deleting")
@@ -1417,15 +1459,6 @@ class DeterministicRedis(fakeredis.FakeRedis):
             self.hdel(state_key, "deleting")
         if self._number(state_key, "active_count") != 0:
             return 1
-        for raw_task_id in self.smembers(task_pins_key):
-            task_id = self._text(raw_task_id)
-            pin_key = f"{task_pin_prefix}{task_id}"
-            pin_session = self.hget(pin_key, "session_id")
-            if (
-                not self.exists(pin_key)
-                or self._text(pin_session) != session_id
-            ):
-                self.srem(task_pins_key, task_id)
         if self.scard(task_pins_key):
             return 1
         self.hset(state_key, "deleting", token)
@@ -2230,6 +2263,41 @@ def test_real_redis_same_id_generations_commit_and_release_independently(
         second_generation,
     )
     resources.reserve_upload(SESSION_A, 5, free_bytes=100).release()
+
+
+def test_released_upload_generation_cannot_be_registered_again(
+    redis_connection: DeterministicRedis,
+) -> None:
+    resources = coordinator(redis_connection, max_session_bytes=5)
+    asset_id = "1" * 32
+    generation_id = "2" * 32
+    registration = resources.register_upload(
+        SESSION_A,
+        asset_id,
+        generation_token=generation_id,
+    )
+    reservation = resources.reserve_upload(
+        SESSION_A,
+        5,
+        free_bytes=100,
+        asset_id=asset_id,
+        generation_id=generation_id,
+    )
+    reservation.commit()
+    registration.finish()
+    assert resources.release_committed_asset(
+        SESSION_A,
+        asset_id,
+        generation_id,
+    )
+    resources.finalize_asset_release(SESSION_A, asset_id, generation_id)
+
+    with pytest.raises(ResourceUnavailableError, match="already been used"):
+        resources.register_upload(
+            SESSION_A,
+            asset_id,
+            generation_token=generation_id,
+        )
 
 
 def test_real_redis_late_old_release_does_not_release_new_generation(
@@ -3280,6 +3348,31 @@ def test_runtime_task_resource_release_preserves_pin_until_full_release(
     )
 
 
+def test_runtime_cleanup_does_not_release_another_tasks_output_reservation(
+    redis_connection: DeterministicRedis,
+) -> None:
+    resources = coordinator(redis_connection)
+    reservation = resources.reserve_output(
+        "task-b",
+        SESSION_A,
+        5,
+        free_bytes=100,
+    )
+    redis_connection.hset(
+        "dt:resource:task:task-a",
+        mapping={"output_token": reservation.token},
+    )
+
+    with pytest.raises(ResourceUnavailableError, match="metadata conflict"):
+        resources.release_task_runtime_resources("task-a")
+
+    assert redis_connection.exists(
+        f"dt:resource:reservation:{reservation.token}"
+    )
+    assert resources.output_reserved_bytes() == 5
+    reservation.release()
+
+
 def test_mixed_reservations_preserve_strictest_capacity_observation(
     redis_connection: DeterministicRedis,
 ) -> None:
@@ -3602,6 +3695,34 @@ def test_reconcile_fences_late_reservation_retry_without_reviving_accounting(
     assert redis_connection.hget(receipt_key, "state") == b"expired"
     assert redis_connection.hget("dt:resource:state", "reserved_bytes") is None
     assert redis_connection.hlen("dt:resource:reservations") == 0
+
+
+def test_reconcile_preserves_accounting_when_expired_index_is_corrupt(
+    redis_connection: DeterministicRedis,
+) -> None:
+    resources = coordinator(redis_connection)
+    first = resources.reserve_output(
+        "task-a",
+        SESSION_A,
+        20,
+        free_bytes=100,
+    )
+    second = resources.reserve_output(
+        "task-b",
+        SESSION_A,
+        20,
+        free_bytes=100,
+    )
+    redis_connection.delete(f"dt:resource:reservation:{first.token}")
+    redis_connection.hset(
+        "dt:resource:reservations",
+        first.token,
+        f"output|{SESSION_A}|999|100|0",
+    )
+
+    assert resources.reconcile_reservations() == 0
+    assert resources.output_reserved_bytes() == 40
+    second.release()
 
 
 def test_reservation_receipt_records_release_with_bounded_ttl(
@@ -4023,6 +4144,42 @@ def test_cleanup_claim_cannot_overlap_active_session_lease(
     claim = resources.claim_session_cleanup(SESSION_A)
     assert claim is not None
     resources.release_cleanup_claim(SESSION_A, claim)
+
+
+def test_cleanup_claim_fails_closed_for_missing_task_pin(
+    redis_connection: DeterministicRedis,
+) -> None:
+    resources = coordinator(redis_connection)
+    redis_connection.sadd(
+        f"dt:resource:session:{SESSION_A}:task-pins",
+        "active-task",
+    )
+
+    assert resources.claim_session_cleanup(SESSION_A) is None
+
+
+def test_invalid_utf8_task_pin_receipt_does_not_bypass_repair(
+    redis_connection: DeterministicRedis,
+) -> None:
+    receipt_key = "dt:resource:task-pin-release-receipt:task-1"
+    redis_connection.hset(
+        receipt_key,
+        mapping={
+            "task_id": b"\xff",
+            "session_id": SESSION_A,
+            "asset_identities": "[]",
+            "asset_ids": "[]",
+        },
+    )
+
+    assert not _task_pin_release_receipt_matches(
+        redis_connection,
+        receipt_key=receipt_key,
+        task_id="task-1",
+        session_id=SESSION_A,
+        identities_json="[]",
+        asset_ids_json="[]",
+    )
 
 
 def test_cleanup_claim_blocks_new_leases_until_matching_release(

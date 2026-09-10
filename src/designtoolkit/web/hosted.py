@@ -2291,7 +2291,7 @@ def _read_asset_deletion(tombstone: Path, asset_id: str) -> AssetDeletion:
             or reference != f"asset:{asset_id}"
             or isinstance(size, bool)
             or not isinstance(size, int)
-            or size <= 0
+            or size < 0
             or (
                 expected_remaining_bytes is not None
                 and (
