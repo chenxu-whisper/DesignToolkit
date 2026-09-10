@@ -6461,6 +6461,32 @@ def test_hosted_video_frames_rejects_excessive_frame_count_before_enqueue(
     assert manager.queue.count == 0
 
 
+def test_hosted_video_frames_applies_frame_limit_across_batch(
+    tmp_path: Path,
+) -> None:
+    redis_connection = fakeredis.FakeRedis(decode_responses=False)
+    manager = RedisTaskManager(
+        redis_connection=redis_connection,
+        queue=Queue("designtoolkit", connection=redis_connection),
+        data_dir=tmp_path,
+        max_queued_tasks=20,
+        retention_seconds=7200,
+    )
+    with _client(tmp_path, task_manager=manager) as client:
+        references = [
+            _upload(client, f"clip-{index}.mp4", b"video").json()["reference"]
+            for index in range(2)
+        ]
+        response = client.post(
+            "/api/tasks/video-frames",
+            json={"input_paths": references, "frames": 50_001},
+        )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "media_limit_exceeded"
+    assert manager.queue.count == 0
+
+
 @pytest.mark.parametrize(
     ("route", "extra_payload"),
     [

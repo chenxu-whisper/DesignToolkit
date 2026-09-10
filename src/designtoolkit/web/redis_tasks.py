@@ -3358,11 +3358,11 @@ class RedisTaskManager:
             task = self.get_task(task_id)
         except (KeyError, TypeError, UnicodeDecodeError, ValueError):
             return True
-        if task is not None and task.status in {
-            TaskStatus.QUEUED,
-            TaskStatus.RUNNING,
-        }:
-            return True
+        if task is not None:
+            return task.status in {
+                TaskStatus.QUEUED,
+                TaskStatus.RUNNING,
+            }
         job = self.queue.fetch_job(task_id)
         if job is None:
             return False
@@ -4375,6 +4375,6 @@ def _decode_task_for_scan(
 ) -> TaskRecord | None:
     try:
         return _decode_task(value)
-    except (KeyError, TypeError, UnicodeDecodeError, ValueError):
+    except (IndexError, KeyError, TypeError, UnicodeDecodeError, ValueError):
         _LOGGER.warning("Skipping corrupt task record during scan: %s", key)
         return None

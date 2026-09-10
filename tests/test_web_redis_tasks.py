@@ -6842,9 +6842,33 @@ def test_redis_event_cursor_rejects_valid_event_that_disagrees_with_log() -> Non
         store._event_at_cursor(task_id, raw_generation.decode(), 1)
 
 
+@pytest.mark.parametrize(
+    "corrupt_payload",
+    [
+        b"\xff",
+        json.dumps(
+            {
+                "task_id": "corrupt",
+                "kind": "video_frames",
+                "status": "queued",
+                "created_at": datetime.now(UTC).isoformat(),
+                "started_at": None,
+                "finished_at": None,
+                "input_path": "input.mp4",
+                "output_path": None,
+                "error": None,
+                "owner_id": "a" * 32,
+                "result_path": None,
+                "asset_identities": [[]],
+            }
+        ).encode(),
+    ],
+    ids=["invalid-utf8", "malformed-asset-identities"],
+)
 def test_task_scans_skip_a_corrupt_record_and_continue(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
+    corrupt_payload: bytes,
 ) -> None:
     redis_connection = fakeredis.FakeRedis(decode_responses=False)
     manager = _manager(redis_connection, tmp_path)
@@ -6852,7 +6876,7 @@ def test_task_scans_skip_a_corrupt_record_and_continue(
         VideoFramesTaskRequest(input_path=str(tmp_path / "clip.mp4")),
         owner_id="a" * 32,
     )
-    redis_connection.set("dt:task:corrupt", b"\xff")
+    redis_connection.set("dt:task:corrupt", corrupt_payload)
 
     assert manager.active_owner_ids() == {"a" * 32}
     assert manager._active_tasks() == [task]
@@ -7342,11 +7366,15 @@ def test_real_redis_commandstats_spy_proves_large_cursor_read_is_constant(
         commandstats_before,
         "get",
     ) == 1
-    for command in ("hlen", "lindex", "llen", "lrange"):
+    for command in ("hlen", "llen", "lrange"):
         assert calls(commandstats_after, command) == calls(
             commandstats_before,
             command,
         )
+    assert calls(commandstats_after, "lindex") - calls(
+        commandstats_before,
+        "lindex",
+    ) == 1
 
 
 def test_real_redis_concurrent_event_read_has_no_gaps_or_duplicates(

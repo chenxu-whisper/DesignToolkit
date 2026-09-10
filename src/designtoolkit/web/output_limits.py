@@ -7,6 +7,8 @@ from stat import S_ISREG
 from threading import RLock
 from typing import BinaryIO
 
+from designtoolkit.media_constraints import HOSTED_MAX_FRAME_OUTPUTS
+
 type FileIdentity = tuple[str, int, int] | tuple[str, Path]
 
 _TEMPORARY_NAME = re.compile(r"\..+\.[0-9a-f]{32}\.tmp\Z")
@@ -22,14 +24,18 @@ class OutputBudgetGuard:
         root: Path,
         max_bytes: int,
         safety_bytes: int = 1,
+        max_files: int = HOSTED_MAX_FRAME_OUTPUTS,
     ) -> None:
         if max_bytes < 0:
             raise ValueError("max_bytes must not be negative")
         if safety_bytes < 0:
             raise ValueError("safety_bytes must not be negative")
+        if max_files < 1:
+            raise ValueError("max_files must be positive")
         self.root = Path(root).resolve()
         self.max_bytes = max_bytes
         self.safety_bytes = safety_bytes
+        self.max_files = max_files
         self._used_bytes = 0
         self._sizes: dict[FileIdentity, int] = {}
         self._path_identities: dict[Path, FileIdentity] = {}
@@ -72,6 +78,7 @@ class OutputBudgetGuard:
                 stat_result.st_dev,
                 stat_result.st_ino,
             )
+            self._enforce_file_count(identity)
             previous_size = self._sizes.get(identity, 0)
             self._used_bytes += max(stat_result.st_size - previous_size, 0)
             self._sizes[identity] = stat_result.st_size
@@ -90,6 +97,7 @@ class OutputBudgetGuard:
                 stat_result.st_dev,
                 stat_result.st_ino,
             )
+            self._enforce_file_count(identity)
             previous_size = self._sizes.get(identity, 0)
             growth = max(stat_result.st_size - previous_size, 0)
             self._enforce(self._used_bytes + growth)
@@ -322,7 +330,17 @@ class OutputBudgetGuard:
             self._sizes = current_sizes
             self._path_identities = current_paths
             self._created_identities.intersection_update(current_sizes)
+            if len(current_sizes) > self.max_files:
+                raise OutputLimitExceeded(
+                    f"Task output exceeds the {self.max_files}-file limit"
+                )
             self._enforce(self._used_bytes)
+
+    def _enforce_file_count(self, identity: FileIdentity) -> None:
+        if identity not in self._sizes and len(self._sizes) >= self.max_files:
+            raise OutputLimitExceeded(
+                f"Task output exceeds the {self.max_files}-file limit"
+            )
 
     def _account_open_file(
         self,

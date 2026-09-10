@@ -1405,22 +1405,25 @@ def create_router(
                 payload.size,
                 settings.max_video_width * settings.max_video_height,
             )
-        if payload.frames is not None and payload.frames > HOSTED_MAX_FRAME_OUTPUTS:
-            raise ApiError(
-                "media_limit_exceeded",
-                f"Frame export exceeds the {HOSTED_MAX_FRAME_OUTPUTS} frame limit",
-                422,
-            )
-        if payload.fps is not None and media_validator is not None:
+        if media_validator is not None:
             validated = media_validator.validate_media_many(
                 [Path(path) for path in paths]
             )
-            if any(
-                media.video_metadata is not None
-                and media.video_metadata.duration_seconds * payload.fps
-                > HOSTED_MAX_FRAME_OUTPUTS
-                for media in validated
-            ):
+            if payload.frames is not None:
+                output_frames = payload.frames * len(validated)
+            elif payload.fps is not None:
+                output_frames = sum(
+                    media.video_metadata.duration_seconds * payload.fps
+                    for media in validated
+                    if media.video_metadata is not None
+                )
+            else:
+                output_frames = sum(
+                    media.video_metadata.estimated_frame_count
+                    for media in validated
+                    if media.video_metadata is not None
+                )
+            if output_frames > HOSTED_MAX_FRAME_OUTPUTS:
                 raise ApiError(
                     "media_limit_exceeded",
                     f"Frame export exceeds the {HOSTED_MAX_FRAME_OUTPUTS} frame limit",

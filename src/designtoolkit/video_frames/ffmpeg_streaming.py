@@ -400,7 +400,7 @@ class GuardedFfmpegOutput:
     def _open_video_temporary(self) -> None:
         self._target.parent.mkdir(parents=True, exist_ok=True)
         temporary = self._target.with_name(
-            f".{self._target.name}.{uuid.uuid4().hex}.tmp"
+                f".out.{uuid.uuid4().hex}.tmp"
         )
         file = temporary.open("x+b")
         try:
@@ -429,7 +429,7 @@ class GuardedFfmpegOutput:
             )
         target.parent.mkdir(parents=True, exist_ok=True)
         temporary = target.with_name(
-            f".{target.name}.{uuid.uuid4().hex}.tmp"
+            f".out.{uuid.uuid4().hex}.tmp"
         )
         try:
             with temporary.open("x+b") as raw_file:
@@ -457,7 +457,10 @@ class GuardedFfmpegOutput:
                 _PendingPublication(temporary, target)
             )
         except BaseException:
-            self._guard.discard_temporary(temporary)
+            try:
+                self._guard.discard_temporary(temporary)
+            finally:
+                temporary.unlink(missing_ok=True)
             raise
 
     def _publish_pending(self) -> None:

@@ -1397,6 +1397,22 @@ def test_guarded_sequence_has_a_hard_file_count_limit(
     assert not list(tmp_path.iterdir())
 
 
+def test_guarded_image_uses_short_temporary_name_for_max_length_target(
+    tmp_path: Path,
+) -> None:
+    from designtoolkit.video_frames.ffmpeg_streaming import GuardedFfmpegOutput
+
+    target = tmp_path / f"{'a' * 251}.png"
+    guard = OutputBudgetGuard(tmp_path, max_bytes=1_000_000)
+    session = GuardedFfmpegOutput(["ffmpeg", str(target)], guard)
+
+    session.consume(_pam(1, 1, b"abcd"))
+    session.finish()
+
+    assert target.is_file()
+    assert not list(tmp_path.glob(".*.tmp"))
+
+
 def test_webm_decoder_fallback_recovers_full_budget_after_failed_first_run(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

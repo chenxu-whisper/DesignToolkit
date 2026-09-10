@@ -122,6 +122,27 @@ def test_budget_rejects_aggregate_files_at_safety_boundary(tmp_path: Path) -> No
     assert guard.used_bytes == 8
 
 
+def test_budget_rejects_aggregate_file_count_before_registration(
+    tmp_path: Path,
+) -> None:
+    guard = OutputBudgetGuard(
+        tmp_path,
+        max_bytes=100,
+        max_files=2,
+    )
+    for index in range(2):
+        path = tmp_path / f".{index}.{'1' * 32}.tmp"
+        with path.open("x+b") as file:
+            guard.register_created(file, path)
+
+    rejected = tmp_path / f".third.{'2' * 32}.tmp"
+    with rejected.open("x+b") as file:
+        with pytest.raises(OutputLimitExceeded, match="2-file limit"):
+            guard.register_created(file, rejected)
+
+    assert rejected.stat().st_size == 0
+
+
 def test_repeated_account_only_adds_file_growth(tmp_path: Path) -> None:
     guard = OutputBudgetGuard(tmp_path, max_bytes=100)
     output = tmp_path / "output.bin"
