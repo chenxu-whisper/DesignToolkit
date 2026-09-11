@@ -26,6 +26,18 @@ describe('imageViewportMath', () => {
     expect(clampManualScale(9)).toBe(MAX_MANUAL_SCALE)
   })
 
+  it('clamps positive infinity to the maximum manual scale', () => {
+    expect(clampManualScale(Number.POSITIVE_INFINITY)).toBe(MAX_MANUAL_SCALE)
+  })
+
+  it('clamps negative infinity to the minimum manual scale', () => {
+    expect(clampManualScale(Number.NEGATIVE_INFINITY)).toBe(MIN_MANUAL_SCALE)
+  })
+
+  it('clamps NaN to the minimum manual scale', () => {
+    expect(clampManualScale(Number.NaN)).toBe(MIN_MANUAL_SCALE)
+  })
+
   it('fits large media without enlarging small media', () => {
     expect(calculateFitScale({ width: 400, height: 300 }, { width: 800, height: 400 })).toBe(0.5)
     expect(calculateFitScale({ width: 800, height: 600 }, { width: 200, height: 100 })).toBe(1)
@@ -52,6 +64,10 @@ describe('imageViewportMath', () => {
     expect(getWheelScale(1, -1, 2, 500)).toBe(2)
     expect(getWheelScale(8, -500, 0, 600)).toBe(MAX_MANUAL_SCALE)
     expect(getWheelScale(0.25, 500, 0, 600)).toBe(MIN_MANUAL_SCALE)
+  })
+
+  it('clamps an overflowing wheel zoom-in to the maximum manual scale', () => {
+    expect(getWheelScale(1, -1_000_000, 0, 600)).toBe(MAX_MANUAL_SCALE)
   })
 
   it('preserves the content point under the zoom anchor', () => {

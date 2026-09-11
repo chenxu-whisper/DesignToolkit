@@ -11,7 +11,13 @@ const isPositiveSize = ({ height, width }: ViewportSize) =>
   Number.isFinite(height) && Number.isFinite(width) && height > 0 && width > 0
 
 export function clampManualScale(scale: number) {
-  if (!Number.isFinite(scale)) {
+  if (Number.isNaN(scale)) {
+    return MIN_MANUAL_SCALE
+  }
+  if (scale === Number.POSITIVE_INFINITY) {
+    return MAX_MANUAL_SCALE
+  }
+  if (scale === Number.NEGATIVE_INFINITY) {
     return MIN_MANUAL_SCALE
   }
   return Math.min(MAX_MANUAL_SCALE, Math.max(MIN_MANUAL_SCALE, scale))
