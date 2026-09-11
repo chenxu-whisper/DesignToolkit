@@ -1337,6 +1337,7 @@ describe('ChromaKeyerPage', () => {
     expect(screen.getByText('约 375 帧')).toBeInTheDocument()
     expect(screen.getByRole('slider', { name: '视频时间轴' })).toHaveValue('1.25')
     expect(screen.getByText('#2AB448')).toBeInTheDocument()
+    expect(getZoomStatus()).toHaveTextContent('100%')
 
     pageMocks.sampleChromaVideo.mockClear()
     await sampleImage()
