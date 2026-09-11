@@ -505,9 +505,11 @@ describe('ChromaKeyerPage', () => {
     await waitFor(() => expect(getZoomStatus()).toHaveTextContent('50%'))
   })
 
-  it('preserves the loaded image session when a same-path refresh fails', async () => {
+  it('reissues the current image preview when a same-path refresh invalidates it and fails', async () => {
     installViewportMeasurements()
     const refreshRequest = createDeferred<typeof inspectResponse>()
+    const invalidatedPreviewRequest = createDeferred<{ preview_url: string }>()
+    const recoveryPreviewRequest = createDeferred<{ preview_url: string }>()
     render(<ChromaKeyerPage />)
     await inspectImage()
     await sampleImage()
@@ -515,7 +517,26 @@ describe('ChromaKeyerPage', () => {
     await waitFor(() => expect(preview).toHaveAttribute('src', '/api/previews/final.png'))
     fireEvent.click(screen.getByRole('button', { name: '实际大小' }))
     expect(getZoomStatus()).toHaveTextContent('100%')
+    fireEvent.click(screen.getByRole('radio', { name: 'Alpha' }))
+    await waitFor(() => expect(pageMocks.createChromaPreview).toHaveBeenLastCalledWith(
+      expect.objectContaining({ viewMode: 'alpha' }),
+    ))
+    pageMocks.createChromaPreview
+      .mockReturnValueOnce(invalidatedPreviewRequest.promise)
+      .mockReturnValueOnce(recoveryPreviewRequest.promise)
+    pageMocks.createChromaPreview.mockClear()
     pageMocks.inspectChromaImage.mockReturnValueOnce(refreshRequest.promise)
+
+    fireEvent.change(screen.getByLabelText('Screen Gain'), { target: { value: '1.4' } })
+
+    await waitFor(() => expect(pageMocks.createChromaPreview).toHaveBeenCalledOnce())
+    expect(pageMocks.createChromaPreview).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        params: expect.objectContaining({ screenGain: 1.4 }),
+        samples: [[42, 180, 72]],
+        viewMode: 'alpha',
+      }),
+    )
 
     fireEvent.keyDown(screen.getByLabelText('输入图片或视频路径'), { key: 'Enter' })
 
@@ -529,23 +550,66 @@ describe('ChromaKeyerPage', () => {
     })
 
     expect(await screen.findByRole('alert')).toHaveTextContent('图片刷新失败')
+    expect(pageMocks.createChromaPreview).toHaveBeenCalledTimes(2)
+    expect(pageMocks.createChromaPreview).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        params: expect.objectContaining({ screenGain: 1.4 }),
+        samples: [[42, 180, 72]],
+        viewMode: 'alpha',
+      }),
+    )
+
+    await act(async () => {
+      invalidatedPreviewRequest.resolve({ preview_url: '/api/previews/invalidated.png' })
+    })
+
     expect(preview).toHaveAttribute('src', '/api/previews/final.png')
+
+    await act(async () => {
+      recoveryPreviewRequest.resolve({ preview_url: '/api/previews/recovered.png' })
+    })
+
+    expect(preview).toHaveAttribute('src', '/api/previews/recovered.png')
+    expect(screen.getByRole('alert')).toHaveTextContent('图片刷新失败')
     expect(screen.getByText('#2AB448')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: '导出 PNG' })).toBeEnabled()
     expect(getZoomStatus()).toHaveTextContent('100%')
   })
 
-  it('keeps the new path empty and reports an inspection failure', async () => {
-    const user = renderWithUser()
+  it('does not reissue a preview when inspection fails after changing to a new path', async () => {
+    render(<ChromaKeyerPage />)
+    await inspectImage()
+    await sampleImage()
+    await waitFor(() => expect(pageMocks.createChromaPreview).toHaveBeenCalledOnce())
+    pageMocks.createChromaPreview.mockClear()
     pageMocks.inspectChromaImage.mockRejectedValueOnce(new Error('图片无法读取'))
+    const input = screen.getByLabelText('输入图片或视频路径')
 
-    await user.type(screen.getByLabelText('输入图片或视频路径'), 'E:\\media\\broken.png')
-    await user.keyboard('{Enter}')
+    fireEvent.change(input, { target: { value: 'E:\\media\\broken.png' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
 
     expect(await screen.findByRole('alert')).toHaveTextContent('图片无法读取')
-    expect(screen.getByLabelText('输入图片或视频路径')).toHaveValue('E:\\media\\broken.png')
+    expect(input).toHaveValue('E:\\media\\broken.png')
     expect(screen.queryByRole('button', { name: '抠像预览' })).not.toBeInTheDocument()
     expect(screen.getByText('加载本地图片或视频后，可在画面中吸取背景颜色。')).toBeInTheDocument()
+    expect(pageMocks.createChromaPreview).not.toHaveBeenCalled()
+  })
+
+  it('does not reissue a preview after a failed same-path refresh when current values are invalid', async () => {
+    render(<ChromaKeyerPage />)
+    await inspectImage()
+    await sampleImage()
+    await waitFor(() => expect(pageMocks.createChromaPreview).toHaveBeenCalledOnce())
+    pageMocks.createChromaPreview.mockClear()
+    pageMocks.inspectChromaImage.mockRejectedValueOnce(new Error('图片刷新失败'))
+
+    fireEvent.change(screen.getByRole('spinbutton', { name: 'Screen Gain 数值' }), {
+      target: { value: '' },
+    })
+    fireEvent.keyDown(screen.getByLabelText('输入图片或视频路径'), { key: 'Enter' })
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('图片刷新失败')
+    expect(pageMocks.createChromaPreview).not.toHaveBeenCalled()
   })
 
   it('does not let a slower older inspection overwrite a newer committed path', async () => {

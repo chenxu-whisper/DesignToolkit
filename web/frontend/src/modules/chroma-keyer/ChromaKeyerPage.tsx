@@ -535,6 +535,16 @@ export function ChromaKeyerPage() {
               ? '无法加载视频'
               : '无法加载图片',
         }))
+        const currentMedia = mediaRef.current
+        const currentValues = valuesRef.current
+        if (
+          currentMedia
+          && currentMedia.inputPath === inputPath
+          && currentValues.inputPath.trim() === inputPath
+          && isPreviewValid(currentValues)
+        ) {
+          void requestPreview(currentValues, requestSequence)
+        }
       }
     } finally {
       if (inspectingPathRef.current === inputPath) {
