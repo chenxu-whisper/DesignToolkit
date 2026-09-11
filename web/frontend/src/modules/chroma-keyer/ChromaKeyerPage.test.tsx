@@ -468,21 +468,71 @@ describe('ChromaKeyerPage', () => {
     expect(screen.queryByText('#2AB448')).not.toBeInTheDocument()
   })
 
-  it('keeps the loaded image and Screen Color when the same path is committed again', async () => {
-    const user = renderWithUser()
-
+  it('refreshes a loaded image from the same path and resets the accepted session to fit', async () => {
+    installViewportMeasurements()
+    const refreshRequest = createDeferred<typeof inspectResponse>()
+    render(<ChromaKeyerPage />)
     await inspectImage()
     await sampleImage()
-    await waitFor(() => expect(screen.getByText('#2AB448')).toBeInTheDocument())
+    const preview = screen.getByRole('button', { name: '抠像预览' })
+    await waitFor(() => expect(preview).toHaveAttribute('src', '/api/previews/final.png'))
+    fireEvent.click(screen.getByRole('button', { name: '实际大小' }))
+    expect(getZoomStatus()).toHaveTextContent('100%')
+    pageMocks.inspectChromaImage.mockReturnValueOnce(refreshRequest.promise)
     const input = screen.getByLabelText('输入图片或视频路径')
 
-    await user.click(input)
-    await user.keyboard('{Enter}')
-    fireEvent.blur(input)
+    fireEvent.keyDown(input, { key: 'Enter' })
 
-    expect(pageMocks.inspectChromaImage).toHaveBeenCalledOnce()
+    await waitFor(() => expect(pageMocks.inspectChromaImage).toHaveBeenCalledTimes(2))
+    expect(preview).toHaveAttribute('src', '/api/previews/final.png')
     expect(screen.getByText('#2AB448')).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: '抠像预览' })).toBeInTheDocument()
+    expect(getZoomStatus()).toHaveTextContent('100%')
+
+    fireEvent.keyDown(input, { key: 'Enter' })
+    fireEvent.blur(input)
+    expect(pageMocks.inspectChromaImage).toHaveBeenCalledTimes(2)
+
+    await act(async () => {
+      refreshRequest.resolve({
+        ...inspectResponse,
+        preview_url: '/api/previews/image-refreshed.png',
+      })
+    })
+
+    expect(preview).toHaveAttribute('src', '/api/previews/image-refreshed.png')
+    expect(screen.queryByText('#2AB448')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '导出 PNG' })).toBeDisabled()
+    await waitFor(() => expect(getZoomStatus()).toHaveTextContent('50%'))
+  })
+
+  it('preserves the loaded image session when a same-path refresh fails', async () => {
+    installViewportMeasurements()
+    const refreshRequest = createDeferred<typeof inspectResponse>()
+    render(<ChromaKeyerPage />)
+    await inspectImage()
+    await sampleImage()
+    const preview = screen.getByRole('button', { name: '抠像预览' })
+    await waitFor(() => expect(preview).toHaveAttribute('src', '/api/previews/final.png'))
+    fireEvent.click(screen.getByRole('button', { name: '实际大小' }))
+    expect(getZoomStatus()).toHaveTextContent('100%')
+    pageMocks.inspectChromaImage.mockReturnValueOnce(refreshRequest.promise)
+
+    fireEvent.keyDown(screen.getByLabelText('输入图片或视频路径'), { key: 'Enter' })
+
+    await waitFor(() => expect(pageMocks.inspectChromaImage).toHaveBeenCalledTimes(2))
+    expect(preview).toHaveAttribute('src', '/api/previews/final.png')
+    expect(screen.getByText('#2AB448')).toBeInTheDocument()
+    expect(getZoomStatus()).toHaveTextContent('100%')
+
+    await act(async () => {
+      refreshRequest.reject(new Error('图片刷新失败'))
+    })
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('图片刷新失败')
+    expect(preview).toHaveAttribute('src', '/api/previews/final.png')
+    expect(screen.getByText('#2AB448')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '导出 PNG' })).toBeEnabled()
+    expect(getZoomStatus()).toHaveTextContent('100%')
   })
 
   it('keeps the new path empty and reports an inspection failure', async () => {

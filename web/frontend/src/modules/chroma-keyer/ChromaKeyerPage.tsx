@@ -446,10 +446,7 @@ export function ChromaKeyerPage() {
       setErrors((current) => ({ ...current, inputPath: '请输入图片路径' }))
       return
     }
-    if (
-      (media?.kind === 'image' && media.inputPath === inputPath)
-      || inspectingPathRef.current === inputPath
-    ) {
+    if (inspectingPathRef.current === inputPath) {
       return
     }
 
