@@ -1095,10 +1095,20 @@ test('keeps the loaded video editor within desktop and 390px mobile layouts', as
 
 const chromaZoomImagePath = 'E:\\media\\zoom-source.png'
 const chromaZoomVideoPath = 'E:\\media\\zoom-source.mp4'
+const chromaZoomImageWidth = 800
+const chromaZoomImageHeight = 400
+
+type ImageSampleBody = {
+  input_path: string
+  preview_height: number
+  preview_width: number
+  x: number
+  y: number
+}
 
 type ChromaZoomRouteState = {
   frameRequests: unknown[]
-  imageSampleRequests: unknown[]
+  imageSampleRequests: ImageSampleBody[]
   videoPreviewRequests: unknown[]
   videoSampleRequests: unknown[]
 }
@@ -1116,10 +1126,10 @@ async function installChromaZoomRoutes(page: Page): Promise<ChromaZoomRouteState
     await route.fulfill({
       contentType: 'image/svg+xml',
       body: [
-        '<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="800">',
+        `<svg xmlns="http://www.w3.org/2000/svg" width="${chromaZoomImageWidth}" height="${chromaZoomImageHeight}">`,
         `<title>${title}</title>`,
-        '<rect width="1600" height="800" fill="#2a6f55"/>',
-        '<circle cx="800" cy="400" r="80" fill="#d9efe6"/>',
+        `<rect width="${chromaZoomImageWidth}" height="${chromaZoomImageHeight}" fill="#2a6f55"/>`,
+        '<circle cx="400" cy="200" r="40" fill="#d9efe6"/>',
         '</svg>',
       ].join(''),
     })
@@ -1129,8 +1139,8 @@ async function installChromaZoomRoutes(page: Page): Promise<ChromaZoomRouteState
       contentType: 'application/json',
       body: JSON.stringify({
         input_path: chromaZoomImagePath,
-        width: 1600,
-        height: 800,
+        width: chromaZoomImageWidth,
+        height: chromaZoomImageHeight,
         preview_width: 960,
         preview_height: 480,
         preview_url: '/api/chroma-keyer/previews/zoom-image.svg',
@@ -1138,14 +1148,21 @@ async function installChromaZoomRoutes(page: Page): Promise<ChromaZoomRouteState
     })
   })
   await page.route('**/api/chroma-keyer/images/sample', async (route) => {
-    state.imageSampleRequests.push(route.request().postDataJSON())
+    const body = route.request().postDataJSON() as ImageSampleBody
+    state.imageSampleRequests.push(body)
     await route.fulfill({
       contentType: 'application/json',
       body: JSON.stringify({
         rgb: [42, 180, 72],
         hex: '#2AB448',
-        source_x: 600,
-        source_y: 300,
+        source_x: Math.min(
+          Math.floor(body.x * chromaZoomImageWidth / body.preview_width),
+          chromaZoomImageWidth - 1,
+        ),
+        source_y: Math.min(
+          Math.floor(body.y * chromaZoomImageHeight / body.preview_height),
+          chromaZoomImageHeight - 1,
+        ),
       }),
     })
   })
@@ -1289,7 +1306,7 @@ test('Chroma preview zoom keeps wheel anchors stable and separates pan from samp
   await expect.poll(async () => {
     const box = await requireBox(image, 'actual-size image')
     return box.width
-  }).toBeCloseTo(1600, 0)
+  }).toBeCloseTo(chromaZoomImageWidth, 0)
 
   const canvasBox = await requireBox(canvas, 'canvas')
   const anchor = {
@@ -1298,8 +1315,8 @@ test('Chroma preview zoom keeps wheel anchors stable and separates pan from samp
   }
   const beforeWheel = await requireBox(image, 'image before wheel zoom')
   const sourceAtAnchor = {
-    x: ((anchor.x - beforeWheel.x) / beforeWheel.width) * 1600,
-    y: ((anchor.y - beforeWheel.y) / beforeWheel.height) * 800,
+    x: ((anchor.x - beforeWheel.x) / beforeWheel.width) * chromaZoomImageWidth,
+    y: ((anchor.y - beforeWheel.y) / beforeWheel.height) * chromaZoomImageHeight,
   }
 
   await page.mouse.move(anchor.x, anchor.y)
@@ -1308,8 +1325,8 @@ test('Chroma preview zoom keeps wheel anchors stable and separates pan from samp
   await expect.poll(async () => {
     const afterWheel = await requireBox(image, 'image after wheel zoom')
     const nextSource = {
-      x: ((anchor.x - afterWheel.x) / afterWheel.width) * 1600,
-      y: ((anchor.y - afterWheel.y) / afterWheel.height) * 800,
+      x: ((anchor.x - afterWheel.x) / afterWheel.width) * chromaZoomImageWidth,
+      y: ((anchor.y - afterWheel.y) / afterWheel.height) * chromaZoomImageHeight,
     }
     return Math.max(
       Math.abs(nextSource.x - sourceAtAnchor.x),
@@ -1329,11 +1346,30 @@ test('Chroma preview zoom keeps wheel anchors stable and separates pan from samp
   expect(routes.imageSampleRequests).toHaveLength(0)
 
   const clickBox = await requireBox(canvas, 'canvas after pan')
-  await page.mouse.click(
-    clickBox.x + clickBox.width / 2,
-    clickBox.y + clickBox.height / 2,
-  )
+  const imageAtClick = await requireBox(image, 'image at sample click')
+  const clickPoint = {
+    x: clickBox.x + clickBox.width / 2,
+    y: clickBox.y + clickBox.height / 2,
+  }
+  await page.mouse.click(clickPoint.x, clickPoint.y)
   await expect.poll(() => routes.imageSampleRequests.length).toBe(1)
+
+  const sampleRequest = routes.imageSampleRequests[0]
+  expect(sampleRequest.input_path).toBe(chromaZoomImagePath)
+  expect(sampleRequest.x).toBe(Math.floor(clickPoint.x - imageAtClick.x))
+  expect(sampleRequest.y).toBe(Math.floor(clickPoint.y - imageAtClick.y))
+  expect(sampleRequest.preview_width).toBeCloseTo(imageAtClick.width, 3)
+  expect(sampleRequest.preview_height).toBeCloseTo(imageAtClick.height, 3)
+  const returnedSource = {
+    x: Math.min(
+      Math.floor(sampleRequest.x * chromaZoomImageWidth / sampleRequest.preview_width),
+      chromaZoomImageWidth - 1,
+    ),
+    y: Math.min(
+      Math.floor(sampleRequest.y * chromaZoomImageHeight / sampleRequest.preview_height),
+      chromaZoomImageHeight - 1,
+    ),
+  }
 
   const marker = page.getByLabel('采样点 1')
   await expect(marker).toBeVisible()
@@ -1341,8 +1377,8 @@ test('Chroma preview zoom keeps wheel anchors stable and separates pan from samp
     const imageBox = await requireBox(image, 'sampled image')
     const markerBox = await requireBox(marker, 'sample marker')
     const expected = {
-      x: imageBox.x + (600 / 1600) * imageBox.width,
-      y: imageBox.y + (300 / 800) * imageBox.height,
+      x: imageBox.x + (returnedSource.x / chromaZoomImageWidth) * imageBox.width,
+      y: imageBox.y + (returnedSource.y / chromaZoomImageHeight) * imageBox.height,
     }
     const actual = {
       x: markerBox.x + markerBox.width / 2,
@@ -1350,6 +1386,71 @@ test('Chroma preview zoom keeps wheel anchors stable and separates pan from samp
     }
     return Math.max(Math.abs(actual.x - expected.x), Math.abs(actual.y - expected.y))
   }).toBeLessThanOrEqual(2)
+})
+
+test('Chroma preview toolbar has coarse-pointer targets without mobile overflow', async ({ browser }) => {
+  const context = await browser.newContext({
+    hasTouch: true,
+    isMobile: true,
+    viewport: { width: 390, height: 844 },
+  })
+  const mobilePage = await context.newPage()
+  const pageErrors: string[] = []
+  const consoleErrors: string[] = []
+  mobilePage.on('pageerror', (error) => pageErrors.push(error.message))
+  mobilePage.on('console', (message) => {
+    if (message.type() === 'error') {
+      consoleErrors.push(message.text())
+    }
+  })
+
+  try {
+    await installChromaZoomRoutes(mobilePage)
+    await loadChromaZoomMedia(mobilePage, chromaZoomImagePath)
+
+    const viewport = await requireBox(
+      mobilePage.locator('.chroma-preview-viewport'),
+      'mobile preview viewport',
+    )
+    const canvas = await requireBox(
+      mobilePage.locator('.chroma-preview-canvas'),
+      'mobile preview canvas',
+    )
+    const toolbarLocator = mobilePage.getByRole('toolbar', { name: '预览缩放控制' })
+    const toolbar = await requireBox(toolbarLocator, 'mobile preview toolbar')
+    const buttonBoxes = await toolbarLocator.getByRole('button').evaluateAll((buttons) => (
+      buttons.map((button) => {
+        const { height, width } = button.getBoundingClientRect()
+        return { height, width }
+      })
+    ))
+    const widths = await mobilePage.evaluate(() => ({
+      bodyClient: document.body.clientWidth,
+      bodyScroll: document.body.scrollWidth,
+      documentClient: document.documentElement.clientWidth,
+      documentScroll: document.documentElement.scrollWidth,
+    }))
+
+    expect(buttonBoxes).toHaveLength(4)
+    for (const button of buttonBoxes) {
+      expect(button.width).toBeGreaterThanOrEqual(44)
+      expect(button.height).toBeGreaterThanOrEqual(44)
+    }
+    expect(toolbar.x).toBeGreaterThanOrEqual(viewport.x - 0.5)
+    expect(toolbar.x + toolbar.width).toBeLessThanOrEqual(viewport.x + viewport.width + 0.5)
+    expect(toolbar.y).toBeGreaterThanOrEqual(viewport.y - 0.5)
+    expect(toolbar.y + toolbar.height).toBeLessThanOrEqual(viewport.y + viewport.height + 0.5)
+    expect(toolbar.x).toBeGreaterThanOrEqual(canvas.x - 0.5)
+    expect(toolbar.x + toolbar.width).toBeLessThanOrEqual(canvas.x + canvas.width + 0.5)
+    expect(toolbar.y).toBeGreaterThanOrEqual(canvas.y - 0.5)
+    expect(toolbar.y + toolbar.height).toBeLessThanOrEqual(canvas.y + canvas.height + 0.5)
+    expect(widths.documentScroll).toBeLessThanOrEqual(widths.documentClient)
+    expect(widths.bodyScroll).toBeLessThanOrEqual(widths.bodyClient)
+    expect(pageErrors).toEqual([])
+    expect(consoleErrors).toEqual([])
+  } finally {
+    await context.close()
+  }
 })
 
 test('Chroma preview zoom preserves video zoom across frame and preview URL refreshes', async ({ page }) => {
@@ -1390,6 +1491,32 @@ test('Chroma preview zoom stays contained at target widths in light and dark the
   })
   await installChromaZoomRoutes(page)
 
+  const readToolbarColors = async () => page.getByRole(
+    'toolbar',
+    { name: '预览缩放控制' },
+  ).evaluate((toolbar) => {
+    const status = toolbar.querySelector<HTMLElement>('[role="status"]')
+    const button = toolbar.querySelector<HTMLElement>('button')
+    if (!status || !button) {
+      throw new Error('Expected preview toolbar status and button')
+    }
+    const toolbarStyle = getComputedStyle(toolbar)
+    const statusStyle = getComputedStyle(status)
+    const buttonStyle = getComputedStyle(button)
+    return {
+      buttonBackground: buttonStyle.backgroundColor,
+      buttonBorder: buttonStyle.borderColor,
+      buttonColor: buttonStyle.color,
+      buttonVisibility: buttonStyle.visibility,
+      statusColor: statusStyle.color,
+      statusVisibility: statusStyle.visibility,
+      toolbarBackground: toolbarStyle.backgroundColor,
+      toolbarBorder: toolbarStyle.borderColor,
+      toolbarColor: toolbarStyle.color,
+      toolbarVisibility: toolbarStyle.visibility,
+    }
+  })
+
   for (const viewportSize of [
     { width: 1440, height: 900 },
     { width: 900, height: 800 },
@@ -1429,13 +1556,44 @@ test('Chroma preview zoom stays contained at target widths in light and dark the
   }
 
   await page.getByRole('button', { name: '主题设置' }).click()
-  await page.getByRole('menuitemradio', { name: '深色' }).click()
-  await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark')
-  await expect(page.getByRole('toolbar', { name: '预览缩放控制' })).toBeVisible()
-
-  await page.getByRole('button', { name: '主题设置' }).click()
   await page.getByRole('menuitemradio', { name: '浅色' }).click()
   await expect(page.locator('html')).toHaveAttribute('data-theme', 'light')
+  const lightColors = await readToolbarColors()
+
+  await page.getByRole('button', { name: '主题设置' }).click()
+  await page.getByRole('menuitemradio', { name: '深色' }).click()
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark')
+  const darkColors = await readToolbarColors()
+
+  for (const colors of [lightColors, darkColors]) {
+    for (const color of [
+      colors.toolbarBackground,
+      colors.toolbarBorder,
+      colors.toolbarColor,
+      colors.statusColor,
+      colors.buttonBackground,
+      colors.buttonBorder,
+      colors.buttonColor,
+    ]) {
+      expect(color).not.toBe('')
+      expect(color).not.toBe('transparent')
+      expect(color).not.toBe('rgba(0, 0, 0, 0)')
+    }
+    expect(colors.toolbarVisibility).toBe('visible')
+    expect(colors.statusVisibility).toBe('visible')
+    expect(colors.buttonVisibility).toBe('visible')
+  }
+  for (const key of [
+    'toolbarBackground',
+    'toolbarBorder',
+    'toolbarColor',
+    'statusColor',
+    'buttonBackground',
+    'buttonBorder',
+    'buttonColor',
+  ] as const) {
+    expect(darkColors[key], `${key} must differ between themes`).not.toBe(lightColors[key])
+  }
   expect(pageErrors).toEqual([])
   expect(consoleErrors).toEqual([])
 })
