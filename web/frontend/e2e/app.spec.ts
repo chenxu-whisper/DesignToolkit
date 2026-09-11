@@ -1092,3 +1092,350 @@ test('keeps the loaded video editor within desktop and 390px mobile layouts', as
     }
   }
 })
+
+const chromaZoomImagePath = 'E:\\media\\zoom-source.png'
+const chromaZoomVideoPath = 'E:\\media\\zoom-source.mp4'
+
+type ChromaZoomRouteState = {
+  frameRequests: unknown[]
+  imageSampleRequests: unknown[]
+  videoPreviewRequests: unknown[]
+  videoSampleRequests: unknown[]
+}
+
+async function installChromaZoomRoutes(page: Page): Promise<ChromaZoomRouteState> {
+  const state: ChromaZoomRouteState = {
+    frameRequests: [],
+    imageSampleRequests: [],
+    videoPreviewRequests: [],
+    videoSampleRequests: [],
+  }
+
+  await page.route('**/api/chroma-keyer/previews/*.svg', async (route) => {
+    const title = new URL(route.request().url()).pathname.split('/').at(-1) ?? 'zoom-preview'
+    await route.fulfill({
+      contentType: 'image/svg+xml',
+      body: [
+        '<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="800">',
+        `<title>${title}</title>`,
+        '<rect width="1600" height="800" fill="#2a6f55"/>',
+        '<circle cx="800" cy="400" r="80" fill="#d9efe6"/>',
+        '</svg>',
+      ].join(''),
+    })
+  })
+  await page.route('**/api/chroma-keyer/images/inspect', async (route) => {
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({
+        input_path: chromaZoomImagePath,
+        width: 1600,
+        height: 800,
+        preview_width: 960,
+        preview_height: 480,
+        preview_url: '/api/chroma-keyer/previews/zoom-image.svg',
+      }),
+    })
+  })
+  await page.route('**/api/chroma-keyer/images/sample', async (route) => {
+    state.imageSampleRequests.push(route.request().postDataJSON())
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({
+        rgb: [42, 180, 72],
+        hex: '#2AB448',
+        source_x: 600,
+        source_y: 300,
+      }),
+    })
+  })
+  await page.route('**/api/chroma-keyer/preview', async (route) => {
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({
+        preview_url: `/api/chroma-keyer/previews/zoom-image-keyed-${state.imageSampleRequests.length}.svg`,
+      }),
+    })
+  })
+  await page.route('**/api/chroma-keyer/videos/inspect', async (route) => {
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({
+        input_path: chromaZoomVideoPath,
+        width: 1280,
+        height: 720,
+        preview_width: 960,
+        preview_height: 540,
+        preview_url: '/api/chroma-keyer/previews/zoom-video.svg',
+        duration_seconds: 4,
+        fps: 4,
+        estimated_frame_count: 16,
+        timestamp_seconds: 0,
+      }),
+    })
+  })
+  await page.route('**/api/chroma-keyer/videos/frame', async (route) => {
+    const body = route.request().postDataJSON() as { timestamp_seconds: number }
+    state.frameRequests.push(body)
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({
+        preview_url: `/api/chroma-keyer/previews/zoom-video-frame-${state.frameRequests.length}.svg`,
+        timestamp_seconds: body.timestamp_seconds,
+      }),
+    })
+  })
+  await page.route('**/api/chroma-keyer/videos/sample', async (route) => {
+    const body = route.request().postDataJSON() as { timestamp_seconds: number }
+    state.videoSampleRequests.push(body)
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({
+        rgb: [42, 180, 72],
+        hex: '#2AB448',
+        source_x: 600,
+        source_y: 300,
+        timestamp_seconds: body.timestamp_seconds,
+      }),
+    })
+  })
+  await page.route('**/api/chroma-keyer/videos/preview', async (route) => {
+    const body = route.request().postDataJSON() as { timestamp_seconds: number }
+    state.videoPreviewRequests.push(body)
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({
+        preview_url: `/api/chroma-keyer/previews/zoom-video-keyed-${state.videoPreviewRequests.length}.svg`,
+        timestamp_seconds: body.timestamp_seconds,
+      }),
+    })
+  })
+
+  return state
+}
+
+async function loadChromaZoomMedia(page: Page, path: string) {
+  await page.goto('/')
+  await page.getByRole('button', { exact: true, name: '色键抠图' }).click()
+
+  const inspectorTrigger = page.getByRole('button', { name: '打开参数检查器' })
+  if (await inspectorTrigger.isVisible()) {
+    await inspectorTrigger.click()
+  }
+
+  const input = page.getByRole('textbox', { name: '输入图片或视频路径' })
+  await input.fill(path)
+  await input.press('Enter')
+  await expect(page.getByRole('button', { name: '抠像预览' })).toBeVisible()
+
+  const inspectorClose = page.getByRole('button', { name: '关闭参数检查器' })
+  if (await inspectorClose.isVisible()) {
+    await inspectorClose.click()
+  }
+}
+
+async function requireBox(
+  locator: ReturnType<Page['locator']>,
+  label: string,
+) {
+  const box = await locator.boundingBox()
+  expect(box, `${label} must have a bounding box`).not.toBeNull()
+  return box!
+}
+
+test('Chroma preview zoom loads stable image geometry and supports toolbar commands', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 })
+  await installChromaZoomRoutes(page)
+  await loadChromaZoomMedia(page, chromaZoomImagePath)
+
+  const viewport = page.locator('.chroma-preview-viewport')
+  const canvas = page.locator('.chroma-preview-canvas')
+  const image = page.locator('.chroma-preview-image')
+  const toolbar = page.getByRole('toolbar', { name: '预览缩放控制' })
+  const status = toolbar.getByRole('status')
+
+  for (const [label, locator] of [
+    ['viewport', viewport],
+    ['canvas', canvas],
+    ['image', image],
+  ] as const) {
+    const box = await requireBox(locator, label)
+    expect(box.width, `${label} width`).toBeGreaterThan(0)
+    expect(box.height, `${label} height`).toBeGreaterThan(0)
+  }
+  await expect(toolbar).toBeVisible()
+
+  const fittedStatus = await status.textContent()
+  await toolbar.getByRole('button', { name: '实际大小' }).click()
+  await expect(status).toHaveText('100%')
+  await toolbar.getByRole('button', { name: '放大预览' }).click()
+  await expect(status).toHaveText('125%')
+  await toolbar.getByRole('button', { name: '缩小预览' }).click()
+  await expect(status).toHaveText('100%')
+  await toolbar.getByRole('button', { name: '适应窗口' }).click()
+  await expect(status).toHaveText(fittedStatus ?? '')
+})
+
+test('Chroma preview zoom keeps wheel anchors stable and separates pan from sampling', async ({ page }) => {
+  await page.setViewportSize({ width: 900, height: 800 })
+  const routes = await installChromaZoomRoutes(page)
+  await loadChromaZoomMedia(page, chromaZoomImagePath)
+
+  const viewport = page.locator('.chroma-preview-viewport')
+  const canvas = page.locator('.chroma-preview-canvas')
+  const image = page.locator('.chroma-preview-image')
+  const toolbar = page.getByRole('toolbar', { name: '预览缩放控制' })
+  await toolbar.getByRole('button', { name: '实际大小' }).click()
+  await expect.poll(async () => {
+    const box = await requireBox(image, 'actual-size image')
+    return box.width
+  }).toBeCloseTo(1600, 0)
+
+  const canvasBox = await requireBox(canvas, 'canvas')
+  const anchor = {
+    x: canvasBox.x + canvasBox.width * 0.38,
+    y: canvasBox.y + canvasBox.height * 0.62,
+  }
+  const beforeWheel = await requireBox(image, 'image before wheel zoom')
+  const sourceAtAnchor = {
+    x: ((anchor.x - beforeWheel.x) / beforeWheel.width) * 1600,
+    y: ((anchor.y - beforeWheel.y) / beforeWheel.height) * 800,
+  }
+
+  await page.mouse.move(anchor.x, anchor.y)
+  await page.mouse.wheel(0, -240)
+  await expect(toolbar.getByRole('status')).not.toHaveText('100%')
+  await expect.poll(async () => {
+    const afterWheel = await requireBox(image, 'image after wheel zoom')
+    const nextSource = {
+      x: ((anchor.x - afterWheel.x) / afterWheel.width) * 1600,
+      y: ((anchor.y - afterWheel.y) / afterWheel.height) * 800,
+    }
+    return Math.max(
+      Math.abs(nextSource.x - sourceAtAnchor.x),
+      Math.abs(nextSource.y - sourceAtAnchor.y),
+    )
+  }).toBeLessThanOrEqual(2)
+
+  await viewport.focus()
+  await page.keyboard.down('Space')
+  await expect(viewport).toHaveClass(/is-pan-ready/)
+  await page.mouse.move(anchor.x, anchor.y)
+  await page.mouse.down()
+  await page.mouse.move(anchor.x + 48, anchor.y + 24, { steps: 4 })
+  await expect(viewport).toHaveClass(/is-panning/)
+  await page.mouse.up()
+  await page.keyboard.up('Space')
+  expect(routes.imageSampleRequests).toHaveLength(0)
+
+  const clickBox = await requireBox(canvas, 'canvas after pan')
+  await page.mouse.click(
+    clickBox.x + clickBox.width / 2,
+    clickBox.y + clickBox.height / 2,
+  )
+  await expect.poll(() => routes.imageSampleRequests.length).toBe(1)
+
+  const marker = page.getByLabel('采样点 1')
+  await expect(marker).toBeVisible()
+  await expect.poll(async () => {
+    const imageBox = await requireBox(image, 'sampled image')
+    const markerBox = await requireBox(marker, 'sample marker')
+    const expected = {
+      x: imageBox.x + (600 / 1600) * imageBox.width,
+      y: imageBox.y + (300 / 800) * imageBox.height,
+    }
+    const actual = {
+      x: markerBox.x + markerBox.width / 2,
+      y: markerBox.y + markerBox.height / 2,
+    }
+    return Math.max(Math.abs(actual.x - expected.x), Math.abs(actual.y - expected.y))
+  }).toBeLessThanOrEqual(2)
+})
+
+test('Chroma preview zoom preserves video zoom across frame and preview URL refreshes', async ({ page }) => {
+  await page.setViewportSize({ width: 900, height: 800 })
+  const routes = await installChromaZoomRoutes(page)
+  await loadChromaZoomMedia(page, chromaZoomVideoPath)
+
+  const toolbar = page.getByRole('toolbar', { name: '预览缩放控制' })
+  const image = page.locator('.chroma-preview-image')
+  await expect(toolbar).toBeVisible()
+  await toolbar.getByRole('button', { name: '实际大小' }).click()
+  await expect(toolbar.getByRole('status')).toHaveText('100%')
+
+  await page.getByRole('slider', { name: '视频时间轴' }).fill('1')
+  await expect.poll(() => routes.frameRequests.length).toBe(1)
+  await expect(image).toHaveAttribute('src', /zoom-video-frame-1\.svg$/)
+  await expect(toolbar.getByRole('status')).toHaveText('100%')
+
+  const imageBox = await requireBox(image, 'video image')
+  await page.mouse.click(
+    imageBox.x + imageBox.width / 2,
+    imageBox.y + imageBox.height / 2,
+  )
+  await expect.poll(() => routes.videoSampleRequests.length).toBe(1)
+  await expect.poll(() => routes.videoPreviewRequests.length).toBe(1)
+  await expect(image).toHaveAttribute('src', /zoom-video-keyed-1\.svg$/)
+  await expect(toolbar.getByRole('status')).toHaveText('100%')
+})
+
+test('Chroma preview zoom stays contained at target widths in light and dark themes', async ({ page }) => {
+  const pageErrors: string[] = []
+  const consoleErrors: string[] = []
+  page.on('pageerror', (error) => pageErrors.push(error.message))
+  page.on('console', (message) => {
+    if (message.type() === 'error') {
+      consoleErrors.push(message.text())
+    }
+  })
+  await installChromaZoomRoutes(page)
+
+  for (const viewportSize of [
+    { width: 1440, height: 900 },
+    { width: 900, height: 800 },
+    { width: 390, height: 844 },
+  ]) {
+    await page.setViewportSize(viewportSize)
+    await loadChromaZoomMedia(page, chromaZoomImagePath)
+
+    const viewport = await requireBox(page.locator('.chroma-preview-viewport'), 'preview viewport')
+    const canvas = await requireBox(page.locator('.chroma-preview-canvas'), 'preview canvas')
+    const toolbar = await requireBox(
+      page.getByRole('toolbar', { name: '预览缩放控制' }),
+      'preview toolbar',
+    )
+    const documentWidths = await page.evaluate(() => ({
+      client: document.documentElement.clientWidth,
+      scroll: document.documentElement.scrollWidth,
+    }))
+    const center = {
+      x: canvas.x + canvas.width / 2,
+      y: canvas.y + canvas.height / 2,
+    }
+
+    expect(documentWidths.scroll).toBeLessThanOrEqual(documentWidths.client)
+    expect(viewport.x).toBeGreaterThanOrEqual(0)
+    expect(viewport.x + viewport.width).toBeLessThanOrEqual(viewportSize.width + 0.5)
+    expect(toolbar.x).toBeGreaterThanOrEqual(viewport.x - 0.5)
+    expect(toolbar.x + toolbar.width).toBeLessThanOrEqual(viewport.x + viewport.width + 0.5)
+    expect(toolbar.y).toBeGreaterThanOrEqual(viewport.y - 0.5)
+    expect(toolbar.y + toolbar.height).toBeLessThanOrEqual(viewport.y + viewport.height + 0.5)
+    expect(
+      center.x >= toolbar.x
+      && center.x <= toolbar.x + toolbar.width
+      && center.y >= toolbar.y
+      && center.y <= toolbar.y + toolbar.height,
+    ).toBe(false)
+  }
+
+  await page.getByRole('button', { name: '主题设置' }).click()
+  await page.getByRole('menuitemradio', { name: '深色' }).click()
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark')
+  await expect(page.getByRole('toolbar', { name: '预览缩放控制' })).toBeVisible()
+
+  await page.getByRole('button', { name: '主题设置' }).click()
+  await page.getByRole('menuitemradio', { name: '浅色' }).click()
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'light')
+  expect(pageErrors).toEqual([])
+  expect(consoleErrors).toEqual([])
+})
