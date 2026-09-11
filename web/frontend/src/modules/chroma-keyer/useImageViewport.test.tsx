@@ -182,6 +182,56 @@ describe('useImageViewport', () => {
     expect(screen.getByTestId('offset')).toHaveTextContent('-110,-20')
   })
 
+  it('ignores a zero-delta wheel event below the minimum manual scale', () => {
+    const onWheelHandled = vi.fn()
+    rectangle = makeRect(100, 100)
+    render(
+      <ViewportHarness
+        imageHeight={1000}
+        imageWidth={1000}
+        onWheelHandled={onWheelHandled}
+        viewportKey={1}
+      />,
+    )
+    const viewport = screen.getByTestId('viewport')
+    const wheel = createEvent.wheel(viewport, {
+      cancelable: true,
+      deltaMode: 0,
+      deltaY: 0,
+    })
+
+    fireEvent(viewport, wheel)
+
+    expect(onWheelHandled).toHaveBeenCalledWith(false)
+    expect(screen.getByTestId('mode')).toHaveTextContent('fit')
+    expect(screen.getByTestId('scale')).toHaveTextContent('0.1')
+  })
+
+  it('ignores a non-finite wheel delta without corrupting viewport state', () => {
+    const onWheelHandled = vi.fn()
+    render(
+      <ViewportHarness
+        onWheelHandled={onWheelHandled}
+        viewportKey={1}
+      />,
+    )
+    const viewport = screen.getByTestId('viewport')
+    const wheel = createEvent.wheel(viewport, {
+      cancelable: true,
+      deltaMode: 0,
+      deltaY: 1,
+    })
+    Object.defineProperty(wheel, 'deltaY', { value: Number.NaN })
+
+    fireEvent(viewport, wheel)
+
+    const scale = Number(screen.getByTestId('scale').textContent)
+    expect(onWheelHandled).toHaveBeenCalledWith(false)
+    expect(Number.isFinite(scale)).toBe(true)
+    expect(scale).toBe(0.5)
+    expect(screen.getByTestId('mode')).toHaveTextContent('fit')
+  })
+
   it('handles zoom keyboard commands without hijacking Enter', () => {
     render(<ViewportHarness viewportKey={1} />)
     const viewport = screen.getByTestId('viewport')

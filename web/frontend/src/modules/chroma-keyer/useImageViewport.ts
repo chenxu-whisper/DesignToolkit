@@ -198,6 +198,10 @@ export function useImageViewport({
   }, [createFitState, updateState])
 
   const handleWheel = useCallback((event: WheelEvent<HTMLElement>) => {
+    if (!Number.isFinite(event.deltaY) || event.deltaY === 0) {
+      return
+    }
+
     const current = stateRef.current
     if (
       current.mode === 'fit'
