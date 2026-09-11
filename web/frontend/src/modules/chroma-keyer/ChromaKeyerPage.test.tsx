@@ -203,6 +203,53 @@ describe('ChromaKeyerPage', () => {
     expect(await screen.findByRole('button', { name: '抠像预览' })).toBeInTheDocument()
   })
 
+  it('loads zoom controls with a stable initial viewport across preview updates', async () => {
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue({
+      bottom: 300,
+      height: 300,
+      left: 0,
+      right: 400,
+      toJSON: () => ({}),
+      top: 0,
+      width: 400,
+      x: 0,
+      y: 0,
+    })
+    vi.stubGlobal('ResizeObserver', class {
+      private readonly callback: ResizeObserverCallback
+
+      constructor(callback: ResizeObserverCallback) {
+        this.callback = callback
+      }
+
+      disconnect() {}
+
+      observe() {
+        this.callback([], this as unknown as ResizeObserver)
+      }
+
+      unobserve() {}
+    })
+    const user = renderWithUser()
+
+    await inspectImage()
+
+    expect(screen.getByRole('toolbar', { name: '预览缩放控制' })).toBeInTheDocument()
+    await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('50%'))
+
+    await user.click(screen.getByRole('button', { name: '实际大小' }))
+    expect(screen.getByRole('status')).toHaveTextContent('100%')
+
+    await sampleImage()
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: '抠像预览' })).toHaveAttribute(
+        'src',
+        '/api/previews/final.png',
+      ),
+    )
+    expect(screen.getByRole('status')).toHaveTextContent('100%')
+  })
+
   it('does not inspect while typing and commits once on Enter followed by blur', async () => {
     const user = renderWithUser()
     const input = screen.getByLabelText('输入图片或视频路径')
@@ -1263,11 +1310,12 @@ describe('ChromaKeyerPage', () => {
     })
 
     const error = await screen.findByRole('alert')
-    const canvas = screen.getByRole('button', { name: '抠像预览' }).parentElement
+    const canvas = screen.getByRole('button', { name: '抠像预览' })
+      .closest('.chroma-preview-viewport')
     const timeline = screen.getByTestId('chroma-video-timeline')
     const timelineRange = screen.getByRole('slider', { name: '视频时间轴' })
     const instructions = screen.getByText(
-      '点击预览采样，或聚焦后按 Enter 或空格从画面中心采样。',
+      '点击预览采样；按 Enter 从画面中心采样；按住空格并拖拽可平移画面。',
     )
 
     expect(error).toHaveAttribute('id', 'chroma-video-timestamp-error')

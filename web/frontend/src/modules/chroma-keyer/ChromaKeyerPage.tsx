@@ -924,6 +924,7 @@ export function ChromaKeyerPage() {
               previewUrl={previewUrl}
               samples={sampleDetails}
               viewMode={values.viewMode}
+              viewportKey={0}
             >
               {media.kind === 'video' ? (
                 <>
