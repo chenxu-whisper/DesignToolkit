@@ -1,4 +1,4 @@
-import type { KeyboardEvent, MouseEvent, ReactNode } from 'react'
+import { useRef, type KeyboardEvent, type MouseEvent, type ReactNode } from 'react'
 import { ImageViewportToolbar } from './ImageViewportToolbar'
 import { useImageViewport } from './useImageViewport'
 
@@ -61,13 +61,18 @@ export function ChromaKeyerCanvas({
     imageWidth: originalWidth ?? 0,
     viewportKey,
   })
+  const imageRef = useRef<HTMLImageElement>(null)
 
-  const sampleAt = (element: HTMLImageElement, clientX: number, clientY: number) => {
+  const sampleAt = (
+    rect: Pick<DOMRect, 'height' | 'left' | 'top' | 'width'>,
+    clientX: number,
+    clientY: number,
+  ) => {
     if (disabled) {
       return
     }
 
-    const payload = buildChromaSamplePayload(element.getBoundingClientRect(), clientX, clientY)
+    const payload = buildChromaSamplePayload(rect, clientX, clientY)
     if (payload) {
       onSample(payload)
     }
@@ -78,32 +83,57 @@ export function ChromaKeyerCanvas({
       event.preventDefault()
       return
     }
-    sampleAt(event.currentTarget, event.clientX, event.clientY)
+    if (disabled) {
+      return
+    }
+    sampleAt(event.currentTarget.getBoundingClientRect(), event.clientX, event.clientY)
   }
 
-  const handleKeyDown = (event: KeyboardEvent<HTMLImageElement>) => {
+  const sampleImageCenter = (image: HTMLImageElement) => {
+    if (disabled) {
+      return
+    }
+    const rect = image.getBoundingClientRect()
+    sampleAt(rect, rect.left + rect.width / 2, rect.top + rect.height / 2)
+  }
+
+  const handleImageKeyDown = (event: KeyboardEvent<HTMLImageElement>) => {
     if (event.key !== 'Enter') {
       return
     }
 
     event.preventDefault()
-    const rect = event.currentTarget.getBoundingClientRect()
-    sampleAt(event.currentTarget, rect.left + rect.width / 2, rect.top + rect.height / 2)
+    sampleImageCenter(event.currentTarget)
+  }
+
+  const handleViewportKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    viewport.handleKeyDown(event)
+    if (event.key !== 'Enter' || event.target !== event.currentTarget) {
+      return
+    }
+
+    event.preventDefault()
+    if (imageRef.current) {
+      sampleImageCenter(imageRef.current)
+    }
   }
 
   return (
     <>
       <div
+        aria-describedby="chroma-keyer-preview-sampling-instructions"
+        aria-label="抠像预览视口"
         className={[
           'chroma-preview-viewport',
           viewport.isPanReady ? 'is-pan-ready' : '',
           viewport.isPanning ? 'is-panning' : '',
         ].filter(Boolean).join(' ')}
-        onKeyDown={viewport.handleKeyDown}
+        onKeyDown={handleViewportKeyDown}
         onKeyUp={viewport.handleKeyUp}
         onPointerDown={viewport.handlePointerDown}
         onWheel={viewport.handleWheel}
         ref={viewport.viewportRef}
+        role="group"
         tabIndex={0}
       >
         <div
@@ -126,7 +156,8 @@ export function ChromaKeyerCanvas({
               className={`chroma-preview-image${disabled ? ' chroma-preview-image-disabled' : ''}`}
               draggable={false}
               onClick={handleClick}
-              onKeyDown={handleKeyDown}
+              onKeyDown={handleImageKeyDown}
+              ref={imageRef}
               role="button"
               src={previewUrl}
               tabIndex={disabled ? -1 : 0}

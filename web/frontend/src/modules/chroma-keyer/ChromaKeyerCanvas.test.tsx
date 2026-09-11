@@ -1,4 +1,5 @@
 import { createEvent, fireEvent, render, screen } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   ChromaKeyerCanvas,
@@ -88,6 +89,25 @@ describe('ChromaKeyerCanvas', () => {
     vi.unstubAllGlobals()
   })
 
+  it('gives the keyboard-focusable viewport an accessible name and instructions', () => {
+    renderCanvas()
+
+    const viewport = screen.getByRole('group', { name: '抠像预览视口' })
+    const instructions = screen.getByText(
+      '点击预览采样；按 Enter 从画面中心采样；按住空格并拖拽可平移画面。',
+    )
+
+    expect(viewport).toHaveAttribute('tabindex', '0')
+    expect(viewport).toHaveAttribute(
+      'aria-describedby',
+      'chroma-keyer-preview-sampling-instructions',
+    )
+    expect(instructions).toHaveAttribute(
+      'id',
+      'chroma-keyer-preview-sampling-instructions',
+    )
+  })
+
   it('submits click coordinates relative to the rendered preview', () => {
     const onSample = vi.fn()
     renderCanvas({ onSample })
@@ -126,12 +146,38 @@ describe('ChromaKeyerCanvas', () => {
     })
   })
 
-  it('samples only the transformed image center with Enter', () => {
+  it('samples the transformed image center once when Enter is pressed on the viewport', () => {
+    const onSample = vi.fn()
+    renderCanvas({ onSample })
+
+    const viewport = screen.getByRole('group', { name: '抠像预览视口' })
+    const image = screen.getByRole('button', { name: '抠像预览' })
+    const getImageRect = vi.spyOn(image, 'getBoundingClientRect').mockReturnValue(
+      makeRect({ height: 200.5, left: 10, top: 20, width: 400.5 }),
+    )
+    viewport.focus()
+    const enter = createEvent.keyDown(viewport, { key: 'Enter' })
+
+    fireEvent(viewport, enter)
+
+    expect(viewport).toHaveFocus()
+    expect(enter.defaultPrevented).toBe(true)
+    expect(getImageRect).toHaveBeenCalledOnce()
+    expect(onSample).toHaveBeenCalledOnce()
+    expect(onSample).toHaveBeenCalledWith({
+      x: 200,
+      y: 100,
+      previewHeight: 200.5,
+      previewWidth: 400.5,
+    })
+  })
+
+  it('samples the transformed image center once when image Enter bubbles', () => {
     const onSample = vi.fn()
     renderCanvas({ onSample })
 
     const image = screen.getByRole('button', { name: '抠像预览' })
-    vi.spyOn(image, 'getBoundingClientRect').mockReturnValue(
+    const getImageRect = vi.spyOn(image, 'getBoundingClientRect').mockReturnValue(
       makeRect({ height: 200.5, left: 10, top: 20, width: 400.5 }),
     )
     const enter = createEvent.keyDown(image, { key: 'Enter' })
@@ -140,6 +186,8 @@ describe('ChromaKeyerCanvas', () => {
 
     expect(enter.defaultPrevented).toBe(true)
     expect(image).toHaveAttribute('aria-describedby')
+    expect(getImageRect).toHaveBeenCalledOnce()
+    expect(onSample).toHaveBeenCalledOnce()
     expect(onSample).toHaveBeenCalledWith({
       x: 200,
       y: 100,
@@ -262,7 +310,8 @@ describe('ChromaKeyerCanvas', () => {
     expect(onSample).toHaveBeenCalledOnce()
   })
 
-  it('wires toolbar and keyboard zoom, actual-size, and fit commands', () => {
+  it('wires toolbar and keyboard zoom, actual-size, and fit commands', async () => {
+    const user = userEvent.setup()
     renderCanvas()
     const image = screen.getByRole('button', { name: '抠像预览' })
     const content = image.closest('.chroma-preview-content') as HTMLElement
@@ -288,15 +337,10 @@ describe('ChromaKeyerCanvas', () => {
     }
 
     const toolbarZoom = screen.getByRole('button', { name: '放大预览' })
-    const toolbarEnter = createEvent.keyDown(toolbarZoom, { key: 'Enter' })
-    fireEvent(toolbarZoom, toolbarEnter)
-    expect(toolbarEnter.defaultPrevented).toBe(false)
-    expect(status).toHaveTextContent('50%')
-
-    const toolbarSpace = createEvent.keyDown(toolbarZoom, { key: ' ' })
-    fireEvent(toolbarZoom, toolbarSpace)
-    expect(toolbarSpace.defaultPrevented).toBe(false)
-    expect(image.closest('.chroma-preview-viewport')).not.toHaveClass('is-pan-ready')
+    toolbarZoom.focus()
+    await user.keyboard('{Enter}')
+    expect(toolbarZoom).toHaveFocus()
+    expect(status).toHaveTextContent('67%')
   })
 
   it('zooms around the wheel pointer and prevents workspace scrolling', () => {
@@ -379,17 +423,24 @@ describe('ChromaKeyerCanvas', () => {
   it('blocks disabled sampling while leaving inspection controls usable', () => {
     const onSample = vi.fn()
     renderCanvas({ disabled: true, onSample })
+    const viewport = screen.getByRole('group', { name: '抠像预览视口' })
     const image = screen.getByRole('button', { name: '抠像预览' })
-    vi.spyOn(image, 'getBoundingClientRect').mockReturnValue(
+    const getImageRect = vi.spyOn(image, 'getBoundingClientRect').mockReturnValue(
       makeRect({ height: 200, width: 400 }),
     )
 
     fireEvent.click(image, { clientX: 10, clientY: 10 })
     fireEvent.keyDown(image, { key: 'Enter' })
+    viewport.focus()
+    const viewportEnter = createEvent.keyDown(viewport, { key: 'Enter' })
+    fireEvent(viewport, viewportEnter)
 
     expect(image).toHaveAttribute('aria-disabled', 'true')
     expect(image).toHaveAttribute('tabindex', '-1')
     expect(image).toHaveClass('chroma-preview-image-disabled')
+    expect(viewport).toHaveFocus()
+    expect(viewportEnter.defaultPrevented).toBe(true)
+    expect(getImageRect).not.toHaveBeenCalled()
     expect(onSample).not.toHaveBeenCalled()
 
     fireEvent.click(screen.getByRole('button', { name: '实际大小' }))
