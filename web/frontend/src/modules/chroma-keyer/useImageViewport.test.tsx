@@ -12,6 +12,7 @@ import { useImageViewport } from './useImageViewport'
 type HarnessProps = {
   imageHeight?: number
   imageWidth?: number
+  isolateReactKeyUp?: boolean
   onWheelHandled?: (defaultPrevented: boolean) => void
   viewportKey: number
 }
@@ -81,6 +82,7 @@ function firePointerEvent(
 function ViewportHarness({
   imageHeight = 400,
   imageWidth = 800,
+  isolateReactKeyUp = false,
   onWheelHandled,
   viewportKey,
 }: HarnessProps) {
@@ -95,7 +97,12 @@ function ViewportHarness({
     <div
       data-testid="viewport"
       onKeyDown={viewport.handleKeyDown}
-      onKeyUp={viewport.handleKeyUp}
+      onKeyUp={(event) => {
+        viewport.handleKeyUp(event)
+        if (isolateReactKeyUp) {
+          event.stopPropagation()
+        }
+      }}
       onPointerDown={viewport.handlePointerDown}
       onWheel={(event) => {
         viewport.handleWheel(event)
@@ -477,6 +484,73 @@ describe('useImageViewport', () => {
     expect(spaceDown.defaultPrevented).toBe(false)
     expect(spaceUp.defaultPrevented).toBe(false)
     expect(screen.getByTestId('pan-ready')).toHaveTextContent('false')
+  })
+
+  it('releases the pan latch on React Space keyup from a toolbar button', () => {
+    render(<ViewportHarness isolateReactKeyUp viewportKey={1} />)
+    const viewport = screen.getByTestId('viewport')
+    const toolbarButton = screen.getByRole('button', {
+      name: 'Toolbar target',
+    })
+    fireEvent.keyDown(viewport, { key: ' ' })
+    expect(screen.getByTestId('pan-ready')).toHaveTextContent('true')
+
+    const spaceUp = createEvent.keyUp(toolbarButton, {
+      cancelable: true,
+      key: ' ',
+    })
+    fireEvent(toolbarButton, spaceUp)
+
+    expect(spaceUp.defaultPrevented).toBe(false)
+    expect(screen.getByTestId('pan-ready')).toHaveTextContent('false')
+  })
+
+  it('globally releases a completed pan from an interactive Space keyup', () => {
+    const addEventListener = vi.spyOn(window, 'addEventListener')
+    const removeEventListener = vi.spyOn(window, 'removeEventListener')
+    render(<ViewportHarness viewportKey={1} />)
+    fireEvent.click(screen.getByRole('button', { name: 'Actual size' }))
+    const viewport = screen.getByTestId('viewport')
+    const toolbarButton = screen.getByRole('button', {
+      name: 'Toolbar target',
+    })
+    const windowKeyUp = addEventListener.mock.calls.find(
+      ([eventName]) => eventName === 'keyup',
+    )?.[1] as EventListener | undefined
+    expect(windowKeyUp).toBeDefined()
+
+    fireEvent.keyDown(viewport, { key: ' ' })
+    expect(screen.getByTestId('pan-ready')).toHaveTextContent('true')
+    addEventListener.mockClear()
+    firePointerEvent(viewport, 'pointerdown', {
+      button: 0,
+      clientX: 20,
+      clientY: 20,
+      pointerId: 25,
+    })
+    const listeners = getAddedPanListeners(addEventListener)
+    firePointerEvent(window, 'pointermove', {
+      clientX: 24,
+      clientY: 20,
+      pointerId: 25,
+    })
+
+    const spaceUp = new KeyboardEvent('keyup', {
+      bubbles: true,
+      cancelable: true,
+      key: ' ',
+    })
+    Object.defineProperty(spaceUp, 'target', { value: toolbarButton })
+    act(() => {
+      windowKeyUp?.(spaceUp)
+    })
+
+    expect(spaceUp.defaultPrevented).toBe(false)
+    expect(screen.getByTestId('pan-ready')).toHaveTextContent('false')
+    expect(screen.getByTestId('panning')).toHaveTextContent('false')
+    expectPanListenersRemoved(removeEventListener, listeners)
+    fireEvent.click(screen.getByRole('button', { name: 'Consume suppression' }))
+    expect(screen.getByTestId('suppress')).toHaveTextContent('true')
   })
 
   it('clamps movement to the near and far boundary on both axes', () => {

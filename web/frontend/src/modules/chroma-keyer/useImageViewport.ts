@@ -345,10 +345,12 @@ export function useImageViewport({
   }, [fit, setActualSize, zoomIn, zoomOut])
 
   const handleKeyUp = useCallback((event: KeyboardEvent<HTMLElement>) => {
-    if (!isSpaceKey(event.key) || isPanKeyboardTarget(event.target)) {
+    if (!isSpaceKey(event.key) || !spacePressedRef.current) {
       return
     }
-    event.preventDefault()
+    if (!isPanKeyboardTarget(event.target)) {
+      event.preventDefault()
+    }
     releaseSpace()
   }, [releaseSpace])
 
@@ -451,14 +453,12 @@ export function useImageViewport({
       clearPanInteraction()
     }
     const handleWindowKeyUp = (event: globalThis.KeyboardEvent) => {
-      if (
-        !isSpaceKey(event.key)
-        || isPanKeyboardTarget(event.target)
-        || !spacePressedRef.current
-      ) {
+      if (!isSpaceKey(event.key) || !spacePressedRef.current) {
         return
       }
-      event.preventDefault()
+      if (!isPanKeyboardTarget(event.target)) {
+        event.preventDefault()
+      }
       releaseSpace()
     }
     window.addEventListener('blur', handleBlur)
