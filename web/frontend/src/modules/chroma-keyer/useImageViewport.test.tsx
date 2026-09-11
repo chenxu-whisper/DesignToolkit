@@ -478,6 +478,41 @@ describe('useImageViewport', () => {
     expect(screen.getByTestId('pan-ready')).toHaveTextContent('false')
     expect(screen.getByTestId('panning')).toHaveTextContent('false')
     expectPanListenersRemoved(removeEventListener, listeners)
+    fireEvent.click(screen.getByRole('button', { name: 'Consume suppression' }))
+    expect(screen.getByTestId('suppress')).toHaveTextContent('false')
+  })
+
+  it('suppresses the next click when Space ends a completed drag', () => {
+    const addEventListener = vi.spyOn(window, 'addEventListener')
+    const removeEventListener = vi.spyOn(window, 'removeEventListener')
+    render(<ViewportHarness viewportKey={1} />)
+    fireEvent.click(screen.getByRole('button', { name: 'Actual size' }))
+    const viewport = screen.getByTestId('viewport')
+    fireEvent.keyDown(viewport, { key: ' ' })
+    addEventListener.mockClear()
+    firePointerEvent(viewport, 'pointerdown', {
+      button: 0,
+      clientX: 20,
+      clientY: 20,
+      pointerId: 19,
+    })
+    const listeners = getAddedPanListeners(addEventListener)
+    firePointerEvent(window, 'pointermove', {
+      clientX: 24,
+      clientY: 20,
+      pointerId: 19,
+    })
+
+    fireEvent.keyUp(viewport, { key: ' ' })
+
+    expect(screen.getByTestId('pan-ready')).toHaveTextContent('false')
+    expect(screen.getByTestId('panning')).toHaveTextContent('false')
+    expectPanListenersRemoved(removeEventListener, listeners)
+    firePointerEvent(window, 'pointerup', { pointerId: 19 })
+    fireEvent.click(screen.getByRole('button', { name: 'Consume suppression' }))
+    expect(screen.getByTestId('suppress')).toHaveTextContent('true')
+    fireEvent.click(screen.getByRole('button', { name: 'Consume suppression' }))
+    expect(screen.getByTestId('suppress')).toHaveTextContent('false')
   })
 
   it('ignores movement and pointer-up from a different pointer', () => {

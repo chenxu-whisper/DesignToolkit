@@ -318,8 +318,10 @@ export function useImageViewport({
       return
     }
     event.preventDefault()
-    clearPanInteraction()
-  }, [clearPanInteraction])
+    spacePressedRef.current = false
+    setIsPanReady(false)
+    finishPan(true)
+  }, [finishPan])
 
   const handlePointerDown = useCallback((event: PointerEvent<HTMLElement>) => {
     const target = event.target
