@@ -37,6 +37,13 @@ export function ImageViewportToolbar({
         label="缩小预览"
         onClick={onZoomOut}
       />
+      <output
+        aria-live="polite"
+        className="image-viewport-zoom-status"
+        role="status"
+      >
+        {Math.round(scale * 100)}%
+      </output>
       <ToolbarButton
         disabled={!canZoomIn}
         icon={Plus}
@@ -45,13 +52,6 @@ export function ImageViewportToolbar({
       />
       <ToolbarButton icon={Scan} label="适应窗口" onClick={onFit} />
       <ToolbarButton icon={Maximize} label="实际大小" onClick={onActualSize} />
-      <output
-        aria-live="polite"
-        className="image-viewport-zoom-status"
-        role="status"
-      >
-        {Math.round(scale * 100)}%
-      </output>
     </div>
   )
 }

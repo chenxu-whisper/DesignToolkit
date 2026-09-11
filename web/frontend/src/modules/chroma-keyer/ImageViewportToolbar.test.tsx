@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react'
+import { render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { describe, expect, it, vi } from 'vitest'
 import { ImageViewportToolbar } from './ImageViewportToolbar'
@@ -22,10 +22,16 @@ describe('ImageViewportToolbar', () => {
     const props = createProps()
     render(<ImageViewportToolbar {...props} />)
 
-    expect(screen.getByRole('toolbar', { name: '预览缩放控制' })).toHaveClass(
-      'image-viewport-toolbar',
-    )
-    expect(screen.getByRole('status')).toHaveTextContent('125%')
+    const toolbar = screen.getByRole('toolbar', { name: '预览缩放控制' })
+    expect(toolbar).toHaveClass('image-viewport-toolbar')
+    expect(Array.from(toolbar.children)).toEqual([
+      within(toolbar).getByRole('button', { name: '缩小预览' }),
+      within(toolbar).getByRole('status'),
+      within(toolbar).getByRole('button', { name: '放大预览' }),
+      within(toolbar).getByRole('button', { name: '适应窗口' }),
+      within(toolbar).getByRole('button', { name: '实际大小' }),
+    ])
+    expect(screen.getByRole('status').textContent).toBe('125%')
 
     for (const [label, callbackName] of [
       ['缩小预览', 'onZoomOut'],
@@ -82,7 +88,7 @@ describe('ImageViewportToolbar', () => {
     expect(status.tagName).toBe('OUTPUT')
     expect(status).toHaveAttribute('aria-live', 'polite')
     expect(status).toHaveClass('image-viewport-zoom-status')
-    expect(status).toHaveTextContent(expected)
+    expect(status.textContent).toBe(expected)
   })
 
   it('uses the requested decorative Lucide icons', () => {
