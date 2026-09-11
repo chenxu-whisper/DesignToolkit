@@ -750,15 +750,20 @@ test('runs the complete chroma video timeline and PNG sequence export workflow',
   await fulfillFrame(pendingFrameRoutes[10], 'video-step-back-clamped')
   await expect(timeline).toHaveValue('0')
 
-  await canvas.click({ position: { x: 100, y: 50 } })
+  const imageBox = await requireBox(canvas, 'video preview image before sample')
+  const samplePoint = {
+    x: Math.floor(imageBox.x + 100),
+    y: Math.floor(imageBox.y + 50),
+  }
+  await page.mouse.click(samplePoint.x, samplePoint.y)
   await expect.poll(() => sampleBodies.length).toBe(1)
   expect(sampleBodies[0]).toEqual({
     input_path: videoInputPath,
     timestamp_seconds: 0,
-    x: 100,
-    y: 50,
-    preview_width: 400,
-    preview_height: 200,
+    x: Math.floor(samplePoint.x - imageBox.x),
+    y: Math.floor(samplePoint.y - imageBox.y),
+    preview_width: imageBox.width,
+    preview_height: imageBox.height,
   })
   await expect(page.getByText('Screen Color', { exact: true })).toBeVisible()
   const defaultVideoPreviewBody: VideoPreviewBody = {
