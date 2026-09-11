@@ -1,5 +1,5 @@
 import { StrictMode } from 'react'
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { useLogStore } from '../../state/useLogStore'
@@ -204,41 +204,16 @@ describe('ChromaKeyerPage', () => {
   })
 
   it('loads zoom controls with a stable initial viewport across preview updates', async () => {
-    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue({
-      bottom: 300,
-      height: 300,
-      left: 0,
-      right: 400,
-      toJSON: () => ({}),
-      top: 0,
-      width: 400,
-      x: 0,
-      y: 0,
-    })
-    vi.stubGlobal('ResizeObserver', class {
-      private readonly callback: ResizeObserverCallback
-
-      constructor(callback: ResizeObserverCallback) {
-        this.callback = callback
-      }
-
-      disconnect() {}
-
-      observe() {
-        this.callback([], this as unknown as ResizeObserver)
-      }
-
-      unobserve() {}
-    })
+    installViewportMeasurements()
     const user = renderWithUser()
 
     await inspectImage()
 
     expect(screen.getByRole('toolbar', { name: '预览缩放控制' })).toBeInTheDocument()
-    await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('50%'))
+    await waitFor(() => expect(getZoomStatus()).toHaveTextContent('50%'))
 
     await user.click(screen.getByRole('button', { name: '实际大小' }))
-    expect(screen.getByRole('status')).toHaveTextContent('100%')
+    expect(getZoomStatus()).toHaveTextContent('100%')
 
     await sampleImage()
     await waitFor(() =>
@@ -247,7 +222,44 @@ describe('ChromaKeyerPage', () => {
         '/api/previews/final.png',
       ),
     )
-    expect(screen.getByRole('status')).toHaveTextContent('100%')
+    expect(getZoomStatus()).toHaveTextContent('100%')
+
+    await user.click(screen.getByRole('radio', { name: 'Alpha' }))
+    await waitFor(() => expect(pageMocks.createChromaPreview).toHaveBeenLastCalledWith(
+      expect.objectContaining({ viewMode: 'alpha' }),
+    ))
+    expect(getZoomStatus()).toHaveTextContent('100%')
+
+    fireEvent.change(screen.getByLabelText('Screen Gain 数值'), { target: { value: '1.2' } })
+    await waitFor(() => expect(pageMocks.createChromaPreview).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        params: expect.objectContaining({ screenGain: 1.2 }),
+        viewMode: 'alpha',
+      }),
+    ))
+    expect(getZoomStatus()).toHaveTextContent('100%')
+  })
+
+  it('resets to fit after each accepted image inspection across reused paths', async () => {
+    installViewportMeasurements()
+    const user = renderWithUser()
+    const input = screen.getByLabelText('输入图片或视频路径')
+
+    await inspectImage()
+    await waitFor(() => expect(getZoomStatus()).toHaveTextContent('50%'))
+    await user.click(screen.getByRole('button', { name: '实际大小' }))
+    expect(getZoomStatus()).toHaveTextContent('100%')
+
+    fireEvent.change(input, { target: { value: 'E:\\media\\replacement.png' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    await waitFor(() => expect(getZoomStatus()).toHaveTextContent('50%'))
+    await user.click(screen.getByRole('button', { name: '实际大小' }))
+    expect(getZoomStatus()).toHaveTextContent('100%')
+
+    fireEvent.change(input, { target: { value: 'E:\\media\\screen.png' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    await waitFor(() => expect(pageMocks.inspectChromaImage).toHaveBeenCalledTimes(3))
+    await waitFor(() => expect(getZoomStatus()).toHaveTextContent('50%'))
   })
 
   it('does not inspect while typing and commits once on Enter followed by blur', async () => {
@@ -487,6 +499,7 @@ describe('ChromaKeyerPage', () => {
   })
 
   it('does not let a slower older inspection overwrite a newer committed path', async () => {
+    installViewportMeasurements()
     const oldRequest = createDeferred<typeof inspectResponse>()
     const newRequest = createDeferred<typeof inspectResponse>()
     pageMocks.inspectChromaImage
@@ -514,6 +527,9 @@ describe('ChromaKeyerPage', () => {
       'src',
       '/api/previews/new.png',
     )
+    await waitFor(() => expect(getZoomStatus()).toHaveTextContent('50%'))
+    fireEvent.click(screen.getByRole('button', { name: '实际大小' }))
+    expect(getZoomStatus()).toHaveTextContent('100%')
 
     await act(async () => {
       oldRequest.resolve({
@@ -528,6 +544,7 @@ describe('ChromaKeyerPage', () => {
       'src',
       '/api/previews/new.png',
     )
+    expect(getZoomStatus()).toHaveTextContent('100%')
   })
 
   it('requests Final and immediately re-requests Alpha previews with complete samples', async () => {
@@ -1077,13 +1094,36 @@ describe('ChromaKeyerPage', () => {
   })
 
   it('refreshes a loaded video when the same path is committed again', async () => {
+    installViewportMeasurements()
     render(<ChromaKeyerPage />)
     await inspectVideo()
+    await waitFor(() => expect(getZoomStatus()).toHaveTextContent('21%'))
+    fireEvent.click(screen.getByRole('button', { name: '实际大小' }))
+    expect(getZoomStatus()).toHaveTextContent('100%')
+
+    fireEvent.change(screen.getByRole('slider', { name: '视频时间轴' }), {
+      target: { value: '1' },
+    })
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: '抠像预览' })).toHaveAttribute(
+        'src',
+        '/api/previews/video-frame.png',
+      ),
+    )
+    expect(getZoomStatus()).toHaveTextContent('100%')
+
     await sampleImage()
     await waitFor(() => expect(screen.getByText('#2AB448')).toBeInTheDocument())
     await waitFor(() =>
       expect(screen.getByRole('slider', { name: '视频时间轴' })).toHaveValue('1.25'),
     )
+    expect(getZoomStatus()).toHaveTextContent('100%')
+    fireEvent.click(screen.getByRole('radio', { name: 'Alpha' }))
+    await waitFor(() => expect(pageMocks.createChromaVideoPreview).toHaveBeenLastCalledWith(
+      expect.objectContaining({ viewMode: 'alpha' }),
+    ))
+    expect(getZoomStatus()).toHaveTextContent('100%')
+
     pageMocks.inspectChromaVideo.mockResolvedValueOnce({
       ...videoInspectResponse,
       duration_seconds: 20,
@@ -1107,6 +1147,7 @@ describe('ChromaKeyerPage', () => {
     expect(screen.getByText('约 480 帧')).toBeInTheDocument()
     expect(screen.getByRole('slider', { name: '视频时间轴' })).toHaveValue('0')
     expect(screen.queryByText('#2AB448')).not.toBeInTheDocument()
+    await waitFor(() => expect(getZoomStatus()).toHaveTextContent('31%'))
 
     await sampleImage()
     expect(pageMocks.sampleChromaVideo).toHaveBeenLastCalledWith(
@@ -1255,6 +1296,7 @@ describe('ChromaKeyerPage', () => {
   })
 
   it('preserves the loaded video session when a same-path refresh fails', async () => {
+    installViewportMeasurements()
     const refreshRequest = createDeferred<typeof videoInspectResponse>()
     render(<ChromaKeyerPage />)
     await inspectVideo()
@@ -1263,6 +1305,8 @@ describe('ChromaKeyerPage', () => {
     await waitFor(() =>
       expect(screen.getByRole('slider', { name: '视频时间轴' })).toHaveValue('1.25'),
     )
+    fireEvent.click(screen.getByRole('button', { name: '实际大小' }))
+    expect(getZoomStatus()).toHaveTextContent('100%')
     pageMocks.inspectChromaVideo.mockReturnValueOnce(refreshRequest.promise)
 
     fireEvent.keyDown(screen.getByLabelText('输入图片或视频路径'), { key: 'Enter' })
@@ -1277,6 +1321,7 @@ describe('ChromaKeyerPage', () => {
     expect(screen.getByText('约 375 帧')).toBeInTheDocument()
     expect(screen.getByRole('slider', { name: '视频时间轴' })).toHaveValue('1.25')
     expect(screen.getByText('#2AB448')).toBeInTheDocument()
+    expect(getZoomStatus()).toHaveTextContent('100%')
 
     await act(async () => {
       refreshRequest.reject(new Error('视频刷新失败'))
@@ -2791,6 +2836,10 @@ function renderWithUser() {
   return userEvent.setup()
 }
 
+function getZoomStatus() {
+  return within(screen.getByRole('toolbar', { name: '预览缩放控制' })).getByRole('status')
+}
+
 function createDeferred<T>() {
   let resolve!: (value: T) => void
   let reject!: (reason?: unknown) => void
@@ -2799,6 +2848,49 @@ function createDeferred<T>() {
     reject = nextReject
   })
   return { promise, reject, resolve }
+}
+
+function installViewportMeasurements() {
+  vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (
+    this: HTMLElement,
+  ) {
+    if (this.classList.contains('chroma-preview-viewport')) {
+      return createRect(400, 300)
+    }
+    if (this.classList.contains('chroma-preview-image')) {
+      return createRect(400, 200, 10, 20)
+    }
+    return createRect(0, 0)
+  })
+  vi.stubGlobal('ResizeObserver', class {
+    private readonly callback: ResizeObserverCallback
+
+    constructor(callback: ResizeObserverCallback) {
+      this.callback = callback
+    }
+
+    disconnect() {}
+
+    observe() {
+      this.callback([], this as unknown as ResizeObserver)
+    }
+
+    unobserve() {}
+  })
+}
+
+function createRect(width: number, height: number, left = 0, top = 0): DOMRect {
+  return {
+    bottom: top + height,
+    height,
+    left,
+    right: left + width,
+    toJSON: () => ({}),
+    top,
+    width,
+    x: left,
+    y: top,
+  }
 }
 
 function installPlaybackClock() {

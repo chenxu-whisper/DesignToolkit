@@ -116,6 +116,7 @@ export function ChromaKeyerPage() {
   const [values, setValues] = useState<ChromaKeyerValues>(() => createChromaKeyerDefaultValues())
   const [errors, setErrors] = useState<ChromaKeyerErrors>({})
   const [media, setMedia] = useState<InspectedMedia | null>(null)
+  const [viewportKey, setViewportKey] = useState(0)
   const [previewUrl, setPreviewUrl] = useState<string | null>(null)
   const [sampleDetails, setSampleDetails] = useState<ChromaCanvasSample[]>([])
   const [exportError, setExportError] = useState<string | null>(null)
@@ -479,6 +480,7 @@ export function ChromaKeyerPage() {
           getLastVideoFrameTime(response.duration_seconds, response.fps),
           Math.max(0, response.timestamp_seconds),
         )
+        setViewportKey((current) => current + 1)
         mediaRef.current = inspectedVideo
         setMedia(inspectedVideo)
         setPreviewUrl(response.preview_url)
@@ -507,6 +509,7 @@ export function ChromaKeyerPage() {
           previewUrl: response.preview_url,
           width: response.width,
         }
+        setViewportKey((current) => current + 1)
         mediaRef.current = inspectedImage
         setMedia(inspectedImage)
         setPreviewUrl(response.preview_url)
@@ -924,7 +927,7 @@ export function ChromaKeyerPage() {
               previewUrl={previewUrl}
               samples={sampleDetails}
               viewMode={values.viewMode}
-              viewportKey={0}
+              viewportKey={viewportKey}
             >
               {media.kind === 'video' ? (
                 <>
