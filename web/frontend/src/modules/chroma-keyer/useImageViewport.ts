@@ -80,6 +80,19 @@ function isPositiveSize({ height, width }: ViewportSize) {
   )
 }
 
+function isSpaceKey(key: string) {
+  return key === ' ' || key === 'Spacebar'
+}
+
+function isPanKeyboardTarget(target: EventTarget | null) {
+  return (
+    target instanceof Element
+    && Boolean(target.closest(
+      '.image-viewport-toolbar, button, input, select, textarea, a',
+    ))
+  )
+}
+
 export function useImageViewport({
   imageHeight,
   imageWidth,
@@ -221,13 +234,13 @@ export function useImageViewport({
     updateState(() => createFitState())
   }, [createFitState, updateState])
 
-  const finishPan = useCallback((completed: boolean) => {
+  const teardownPan = useCallback((completed: boolean) => {
     const session = panRef.current
     if (!session) {
       if (!completed) {
         suppressClickRef.current = false
       }
-      return
+      return false
     }
 
     window.removeEventListener('pointermove', session.listeners.move)
@@ -235,14 +248,29 @@ export function useImageViewport({
     window.removeEventListener('pointercancel', session.listeners.cancel)
     suppressClickRef.current = completed && session.dragged
     panRef.current = null
-    setIsPanning(false)
+    return true
   }, [])
+
+  const finishPan = useCallback((completed: boolean) => {
+    if (teardownPan(completed)) {
+      setIsPanning(false)
+    }
+  }, [teardownPan])
 
   const clearPanInteraction = useCallback(() => {
     spacePressedRef.current = false
     suppressClickRef.current = false
     setIsPanReady(false)
     finishPan(false)
+  }, [finishPan])
+
+  const releaseSpace = useCallback(() => {
+    if (!spacePressedRef.current) {
+      return
+    }
+    spacePressedRef.current = false
+    setIsPanReady(false)
+    finishPan(true)
   }, [finishPan])
 
   const handleWheel = useCallback((event: WheelEvent<HTMLElement>) => {
@@ -283,7 +311,10 @@ export function useImageViewport({
   }, [applyScale])
 
   const handleKeyDown = useCallback((event: KeyboardEvent<HTMLElement>) => {
-    if (event.key === ' ' || event.key === 'Spacebar') {
+    if (isSpaceKey(event.key)) {
+      if (isPanKeyboardTarget(event.target)) {
+        return
+      }
       event.preventDefault()
       if (!spacePressedRef.current) {
         spacePressedRef.current = true
@@ -314,14 +345,12 @@ export function useImageViewport({
   }, [fit, setActualSize, zoomIn, zoomOut])
 
   const handleKeyUp = useCallback((event: KeyboardEvent<HTMLElement>) => {
-    if (event.key !== ' ' && event.key !== 'Spacebar') {
+    if (!isSpaceKey(event.key) || isPanKeyboardTarget(event.target)) {
       return
     }
     event.preventDefault()
-    spacePressedRef.current = false
-    setIsPanReady(false)
-    finishPan(true)
-  }, [finishPan])
+    releaseSpace()
+  }, [releaseSpace])
 
   const handlePointerDown = useCallback((event: PointerEvent<HTMLElement>) => {
     const target = event.target
@@ -342,6 +371,8 @@ export function useImageViewport({
     ) {
       return
     }
+
+    event.preventDefault()
 
     const matchesPointer = (pointerEvent: globalThis.PointerEvent) => {
       const activePointerId = panRef.current?.pointerId
@@ -419,15 +450,27 @@ export function useImageViewport({
     const handleBlur = () => {
       clearPanInteraction()
     }
+    const handleWindowKeyUp = (event: globalThis.KeyboardEvent) => {
+      if (
+        !isSpaceKey(event.key)
+        || isPanKeyboardTarget(event.target)
+        || !spacePressedRef.current
+      ) {
+        return
+      }
+      event.preventDefault()
+      releaseSpace()
+    }
     window.addEventListener('blur', handleBlur)
+    window.addEventListener('keyup', handleWindowKeyUp)
     return () => {
       window.removeEventListener('blur', handleBlur)
+      window.removeEventListener('keyup', handleWindowKeyUp)
+      spacePressedRef.current = false
+      suppressClickRef.current = false
+      teardownPan(false)
     }
-  }, [clearPanInteraction])
-
-  useEffect(() => () => {
-    clearPanInteraction()
-  }, [clearPanInteraction])
+  }, [clearPanInteraction, releaseSpace, teardownPan])
 
   useEffect(() => {
     measure()

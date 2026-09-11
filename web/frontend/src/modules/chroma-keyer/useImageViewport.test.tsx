@@ -378,6 +378,39 @@ describe('useImageViewport', () => {
     expect(screen.getByTestId('suppress')).toHaveTextContent('false')
   })
 
+  it('prevents native drag only for an accepted pan pointer-down', () => {
+    render(<ViewportHarness viewportKey={1} />)
+    const viewport = screen.getByTestId('viewport')
+
+    const withoutSpace = firePointerEvent(viewport, 'pointerdown', {
+      button: 0,
+      pointerId: 20,
+    })
+    fireEvent.keyDown(viewport, { key: ' ' })
+    const nonPrimary = firePointerEvent(viewport, 'pointerdown', {
+      button: 1,
+      pointerId: 21,
+    })
+    const toolbar = firePointerEvent(
+      screen.getByRole('button', { name: 'Toolbar target' }),
+      'pointerdown',
+      {
+        button: 0,
+        pointerId: 22,
+      },
+    )
+    const accepted = firePointerEvent(viewport, 'pointerdown', {
+      button: 0,
+      pointerId: 23,
+    })
+
+    expect(withoutSpace.defaultPrevented).toBe(false)
+    expect(nonPrimary.defaultPrevented).toBe(false)
+    expect(toolbar.defaultPrevented).toBe(false)
+    expect(accepted.defaultPrevented).toBe(true)
+    expect(screen.getByTestId('panning')).toHaveTextContent('true')
+  })
+
   it('requires Space, a primary pointer, valid dimensions, and a non-toolbar target', () => {
     const addEventListener = vi.spyOn(window, 'addEventListener')
     render(<ViewportHarness viewportKey={1} />)
@@ -428,6 +461,22 @@ describe('useImageViewport', () => {
     })
 
     expect(screen.getByTestId('panning')).toHaveTextContent('false')
+  })
+
+  it('does not intercept Space from a toolbar button', () => {
+    render(<ViewportHarness viewportKey={1} />)
+    const toolbarButton = screen.getByRole('button', {
+      name: 'Toolbar target',
+    })
+
+    const spaceDown = createEvent.keyDown(toolbarButton, { key: ' ' })
+    fireEvent(toolbarButton, spaceDown)
+    const spaceUp = createEvent.keyUp(toolbarButton, { key: ' ' })
+    fireEvent(toolbarButton, spaceUp)
+
+    expect(spaceDown.defaultPrevented).toBe(false)
+    expect(spaceUp.defaultPrevented).toBe(false)
+    expect(screen.getByTestId('pan-ready')).toHaveTextContent('false')
   })
 
   it('clamps movement to the near and far boundary on both axes', () => {
@@ -513,6 +562,40 @@ describe('useImageViewport', () => {
     expect(screen.getByTestId('suppress')).toHaveTextContent('true')
     fireEvent.click(screen.getByRole('button', { name: 'Consume suppression' }))
     expect(screen.getByTestId('suppress')).toHaveTextContent('false')
+  })
+
+  it('ends a completed drag on window Space release and preserves suppression', () => {
+    const addEventListener = vi.spyOn(window, 'addEventListener')
+    const removeEventListener = vi.spyOn(window, 'removeEventListener')
+    render(<ViewportHarness viewportKey={1} />)
+    const viewport = screen.getByTestId('viewport')
+    const windowKeyUp = addEventListener.mock.calls.find(
+      ([eventName]) => eventName === 'keyup',
+    )?.[1]
+    expect(windowKeyUp).toBeDefined()
+
+    fireEvent.keyDown(viewport, { key: ' ' })
+    addEventListener.mockClear()
+    firePointerEvent(viewport, 'pointerdown', {
+      button: 0,
+      clientX: 20,
+      clientY: 20,
+      pointerId: 24,
+    })
+    const listeners = getAddedPanListeners(addEventListener)
+    firePointerEvent(window, 'pointermove', {
+      clientX: 24,
+      clientY: 20,
+      pointerId: 24,
+    })
+
+    fireEvent.keyUp(window, { key: ' ' })
+
+    expect(screen.getByTestId('pan-ready')).toHaveTextContent('false')
+    expect(screen.getByTestId('panning')).toHaveTextContent('false')
+    expectPanListenersRemoved(removeEventListener, listeners)
+    fireEvent.click(screen.getByRole('button', { name: 'Consume suppression' }))
+    expect(screen.getByTestId('suppress')).toHaveTextContent('true')
   })
 
   it('ignores movement and pointer-up from a different pointer', () => {
@@ -641,6 +724,10 @@ describe('useImageViewport', () => {
     const removeEventListener = vi.spyOn(window, 'removeEventListener')
     const { unmount } = render(<ViewportHarness viewportKey={1} />)
     const viewport = screen.getByTestId('viewport')
+    const windowKeyUp = addEventListener.mock.calls.find(
+      ([eventName]) => eventName === 'keyup',
+    )?.[1]
+    expect(windowKeyUp).toBeDefined()
     fireEvent.keyDown(viewport, { key: ' ' })
     addEventListener.mockClear()
     firePointerEvent(viewport, 'pointerdown', { button: 0, pointerId: 18 })
@@ -649,6 +736,7 @@ describe('useImageViewport', () => {
     unmount()
 
     expectPanListenersRemoved(removeEventListener, listeners)
+    expect(removeEventListener).toHaveBeenCalledWith('keyup', windowKeyUp)
   })
 
   it('reports zoom limits for sub-minimum fit and manual endpoints', () => {
