@@ -355,6 +355,10 @@ export function useImageViewport({
   }, [releaseSpace])
 
   const handlePointerDown = useCallback((event: PointerEvent<HTMLElement>) => {
+    if (event.button === 0) {
+      suppressClickRef.current = false
+    }
+
     const target = event.target
     if (
       event.button !== 0

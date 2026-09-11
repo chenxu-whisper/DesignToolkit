@@ -364,6 +364,64 @@ describe('useImageViewport', () => {
     expect(screen.getByTestId('suppress')).toHaveTextContent('false')
   })
 
+  it('clears completed drag suppression when a new primary gesture starts', () => {
+    render(<ViewportHarness viewportKey={1} />)
+    const viewport = screen.getByTestId('viewport')
+    fireEvent.keyDown(viewport, { key: ' ' })
+    firePointerEvent(viewport, 'pointerdown', {
+      button: 0,
+      clientX: 20,
+      clientY: 20,
+      pointerId: 26,
+    })
+    firePointerEvent(window, 'pointermove', {
+      clientX: 24,
+      clientY: 20,
+      pointerId: 26,
+    })
+    firePointerEvent(window, 'pointerup', { pointerId: 26 })
+    fireEvent.keyUp(viewport, { key: ' ' })
+
+    firePointerEvent(viewport, 'pointerdown', {
+      button: 0,
+      clientX: 30,
+      clientY: 30,
+      pointerId: 27,
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Consume suppression' }))
+
+    expect(screen.getByTestId('suppress')).toHaveTextContent('false')
+  })
+
+  it('keeps completed drag suppression after a rejected secondary pointer-down', () => {
+    render(<ViewportHarness viewportKey={1} />)
+    const viewport = screen.getByTestId('viewport')
+    fireEvent.keyDown(viewport, { key: ' ' })
+    firePointerEvent(viewport, 'pointerdown', {
+      button: 0,
+      clientX: 20,
+      clientY: 20,
+      pointerId: 28,
+    })
+    firePointerEvent(window, 'pointermove', {
+      clientX: 24,
+      clientY: 20,
+      pointerId: 28,
+    })
+    firePointerEvent(window, 'pointerup', { pointerId: 28 })
+    fireEvent.keyUp(viewport, { key: ' ' })
+
+    firePointerEvent(viewport, 'pointerdown', {
+      button: 2,
+      clientX: 30,
+      clientY: 30,
+      pointerId: 29,
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Consume suppression' }))
+
+    expect(screen.getByTestId('suppress')).toHaveTextContent('true')
+  })
+
   it('does not classify movement below four CSS pixels as a drag', () => {
     render(<ViewportHarness viewportKey={1} />)
     const viewport = screen.getByTestId('viewport')

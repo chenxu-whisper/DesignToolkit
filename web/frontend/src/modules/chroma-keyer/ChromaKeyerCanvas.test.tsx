@@ -283,6 +283,46 @@ describe('ChromaKeyerCanvas', () => {
     expect(onSample).toHaveBeenCalledOnce()
   })
 
+  it('samples the first deliberate primary click after a drag releases outside', () => {
+    const onSample = vi.fn()
+    renderCanvas({ onSample })
+    const image = screen.getByRole('button', { name: '抠像预览' })
+    const viewport = image.closest('.chroma-preview-viewport') as HTMLElement
+    vi.spyOn(image, 'getBoundingClientRect').mockReturnValue(
+      makeRect({ height: 200, width: 400 }),
+    )
+
+    fireEvent.keyDown(viewport, { key: ' ' })
+    firePointerEvent(viewport, 'pointerdown', {
+      button: 0,
+      clientX: 200,
+      clientY: 100,
+      pointerId: 3,
+    })
+    firePointerEvent(window, 'pointermove', {
+      clientX: -10,
+      clientY: -10,
+      pointerId: 3,
+    })
+    firePointerEvent(window, 'pointerup', {
+      clientX: -10,
+      clientY: -10,
+      pointerId: 3,
+    })
+    fireEvent.keyUp(viewport, { key: ' ' })
+    expect(onSample).not.toHaveBeenCalled()
+
+    firePointerEvent(image, 'pointerdown', {
+      button: 0,
+      clientX: 150,
+      clientY: 100,
+      pointerId: 4,
+    })
+    fireEvent.click(image, { clientX: 150, clientY: 100 })
+
+    expect(onSample).toHaveBeenCalledOnce()
+  })
+
   it('samples a click after movement below the drag threshold', () => {
     const onSample = vi.fn()
     renderCanvas({ onSample })
