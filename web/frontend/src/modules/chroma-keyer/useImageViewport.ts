@@ -4,6 +4,7 @@ import {
   useRef,
   useState,
   type KeyboardEvent,
+  type PointerEvent,
   type RefObject,
   type WheelEvent,
 } from 'react'
@@ -38,13 +39,31 @@ type ImageViewport = ImageViewportState & {
   canZoomOut: boolean
   fit: () => void
   handleKeyDown: (event: KeyboardEvent<HTMLElement>) => void
+  handleKeyUp: (event: KeyboardEvent<HTMLElement>) => void
+  handlePointerDown: (event: PointerEvent<HTMLElement>) => void
   handleWheel: (event: WheelEvent<HTMLElement>) => void
+  isPanReady: boolean
+  isPanning: boolean
   setActualSize: () => void
+  shouldSuppressClick: () => boolean
   viewportRef: RefObject<HTMLDivElement | null>
   zoomIn: () => void
   zoomOut: () => void
 }
 
+type PanSession = {
+  dragged: boolean
+  listeners: {
+    cancel: (event: globalThis.PointerEvent) => void
+    move: (event: globalThis.PointerEvent) => void
+    up: (event: globalThis.PointerEvent) => void
+  }
+  originOffset: ViewportPoint
+  pointerId: number | undefined
+  start: ViewportPoint
+}
+
+const DRAG_THRESHOLD = 4
 const EMPTY_SIZE: ViewportSize = { height: 0, width: 0 }
 const FIT_FALLBACK: ImageViewportState = {
   mode: 'fit',
@@ -72,7 +91,12 @@ export function useImageViewport({
     height: imageHeight,
     width: imageWidth,
   })
+  const panRef = useRef<PanSession | null>(null)
+  const spacePressedRef = useRef(false)
   const stateRef = useRef<ImageViewportState>(FIT_FALLBACK)
+  const suppressClickRef = useRef(false)
+  const [isPanReady, setIsPanReady] = useState(false)
+  const [isPanning, setIsPanning] = useState(false)
   const [state, setState] = useState<ImageViewportState>(FIT_FALLBACK)
 
   imageSizeRef.current = { height: imageHeight, width: imageWidth }
@@ -197,6 +221,30 @@ export function useImageViewport({
     updateState(() => createFitState())
   }, [createFitState, updateState])
 
+  const finishPan = useCallback((completed: boolean) => {
+    const session = panRef.current
+    if (!session) {
+      if (!completed) {
+        suppressClickRef.current = false
+      }
+      return
+    }
+
+    window.removeEventListener('pointermove', session.listeners.move)
+    window.removeEventListener('pointerup', session.listeners.up)
+    window.removeEventListener('pointercancel', session.listeners.cancel)
+    suppressClickRef.current = completed && session.dragged
+    panRef.current = null
+    setIsPanning(false)
+  }, [])
+
+  const clearPanInteraction = useCallback(() => {
+    spacePressedRef.current = false
+    suppressClickRef.current = false
+    setIsPanReady(false)
+    finishPan(false)
+  }, [finishPan])
+
   const handleWheel = useCallback((event: WheelEvent<HTMLElement>) => {
     if (!Number.isFinite(event.deltaY) || event.deltaY === 0) {
       return
@@ -235,6 +283,15 @@ export function useImageViewport({
   }, [applyScale])
 
   const handleKeyDown = useCallback((event: KeyboardEvent<HTMLElement>) => {
+    if (event.key === ' ' || event.key === 'Spacebar') {
+      event.preventDefault()
+      if (!spacePressedRef.current) {
+        spacePressedRef.current = true
+        setIsPanReady(true)
+      }
+      return
+    }
+
     switch (event.key.toLowerCase()) {
       case '+':
       case '=':
@@ -256,9 +313,119 @@ export function useImageViewport({
     }
   }, [fit, setActualSize, zoomIn, zoomOut])
 
+  const handleKeyUp = useCallback((event: KeyboardEvent<HTMLElement>) => {
+    if (event.key !== ' ' && event.key !== 'Spacebar') {
+      return
+    }
+    event.preventDefault()
+    clearPanInteraction()
+  }, [clearPanInteraction])
+
+  const handlePointerDown = useCallback((event: PointerEvent<HTMLElement>) => {
+    const target = event.target
+    if (
+      event.button !== 0
+      || !spacePressedRef.current
+      || panRef.current
+      || !isPositiveSize(imageSizeRef.current)
+      || !isPositiveSize(viewportSizeRef.current)
+      || !Number.isFinite(stateRef.current.scale)
+      || stateRef.current.scale <= 0
+      || !Number.isFinite(event.clientX)
+      || !Number.isFinite(event.clientY)
+      || (
+        target instanceof Element
+        && target.closest('.image-viewport-toolbar')
+      )
+    ) {
+      return
+    }
+
+    const matchesPointer = (pointerEvent: globalThis.PointerEvent) => {
+      const activePointerId = panRef.current?.pointerId
+      return (
+        activePointerId === undefined
+        || pointerEvent.pointerId === undefined
+        || pointerEvent.pointerId === activePointerId
+      )
+    }
+    const move = (pointerEvent: globalThis.PointerEvent) => {
+      const session = panRef.current
+      if (!session || !matchesPointer(pointerEvent)) {
+        return
+      }
+      const dx = pointerEvent.clientX - session.start.x
+      const dy = pointerEvent.clientY - session.start.y
+      if (!Number.isFinite(dx) || !Number.isFinite(dy)) {
+        return
+      }
+      if (Math.hypot(dx, dy) >= DRAG_THRESHOLD) {
+        session.dragged = true
+      }
+      updateState((current) => ({
+        ...current,
+        offset: clampOffset(
+          {
+            x: session.originOffset.x + dx,
+            y: session.originOffset.y + dy,
+          },
+          current.scale,
+          imageSizeRef.current,
+          viewportSizeRef.current,
+        ),
+      }))
+    }
+    const up = (pointerEvent: globalThis.PointerEvent) => {
+      if (matchesPointer(pointerEvent)) {
+        finishPan(true)
+      }
+    }
+    const cancel = (pointerEvent: globalThis.PointerEvent) => {
+      if (matchesPointer(pointerEvent)) {
+        finishPan(false)
+      }
+    }
+
+    panRef.current = {
+      dragged: false,
+      listeners: { cancel, move, up },
+      originOffset: stateRef.current.offset,
+      pointerId: Number.isFinite(event.pointerId)
+        ? event.pointerId
+        : undefined,
+      start: { x: event.clientX, y: event.clientY },
+    }
+    suppressClickRef.current = false
+    setIsPanning(true)
+    window.addEventListener('pointermove', move)
+    window.addEventListener('pointerup', up)
+    window.addEventListener('pointercancel', cancel)
+  }, [finishPan, updateState])
+
+  const shouldSuppressClick = useCallback(() => {
+    const shouldSuppress = suppressClickRef.current
+    suppressClickRef.current = false
+    return shouldSuppress
+  }, [])
+
   useEffect(() => {
+    clearPanInteraction()
     updateState(() => createFitState())
-  }, [viewportKey, createFitState, updateState])
+  }, [viewportKey, clearPanInteraction, createFitState, updateState])
+
+  useEffect(() => {
+    const handleBlur = () => {
+      clearPanInteraction()
+    }
+    window.addEventListener('blur', handleBlur)
+    return () => {
+      window.removeEventListener('blur', handleBlur)
+    }
+  }, [clearPanInteraction])
+
+  useEffect(() => () => {
+    clearPanInteraction()
+  }, [clearPanInteraction])
 
   useEffect(() => {
     measure()
@@ -290,11 +457,16 @@ export function useImageViewport({
     canZoomOut: hasValidDimensions && state.scale > MIN_MANUAL_SCALE,
     fit,
     handleKeyDown,
+    handleKeyUp,
+    handlePointerDown,
     handleWheel,
+    isPanReady,
+    isPanning,
     mode: state.mode,
     offset: state.offset,
     scale: state.scale,
     setActualSize,
+    shouldSuppressClick,
     viewportRef,
     zoomIn,
     zoomOut,
