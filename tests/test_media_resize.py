@@ -1,3 +1,5 @@
+import errno
+import os
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -144,6 +146,62 @@ def test_video_without_audio_maps_only_primary_video_and_optional_audio(
         if argument == "-map"
     ]
     assert mappings == [("-map", "0:v:0"), ("-map", "0:a:0?")]
+
+
+@pytest.mark.parametrize("suffix", [".flv", ".mpeg", ".avif"])
+def test_unclassified_same_container_uses_legacy_generic_command(
+    tmp_path: Path,
+    suffix: str,
+) -> None:
+    input_path = tmp_path / f"input{suffix}"
+    output_path = tmp_path / f"output{suffix}"
+    input_path.write_bytes(b"media")
+    backend = RecordingBackend()
+
+    resize_media(
+        MediaResizeOptions(
+            input_path=input_path,
+            output_path=output_path,
+            size=(640, 360),
+        ),
+        backend,
+    )
+
+    command = backend.commands[0]
+    assert command[command.index("-vf") + 1].endswith("force_divisible_by=2")
+    assert command[command.index("-map") + 1] == "0"
+    assert command[command.index("-c:a") + 1] == "copy"
+    assert output_path.read_bytes() == b"resized"
+
+
+@pytest.mark.parametrize("target_suffix", [".flv", ".mpeg"])
+def test_known_video_with_unclassified_target_uses_default_audio_codec(
+    tmp_path: Path,
+    target_suffix: str,
+) -> None:
+    input_path = tmp_path / "input.mp4"
+    output_path = tmp_path / f"output{target_suffix}"
+    input_path.write_bytes(b"video")
+    backend = RecordingBackend()
+
+    resize_media(
+        MediaResizeOptions(
+            input_path=input_path,
+            output_path=output_path,
+            size=(640, 360),
+        ),
+        backend,
+    )
+
+    command = backend.commands[0]
+    mappings = [
+        command[index + 1]
+        for index, argument in enumerate(command)
+        if argument == "-map"
+    ]
+    assert mappings == ["0:v:0", "0:a:0?"]
+    assert "-c:a" not in command
+    assert output_path.read_bytes() == b"resized"
 
 
 def test_failed_resize_removes_partial_temporary_output_and_preserves_stderr(
@@ -419,6 +477,188 @@ def test_cleanup_and_rollback_failure_reports_final_may_remain(
     monkeypatch.undo()
     output_path.unlink()
     temporary_path.parent.rmdir()
+
+
+def test_cleanup_failure_preserves_replaced_final_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_path = tmp_path / "input.png"
+    output_path = tmp_path / "output.png"
+    input_path.write_bytes(b"image")
+    backend = RecordingBackend()
+    original_cleanup = media_resize_core._cleanup_temporary_output
+
+    def replace_final_before_cleanup(
+        temporary_directory: Path,
+        temporary_path: Path,
+    ) -> OSError:
+        output_path.unlink()
+        output_path.write_bytes(b"foreign")
+        return PermissionError("cleanup denied")
+
+    monkeypatch.setattr(
+        media_resize_core,
+        "_cleanup_temporary_output",
+        replace_final_before_cleanup,
+    )
+
+    with pytest.raises(
+        MediaResizeError,
+        match="rollback skipped.*final.*replaced",
+    ) as error:
+        resize_media(
+            MediaResizeOptions(
+                input_path=input_path,
+                output_path=output_path,
+                size=(100, 100),
+            ),
+            backend,
+        )
+
+    assert error.value.exit_code == 1
+    assert output_path.read_bytes() == b"foreign"
+
+    temporary_path = Path(backend.commands[0][-1])
+    monkeypatch.setattr(
+        media_resize_core,
+        "_cleanup_temporary_output",
+        original_cleanup,
+    )
+    assert original_cleanup(temporary_path.parent, temporary_path) is None
+
+
+def test_publish_falls_back_when_hard_links_are_unsupported(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_path = tmp_path / "input.png"
+    output_path = tmp_path / "output.png"
+    input_path.write_bytes(b"image")
+    backend = RecordingBackend()
+
+    def reject_hard_link(source: Path, target: Path) -> None:
+        raise OSError(errno.EOPNOTSUPP, "hard links unsupported")
+
+    monkeypatch.setattr(os, "link", reject_hard_link)
+
+    result = resize_media(
+        MediaResizeOptions(
+            input_path=input_path,
+            output_path=output_path,
+            size=(100, 100),
+        ),
+        backend,
+    )
+
+    assert result.output_path == output_path
+    assert output_path.read_bytes() == b"resized"
+    temporary_path = Path(backend.commands[0][-1])
+    assert not temporary_path.exists()
+    assert not temporary_path.parent.exists()
+
+
+def test_publish_fallback_collision_preserves_concurrent_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_path = tmp_path / "input.png"
+    output_path = tmp_path / "output.png"
+    input_path.write_bytes(b"image")
+    backend = RecordingBackend()
+
+    def collide_before_fallback(source: Path, target: Path) -> None:
+        output_path.write_bytes(b"concurrent")
+        raise OSError(errno.EOPNOTSUPP, "hard links unsupported")
+
+    monkeypatch.setattr(os, "link", collide_before_fallback)
+
+    with pytest.raises(MediaResizeError, match="already exists"):
+        resize_media(
+            MediaResizeOptions(
+                input_path=input_path,
+                output_path=output_path,
+                size=(100, 100),
+            ),
+            backend,
+        )
+
+    assert output_path.read_bytes() == b"concurrent"
+    temporary_path = Path(backend.commands[0][-1])
+    assert not temporary_path.exists()
+    assert not temporary_path.parent.exists()
+
+
+def test_publish_fallback_failure_removes_owned_placeholder(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_path = tmp_path / "input.png"
+    output_path = tmp_path / "output.png"
+    input_path.write_bytes(b"image")
+    backend = RecordingBackend()
+
+    def reject_hard_link(source: Path, target: Path) -> None:
+        raise OSError(errno.EOPNOTSUPP, "hard links unsupported")
+
+    def fail_replace(source: Path, target: Path) -> None:
+        raise PermissionError("replace denied")
+
+    monkeypatch.setattr(os, "link", reject_hard_link)
+    monkeypatch.setattr(os, "replace", fail_replace)
+
+    with pytest.raises(MediaResizeError, match="could not be published") as error:
+        resize_media(
+            MediaResizeOptions(
+                input_path=input_path,
+                output_path=output_path,
+                size=(100, 100),
+            ),
+            backend,
+        )
+
+    assert error.value.exit_code == 1
+    assert isinstance(error.value.__cause__, PermissionError)
+    assert not output_path.exists()
+    temporary_path = Path(backend.commands[0][-1])
+    assert not temporary_path.exists()
+    assert not temporary_path.parent.exists()
+
+
+def test_publish_fallback_failure_preserves_replaced_placeholder(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_path = tmp_path / "input.png"
+    output_path = tmp_path / "output.png"
+    input_path.write_bytes(b"image")
+    backend = RecordingBackend()
+
+    def reject_hard_link(source: Path, target: Path) -> None:
+        raise OSError(errno.EOPNOTSUPP, "hard links unsupported")
+
+    def replace_placeholder_then_fail(source: Path, target: Path) -> None:
+        output_path.unlink()
+        output_path.write_bytes(b"foreign")
+        raise PermissionError("replace denied")
+
+    monkeypatch.setattr(os, "link", reject_hard_link)
+    monkeypatch.setattr(os, "replace", replace_placeholder_then_fail)
+
+    with pytest.raises(MediaResizeError, match="could not be published"):
+        resize_media(
+            MediaResizeOptions(
+                input_path=input_path,
+                output_path=output_path,
+                size=(100, 100),
+            ),
+            backend,
+        )
+
+    assert output_path.read_bytes() == b"foreign"
+    temporary_path = Path(backend.commands[0][-1])
+    assert not temporary_path.exists()
+    assert not temporary_path.parent.exists()
 
 
 @pytest.mark.parametrize("cleanup_operation", ["unlink", "rmdir"])

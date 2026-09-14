@@ -87,7 +87,7 @@ def resize_media(
             exit_code=1,
         ) from exc
 
-    publication_succeeded = False
+    published_identity: tuple[int, int] | None = None
     try:
         try:
             ffmpeg_exe = backend.get_ffmpeg_exe()
@@ -108,8 +108,7 @@ def resize_media(
                 f"FFmpeg failed with exit code {result.returncode}{detail}",
                 exit_code=1,
             )
-        _publish_output_no_replace(temporary_path, output_path)
-        publication_succeeded = True
+        published_identity = _publish_output_no_replace(temporary_path, output_path)
     except BaseException as primary_error:
         cleanup_error = _cleanup_temporary_output(
             temporary_directory,
@@ -133,7 +132,13 @@ def resize_media(
             temporary_directory,
             cleanup_error,
         )
-        if publication_succeeded:
+        if published_identity is not None:
+            if not _path_has_identity(output_path, published_identity):
+                raise MediaResizeError(
+                    f"{cleanup_context}. rollback skipped because final output "
+                    f"was replaced: {output_path}",
+                    exit_code=1,
+                ) from cleanup_error
             try:
                 output_path.unlink(missing_ok=True)
             except OSError as rollback_error:
@@ -183,9 +188,45 @@ def _temporary_cleanup_error_context(
     return f"Temporary output cleanup failed for {temporary_directory}: {cleanup_error}"
 
 
-def _publish_output_no_replace(temporary_path: Path, output_path: Path) -> None:
+def _publish_output_no_replace(
+    temporary_path: Path,
+    output_path: Path,
+) -> tuple[int, int]:
+    try:
+        completed_identity = _path_identity(temporary_path)
+    except OSError as exc:
+        raise MediaResizeError(
+            f"Resized media could not be published: {output_path}",
+            exit_code=1,
+        ) from exc
+
     try:
         os.link(temporary_path, output_path)
+    except FileExistsError as exc:
+        raise MediaResizeError(f"Output path already exists: {output_path}") from exc
+    except OSError as exc:
+        return _publish_output_with_reservation(
+            temporary_path,
+            output_path,
+            completed_identity=completed_identity,
+            link_error=exc,
+        )
+    return completed_identity
+
+
+def _publish_output_with_reservation(
+    temporary_path: Path,
+    output_path: Path,
+    *,
+    completed_identity: tuple[int, int],
+    link_error: OSError,
+) -> tuple[int, int]:
+    try:
+        descriptor = os.open(
+            output_path,
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+            0o600,
+        )
     except FileExistsError as exc:
         raise MediaResizeError(f"Output path already exists: {output_path}") from exc
     except OSError as exc:
@@ -193,6 +234,55 @@ def _publish_output_no_replace(temporary_path: Path, output_path: Path) -> None:
             f"Resized media could not be published: {output_path}",
             exit_code=1,
         ) from exc
+
+    try:
+        reservation_identity = _stat_identity(os.fstat(descriptor))
+    finally:
+        os.close(descriptor)
+
+    try:
+        if not _path_has_identity(output_path, reservation_identity):
+            raise OSError("Output reservation was replaced before publication")
+        os.replace(temporary_path, output_path)
+        return completed_identity
+    except OSError as exc:
+        cleanup_error = _unlink_if_owned(output_path, reservation_identity)
+        error = MediaResizeError(
+            f"Resized media could not be published: {output_path}",
+            exit_code=1,
+        )
+        error.add_note(f"Hard-link publication failed: {link_error}")
+        if cleanup_error is not None:
+            error.add_note(f"Output reservation cleanup failed: {cleanup_error}")
+        raise error from exc
+
+
+def _path_identity(path: Path) -> tuple[int, int]:
+    return _stat_identity(os.stat(path, follow_symlinks=False))
+
+
+def _stat_identity(stat_result: os.stat_result) -> tuple[int, int]:
+    return stat_result.st_dev, stat_result.st_ino
+
+
+def _path_has_identity(path: Path, identity: tuple[int, int]) -> bool:
+    try:
+        return _path_identity(path) == identity
+    except OSError:
+        return False
+
+
+def _unlink_if_owned(
+    path: Path,
+    identity: tuple[int, int],
+) -> OSError | None:
+    if not _path_has_identity(path, identity):
+        return None
+    try:
+        path.unlink()
+    except OSError as exc:
+        return exc
+    return None
 
 
 def _run_backend(
@@ -212,7 +302,7 @@ def _validate_input_path(input_path: Path) -> None:
         raise MediaResizeError(f"Input path is not a file: {input_path}")
 
 
-def _validate_output_path(*, input_path: Path, output_path: Path) -> str:
+def _validate_output_path(*, input_path: Path, output_path: Path) -> str | None:
     if output_path == input_path:
         raise MediaResizeError(
             f"Output path must differ from input path: {output_path}"
@@ -230,11 +320,7 @@ def _validate_output_path(*, input_path: Path, output_path: Path) -> str:
             "Output media type must match input media type: "
             f"{input_path.suffix} -> {output_path.suffix}"
         )
-    if input_media_type is None:
-        raise MediaResizeError(f"Unsupported input media type: {input_path.suffix}")
-    if output_media_type is None:
-        raise MediaResizeError(f"Unsupported output media type: {output_path.suffix}")
-    return input_media_type
+    return input_media_type or output_media_type
 
 
 def _media_type_for_suffix(suffix: str) -> str | None:
@@ -252,7 +338,7 @@ def _build_ffmpeg_command(
     input_path: Path,
     output_path: Path,
     size: tuple[int, int],
-    media_type: str,
+    media_type: str | None,
 ) -> list[str]:
     width, height = size
     scale = f"scale={width}:{height}:force_original_aspect_ratio=decrease"
@@ -269,20 +355,20 @@ def _build_ffmpeg_command(
         command[command.index("-vf") + 1] += ":force_divisible_by=2"
         input_suffix = input_path.suffix.lower()
         output_suffix = output_path.suffix.lower()
-        audio_codec = (
-            "copy"
-            if input_suffix == output_suffix
-            else AUDIO_CODEC_BY_VIDEO_SUFFIX[output_suffix]
-        )
         command.extend(
             [
                 "-map",
                 "0:v:0",
                 "-map",
                 "0:a:0?",
-                "-c:a",
-                audio_codec,
             ]
         )
+        if input_suffix == output_suffix:
+            command.extend(["-c:a", "copy"])
+        elif audio_codec := AUDIO_CODEC_BY_VIDEO_SUFFIX.get(output_suffix):
+            command.extend(["-c:a", audio_codec])
+    elif media_type is None:
+        command[command.index("-vf") + 1] += ":force_divisible_by=2"
+        command.extend(["-map", "0", "-c:a", "copy"])
     command.append(str(output_path))
     return command
