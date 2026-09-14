@@ -4,6 +4,17 @@ import { createRequire } from 'node:module'
 const require = createRequire(import.meta.url)
 const playwrightCli = require.resolve('@playwright/test/cli')
 const forwardedArgs = process.argv.slice(2)
+const runnerOwnedArg = forwardedArgs.find(
+  (arg) =>
+    arg === '--pass-with-no-tests' ||
+    arg === '--project' ||
+    arg.startsWith('--project='),
+)
+
+if (runnerOwnedArg !== undefined) {
+  console.error(`E2E runner argument is not allowed: ${runnerOwnedArg}`)
+  process.exit(2)
+}
 
 for (const project of ['local', 'hosted']) {
   const result = spawnSync(
