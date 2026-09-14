@@ -1,0 +1,219 @@
+from pathlib import Path
+
+import pytest
+
+from designtoolkit.media_resize import (
+    MediaResizeError,
+    MediaResizeOptions,
+    ResizeBackendResult,
+    resize_media,
+)
+
+
+class RecordingBackend:
+    def __init__(self, result: ResizeBackendResult | None = None) -> None:
+        self.commands: list[tuple[str, ...]] = []
+        self.get_ffmpeg_calls = 0
+        self.result = result or ResizeBackendResult(returncode=0)
+
+    def get_ffmpeg_exe(self) -> str:
+        self.get_ffmpeg_calls += 1
+        return "ffmpeg"
+
+    def run(self, command: list[str]) -> ResizeBackendResult:
+        self.commands.append(tuple(command))
+        return self.result
+
+
+@pytest.mark.parametrize("size", [(1, 1), (1, 10), (10, 1)])
+def test_image_resize_preserves_one_pixel_bounds(
+    tmp_path: Path,
+    size: tuple[int, int],
+) -> None:
+    input_path = tmp_path / "input.png"
+    input_path.write_bytes(b"image")
+    backend = RecordingBackend()
+
+    result = resize_media(
+        MediaResizeOptions(input_path=input_path, size=size),
+        backend,
+    )
+
+    command = backend.commands[0]
+    scale = command[command.index("-vf") + 1]
+    assert scale == f"scale={size[0]}:{size[1]}:force_original_aspect_ratio=decrease"
+    assert "force_divisible_by" not in scale
+    assert result.output_path == tmp_path / "input_resized.png"
+
+
+@pytest.mark.parametrize("size", [(1, 10), (10, 1), (1, 1)])
+def test_video_resize_rejects_sub_two_pixel_bounds_before_backend_lookup(
+    tmp_path: Path,
+    size: tuple[int, int],
+) -> None:
+    input_path = tmp_path / "input.mp4"
+    input_path.write_bytes(b"video")
+    backend = RecordingBackend()
+
+    with pytest.raises(MediaResizeError, match="at least 2"):
+        resize_media(MediaResizeOptions(input_path=input_path, size=size), backend)
+
+    assert backend.get_ffmpeg_calls == 0
+    assert backend.commands == []
+
+
+@pytest.mark.parametrize(
+    ("source_suffix", "target_suffix", "audio_codec"),
+    [
+        (".mkv", ".webm", "libopus"),
+        (".mkv", ".mp4", "aac"),
+        (".mkv", ".mov", "aac"),
+        (".mkv", ".m4v", "aac"),
+        (".mkv", ".avi", "libmp3lame"),
+        (".webm", ".mkv", "aac"),
+    ],
+)
+def test_cross_container_video_uses_compatible_audio(
+    tmp_path: Path,
+    source_suffix: str,
+    target_suffix: str,
+    audio_codec: str,
+) -> None:
+    input_path = tmp_path / f"input{source_suffix}"
+    output_path = tmp_path / f"output{target_suffix}"
+    input_path.write_bytes(b"video")
+    backend = RecordingBackend()
+
+    resize_media(
+        MediaResizeOptions(
+            input_path=input_path,
+            output_path=output_path,
+            size=(640, 360),
+        ),
+        backend,
+    )
+
+    command = backend.commands[0]
+    assert command[command.index("-c:a") + 1] == audio_codec
+
+
+def test_same_normalized_container_copies_audio_and_keeps_even_video_filter(
+    tmp_path: Path,
+) -> None:
+    input_path = tmp_path / "input.MP4"
+    output_path = tmp_path / "output.mp4"
+    input_path.write_bytes(b"video")
+    backend = RecordingBackend()
+
+    resize_media(
+        MediaResizeOptions(
+            input_path=input_path,
+            output_path=output_path,
+            size=(640, 360),
+        ),
+        backend,
+    )
+
+    command = backend.commands[0]
+    assert command[command.index("-c:a") + 1] == "copy"
+    assert "force_divisible_by=2" in command[command.index("-vf") + 1]
+
+
+def test_video_without_audio_maps_only_primary_video_and_optional_audio(
+    tmp_path: Path,
+) -> None:
+    input_path = tmp_path / "silent.mp4"
+    input_path.write_bytes(b"video")
+    backend = RecordingBackend()
+
+    resize_media(
+        MediaResizeOptions(input_path=input_path, size=(640, 360)),
+        backend,
+    )
+
+    command = backend.commands[0]
+    mappings = [
+        (argument, command[index + 1])
+        for index, argument in enumerate(command)
+        if argument == "-map"
+    ]
+    assert mappings == [("-map", "0:v:0"), ("-map", "0:a?")]
+
+
+def test_failed_resize_removes_partial_output_and_preserves_stderr(
+    tmp_path: Path,
+) -> None:
+    input_path = tmp_path / "input.png"
+    output_path = tmp_path / "output.png"
+    input_path.write_bytes(b"image")
+
+    class PartialOutputBackend(RecordingBackend):
+        def run(self, command: list[str]) -> ResizeBackendResult:
+            self.commands.append(tuple(command))
+            Path(command[-1]).write_bytes(b"partial")
+            return ResizeBackendResult(returncode=1, stderr="encode failed")
+
+    with pytest.raises(MediaResizeError, match="encode failed"):
+        resize_media(
+            MediaResizeOptions(
+                input_path=input_path,
+                output_path=output_path,
+                size=(100, 100),
+            ),
+            PartialOutputBackend(),
+        )
+
+    assert not output_path.exists()
+
+
+def test_failed_resize_reports_partial_output_cleanup_failure(
+    tmp_path: Path,
+) -> None:
+    input_path = tmp_path / "input.png"
+    output_path = tmp_path / "output.png"
+    input_path.write_bytes(b"image")
+
+    class UnremovableOutputBackend(RecordingBackend):
+        def run(self, command: list[str]) -> ResizeBackendResult:
+            self.commands.append(tuple(command))
+            Path(command[-1]).mkdir()
+            return ResizeBackendResult(returncode=1, stderr="encode failed")
+
+    with pytest.raises(MediaResizeError) as exc_info:
+        resize_media(
+            MediaResizeOptions(
+                input_path=input_path,
+                output_path=output_path,
+                size=(100, 100),
+            ),
+            UnremovableOutputBackend(),
+        )
+
+    message = str(exc_info.value)
+    assert "encode failed" in message
+    assert "failed to remove partial output" in message
+    assert output_path.is_dir()
+
+
+def test_existing_output_is_rejected_before_backend_and_preserved(
+    tmp_path: Path,
+) -> None:
+    input_path = tmp_path / "input.png"
+    output_path = tmp_path / "output.png"
+    input_path.write_bytes(b"image")
+    output_path.write_bytes(b"existing")
+    backend = RecordingBackend()
+
+    with pytest.raises(MediaResizeError, match="already exists"):
+        resize_media(
+            MediaResizeOptions(
+                input_path=input_path,
+                output_path=output_path,
+                size=(100, 100),
+            ),
+            backend,
+        )
+
+    assert backend.get_ffmpeg_calls == 0
+    assert backend.commands == []
+    assert output_path.read_bytes() == b"existing"

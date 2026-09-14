@@ -11,6 +11,14 @@ IMAGE_SUFFIXES = frozenset(
     {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
 )
 VIDEO_SUFFIXES = frozenset({".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"})
+AUDIO_CODEC_BY_VIDEO_SUFFIX = {
+    ".avi": "libmp3lame",
+    ".m4v": "aac",
+    ".mkv": "aac",
+    ".mov": "aac",
+    ".mp4": "aac",
+    ".webm": "libopus",
+}
 
 
 class MediaResizeError(Exception):
@@ -62,7 +70,12 @@ def resize_media(
     input_path = options.input_path
     _validate_input_path(input_path)
     output_path = options.output_path or default_output_path(input_path)
-    _validate_output_path(input_path=input_path, output_path=output_path)
+    media_type = _validate_output_path(
+        input_path=input_path,
+        output_path=output_path,
+    )
+    if media_type == "video" and min(options.size) < 2:
+        raise MediaResizeError("Video width and height must each be at least 2")
 
     try:
         ffmpeg_exe = backend.get_ffmpeg_exe()
@@ -74,10 +87,19 @@ def resize_media(
         input_path=input_path,
         output_path=output_path,
         size=options.size,
+        media_type=media_type,
     )
     result = _run_backend(backend, command)
     if result.returncode != 0:
+        cleanup_error: OSError | None = None
+        try:
+            output_path.unlink(missing_ok=True)
+        except OSError as exc:
+            cleanup_error = exc
+
         detail = f": {result.stderr.strip()}" if result.stderr.strip() else ""
+        if cleanup_error is not None:
+            detail += f"; failed to remove partial output: {cleanup_error}"
         raise MediaResizeError(
             f"FFmpeg failed with exit code {result.returncode}{detail}",
             exit_code=1,
@@ -103,7 +125,7 @@ def _validate_input_path(input_path: Path) -> None:
         raise MediaResizeError(f"Input path is not a file: {input_path}")
 
 
-def _validate_output_path(*, input_path: Path, output_path: Path) -> None:
+def _validate_output_path(*, input_path: Path, output_path: Path) -> str:
     if output_path == input_path:
         raise MediaResizeError(
             f"Output path must differ from input path: {output_path}"
@@ -121,6 +143,11 @@ def _validate_output_path(*, input_path: Path, output_path: Path) -> None:
             "Output media type must match input media type: "
             f"{input_path.suffix} -> {output_path.suffix}"
         )
+    if input_media_type is None:
+        raise MediaResizeError(f"Unsupported input media type: {input_path.suffix}")
+    if output_media_type is None:
+        raise MediaResizeError(f"Unsupported output media type: {output_path.suffix}")
+    return input_media_type
 
 
 def _media_type_for_suffix(suffix: str) -> str | None:
@@ -138,20 +165,37 @@ def _build_ffmpeg_command(
     input_path: Path,
     output_path: Path,
     size: tuple[int, int],
+    media_type: str,
 ) -> list[str]:
     width, height = size
-    return [
+    scale = f"scale={width}:{height}:force_original_aspect_ratio=decrease"
+    command = [
         ffmpeg_exe,
         "-hide_banner",
         "-n",
         "-i",
         str(input_path),
         "-vf",
-        f"scale={width}:{height}:force_original_aspect_ratio=decrease:"
-        "force_divisible_by=2",
-        "-map",
-        "0",
-        "-c:a",
-        "copy",
-        str(output_path),
+        scale,
     ]
+    if media_type == "video":
+        command[command.index("-vf") + 1] += ":force_divisible_by=2"
+        input_suffix = input_path.suffix.lower()
+        output_suffix = output_path.suffix.lower()
+        audio_codec = (
+            "copy"
+            if input_suffix == output_suffix
+            else AUDIO_CODEC_BY_VIDEO_SUFFIX[output_suffix]
+        )
+        command.extend(
+            [
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a?",
+                "-c:a",
+                audio_codec,
+            ]
+        )
+    command.append(str(output_path))
+    return command
