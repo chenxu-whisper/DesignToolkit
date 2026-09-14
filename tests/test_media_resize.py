@@ -23,7 +23,9 @@ class RecordingBackend:
 
     def run(self, command: Sequence[str]) -> ResizeBackendResult:
         self.commands.append(tuple(command))
-        Path(command[-1]).write_bytes(b"resized")
+        temporary_path = Path(command[-1])
+        assert not temporary_path.exists()
+        temporary_path.write_bytes(b"resized")
         return self.result
 
 

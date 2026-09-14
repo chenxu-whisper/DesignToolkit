@@ -113,9 +113,9 @@ def _create_temporary_output_path(output_path: Path) -> Path:
         prefix=f".{output_path.stem}.",
         suffix=output_path.suffix,
         dir=output_path.parent,
-        delete=False,
     ) as temporary:
-        return Path(temporary.name)
+        temporary_path = Path(temporary.name)
+    return temporary_path
 
 
 def _publish_output_no_replace(temporary_path: Path, output_path: Path) -> None:
@@ -194,7 +194,7 @@ def _build_ffmpeg_command(
     command = [
         ffmpeg_exe,
         "-hide_banner",
-        "-y",
+        "-n",
         "-i",
         str(input_path),
         "-vf",
