@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+import designtoolkit.media_resize.core as media_resize_core
 from designtoolkit.media_resize import (
     MediaResizeError,
     MediaResizeOptions,
@@ -290,6 +291,134 @@ def test_each_resize_uses_a_different_private_output_directory(
     assert temporary_paths[0].parent != temporary_paths[1].parent
     assert all(path.parent.parent == tmp_path for path in temporary_paths)
     assert all(not path.parent.exists() for path in temporary_paths)
+
+
+def test_temporary_directory_creation_failure_is_user_facing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_path = tmp_path / "input.png"
+    output_path = tmp_path / "output.png"
+    input_path.write_bytes(b"image")
+    backend = RecordingBackend()
+
+    def deny_temporary_directory(*args: object, **kwargs: object) -> str:
+        raise PermissionError("temporary directory denied")
+
+    monkeypatch.setattr(media_resize_core, "mkdtemp", deny_temporary_directory)
+
+    with pytest.raises(MediaResizeError) as error:
+        resize_media(
+            MediaResizeOptions(
+                input_path=input_path,
+                output_path=output_path,
+                size=(100, 100),
+            ),
+            backend,
+        )
+
+    assert error.value.exit_code == 1
+    assert str(output_path) in str(error.value)
+    assert "temporary" in str(error.value).lower()
+    assert isinstance(error.value.__cause__, PermissionError)
+    assert backend.get_ffmpeg_calls == 0
+    assert backend.commands == []
+
+
+@pytest.mark.parametrize("cleanup_operation", ["unlink", "rmdir"])
+def test_cleanup_failure_after_publish_rolls_back_final_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cleanup_operation: str,
+) -> None:
+    input_path = tmp_path / "input.png"
+    output_path = tmp_path / "output.png"
+    input_path.write_bytes(b"image")
+    backend = RecordingBackend()
+    original_cleanup = getattr(Path, cleanup_operation)
+
+    def fail_owned_cleanup(path: Path, *args: object, **kwargs: object) -> None:
+        is_owned_child = (
+            cleanup_operation == "unlink" and path.parent.parent == tmp_path
+        )
+        is_owned_directory = cleanup_operation == "rmdir" and path.parent == tmp_path
+        if is_owned_child or is_owned_directory:
+            raise PermissionError(f"{cleanup_operation} denied")
+        original_cleanup(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, cleanup_operation, fail_owned_cleanup)
+
+    with pytest.raises(MediaResizeError, match="cleanup failed") as error:
+        resize_media(
+            MediaResizeOptions(
+                input_path=input_path,
+                output_path=output_path,
+                size=(100, 100),
+            ),
+            backend,
+        )
+
+    assert error.value.exit_code == 1
+    assert isinstance(error.value.__cause__, PermissionError)
+    assert not output_path.exists()
+
+    temporary_path = Path(backend.commands[0][-1])
+    monkeypatch.undo()
+    temporary_path.unlink(missing_ok=True)
+    temporary_path.parent.rmdir()
+
+
+def test_cleanup_and_rollback_failure_reports_final_may_remain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_path = tmp_path / "input.png"
+    output_path = tmp_path / "output.png"
+    input_path.write_bytes(b"image")
+    backend = RecordingBackend()
+    original_unlink = Path.unlink
+    original_rmdir = Path.rmdir
+
+    def fail_final_rollback(
+        path: Path,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        if path == output_path:
+            raise PermissionError("rollback denied")
+        original_unlink(path, *args, **kwargs)
+
+    def fail_owned_rmdir(path: Path) -> None:
+        if path.parent == tmp_path:
+            raise PermissionError("rmdir denied")
+        original_rmdir(path)
+
+    monkeypatch.setattr(Path, "unlink", fail_final_rollback)
+    monkeypatch.setattr(Path, "rmdir", fail_owned_rmdir)
+
+    with pytest.raises(
+        MediaResizeError,
+        match="cleanup and rollback failed.*final output may remain",
+    ) as error:
+        resize_media(
+            MediaResizeOptions(
+                input_path=input_path,
+                output_path=output_path,
+                size=(100, 100),
+            ),
+            backend,
+        )
+
+    assert error.value.exit_code == 1
+    assert isinstance(error.value.__cause__, PermissionError)
+    assert "rollback denied" in str(error.value.__cause__)
+    assert any("rmdir denied" in note for note in getattr(error.value, "__notes__", ()))
+    assert output_path.read_bytes() == b"resized"
+
+    temporary_path = Path(backend.commands[0][-1])
+    monkeypatch.undo()
+    output_path.unlink()
+    temporary_path.parent.rmdir()
 
 
 @pytest.mark.parametrize("cleanup_operation", ["unlink", "rmdir"])

@@ -80,20 +80,27 @@ def resize_media(
         raise MediaResizeError("Video width and height must each be at least 2")
 
     try:
-        ffmpeg_exe = backend.get_ffmpeg_exe()
-    except BackendUnavailableError as exc:
-        raise MediaResizeError(str(exc), exit_code=1) from exc
+        temporary_directory, temporary_path = _create_temporary_output_path(output_path)
+    except OSError as exc:
+        raise MediaResizeError(
+            f"Temporary output directory could not be created for {output_path}: {exc}",
+            exit_code=1,
+        ) from exc
 
-    temporary_directory, temporary_path = _create_temporary_output_path(output_path)
-    command = _build_ffmpeg_command(
-        ffmpeg_exe=ffmpeg_exe,
-        input_path=input_path,
-        output_path=temporary_path,
-        size=options.size,
-        media_type=media_type,
-    )
-    primary_error: BaseException | None = None
+    publication_succeeded = False
     try:
+        try:
+            ffmpeg_exe = backend.get_ffmpeg_exe()
+        except BackendUnavailableError as exc:
+            raise MediaResizeError(str(exc), exit_code=1) from exc
+
+        command = _build_ffmpeg_command(
+            ffmpeg_exe=ffmpeg_exe,
+            input_path=input_path,
+            output_path=temporary_path,
+            size=options.size,
+            media_type=media_type,
+        )
         result = _run_backend(backend, command)
         if result.returncode != 0:
             detail = f": {result.stderr.strip()}" if result.stderr.strip() else ""
@@ -102,15 +109,45 @@ def resize_media(
                 exit_code=1,
             )
         _publish_output_no_replace(temporary_path, output_path)
-    except BaseException as exc:
-        primary_error = exc
-        raise
-    finally:
-        _cleanup_temporary_output(
+        publication_succeeded = True
+    except BaseException as primary_error:
+        cleanup_error = _cleanup_temporary_output(
             temporary_directory,
             temporary_path,
-            primary_error=primary_error,
         )
+        if cleanup_error is not None:
+            primary_error.add_note(
+                _temporary_cleanup_error_context(
+                    temporary_directory,
+                    cleanup_error,
+                )
+            )
+        raise
+
+    cleanup_error = _cleanup_temporary_output(
+        temporary_directory,
+        temporary_path,
+    )
+    if cleanup_error is not None:
+        cleanup_context = _temporary_cleanup_error_context(
+            temporary_directory,
+            cleanup_error,
+        )
+        if publication_succeeded:
+            try:
+                output_path.unlink(missing_ok=True)
+            except OSError as rollback_error:
+                error = MediaResizeError(
+                    "Temporary output cleanup and rollback failed; "
+                    f"final output may remain at {output_path}: {rollback_error}",
+                    exit_code=1,
+                )
+                error.add_note(cleanup_context)
+                raise error from rollback_error
+        raise MediaResizeError(
+            f"{cleanup_context}. Published output was rolled back: {output_path}",
+            exit_code=1,
+        ) from cleanup_error
 
     public_command = (*command[:-1], str(output_path))
     return MediaResizeResult(output_path=output_path, command=public_command)
@@ -130,21 +167,20 @@ def _create_temporary_output_path(output_path: Path) -> tuple[Path, Path]:
 def _cleanup_temporary_output(
     temporary_directory: Path,
     temporary_path: Path,
-    *,
-    primary_error: BaseException | None,
-) -> None:
+) -> OSError | None:
     try:
         temporary_path.unlink(missing_ok=True)
         temporary_directory.rmdir()
     except OSError as cleanup_error:
-        context = (
-            f"Temporary output cleanup failed for {temporary_directory}: "
-            f"{cleanup_error}"
-        )
-        if primary_error is not None:
-            primary_error.add_note(context)
-            return
-        raise MediaResizeError(context, exit_code=1) from cleanup_error
+        return cleanup_error
+    return None
+
+
+def _temporary_cleanup_error_context(
+    temporary_directory: Path,
+    cleanup_error: OSError,
+) -> str:
+    return f"Temporary output cleanup failed for {temporary_directory}: {cleanup_error}"
 
 
 def _publish_output_no_replace(temporary_path: Path, output_path: Path) -> None:
