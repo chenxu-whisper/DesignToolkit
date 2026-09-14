@@ -4,7 +4,7 @@ import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from tempfile import NamedTemporaryFile
+from tempfile import mkdtemp
 from typing import Protocol
 
 from designtoolkit.video_frames import BackendUnavailableError
@@ -84,7 +84,7 @@ def resize_media(
     except BackendUnavailableError as exc:
         raise MediaResizeError(str(exc), exit_code=1) from exc
 
-    temporary_path = _create_temporary_output_path(output_path)
+    temporary_directory, temporary_path = _create_temporary_output_path(output_path)
     command = _build_ffmpeg_command(
         ffmpeg_exe=ffmpeg_exe,
         input_path=input_path,
@@ -92,6 +92,7 @@ def resize_media(
         size=options.size,
         media_type=media_type,
     )
+    primary_error: BaseException | None = None
     try:
         result = _run_backend(backend, command)
         if result.returncode != 0:
@@ -101,21 +102,49 @@ def resize_media(
                 exit_code=1,
             )
         _publish_output_no_replace(temporary_path, output_path)
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
-        temporary_path.unlink(missing_ok=True)
+        _cleanup_temporary_output(
+            temporary_directory,
+            temporary_path,
+            primary_error=primary_error,
+        )
 
     public_command = (*command[:-1], str(output_path))
     return MediaResizeResult(output_path=output_path, command=public_command)
 
 
-def _create_temporary_output_path(output_path: Path) -> Path:
-    with NamedTemporaryFile(
-        prefix=f".{output_path.stem}.",
-        suffix=output_path.suffix,
-        dir=output_path.parent,
-    ) as temporary:
-        temporary_path = Path(temporary.name)
-    return temporary_path
+def _create_temporary_output_path(output_path: Path) -> tuple[Path, Path]:
+    temporary_directory = Path(
+        mkdtemp(
+            prefix=f".{output_path.stem}.",
+            dir=output_path.parent,
+        )
+    )
+    temporary_path = temporary_directory / f"output{output_path.suffix}"
+    return temporary_directory, temporary_path
+
+
+def _cleanup_temporary_output(
+    temporary_directory: Path,
+    temporary_path: Path,
+    *,
+    primary_error: BaseException | None,
+) -> None:
+    try:
+        temporary_path.unlink(missing_ok=True)
+        temporary_directory.rmdir()
+    except OSError as cleanup_error:
+        context = (
+            f"Temporary output cleanup failed for {temporary_directory}: "
+            f"{cleanup_error}"
+        )
+        if primary_error is not None:
+            primary_error.add_note(context)
+            return
+        raise MediaResizeError(context, exit_code=1) from cleanup_error
 
 
 def _publish_output_no_replace(temporary_path: Path, output_path: Path) -> None:
