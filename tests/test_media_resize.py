@@ -2,7 +2,6 @@ import errno
 import os
 from collections.abc import Sequence
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -497,7 +496,7 @@ def test_windows_publisher_uses_actual_rename(
     def reject_hard_link(source: Path, target: Path) -> None:
         raise AssertionError("Windows publication must not use os.link")
 
-    monkeypatch.setattr(os, "link", reject_hard_link)
+    monkeypatch.setattr(media_resize_core.os, "link", reject_hard_link)
 
     media_resize_core._publish_output_no_replace(temporary_path, output_path)
 
@@ -520,15 +519,8 @@ def test_windows_publisher_maps_winerror_collision(
         error.winerror = winerror
         raise error
 
-    def reject_hard_link(source: Path, target: Path) -> None:
-        raise AssertionError("Windows publication must not use os.link")
-
-    platform_os = SimpleNamespace(
-        name="nt",
-        rename=collide,
-        link=reject_hard_link,
-    )
-    monkeypatch.setattr(media_resize_core, "os", platform_os)
+    monkeypatch.setattr(media_resize_core, "IS_WINDOWS", True)
+    monkeypatch.setattr(media_resize_core.os, "rename", collide)
 
     with pytest.raises(MediaResizeError, match="already exists"):
         media_resize_core._publish_output_no_replace(temporary_path, output_path)
@@ -551,8 +543,8 @@ def test_posix_publisher_uses_hard_link(
         link_calls.append((source, target))
         actual_link(source, target)
 
-    platform_os = SimpleNamespace(name="posix", link=record_link)
-    monkeypatch.setattr(media_resize_core, "os", platform_os)
+    monkeypatch.setattr(media_resize_core, "IS_WINDOWS", False)
+    monkeypatch.setattr(media_resize_core.os, "link", record_link)
 
     media_resize_core._publish_output_no_replace(temporary_path, output_path)
 
@@ -573,16 +565,8 @@ def test_posix_unsupported_hard_link_fails_without_fallback_and_cleans_temp(
     def reject_hard_link(source: Path, target: Path) -> None:
         raise OSError(errno.EOPNOTSUPP, "hard links unsupported")
 
-    def reject_fallback(source: Path, target: Path) -> None:
-        raise AssertionError("publication fallback must not be used")
-
-    platform_os = SimpleNamespace(
-        name="posix",
-        link=reject_hard_link,
-        replace=reject_fallback,
-        rename=reject_fallback,
-    )
-    monkeypatch.setattr(media_resize_core, "os", platform_os)
+    monkeypatch.setattr(media_resize_core, "IS_WINDOWS", False)
+    monkeypatch.setattr(media_resize_core.os, "link", reject_hard_link)
 
     with pytest.raises(MediaResizeError, match="could not be published"):
         resize_media(

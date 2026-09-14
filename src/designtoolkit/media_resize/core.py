@@ -9,6 +9,7 @@ from typing import Protocol
 
 from designtoolkit.video_frames import BackendUnavailableError
 
+IS_WINDOWS = os.name == "nt"
 IMAGE_SUFFIXES = frozenset(
     {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
 )
@@ -166,14 +167,14 @@ def _publish_output_no_replace(
     output_path: Path,
 ) -> None:
     try:
-        if os.name == "nt":
+        if IS_WINDOWS:
             os.rename(temporary_path, output_path)
         else:
             os.link(temporary_path, output_path)
     except FileExistsError as exc:
         raise MediaResizeError(f"Output path already exists: {output_path}") from exc
     except OSError as exc:
-        if os.name == "nt" and getattr(exc, "winerror", None) in {80, 183}:
+        if IS_WINDOWS and getattr(exc, "winerror", None) in {80, 183}:
             raise MediaResizeError(
                 f"Output path already exists: {output_path}"
             ) from exc
