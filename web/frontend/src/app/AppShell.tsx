@@ -2,6 +2,7 @@ import { type CSSProperties, useEffect, useState } from 'react'
 import { HeaderBar } from '../components/HeaderBar'
 import { LogPanel } from '../components/LogPanel'
 import { Sidebar } from '../components/Sidebar'
+import { useTaskStore } from '../state/useTaskStore'
 import { toolModules } from './modules'
 import { TaskEventController } from './TaskEventController'
 import type { ModuleId } from './types'
@@ -37,6 +38,7 @@ export function AppShell() {
   const [activeModuleId, setActiveModuleId] = useState<ModuleId>('video_frames')
   const [logsCollapsed, setLogsCollapsed] = useState(readLogCollapsed)
   const [logHeight, setLogHeight] = useState(readLogHeight)
+  const isCreating = useTaskStore((state) => state.isCreating)
   const activeModule = toolModules.find((item) => item.id === activeModuleId) ?? toolModules[0]
   const ActiveComponent = activeModule.component
 
@@ -69,7 +71,12 @@ export function AppShell() {
         onToggleLogs={() => setLogsCollapsed((current) => !current)}
       />
       <TaskEventController />
-      <Sidebar activeModuleId={activeModuleId} modules={toolModules} onModuleSelect={setActiveModuleId} />
+      <Sidebar
+        activeModuleId={activeModuleId}
+        disabled={isCreating}
+        modules={toolModules}
+        onModuleSelect={setActiveModuleId}
+      />
       <main className="workspace">
         <ActiveComponent />
       </main>

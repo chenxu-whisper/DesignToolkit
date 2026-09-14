@@ -2,11 +2,17 @@ import type { ModuleId, ToolModule } from '../app/types'
 
 type SidebarProps = {
   activeModuleId: ModuleId
+  disabled?: boolean
   modules: ToolModule[]
   onModuleSelect: (moduleId: ModuleId) => void
 }
 
-export function Sidebar({ activeModuleId, modules, onModuleSelect }: SidebarProps) {
+export function Sidebar({
+  activeModuleId,
+  disabled = false,
+  modules,
+  onModuleSelect,
+}: SidebarProps) {
   return (
     <nav className="sidebar tool-rail" aria-label="工具模块">
       {modules.map((module) => {
@@ -17,6 +23,7 @@ export function Sidebar({ activeModuleId, modules, onModuleSelect }: SidebarProp
           <button
             aria-current={isActive ? 'page' : undefined}
             className={isActive ? 'nav-item nav-item-active' : 'nav-item'}
+            disabled={disabled}
             key={module.id}
             onClick={() => onModuleSelect(module.id)}
             title={module.description}

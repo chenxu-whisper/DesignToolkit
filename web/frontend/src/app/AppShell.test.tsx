@@ -255,34 +255,80 @@ describe('AppShell', () => {
     expect(useLogStore.getState().events).toEqual(expect.arrayContaining([terminalEvent]))
   })
 
-  it('disables all module forms while a create request is pending to prevent cross-module submit race', async () => {
+  it('keeps the submitting module mounted until task creation resolves', async () => {
     const user = userEvent.setup()
-    const videoFramesRequest = createDeferred<TaskCreateResponse>()
-    serviceMocks.createVideoFramesTask.mockReturnValue(videoFramesRequest.promise)
+    const request = createDeferred<TaskCreateResponse>()
+    serviceMocks.createVideoFramesTask.mockReturnValue(request.promise)
 
     renderShell()
 
     await user.type(screen.getByLabelText('输入视频路径'), 'clip.webm')
-    const videoSubmitButton = screen.getByRole('button', { name: '开始导出' })
-    await user.click(videoSubmitButton)
+    await user.click(screen.getByRole('button', { name: '开始导出' }))
 
-    expect(serviceMocks.createVideoFramesTask).toHaveBeenCalledTimes(1)
-
-    await user.click(screen.getByRole('button', { name: '媒体尺寸修改' }))
-
-    const resizeSubmitButton = screen.getByRole('button', { name: '开始调整' })
-    expect(resizeSubmitButton).toBeDisabled()
-
-    await user.click(resizeSubmitButton)
-    expect(serviceMocks.createMediaResizeTask).not.toHaveBeenCalled()
+    const resizeModule = screen.getByRole('button', { name: '媒体尺寸修改' })
+    expect(resizeModule).toBeDisabled()
+    await user.click(resizeModule)
+    expect(screen.getByRole('heading', { name: '视频转序列' })).toBeInTheDocument()
 
     await act(async () => {
-      videoFramesRequest.resolve({ task_id: 'task-vf-1', status: 'queued' })
-      await videoFramesRequest.promise
+      request.resolve({ task_id: 'task-vf-1', status: 'queued' })
+      await request.promise
     })
 
-    expect(serviceMocks.createMediaResizeTask).not.toHaveBeenCalled()
+    expect(useTaskStore.getState()).toMatchObject({
+      currentTaskId: 'task-vf-1',
+      isCreating: false,
+      status: 'queued',
+    })
+    expect(resizeModule).toBeEnabled()
   })
+
+  it('restores navigation and preserves failure behavior when task creation rejects', async () => {
+    const user = userEvent.setup()
+    const request = createDeferred<TaskCreateResponse>()
+    serviceMocks.createVideoFramesTask.mockReturnValue(request.promise)
+
+    renderShell()
+
+    await user.type(screen.getByLabelText('输入视频路径'), 'clip.webm')
+    await user.click(screen.getByRole('button', { name: '开始导出' }))
+
+    const resizeModule = screen.getByRole('button', { name: '媒体尺寸修改' })
+    expect(resizeModule).toBeDisabled()
+    await user.click(resizeModule)
+    expect(screen.getByRole('heading', { name: '视频转序列' })).toBeInTheDocument()
+
+    await act(async () => {
+      request.reject(new Error('create failed'))
+      await expect(request.promise).rejects.toThrow('create failed')
+    })
+
+    expect(useTaskStore.getState()).toMatchObject({
+      currentTaskId: null,
+      error: 'create failed',
+      isCreating: false,
+      status: 'failed',
+    })
+    expect(screen.getByRole('alert')).toHaveTextContent('失败：create failed')
+    expect(resizeModule).toBeEnabled()
+  })
+
+  it.each(['queued', 'running'] as const)(
+    'keeps navigation enabled while a task is %s',
+    async (status) => {
+      const user = userEvent.setup()
+      useTaskStore.getState().startTask({ taskId: 'task-1', kind: 'video_frames', status })
+
+      renderShell()
+
+      const resizeModule = screen.getByRole('button', { name: '媒体尺寸修改' })
+      expect(resizeModule).toBeEnabled()
+
+      await user.click(resizeModule)
+
+      expect(screen.getByRole('heading', { name: '媒体尺寸修改' })).toBeInTheDocument()
+    },
+  )
 
   it('keeps a running task active and reconnects when only the log stream disconnects', async () => {
     const user = userEvent.setup()
