@@ -1,3 +1,4 @@
+from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
@@ -20,8 +21,9 @@ class RecordingBackend:
         self.get_ffmpeg_calls += 1
         return "ffmpeg"
 
-    def run(self, command: list[str]) -> ResizeBackendResult:
+    def run(self, command: Sequence[str]) -> ResizeBackendResult:
         self.commands.append(tuple(command))
+        Path(command[-1]).write_bytes(b"resized")
         return self.result
 
 
@@ -137,10 +139,10 @@ def test_video_without_audio_maps_only_primary_video_and_optional_audio(
         for index, argument in enumerate(command)
         if argument == "-map"
     ]
-    assert mappings == [("-map", "0:v:0"), ("-map", "0:a?")]
+    assert mappings == [("-map", "0:v:0"), ("-map", "0:a:0?")]
 
 
-def test_failed_resize_removes_partial_output_and_preserves_stderr(
+def test_failed_resize_removes_partial_temporary_output_and_preserves_stderr(
     tmp_path: Path,
 ) -> None:
     input_path = tmp_path / "input.png"
@@ -148,11 +150,12 @@ def test_failed_resize_removes_partial_output_and_preserves_stderr(
     input_path.write_bytes(b"image")
 
     class PartialOutputBackend(RecordingBackend):
-        def run(self, command: list[str]) -> ResizeBackendResult:
+        def run(self, command: Sequence[str]) -> ResizeBackendResult:
             self.commands.append(tuple(command))
             Path(command[-1]).write_bytes(b"partial")
             return ResizeBackendResult(returncode=1, stderr="encode failed")
 
+    backend = PartialOutputBackend()
     with pytest.raises(MediaResizeError, match="encode failed"):
         resize_media(
             MediaResizeOptions(
@@ -160,39 +163,97 @@ def test_failed_resize_removes_partial_output_and_preserves_stderr(
                 output_path=output_path,
                 size=(100, 100),
             ),
-            PartialOutputBackend(),
+            backend,
         )
 
     assert not output_path.exists()
+    temporary_path = Path(backend.commands[0][-1])
+    assert temporary_path.parent == output_path.parent
+    assert temporary_path.suffix == output_path.suffix
+    assert temporary_path != output_path
+    assert not temporary_path.exists()
 
 
-def test_failed_resize_reports_partial_output_cleanup_failure(
+def test_failed_resize_preserves_concurrently_created_final_output(
     tmp_path: Path,
 ) -> None:
     input_path = tmp_path / "input.png"
     output_path = tmp_path / "output.png"
     input_path.write_bytes(b"image")
 
-    class UnremovableOutputBackend(RecordingBackend):
-        def run(self, command: list[str]) -> ResizeBackendResult:
+    class ConcurrentOutputBackend(RecordingBackend):
+        def run(self, command: Sequence[str]) -> ResizeBackendResult:
             self.commands.append(tuple(command))
-            Path(command[-1]).mkdir()
+            Path(command[-1]).write_bytes(b"partial")
+            output_path.write_bytes(b"concurrent")
             return ResizeBackendResult(returncode=1, stderr="encode failed")
 
-    with pytest.raises(MediaResizeError) as exc_info:
+    backend = ConcurrentOutputBackend()
+    with pytest.raises(MediaResizeError, match="encode failed"):
         resize_media(
             MediaResizeOptions(
                 input_path=input_path,
                 output_path=output_path,
                 size=(100, 100),
             ),
-            UnremovableOutputBackend(),
+            backend,
         )
 
-    message = str(exc_info.value)
-    assert "encode failed" in message
-    assert "failed to remove partial output" in message
-    assert output_path.is_dir()
+    assert output_path.read_bytes() == b"concurrent"
+    assert not Path(backend.commands[0][-1]).exists()
+
+
+def test_publish_collision_preserves_concurrent_output_and_removes_temporary(
+    tmp_path: Path,
+) -> None:
+    input_path = tmp_path / "input.png"
+    output_path = tmp_path / "output.png"
+    input_path.write_bytes(b"image")
+
+    class ConcurrentOutputBackend(RecordingBackend):
+        def run(self, command: Sequence[str]) -> ResizeBackendResult:
+            self.commands.append(tuple(command))
+            Path(command[-1]).write_bytes(b"complete")
+            output_path.write_bytes(b"concurrent")
+            return ResizeBackendResult(returncode=0)
+
+    backend = ConcurrentOutputBackend()
+    with pytest.raises(MediaResizeError, match="already exists"):
+        resize_media(
+            MediaResizeOptions(
+                input_path=input_path,
+                output_path=output_path,
+                size=(100, 100),
+            ),
+            backend,
+        )
+
+    assert output_path.read_bytes() == b"concurrent"
+    assert not Path(backend.commands[0][-1]).exists()
+
+
+def test_success_publishes_exact_output_and_removes_temporary(
+    tmp_path: Path,
+) -> None:
+    input_path = tmp_path / "input.png"
+    output_path = tmp_path / "output.png"
+    input_path.write_bytes(b"image")
+    backend = RecordingBackend()
+
+    result = resize_media(
+        MediaResizeOptions(
+            input_path=input_path,
+            output_path=output_path,
+            size=(100, 100),
+        ),
+        backend,
+    )
+
+    temporary_path = Path(backend.commands[0][-1])
+    assert output_path.read_bytes() == b"resized"
+    assert not temporary_path.exists()
+    assert result.output_path == output_path
+    assert result.command[-1] == str(output_path)
 
 
 def test_existing_output_is_rejected_before_backend_and_preserved(

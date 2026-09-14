@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Protocol
 
 from designtoolkit.video_frames import BackendUnavailableError
@@ -82,30 +84,50 @@ def resize_media(
     except BackendUnavailableError as exc:
         raise MediaResizeError(str(exc), exit_code=1) from exc
 
+    temporary_path = _create_temporary_output_path(output_path)
     command = _build_ffmpeg_command(
         ffmpeg_exe=ffmpeg_exe,
         input_path=input_path,
-        output_path=output_path,
+        output_path=temporary_path,
         size=options.size,
         media_type=media_type,
     )
-    result = _run_backend(backend, command)
-    if result.returncode != 0:
-        cleanup_error: OSError | None = None
-        try:
-            output_path.unlink(missing_ok=True)
-        except OSError as exc:
-            cleanup_error = exc
+    try:
+        result = _run_backend(backend, command)
+        if result.returncode != 0:
+            detail = f": {result.stderr.strip()}" if result.stderr.strip() else ""
+            raise MediaResizeError(
+                f"FFmpeg failed with exit code {result.returncode}{detail}",
+                exit_code=1,
+            )
+        _publish_output_no_replace(temporary_path, output_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
-        detail = f": {result.stderr.strip()}" if result.stderr.strip() else ""
-        if cleanup_error is not None:
-            detail += f"; failed to remove partial output: {cleanup_error}"
+    public_command = (*command[:-1], str(output_path))
+    return MediaResizeResult(output_path=output_path, command=public_command)
+
+
+def _create_temporary_output_path(output_path: Path) -> Path:
+    with NamedTemporaryFile(
+        prefix=f".{output_path.stem}.",
+        suffix=output_path.suffix,
+        dir=output_path.parent,
+        delete=False,
+    ) as temporary:
+        return Path(temporary.name)
+
+
+def _publish_output_no_replace(temporary_path: Path, output_path: Path) -> None:
+    try:
+        os.link(temporary_path, output_path)
+    except FileExistsError as exc:
+        raise MediaResizeError(f"Output path already exists: {output_path}") from exc
+    except OSError as exc:
         raise MediaResizeError(
-            f"FFmpeg failed with exit code {result.returncode}{detail}",
+            f"Resized media could not be published: {output_path}",
             exit_code=1,
-        )
-
-    return MediaResizeResult(output_path=output_path, command=tuple(command))
+        ) from exc
 
 
 def _run_backend(
@@ -172,7 +194,7 @@ def _build_ffmpeg_command(
     command = [
         ffmpeg_exe,
         "-hide_banner",
-        "-n",
+        "-y",
         "-i",
         str(input_path),
         "-vf",
@@ -192,7 +214,7 @@ def _build_ffmpeg_command(
                 "-map",
                 "0:v:0",
                 "-map",
-                "0:a?",
+                "0:a:0?",
                 "-c:a",
                 audio_codec,
             ]
