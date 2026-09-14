@@ -1,10 +1,5 @@
 import { expect, test } from '@playwright/test'
 
-test.skip(
-  process.env.VITE_HOSTED_MODE !== 'true',
-  'requires a hosted frontend build',
-)
-
 test('hosted mode uploads browser files and hides server output paths', async ({
   page,
 }) => {
