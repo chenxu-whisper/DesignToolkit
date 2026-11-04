@@ -6,6 +6,7 @@ import { SizeInput } from '../../components/SizeInput'
 import { SubmitButton } from '../../components/SubmitButton'
 import {
   deleteUploadedAsset,
+  importDroppedFiles,
   pickLocalFiles,
   pickLocalSaveFile,
   resolveDroppedFilePaths,
@@ -98,6 +99,7 @@ export function MediaResizeForm({ disabled, onSubmit }: MediaResizeFormProps) {
         disabled={formDisabled}
         error={errors.inputPath}
         id="media-resize-input-path"
+        importDroppedFiles={hostedMode ? undefined : importDroppedFiles}
         label={hostedMode ? '输入媒体' : '输入媒体路径'}
         multiline
         onChange={updateInputPath}

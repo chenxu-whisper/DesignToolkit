@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import StrEnum
+from pathlib import Path
 from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -158,8 +159,10 @@ class ChromaVideoKeyerTaskRequest(BaseModel):
     samples: list[list[RgbChannel]] = Field(min_length=1, max_length=1)
     params: ChromaKeyerParams
     output_root: str | None = None
+    output_format: Literal["png_sequence", "packed_alpha_mp4"] = "png_sequence"
+    output_path: str | None = None
 
-    @field_validator("input_path", "output_root")
+    @field_validator("input_path", "output_root", "output_path")
     @classmethod
     def validate_paths(cls, value: str | None) -> str | None:
         if value is not None and not value.strip():
@@ -172,6 +175,18 @@ class ChromaVideoKeyerTaskRequest(BaseModel):
         if any(len(sample) != 3 for sample in value):
             raise ValueError("each sample must contain exactly three channels")
         return value
+
+    @model_validator(mode="after")
+    def validate_video_output(self) -> ChromaVideoKeyerTaskRequest:
+        if self.output_path is not None:
+            if self.output_format != "packed_alpha_mp4":
+                raise ValueError("output_path is only valid for packed_alpha_mp4")
+            output = Path(self.output_path)
+            if output.suffix.lower() != ".mp4":
+                raise ValueError("output_path must end with .mp4")
+            if output.resolve() == Path(self.input_path).resolve():
+                raise ValueError("output_path cannot replace input video")
+        return self
 
 
 class ChromaPreviewRequest(BaseModel):
@@ -390,7 +405,7 @@ class LocalDirectoryPickRequest(BaseModel):
 
 
 class LocalSaveFilePickRequest(BaseModel):
-    file_kind: Literal["media", "image", "any"] = "any"
+    file_kind: Literal["video", "media", "image", "any"] = "any"
     title: str = "Select output path"
 
 

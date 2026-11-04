@@ -12,6 +12,7 @@ type TaskCreateResponse = {
 
 const pageMocks = vi.hoisted(() => ({
   createMediaResizeTask: vi.fn<(payload: unknown) => Promise<TaskCreateResponse>>(),
+  importDroppedFiles: vi.fn(),
   pickLocalFiles: vi.fn(),
   pickLocalSaveFile: vi.fn(),
   resolveDroppedFilePaths: vi.fn(),
@@ -19,6 +20,7 @@ const pageMocks = vi.hoisted(() => ({
 
 vi.mock('../../services/apiClient', () => ({
   createMediaResizeTask: pageMocks.createMediaResizeTask,
+  importDroppedFiles: pageMocks.importDroppedFiles,
   pickLocalFiles: pageMocks.pickLocalFiles,
   pickLocalSaveFile: pageMocks.pickLocalSaveFile,
   resolveDroppedFilePaths: pageMocks.resolveDroppedFilePaths,
@@ -26,6 +28,7 @@ vi.mock('../../services/apiClient', () => ({
 
 beforeEach(() => {
   pageMocks.createMediaResizeTask.mockReset()
+  pageMocks.importDroppedFiles.mockReset()
   pageMocks.pickLocalFiles.mockReset()
   pageMocks.pickLocalSaveFile.mockReset()
   pageMocks.resolveDroppedFilePaths.mockReset()

@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Packed Alpha Player | DesignToolkit</title>
+  <link rel="stylesheet" href="player.css">
+  <script src="player.js" defer></script>
+</head>
+<body>
+  <main id="packed-alpha-demo">
+    <header>
+      <span class="brand">DesignToolkit / Local Preview</span>
+      <h1>Packed Alpha Player</h1>
+      <p>Restore transparency from a color-left, alpha-right MP4. Files stay on this device.</p>
+    </header>
+    <section class="files" aria-label="Local files">
+      <label for="video-file">MP4 video
+        <input id="video-file" type="file" accept="video/mp4,.mp4">
+      </label>
+      <label for="metadata-file">JSON metadata
+        <input id="metadata-file" type="file" accept="application/json,.json">
+      </label>
+    </section>
+    <div id="stage" data-background="checker">
+      <canvas id="preview" width="640" height="360" aria-label="Transparent video preview"></canvas>
+    </div>
+    <section class="controls" aria-label="Playback controls">
+      <button id="play" type="button" disabled>Play</button>
+      <button id="mute" type="button" disabled>Unmute</button>
+      <label class="timeline" for="seek">Seek
+        <input id="seek" type="range" min="0" max="0" step="0.01" value="0" disabled>
+      </label>
+      <output id="time" role="timer" aria-label="Playback time">0.00 / 0.00 s</output>
+      <label for="background">Background
+        <select id="background">
+          <option value="checker">Checkerboard</option>
+          <option value="light">Light</option>
+          <option value="dark">Dark</option>
+        </select>
+      </label>
+    </section>
+    <p id="status" role="status" aria-live="polite">Select an MP4 and its matching JSON metadata.</p>
+    <footer>
+      This is a custom packed format, not native MP4 transparency.
+      <a href="README.md">Format and integration guide</a>
+    </footer>
+  </main>
+</body>
+</html>

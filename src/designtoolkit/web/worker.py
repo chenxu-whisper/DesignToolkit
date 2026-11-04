@@ -67,6 +67,8 @@ class RedisTaskExecutor(TaskManager):
         self._resource_health_check = resource_health_check
         self._before_success_publish = before_success_publish
         self._task_already_running = task_already_running
+        self._packed_request = False
+        self._packed_owned_paths: list[Path] = []
         self._backend_factory = self._guarded_backend
 
     def execute_reserved_task(
@@ -80,6 +82,11 @@ class RedisTaskExecutor(TaskManager):
         ),
     ) -> None:
         output_root = _request_output_root(request)
+        self._packed_request = (
+            isinstance(request, ChromaVideoKeyerTaskRequest)
+            and request.output_format == "packed_alpha_mp4"
+        )
+        self._packed_owned_paths = []
         self._output_root = output_root.resolve() if output_root is not None else None
         self._input_paths = _request_input_paths(request)
         self._output_guard = (
@@ -146,6 +153,10 @@ class RedisTaskExecutor(TaskManager):
             return
         super()._handle_task_failure(task_id, exc)
 
+    def _handle_packed_task_failure(self, task_id: str, exc: Exception) -> None:
+        output_limit_error = _find_output_limit_error(exc)
+        self._mark_failed(task_id, str(output_limit_error or exc))
+
     def _mark_failed(self, task_id: str, message: str) -> None:
         self._state._finalize_external_failure(task_id, message)
 
@@ -159,11 +170,20 @@ class RedisTaskExecutor(TaskManager):
     ) -> None:
         artifact: Path | None = None
         paths = decode_output_paths(output_paths)
+        if self._packed_request:
+            self._packed_owned_paths = paths
         archive_candidate = (
             paths[0].parent / f"{task_id}.zip" if paths else None
         )
         try:
             self._check_output_tree()
+            self.log_store.append(
+                task_id=task_id,
+                level=LogLevel.PROGRESS,
+                phase=LogPhase.RUNNING,
+                message="Preparing download",
+                details={"stage": "packaging"},
+            )
             artifact = prepare_download_artifact(
                 task_id,
                 paths,
@@ -263,6 +283,15 @@ class RedisTaskExecutor(TaskManager):
         artifact_guard.account(artifact)
 
     def _discard_partial_output(self) -> None:
+        if self._packed_request:
+            for path in self._packed_owned_paths:
+                if path.is_symlink():
+                    path.unlink(missing_ok=True)
+                elif path.is_dir():
+                    rmtree(path, ignore_errors=True)
+                else:
+                    path.unlink(missing_ok=True)
+            return
         if self._output_root is None:
             return
         protected = {
@@ -428,6 +457,15 @@ def discard_failed_task_output(
     try:
         request = _task_request(job_kind, payload)
     except (TypeError, ValueError):
+        return
+    if (
+        isinstance(request, ChromaVideoKeyerTaskRequest)
+        and request.output_format == "packed_alpha_mp4"
+    ):
+        # Live packed exports own and roll back their individual files. A
+        # restarted worker has no ownership proof for existing destinations.
+        # Do not purge a shared parent; abandoned files remain subject to the
+        # existing hosted session retention cleanup.
         return
     executor = RedisTaskExecutor(state)
     output_root = _request_output_root(request)
@@ -624,6 +662,8 @@ def _request_output_root(
             return Path(request.output_path).parent
         return None
     if isinstance(request, ChromaVideoKeyerTaskRequest):
+        if request.output_format == "packed_alpha_mp4" and request.output_path:
+            return Path(request.output_path).parent
         return Path(request.output_root) if request.output_root is not None else None
     return (
         Path(request.output_path).parent

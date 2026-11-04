@@ -213,12 +213,16 @@ def _filetype_pattern(suffixes: tuple[str, ...]) -> str:
 
 
 def _save_filetypes(file_kind: str):
+    if file_kind == "video":
+        return [("MP4 files", "*.mp4")]
     if file_kind == "image":
         return [("PNG files", "*.png")]
     return _filetypes(file_kind)
 
 
 def _save_file_options(file_kind: str) -> dict[str, str]:
+    if file_kind == "video":
+        return {"defaultextension": ".mp4"}
     if file_kind == "image":
         return {"defaultextension": ".png"}
     return {}
@@ -238,6 +242,12 @@ def _filter_paths_by_file_kind(
 
 
 def _normalize_save_paths(paths: list[Path], file_kind: str) -> list[Path]:
+    if file_kind == "video":
+        return [
+            path.with_suffix(".mp4") if not path.suffix else path
+            for path in paths
+            if not path.suffix or path.suffix.lower() == ".mp4"
+        ]
     if file_kind != "image":
         return paths
 

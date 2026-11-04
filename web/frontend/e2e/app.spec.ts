@@ -514,6 +514,65 @@ async function installVideoPreviewRoutes(page: Page) {
   })
 }
 
+test('exports the default packed MP4 through the save picker and shared task status', async ({ page }) => {
+  await installVideoPreviewRoutes(page)
+  const outputPath = `${videoOutputRoot}\\moving-screen_keyed_packed.mp4`
+  const taskBodies: Record<string, unknown>[] = []
+  const pickerBodies: unknown[] = []
+  await page.route('**/api/chroma-keyer/videos/sample', route => route.fulfill({
+    contentType: 'application/json',
+    body: JSON.stringify({ rgb: [42, 180, 72], hex: '#2AB448', source_x: 100, source_y: 50, timestamp_seconds: 0 }),
+  }))
+  await page.route('**/api/chroma-keyer/videos/preview', route => route.fulfill({
+    contentType: 'application/json',
+    body: JSON.stringify({ preview_url: videoInspectPreviewUrl, timestamp_seconds: 0 }),
+  }))
+  await page.route('**/api/local-paths/pick-save-file', async route => {
+    pickerBodies.push(route.request().postDataJSON())
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({ cancelled: false, paths: [outputPath] }),
+    })
+  })
+  await page.route('**/api/tasks/chroma-keyer-video', async route => {
+    taskBodies.push(route.request().postDataJSON())
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({ task_id: 'packed-task', status: 'queued' }),
+    })
+  })
+  await page.route('**/api/tasks/packed-task/events', route => route.fulfill({
+    contentType: 'text/event-stream',
+    body: `data: ${JSON.stringify({
+      task_id: 'packed-task', timestamp: '2026-11-03T10:00:00Z',
+      level: 'success', phase: 'completed', message: 'Packed MP4 completed',
+      details: { output_path: outputPath, frame_count: 12 },
+    })}\n\n`,
+  }))
+  await page.goto('/')
+  await page.getByRole('button', { exact: true, name: '色键抠图' }).click()
+  const input = page.getByRole('textbox', { name: '输入图片或视频路径' })
+  await input.fill(videoInputPath)
+  await input.press('Enter')
+  await expect(page.getByRole('combobox', { name: '输出格式' })).toHaveValue('packed_alpha_mp4')
+  await expect(page.getByText(/需要配套播放器恢复透明效果/)).toBeVisible()
+  await page.getByRole('button', { name: '抠像预览' }).click({ position: { x: 100, y: 50 } })
+  await expect(page.getByText('Screen Color', { exact: true })).toBeVisible()
+  await page.getByRole('button', { name: '指定MP4 输出路径（可选）' }).click()
+  await expect(page.getByRole('textbox', { name: 'MP4 输出路径（可选）' })).toHaveValue(outputPath)
+  expect(pickerBodies).toEqual([{ file_kind: 'video', title: '选择 MP4 输出路径' }])
+  await page.getByRole('button', { name: '导出 MP4' }).click()
+  await expect.poll(() => taskBodies.length).toBe(1)
+  expect(taskBodies[0]).toMatchObject({
+    input_path: videoInputPath, output_path: outputPath,
+    output_format: 'packed_alpha_mp4', samples: [[42, 180, 72]],
+  })
+  expect(taskBodies[0]).not.toHaveProperty('output_root')
+  await expect(page.getByLabel('任务状态：完成')).toBeVisible()
+  await page.getByRole('button', { name: '展开任务日志' }).first().click()
+  await expect(page.getByText(`输出：${outputPath}`)).toBeVisible()
+})
+
 test('runs the complete chroma video timeline and PNG sequence export workflow', async ({ page }) => {
   await page.clock.install()
 
@@ -655,6 +714,8 @@ test('runs the complete chroma video timeline and PNG sequence export workflow',
   await expect(page.getByText('4 FPS')).toBeVisible()
   await expect(page.getByText('400 × 200')).toBeVisible()
   await expect(page.getByText('约 12 帧')).toBeVisible()
+  await expect(page.getByRole('combobox', { name: '输出格式' })).toHaveValue('packed_alpha_mp4')
+  await page.getByRole('combobox', { name: '输出格式' }).selectOption('png_sequence')
 
   const timeline = page.getByRole('slider', { name: '视频时间轴' })
   await timeline.fill('1')
@@ -908,6 +969,7 @@ test('runs the complete chroma video timeline and PNG sequence export workflow',
   expect(taskBodies[0]).toEqual({
     input_path: videoInputPath,
     output_root: videoOutputRoot,
+    output_format: 'png_sequence',
     samples: [[42, 180, 72]],
     params: {
       screen_gain: 1.2,

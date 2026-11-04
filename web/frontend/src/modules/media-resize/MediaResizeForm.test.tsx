@@ -1,27 +1,50 @@
-import { render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { MediaResizeForm } from './MediaResizeForm'
 
 const apiMocks = vi.hoisted(() => ({
+  importDroppedFiles: vi.fn(),
   pickLocalFiles: vi.fn(),
   pickLocalSaveFile: vi.fn(),
   resolveDroppedFilePaths: vi.fn(),
 }))
 
 vi.mock('../../services/apiClient', () => ({
+  importDroppedFiles: apiMocks.importDroppedFiles,
   pickLocalFiles: apiMocks.pickLocalFiles,
   pickLocalSaveFile: apiMocks.pickLocalSaveFile,
   resolveDroppedFilePaths: apiMocks.resolveDroppedFilePaths,
 }))
 
 beforeEach(() => {
+  apiMocks.importDroppedFiles.mockReset()
   apiMocks.pickLocalFiles.mockReset()
   apiMocks.pickLocalSaveFile.mockReset()
   apiMocks.resolveDroppedFilePaths.mockReset()
 })
 
 describe('MediaResizeForm', () => {
+  it('keeps local import pending ahead of submit and preserves existing input on import error', async () => {
+    apiMocks.resolveDroppedFilePaths.mockResolvedValue({ paths: [] })
+    let rejectImport!: (error: Error) => void
+    apiMocks.importDroppedFiles.mockReturnValue(new Promise<readonly string[]>((_resolve, reject) => { rejectImport = reject }))
+    const onSubmit = vi.fn()
+    const { container } = render(<MediaResizeForm disabled={false} onSubmit={onSubmit} />)
+    const input = screen.getByLabelText('输入媒体路径')
+    fireEvent.change(input, { target: { value: 'D:\\old\\original.png' } })
+    const file = new File(['actual'], 'outside.png', { type: 'image/png' })
+    fireEvent.drop(input, { dataTransfer: { files: [file], getData: () => '' } })
+    expect(apiMocks.importDroppedFiles).toHaveBeenCalledWith([file], expect.any(Function), expect.any(AbortSignal))
+    expect(screen.getByRole('button', { name: '开始调整' })).toBeDisabled()
+    fireEvent.submit(container.querySelector('form')!)
+    expect(onSubmit).not.toHaveBeenCalled()
+    await act(async () => rejectImport(new Error('Local import failed')))
+    expect(screen.getByText('Local import failed')).toBeInTheDocument()
+    expect(input).toHaveValue('D:\\old\\original.png')
+    expect(screen.getByRole('button', { name: '开始调整' })).not.toBeDisabled()
+    expect(apiMocks.resolveDroppedFilePaths).not.toHaveBeenCalled()
+  })
   it('renders media resize fields', () => {
     render(<MediaResizeForm disabled={false} onSubmit={vi.fn()} />)
 

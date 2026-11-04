@@ -75,6 +75,13 @@
   padding-bottom: var(--space-4);
 }
 
+.chroma-format-help {
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.4;
+  margin: 0;
+}
+
 .chroma-inspector-footer {
   background: var(--surface-panel);
   bottom: 0;

@@ -5,8 +5,10 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from shutil import rmtree
 from threading import Lock, Thread
 from time import perf_counter
+from typing import Any
 from uuid import uuid4
 
 from designtoolkit.chroma_keyer.core import key_image
@@ -51,6 +53,7 @@ from designtoolkit.web.adapters import (
     video_frame_options_list_from_request,
 )
 from designtoolkit.web.logs import LogStore
+from designtoolkit.web.packed_video import packed_output_path, publish_player
 from designtoolkit.web.schemas import (
     ChromaKeyerTaskRequest,
     ChromaVideoKeyerTaskRequest,
@@ -124,6 +127,7 @@ class TaskManager:
         media_resizer: MediaResizer | None = resize_media,
         keyer: Keyer | None = key_image,
         video_keyer: VideoKeyer | None = key_video_to_png_sequence,
+        packed_video_keyer: Callable[..., Any] | None = None,
         video_decoder_factory: VideoDecoderFactory = ImageioVideoDecoder,
         backend_factory: BackendFactory | None = None,
         clock: Clock = perf_counter,
@@ -134,6 +138,7 @@ class TaskManager:
         self._media_resizer = media_resizer
         self._keyer = keyer
         self._video_keyer = video_keyer
+        self._packed_video_keyer = packed_video_keyer
         self._video_decoder_factory = video_decoder_factory
         self._backend_factory = backend_factory or self._default_backend
         self._clock = clock
@@ -281,6 +286,22 @@ class TaskManager:
         owner_id: str | None = None,
     ) -> TaskRecord:
         options, model, params = chroma_video_keyer_options_from_request(request)
+        if options.output_format == "packed_alpha_mp4":
+            output = packed_output_path(options)
+            task = self.reserve_task(
+                kind=TaskKind.CHROMA_KEYER,
+                input_path=str(options.input_path),
+                output_path=str(output),
+                owner_id=owner_id,
+            )
+            try:
+                self._start(
+                    task,
+                    lambda: self._run_packed_video_keyer(task, options, model, params),
+                )
+            except Exception as exc:
+                self._mark_failed(task.task_id, str(exc))
+            return self.get_task(task.task_id) or task
         output_root = options.output_root or options.input_path.parent
         if not output_root.exists() or not output_root.is_dir():
             raise KeyerError("Output root must exist and be a directory")
@@ -331,6 +352,9 @@ class TaskManager:
             return
         if isinstance(request, ChromaVideoKeyerTaskRequest):
             options, model, params = chroma_video_keyer_options_from_request(request)
+            if options.output_format == "packed_alpha_mp4":
+                self._run_packed_video_keyer(task, options, model, params)
+                return
             self._run_chroma_video_keyer(task, options, model, params)
             return
         options, model, params = chroma_keyer_options_from_request(request)
@@ -492,6 +516,104 @@ class TaskManager:
             [result.output_path],
             elapsed_seconds=self._elapsed_seconds(task_started_at),
         )
+
+    def _run_packed_video_keyer(
+        self,
+        task: TaskRecord,
+        options: VideoKeyOptions,
+        model: ScreenColorModel,
+        params: KeyerParams,
+    ) -> None:
+        self._mark_running(task.task_id)
+        started = self._clock()
+        player_dir: Path | None = None
+        result = None
+        last_bucket = -1
+
+        def progress(processed, total, current_path) -> None:
+            nonlocal last_bucket
+            self._check_output_tree()
+            bucket = min(99, processed * 100 // total) if total else processed // 30
+            if bucket == last_bucket:
+                return
+            last_bucket = bucket
+            self.log_store.append(
+                task_id=task.task_id,
+                level=LogLevel.PROGRESS,
+                phase=LogPhase.RUNNING,
+                message=f"Keying and encoding frame {processed}",
+                details={
+                    "processed_frames": processed,
+                    "total_frames": total,
+                    "progress": min(processed / total, 0.99) if total else None,
+                    "elapsed_seconds": self._elapsed_seconds(started),
+                },
+            )
+
+        def stage_changed(stage: str) -> None:
+            labels = {
+                "validating": "Checking video frame timing",
+                "keying": "Keying and encoding video",
+                "encoding": "Finishing video encoding",
+                "audio": "Encoding and aligning audio",
+                "publishing": "Publishing MP4 and metadata",
+            }
+            self.log_store.append(
+                task_id=task.task_id,
+                level=LogLevel.PROGRESS,
+                phase=LogPhase.RUNNING,
+                message=labels.get(stage, stage),
+                details={
+                    "stage": stage,
+                    "elapsed_seconds": self._elapsed_seconds(started),
+                },
+            )
+
+        try:
+            from designtoolkit.chroma_keyer.packed_video_export import (
+                key_video_to_packed_mp4,
+            )
+
+            output = packed_output_path(options)
+            player_dir = publish_player(output, self._check_output_tree)
+            exporter = self._packed_video_keyer or key_video_to_packed_mp4
+            result = exporter(
+                options,
+                self._video_decoder_factory(),
+                model,
+                params,
+                progress,
+                output_check=self._check_output_tree,
+                stage_callback=stage_changed,
+            )
+            self._check_output_tree()
+        except Exception as exc:
+            cleanup_paths = []
+            if player_dir is not None:
+                cleanup_paths.append(player_dir)
+            if result is not None:
+                cleanup_paths.extend((result.output_path, result.metadata_path))
+            for path in cleanup_paths:
+                try:
+                    if path == player_dir:
+                        rmtree(path)
+                    else:
+                        path.unlink(missing_ok=True)
+                except Exception as cleanup_error:
+                    exc.add_note(f"Could not remove {path}: {cleanup_error}")
+            self._handle_packed_task_failure(task.task_id, exc)
+            return
+        self._mark_succeeded(
+            task.task_id,
+            [result.output_path, result.metadata_path, player_dir],
+            elapsed_seconds=self._elapsed_seconds(started),
+            frame_count=result.frame_count,
+        )
+
+    def _handle_packed_task_failure(self, task_id: str, exc: Exception) -> None:
+        # Cleanup above targets only published outputs. A shared output parent
+        # may contain pre-existing user files.
+        self._mark_failed(task_id, str(exc))
 
     def _run_chroma_video_keyer(
         self,

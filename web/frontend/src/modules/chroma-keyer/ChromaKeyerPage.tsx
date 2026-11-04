@@ -28,6 +28,7 @@ import { ChromaVideoTimeline, getLastVideoFrameTime } from './ChromaVideoTimelin
 import { useChromaVideoPlayback } from './useChromaVideoPlayback'
 import {
   isVideoPath,
+  validateChromaKeyerPreviewValues,
   validateChromaKeyerValues,
   type ChromaKeyerErrors,
   type ChromaKeyerValues,
@@ -97,7 +98,11 @@ function toPayload(values: ChromaKeyerValues): ChromaKeyerPayload {
 function toVideoPayload(values: ChromaKeyerValues): ChromaVideoKeyerPayload {
   return {
     ...toBasePayload(values),
-    outputRoot: values.outputRoot.trim() || undefined,
+    outputFormat: values.outputFormat,
+    ...(!hostedMode && values.outputFormat === 'packed_alpha_mp4' && values.outputPath.trim()
+      ? { outputPath: values.outputPath.trim() } : {}),
+    ...(!hostedMode && values.outputFormat === 'png_sequence' && values.outputRoot.trim()
+      ? { outputRoot: values.outputRoot.trim() } : {}),
   }
 }
 
@@ -198,6 +203,8 @@ export function ChromaKeyerPage() {
       const resetValues = {
         ...nextValues,
         mediaKind: null,
+        outputFormat: 'packed_alpha_mp4',
+        outputPath: '',
         outputRoot: '',
         samples: [],
         timestampSeconds: 0,
@@ -226,7 +233,7 @@ export function ChromaKeyerPage() {
       : nextValues
     valuesRef.current = resolvedNextValues
     setValues(resolvedNextValues)
-    const validationErrors = validateChromaKeyerValues(resolvedNextValues)
+    const validationErrors = validateChromaKeyerPreviewValues(resolvedNextValues)
     setErrors((current) => {
       const nextErrors = { ...current }
       for (const field of previewParameterFields) {
@@ -516,6 +523,7 @@ export function ChromaKeyerPage() {
           const nextValues = {
             ...current,
             mediaKind: 'image' as const,
+            outputFormat: 'png_sequence' as const,
             outputRoot: '',
             samples: [],
             timestampSeconds: 0,
@@ -1026,10 +1034,10 @@ export function ChromaKeyerPage() {
 }
 
 function isPreviewValid(values: ChromaKeyerValues): boolean {
-  return Object.keys(validateChromaKeyerValues(values)).length === 0
+  return Object.keys(validateChromaKeyerPreviewValues(values)).length === 0
 }
 
 function areKeyedPreviewInputsValid(values: ChromaKeyerValues): boolean {
-  const validationErrors = validateChromaKeyerValues(values)
+  const validationErrors = validateChromaKeyerPreviewValues(values)
   return keyedPreviewFields.every((field) => validationErrors[field] === undefined)
 }

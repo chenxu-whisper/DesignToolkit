@@ -73,12 +73,26 @@ class VideoMetadata:
 class VideoKeyOptions:
     input_path: Path
     output_root: Path | None = None
+    output_format: str = "png_sequence"
+    output_path: Path | None = None
 
 
 @dataclass(frozen=True)
 class VideoKeyResult:
     output_dir: Path
     manifest_path: Path
+    frame_count: int
+    metadata: VideoMetadata
+
+    def __post_init__(self) -> None:
+        _validate_positive_integer("frame_count", self.frame_count)
+
+
+@dataclass(frozen=True)
+class PackedVideoKeyResult:
+    output_path: Path
+    metadata_path: Path
+    output_dir: Path
     frame_count: int
     metadata: VideoMetadata
 

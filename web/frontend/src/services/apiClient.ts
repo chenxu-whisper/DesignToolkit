@@ -155,8 +155,11 @@ export type ChromaVideoPreviewResponse = ChromaPreviewResponse & {
   timestamp_seconds: number
 }
 
+export type ChromaVideoOutputFormat = 'png_sequence' | 'packed_alpha_mp4'
+
 export type ChromaVideoKeyerPayload = Omit<ChromaKeyerPayload, 'outputPath'> & {
-  outputPath?: never
+  outputFormat?: ChromaVideoOutputFormat
+  outputPath?: string
   outputRoot?: string
 }
 
@@ -176,13 +179,19 @@ export type UploadResponse = {
   size: number
 }
 
+type LocalImportResponse = {
+  path: string
+  filename: string
+  size: number
+}
+
 type UploadedAssetDeletionTarget = {
   assetId: string
   generation?: string
 }
 
 export type LocalFileKind = 'video' | 'media' | 'image' | 'any'
-type LocalSaveFileKind = 'media' | 'image' | 'any'
+type LocalSaveFileKind = LocalFileKind
 
 const pendingUploadCleanups = new Map<string, UploadedAssetDeletionTarget>()
 let pendingCleanupDrain: Promise<void> | null = null
@@ -230,6 +239,127 @@ async function requestGet<T>(path: string): Promise<T> {
 
 export function createVideoFramesTask(payload: VideoFramesPayload): Promise<TaskCreateResponse> {
   return request<TaskCreateResponse>('/api/tasks/video-frames', payload)
+}
+
+export async function importDroppedFiles(
+  files: readonly File[],
+  onProgress: (percentage: number) => void,
+  signal?: AbortSignal,
+): Promise<readonly string[]> {
+  const paths: string[] = []
+  const attemptedIds: string[] = []
+  try {
+    for (let index = 0; index < files.length; index += 1) {
+      throwIfUploadAborted(signal)
+      const importId = createUploadId()
+      // Record before sending: the server may finish even if its response is lost.
+      attemptedIds.push(importId)
+      const response = await importLocalFile(files[index], importId, (fraction) => {
+        onProgress(Math.round(((index + fraction) / files.length) * 100))
+      }, signal)
+      throwIfUploadAborted(signal)
+      paths.push(response.path)
+    }
+    return paths
+  } catch (error) {
+    const cleanupResults = await Promise.allSettled(attemptedIds.map(deleteLocalImport))
+    const cleanupErrors = cleanupResults.flatMap((result) =>
+      result.status === 'rejected' ? [result.reason] : [],
+    )
+    if (cleanupErrors.length > 0) {
+      const message = error instanceof Error && error.message ? error.message : '文件导入失败'
+      throw new AggregateError(
+        cleanupErrors,
+        `${message}；${cleanupErrors.length} 个导入文件清理失败`,
+        { cause: error },
+      )
+    }
+    throw error
+  }
+}
+
+async function deleteLocalImport(importId: string): Promise<void> {
+  const url = `/api/local-paths/import-files/${importId}`
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    let response: Response
+    try {
+      response = await fetch(url, { method: 'DELETE' })
+    } catch (error) {
+      if (attempt === 3) {
+        throw new Error(`Failed to delete local import ${importId}: network error`, { cause: error })
+      }
+      continue
+    }
+    if (response.status === 204 || response.status === 404) {
+      return
+    }
+    if ((response.status !== 409 && response.status < 500) || attempt === 3) {
+      throw new Error(`Failed to delete local import ${importId}: ${response.status}`)
+    }
+  }
+}
+
+function importLocalFile(
+  file: File,
+  importId: string,
+  onProgress: (fraction: number) => void,
+  signal?: AbortSignal,
+): Promise<LocalImportResponse> {
+  return new Promise((resolve, reject) => {
+    throwIfUploadAborted(signal)
+    const request = new XMLHttpRequest()
+    let settled = false
+    const settle = (callback: () => void) => {
+      if (settled) return
+      settled = true
+      signal?.removeEventListener('abort', abortRequest)
+      callback()
+    }
+    const abortRequest = () => {
+      request.abort()
+      settle(() => reject(uploadAbortError(signal)))
+    }
+    request.open('POST', '/api/local-paths/import-files')
+    request.responseType = 'json'
+    request.setRequestHeader('Content-Type', file.type || 'application/octet-stream')
+    request.setRequestHeader('X-Upload-Filename', encodeURIComponent(file.name))
+    request.setRequestHeader('X-Local-Import-Id', importId)
+    signal?.addEventListener('abort', abortRequest, { once: true })
+    request.upload.addEventListener('progress', (event) => {
+      if (!settled && !signal?.aborted && event.lengthComputable && event.total > 0) {
+        onProgress(event.loaded / event.total)
+      }
+    })
+    request.addEventListener('load', () => {
+      if (settled) return
+      if (signal?.aborted) {
+        settle(() => reject(uploadAbortError(signal)))
+        return
+      }
+      const body = request.response as ApiErrorResponse | LocalImportResponse | null
+      if (request.status !== 201) {
+        const message = body && 'error' in body ? body.error?.message : undefined
+        settle(() => reject(new Error(message ?? `Request failed: ${request.status}`)))
+        return
+      }
+      if (
+        !body || !('path' in body) || typeof body.path !== 'string' || !body.path
+        || typeof body.filename !== 'string' || !body.filename
+        || typeof body.size !== 'number' || !Number.isSafeInteger(body.size) || body.size <= 0
+      ) {
+        settle(() => reject(new Error('Invalid local import response')))
+        return
+      }
+      settle(() => {
+        onProgress(1)
+        resolve(body)
+      })
+    })
+    request.addEventListener('error', () => settle(() => reject(new Error('文件导入失败'))))
+    request.addEventListener('timeout', () => settle(() => reject(new Error('文件导入超时'))))
+    request.addEventListener('abort', () => settle(() => reject(uploadAbortError(signal))))
+    request.send(file)
+  })
 }
 
 export async function uploadFiles(
@@ -526,8 +656,11 @@ function chromaVideoPreviewPayloadToWire(payload: ChromaVideoPreviewPayload) {
 function chromaVideoKeyerPayloadToWire(payload: ChromaVideoKeyerPayload) {
   const { input_path, ...keyerPayload } = chromaBasePayloadToWire(payload)
   const outputRoot = payload.outputRoot?.trim()
+  const outputPath = payload.outputPath?.trim()
   return {
     input_path,
+    ...(payload.outputFormat ? { output_format: payload.outputFormat } : {}),
+    ...(outputPath ? { output_path: outputPath } : {}),
     ...(outputRoot ? { output_root: outputRoot } : {}),
     ...keyerPayload,
   }

@@ -38,6 +38,7 @@ from designtoolkit.web.heartbeat import (
     HeartbeatStopTimeoutError,
     stop_heartbeat_thread,
 )
+from designtoolkit.web.packed_video import packed_output_path
 from designtoolkit.web.redis_errors import EventCursorUnavailable
 from designtoolkit.web.resources import (
     _ASSET_TASK_PREFIX,
@@ -1553,6 +1554,19 @@ class RedisTaskManager:
         asset_read_pin_token: str | None = None,
     ) -> TaskRecord:
         options, _model, _params = chroma_video_keyer_options_from_request(request)
+        if options.output_format == "packed_alpha_mp4":
+            packed_output_path(options)
+            return self._enqueue(
+                TaskKind.CHROMA_KEYER,
+                request,
+                job_kind="chroma_video_keyer",
+                owner_id=owner_id,
+                input_path=options.input_path.name,
+                commit=commit,
+                asset_ids=asset_ids,
+                asset_identities=asset_identities,
+                asset_read_pin_token=asset_read_pin_token,
+            )
         output_root = options.output_root or options.input_path.parent
         if not output_root.exists() or not output_root.is_dir():
             raise KeyerError("Output root must exist and be a directory")

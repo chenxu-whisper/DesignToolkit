@@ -21,6 +21,7 @@ const pageMocks = vi.hoisted(() => ({
   createChromaVideoPreview: vi.fn(),
   inspectChromaImage: vi.fn(),
   inspectChromaVideo: vi.fn(),
+  importDroppedFiles: vi.fn(),
   pickLocalDirectory: vi.fn(),
   pickLocalFiles: vi.fn(),
   pickLocalSaveFile: vi.fn(),
@@ -37,6 +38,7 @@ vi.mock('../../services/apiClient', () => ({
   createChromaVideoPreview: pageMocks.createChromaVideoPreview,
   inspectChromaImage: pageMocks.inspectChromaImage,
   inspectChromaVideo: pageMocks.inspectChromaVideo,
+  importDroppedFiles: pageMocks.importDroppedFiles,
   pickLocalDirectory: pageMocks.pickLocalDirectory,
   pickLocalFiles: pageMocks.pickLocalFiles,
   pickLocalSaveFile: pageMocks.pickLocalSaveFile,
@@ -134,6 +136,7 @@ beforeEach(() => {
   pageMocks.pickLocalFiles.mockReset()
   pageMocks.pickLocalSaveFile.mockReset()
   pageMocks.resolveDroppedFilePaths.mockReset()
+  pageMocks.importDroppedFiles.mockReset()
   pageMocks.sampleChromaImage.mockReset()
   pageMocks.sampleChromaVideo.mockReset()
   pageMocks.pickLocalFiles.mockResolvedValue({ cancelled: false, paths: ['E:\\media\\screen.png'] })
@@ -177,6 +180,119 @@ afterEach(() => {
 })
 
 describe('ChromaKeyerPage', () => {
+  it.each([
+    ['packed_alpha_mp4', 'MP4 输出路径（可选）', 'E:\\exports\\result', '导出 MP4', 'MP4 输出路径必须以 .mp4 结尾'],
+    ['png_sequence', '输出根目录（可选）', 'E:\\media\\screen.mp4', '导出 PNG 序列', '输出目录不能等于输入路径'],
+  ] as const)(
+    'continues parameter and channel previews with an invalid %s destination while blocking export',
+    async (outputFormat, outputLabel, outputValue, exportLabel, exportError) => {
+      render(<ChromaKeyerPage />)
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+      await inspectVideo()
+      fireEvent.change(screen.getByRole('combobox', { name: '输出格式' }), {
+        target: { value: outputFormat },
+      })
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+      await sampleImage()
+      await waitFor(() => expect(screen.getByRole('button', { name: '抠像预览' })).toHaveAttribute(
+        'src', '/api/previews/video-keyed.png',
+      ))
+      fireEvent.change(screen.getByLabelText(outputLabel), {
+        target: { value: outputValue },
+      })
+      pageMocks.createChromaVideoPreview.mockClear()
+      const parameterRequest = createDeferred<{ preview_url: string; timestamp_seconds: number }>()
+      const alphaRequest = createDeferred<{ preview_url: string; timestamp_seconds: number }>()
+      const finalRequest = createDeferred<{ preview_url: string; timestamp_seconds: number }>()
+      pageMocks.createChromaVideoPreview
+        .mockReturnValueOnce(parameterRequest.promise)
+        .mockReturnValueOnce(alphaRequest.promise)
+        .mockReturnValueOnce(finalRequest.promise)
+      vi.useFakeTimers()
+
+      fireEvent.change(screen.getByLabelText('Screen Gain'), { target: { value: '1.4' } })
+      await act(async () => {
+        vi.advanceTimersByTime(150)
+      })
+      expect(pageMocks.createChromaVideoPreview).toHaveBeenNthCalledWith(1, expect.objectContaining({
+        params: expect.objectContaining({ screenGain: 1.4 }),
+        viewMode: 'final',
+      }))
+      fireEvent.click(screen.getByRole('radio', { name: 'Alpha' }))
+      expect(pageMocks.createChromaVideoPreview).toHaveBeenNthCalledWith(2, expect.objectContaining({
+        params: expect.objectContaining({ screenGain: 1.4 }),
+        viewMode: 'alpha',
+      }))
+      await act(async () => {
+        alphaRequest.resolve({ preview_url: '/api/previews/invalid-output-alpha.png', timestamp_seconds: 0 })
+      })
+      expect(screen.getByRole('button', { name: '抠像预览' })).toHaveAttribute(
+        'src', '/api/previews/invalid-output-alpha.png',
+      )
+      fireEvent.click(screen.getByRole('radio', { name: 'Final' }))
+      expect(pageMocks.createChromaVideoPreview).toHaveBeenNthCalledWith(3, expect.objectContaining({
+        params: expect.objectContaining({ screenGain: 1.4 }),
+        viewMode: 'final',
+      }))
+      await act(async () => {
+        finalRequest.resolve({ preview_url: '/api/previews/invalid-output-final.png', timestamp_seconds: 0 })
+        parameterRequest.resolve({ preview_url: '/api/previews/stale-parameter.png', timestamp_seconds: 1 })
+      })
+      expect(screen.getByRole('button', { name: '抠像预览' })).toHaveAttribute(
+        'src', '/api/previews/invalid-output-final.png',
+      )
+      expect(screen.getByRole('slider', { name: '视频时间轴' })).toHaveValue('0')
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+
+      fireEvent.click(screen.getByRole('button', { name: exportLabel }))
+      expect(screen.getByRole('alert')).toHaveTextContent(exportError)
+      expect(pageMocks.createChromaVideoKeyerTask).not.toHaveBeenCalled()
+      expect(pageMocks.createChromaKeyerTask).not.toHaveBeenCalled()
+    },
+  )
+
+  it('resets PNG selection and the image save path when switching back to a new video', async () => {
+    render(<ChromaKeyerPage />)
+    await inspectVideo()
+    fireEvent.change(screen.getByRole('combobox', { name: '输出格式' }), { target: { value: 'png_sequence' } })
+    const input = screen.getByLabelText('输入图片或视频路径')
+    fireEvent.change(input, { target: { value: 'E:\\media\\screen.png' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    await waitFor(() => expect(screen.queryByRole('combobox', { name: '输出格式' })).not.toBeInTheDocument())
+    fireEvent.change(screen.getByLabelText('输出路径（可选）'), { target: { value: 'E:\\exports\\image.png' } })
+
+    await inspectVideo()
+    expect(screen.getByRole('combobox', { name: '输出格式' })).toHaveValue('packed_alpha_mp4')
+    expect(screen.getByLabelText('MP4 输出路径（可选）')).toHaveValue('')
+    await sampleImage()
+    await waitFor(() => expect(screen.getByRole('button', { name: '导出 MP4' })).toBeEnabled())
+    fireEvent.click(screen.getByRole('button', { name: '导出 MP4' }))
+    await waitFor(() => expect(pageMocks.createChromaVideoKeyerTask).toHaveBeenCalled())
+    expect(pageMocks.createChromaVideoKeyerTask.mock.calls[0][0]).toMatchObject({ outputFormat: 'packed_alpha_mp4' })
+    expect(pageMocks.createChromaVideoKeyerTask.mock.calls[0][0]).not.toHaveProperty('outputPath')
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  })
+
+  it('exports a new video as MP4 and preserves the selected save path after creation failure', async () => {
+    pageMocks.createChromaVideoKeyerTask.mockRejectedValueOnce(new Error('编码器不可用'))
+    render(<ChromaKeyerPage />)
+    await inspectVideo()
+    expect(screen.getByRole('combobox', { name: '输出格式' })).toHaveValue('packed_alpha_mp4')
+    await sampleImage()
+    await waitFor(() => expect(screen.getByRole('button', { name: '导出 MP4' })).toBeEnabled())
+    fireEvent.change(screen.getByLabelText('MP4 输出路径（可选）'), { target: { value: ' E:\\exports\\packed.mp4 ' } })
+    fireEvent.click(screen.getByRole('button', { name: '导出 MP4' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('编码器不可用')
+    expect(pageMocks.createChromaVideoKeyerTask).toHaveBeenCalledWith(expect.objectContaining({
+      outputFormat: 'packed_alpha_mp4', outputPath: 'E:\\exports\\packed.mp4',
+    }))
+    expect(pageMocks.createChromaVideoKeyerTask.mock.calls[0][0]).not.toHaveProperty('outputRoot')
+    expect(screen.getByLabelText('MP4 输出路径（可选）')).toHaveValue(' E:\\exports\\packed.mp4 ')
+    expect(screen.getByRole('button', { name: '导出 MP4' })).toBeEnabled()
+    fireEvent.click(screen.getByRole('button', { name: '导出 MP4' }))
+    await waitFor(() => expect(useTaskStore.getState().currentTaskId).toBe('chroma-video-task-1'))
+  })
+
   it('opens the parameter inspector on compact screens', async () => {
     installMatchMedia(true)
     const user = renderWithUser()
@@ -2179,6 +2295,7 @@ describe('ChromaKeyerPage', () => {
     }>()
     render(<ChromaKeyerPage />)
     await inspectVideo()
+    fireEvent.change(screen.getByRole('combobox', { name: '输出格式' }), { target: { value: 'png_sequence' } })
     pageMocks.createChromaVideoFrame.mockClear()
     pageMocks.createChromaVideoFrame.mockReturnValueOnce(playbackRequest.promise)
     installPlaybackClock()
@@ -2611,6 +2728,7 @@ describe('ChromaKeyerPage', () => {
   it('blocks sampled video seeks until keyed preview parameters are valid', async () => {
     render(<ChromaKeyerPage />)
     await inspectVideo()
+    fireEvent.change(screen.getByRole('combobox', { name: '输出格式' }), { target: { value: 'png_sequence' } })
     await sampleImage()
     await waitFor(() => expect(pageMocks.createChromaVideoPreview).toHaveBeenCalledOnce())
     pageMocks.createChromaVideoFrame.mockClear()
@@ -2855,7 +2973,7 @@ describe('ChromaKeyerPage', () => {
 
     fireEvent.click(screen.getByRole('button', { name: '播放' }))
     clock.runAnimationFrame(500)
-    fireEvent.click(screen.getByRole('button', { name: '导出 PNG 序列' }))
+    fireEvent.click(screen.getByRole('button', { name: '导出 MP4' }))
 
     const cancelOrder = vi.mocked(cancelAnimationFrame).mock.invocationCallOrder[0]
     const exportOrder = pageMocks.createChromaVideoKeyerTask.mock.invocationCallOrder[0]
@@ -2881,6 +2999,7 @@ describe('ChromaKeyerPage', () => {
   it('exports video to outputRoot without sending an image outputPath', async () => {
     const user = renderWithUser()
     await inspectVideo()
+    await user.selectOptions(screen.getByRole('combobox', { name: '输出格式' }), 'png_sequence')
     await sampleImage()
     await waitFor(() => expect(screen.getByRole('button', { name: '导出 PNG 序列' })).toBeEnabled())
 
@@ -2889,6 +3008,7 @@ describe('ChromaKeyerPage', () => {
 
     expect(pageMocks.createChromaVideoKeyerTask).toHaveBeenCalledWith({
       inputPath: 'E:\\media\\screen.mp4',
+      outputFormat: 'png_sequence',
       outputRoot: 'E:\\exports',
       params: {
         clipBlack: 0,
@@ -2908,6 +3028,7 @@ describe('ChromaKeyerPage', () => {
   it('clears video-only state when switching to an image and keeps image export semantics', async () => {
     const user = renderWithUser()
     await inspectVideo()
+    await user.selectOptions(screen.getByRole('combobox', { name: '输出格式' }), 'png_sequence')
     fireEvent.change(screen.getByRole('slider', { name: '视频时间轴' }), {
       target: { value: '1.25' },
     })

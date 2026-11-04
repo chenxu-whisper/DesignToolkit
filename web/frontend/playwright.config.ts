@@ -1,5 +1,10 @@
 import { defineConfig, devices } from '@playwright/test'
 
+const localPort = process.env.DESIGNTOOLKIT_E2E_LOCAL_PORT ?? '5173'
+const hostedPort = process.env.DESIGNTOOLKIT_E2E_HOSTED_PORT ?? '5175'
+const localUrl = `http://127.0.0.1:${localPort}`
+const hostedUrl = `http://127.0.0.1:${hostedPort}`
+
 export default defineConfig({
   testDir: './e2e',
   fullyParallel: true,
@@ -17,7 +22,7 @@ export default defineConfig({
       testIgnore: /hosted\.spec\.ts/,
       use: {
         ...devices['Desktop Chrome'],
-        baseURL: 'http://127.0.0.1:5173',
+        baseURL: localUrl,
       },
     },
     {
@@ -25,27 +30,27 @@ export default defineConfig({
       testMatch: /hosted\.spec\.ts/,
       use: {
         ...devices['Desktop Chrome'],
-        baseURL: 'http://127.0.0.1:5175',
+        baseURL: hostedUrl,
       },
     },
   ],
   webServer: [
     {
-      command: 'npm run dev',
+      command: `npm run dev -- --port ${localPort} --strictPort`,
       env: {
         ...process.env,
         VITE_HOSTED_MODE: 'false',
       },
-      url: 'http://127.0.0.1:5173',
+      url: localUrl,
       reuseExistingServer: false,
     },
     {
-      command: 'npm run dev -- --port 5175',
+      command: `npm run dev -- --port ${hostedPort} --strictPort`,
       env: {
         ...process.env,
         VITE_HOSTED_MODE: 'true',
       },
-      url: 'http://127.0.0.1:5175',
+      url: hostedUrl,
       reuseExistingServer: false,
     },
   ],

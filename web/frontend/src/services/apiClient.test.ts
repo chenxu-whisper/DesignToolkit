@@ -37,6 +37,34 @@ afterEach(() => {
 })
 
 describe('apiClient', () => {
+  it.each([
+    ['packed_alpha_mp4', 'outputPath', 'output_path', ' result.mp4 '],
+    ['png_sequence', 'outputRoot', 'output_root', ' E:\\exports '],
+  ] as const)('forwards %s video export fields', async (outputFormat, field, wireField, path) => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ task_id: 'packed-task', status: 'queued' })),
+    )
+    await createChromaVideoKeyerTask({
+      inputPath: 'screen.mp4',
+      outputFormat,
+      [field]: path,
+      samples: [[42, 180, 72]],
+      params: { screenGain: 1, screenBalance: 0.5, clipBlack: 0, clipWhite: 1, shrinkGrow: 0, feather: 0, despillAmount: 1 },
+    })
+    const body = JSON.parse(fetchMock.mock.calls[0][1]?.body as string)
+    expect(body).toMatchObject({ output_format: outputFormat, [wireField]: path.trim() })
+    expect(body).not.toHaveProperty(field === 'outputPath' ? 'output_root' : 'output_path')
+  })
+
+  it('requests the backend MP4 save picker without unsupported suffix fields', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ paths: [], cancelled: true })),
+    )
+    await pickLocalSaveFile({ fileKind: 'video', title: '选择 MP4 输出路径' })
+    expect(JSON.parse(fetchMock.mock.calls[0][1]?.body as string)).toEqual({
+      file_kind: 'video', title: '选择 MP4 输出路径',
+    })
+  })
   it('deletes a four-part asset reference with an encoded generation URL', async () => {
     const cleanup = vi
       .spyOn(globalThis, 'fetch')
@@ -755,7 +783,6 @@ describe('apiClient', () => {
   it('models chroma payloads with exactly one RGB sample', () => {
     expectTypeOf<ChromaKeyerPayload['samples']>().toEqualTypeOf<readonly [ChromaKeyerRgbSample]>()
     expectTypeOf<ChromaVideoKeyerPayload['samples']>().toEqualTypeOf<readonly [ChromaKeyerRgbSample]>()
-    expectTypeOf<ChromaKeyerPayload>().not.toMatchTypeOf<ChromaVideoKeyerPayload>()
     expectTypeOf<ChromaVideoKeyerPayload>().toMatchTypeOf<Parameters<typeof createChromaVideoKeyerTask>[0]>()
     expectTypeOf<ChromaVideoPreviewPayload['viewMode']>().toEqualTypeOf<'final' | 'alpha'>()
     expectTypeOf<Parameters<typeof inspectChromaVideo>[0]>().toEqualTypeOf<ChromaVideoInspectRequest>()
@@ -1300,7 +1327,7 @@ describe('apiClient', () => {
     expectTypeOf<{ fileKind: 'image'; title: string }>().toMatchTypeOf<SaveFilePickerOptions>()
     expectTypeOf<{ fileKind: 'media'; title: string }>().toMatchTypeOf<SaveFilePickerOptions>()
     expectTypeOf<{ fileKind: 'any'; title: string }>().toMatchTypeOf<SaveFilePickerOptions>()
-    expectTypeOf<{ fileKind: 'video'; title: string }>().not.toMatchTypeOf<SaveFilePickerOptions>()
+    expectTypeOf<{ fileKind: 'video'; title: string }>().toMatchTypeOf<SaveFilePickerOptions>()
   })
 
   it('fetches task status by id', async () => {

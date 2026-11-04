@@ -77,6 +77,44 @@ beforeEach(() => {
 })
 
 describe('hosted replacement uploads', () => {
+  it.each(['packed_alpha_mp4', 'png_sequence'] as const)(
+    'exposes hosted video format %s and preserves the upload/task/download flow',
+    async (format) => {
+      apiMocks.uploadFiles.mockResolvedValueOnce([oldVideoReference])
+      apiMocks.inspectChromaVideo.mockResolvedValue({
+        height: 400, width: 800, preview_height: 200, preview_width: 400,
+        preview_url: '/api/previews/video.png', input_path: oldVideoReference,
+        duration_seconds: 2, estimated_frame_count: 60, fps: 30, timestamp_seconds: 0,
+      })
+      apiMocks.sampleChromaVideo.mockResolvedValue({
+        hex: '#2AB448', rgb: [42, 180, 72], source_x: 400, source_y: 200, timestamp_seconds: 0,
+      })
+      apiMocks.createChromaVideoPreview.mockResolvedValue({ preview_url: '/api/previews/keyed.png', timestamp_seconds: 0 })
+      apiMocks.createChromaVideoKeyerTask.mockResolvedValue({ status: 'queued', task_id: 'hosted-video' })
+      const { container } = render(<ChromaKeyerPage />)
+      upload(container, new File(['video'], 'old.mp4', { type: 'video/mp4' }))
+      const selector = await screen.findByRole('combobox', { name: '输出格式' })
+      expect(selector).toHaveValue('packed_alpha_mp4')
+      fireEvent.change(selector, { target: { value: format } })
+      expect(screen.queryByLabelText('MP4 输出路径（可选）')).not.toBeInTheDocument()
+      expect(screen.queryByLabelText('输出根目录（可选）')).not.toBeInTheDocument()
+      await sampleCurrentImage()
+      const action = screen.getByRole('button', { name: format === 'packed_alpha_mp4' ? '导出 MP4' : '导出 PNG 序列' })
+      await waitFor(() => expect(action).toBeEnabled())
+      fireEvent.click(action)
+      await waitFor(() => expect(apiMocks.createChromaVideoKeyerTask).toHaveBeenCalled())
+      expect(apiMocks.createChromaVideoKeyerTask.mock.calls[0][0]).toMatchObject({
+        inputPath: oldVideoReference, outputFormat: format,
+      })
+      expect(apiMocks.createChromaVideoKeyerTask.mock.calls[0][0]).not.toHaveProperty('outputPath')
+      expect(apiMocks.createChromaVideoKeyerTask.mock.calls[0][0]).not.toHaveProperty('outputRoot')
+      act(() => useTaskStore.getState().completeTask({
+        taskId: 'hosted-video', resultPath: '/api/tasks/hosted-video/download',
+      }))
+      expect(screen.getByRole('link', { name: '下载结果' })).toHaveAttribute('href', '/api/tasks/hosted-video/download')
+    },
+  )
+
   it('blocks video frame submission until the new asset replaces the old reference', async () => {
     const replacement = deferred<readonly string[]>()
     apiMocks.uploadFiles

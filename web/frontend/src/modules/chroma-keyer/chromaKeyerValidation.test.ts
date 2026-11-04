@@ -1,12 +1,13 @@
 import { describe, expect, it } from 'vitest'
 import { createChromaKeyerDefaultValues, chromaKeyerDefaultValues } from './chromaKeyerDefaults'
-import { isVideoPath, validateChromaKeyerValues } from './chromaKeyerValidation'
+import { isVideoPath, validateChromaKeyerPreviewValues, validateChromaKeyerValues } from './chromaKeyerValidation'
 
 describe('chromaKeyerDefaultValues', () => {
   it('uses the initial chroma keyer form values', () => {
     expect(chromaKeyerDefaultValues).toEqual({
       inputPath: '',
       mediaKind: null,
+      outputFormat: 'packed_alpha_mp4',
       outputPath: '',
       outputRoot: '',
       samples: [],
@@ -47,6 +48,54 @@ describe('isVideoPath', () => {
 
   it.each(['screen.png', 'clip.mp4.png', 'clip', 'clip.mp4.backup'])('rejects unsupported path %s', (path) => {
     expect(isVideoPath(path)).toBe(false)
+  })
+})
+
+describe('validateChromaKeyerPreviewValues', () => {
+  it.each([
+    ['image', 'packed_alpha_mp4', 'screen.png', 'screen.png', ''],
+    ['video', 'packed_alpha_mp4', 'screen.mp4', 'E:\\exports\\result', ''],
+    ['video', 'packed_alpha_mp4', 'screen.mp4', 'screen.mp4', ''],
+    ['video', 'png_sequence', 'screen.mp4', '', 'screen.mp4'],
+  ] as const)(
+    'ignores export-only destinations for %s/%s with inputPath=%s, outputPath=%s, outputRoot=%s',
+    (mediaKind, outputFormat, inputPath, outputPath, outputRoot) => {
+      const values = {
+        ...createChromaKeyerDefaultValues(),
+        mediaKind,
+        outputFormat,
+        inputPath,
+        outputPath,
+        outputRoot,
+        samples: [[42, 180, 72] as [number, number, number]],
+      }
+      expect(validateChromaKeyerPreviewValues(values)).toEqual({})
+      expect(validateChromaKeyerValues(values)).not.toEqual({})
+    },
+  )
+
+  it('retains input, sample, parameter, cross-field, and video timestamp errors', () => {
+    const values = {
+      ...createChromaKeyerDefaultValues(),
+      mediaKind: 'video' as const,
+      outputPath: 'E:\\exports\\result',
+      screenGain: Number.NaN,
+      clipBlack: 0.8,
+      clipWhite: 0.8,
+      timestampSeconds: -1,
+    }
+    const previewErrors = validateChromaKeyerPreviewValues(values)
+    expect(previewErrors).toEqual({
+      inputPath: '请输入图片路径',
+      samples: '请先在画布上吸取需要抠除的背景颜色',
+      screenGain: 'Screen Gain 必须是 0 到 2 之间的有限数值',
+      clipBlack: 'Clip Black 必须小于 Clip White',
+      timestampSeconds: '视频时间必须是大于或等于 0 的有限数值',
+    })
+    expect(validateChromaKeyerValues(values)).toEqual({
+      ...previewErrors,
+      outputPath: 'MP4 输出路径必须以 .mp4 结尾',
+    })
   })
 })
 
@@ -202,11 +251,39 @@ describe('validateChromaKeyerValues', () => {
         ...createChromaKeyerDefaultValues(),
         inputPath: 'screen.mp4',
         mediaKind: 'video',
+        outputFormat: 'png_sequence',
         outputPath: 'screen.mp4',
         outputRoot: 'screen.mp4',
         samples: [[42, 180, 72]],
       }),
     ).toEqual({ outputRoot: '输出目录不能等于输入路径' })
+  })
+
+  it('validates MP4 save paths without validating stale PNG roots', () => {
+    expect(validateChromaKeyerValues({
+      ...createChromaKeyerDefaultValues(),
+      inputPath: 'screen.mp4',
+      mediaKind: 'video',
+      outputFormat: 'packed_alpha_mp4',
+      outputPath: 'screen.mp4',
+      outputRoot: 'screen.mp4',
+      samples: [[42, 180, 72]],
+    })).toEqual({ outputPath: '输出路径不能等于输入路径' })
+  })
+
+  it('requires an MP4 suffix only for a nonblank video MP4 save path', () => {
+    const values = {
+      ...createChromaKeyerDefaultValues(),
+      inputPath: 'screen.mp4',
+      mediaKind: 'video' as const,
+      samples: [[42, 180, 72] as [number, number, number]],
+    }
+    expect(validateChromaKeyerValues({ ...values, outputPath: 'result.png' })).toEqual({
+      outputPath: 'MP4 输出路径必须以 .mp4 结尾',
+    })
+    expect(validateChromaKeyerValues({ ...values, outputPath: ' result.MP4 ' })).toEqual({})
+    expect(validateChromaKeyerValues(values)).toEqual({})
+    expect(validateChromaKeyerValues({ ...values, outputFormat: 'png_sequence', outputPath: 'result.png' })).toEqual({})
   })
 
   it.each([Number.NaN, Number.POSITIVE_INFINITY, -0.01])(

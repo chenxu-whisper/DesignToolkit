@@ -35,6 +35,9 @@ uv run designtoolkit web
 
 - 视频转 PNG/JPG/JPEG 序列帧
 - 路径字段支持通过文件夹按钮唤起本机文件/目录选择器，并会记住上一次选择目录；不可用时会回退到内联编辑器手动填写本地路径
+- 本地图片和视频可直接拖入输入框。浏览器未提供真实路径时，按实际文件内容导入到
+  `.temp/local-imports/` 并自动加载；原文件不变，多文件输入支持合并拖入。
+  此类副本的默认输出位于导入目录，可通过输出路径/目录字段指定保存位置。
 - 视频转帧支持在输入路径中按行填写多个视频，任务会按顺序逐个处理；填写输出目录时会作为批量输出根目录使用
 - 视频或图片尺寸修改；输入路径支持按行填写多个媒体文件，批量任务会逐个处理并自动生成 `_resized` 输出路径
 - 实时任务状态追踪
@@ -93,7 +96,7 @@ uv run designtoolkit resize-media .\photo.png 800x600
 默认行为：
 
 - 输出路径：源文件同级目录下的 `{原文件名}_resized.{原扩展名}`
-- 输出尺寸：保持原始宽高比，并放入指定最大边界内
+- 输出尺寸：保持原始宽高比，并放入指定最大边界内z
 - 覆盖策略：默认不覆盖已有输出文件
 
 指定输出路径：
@@ -131,11 +134,26 @@ uv run designtoolkit resize-media .\photo.jpg 800x600 .\small.jpg
 - `Screen Color` 以及 Screen Gain、Screen Balance、Clip Black、Clip White、
   Shrink/Grow、Feather、Despill Amount 七个参数在整个视频中保持不变
 - 图片和当前视频帧均支持 `Final` 与 `Alpha` 预览；图片导出原图尺寸 RGBA PNG
-- 视频按完整时长和原始解码帧率导出源尺寸 RGBA PNG 序列，帧名为
+- PNG 序列模式按完整时长和原始解码帧率导出源尺寸 RGBA PNG 序列，帧名为
   `<视频名>_keyed_%06d.png`，从 1 开始连续编号
-- 视频输出目录包含 `manifest.json`，记录源路径、尺寸、帧率、时长、实际帧数、
+- PNG 序列输出目录包含 `manifest.json`，记录源路径、尺寸、帧率、时长、实际帧数、
   命名模式、Screen Color 和全部七项参数
-- 视频导出显示逐帧进度；内容先写入临时目录，全部完成后原子发布
+- 视频新增默认输出格式 `MP4（颜色 + 透明遮罩）`，仍可选择 `PNG 序列`。
+  MP4 左侧保存非预乘颜色，右侧保存灰度 Alpha；这是自定义布局，普通播放器
+  显示左右拼接画面，必须用配套播放器恢复透明效果。
+- MP4 使用 H.264/yuv420p，并默认保留第一条音轨为 AAC；无音轨也可导出。
+  首版要求恒定帧率，变帧率素材会提示先转换；字幕、多音轨不保留。
+- 本地 MP4 默认生成 `<视频名>_keyed_packed.mp4`、同名 JSON 和配套
+  `<输出名>_player` 目录。奇数尺寸通过补齐编码、按 JSON 裁切显示；
+  压缩有损，包括透明遮罩。
+- 托管模式下载包包含一个 MP4、JSON 和播放器。解压后直接用浏览器打开
+  播放器的 `index.html`，选择 MP4 和 JSON，再点击播放；播放器支持
+  棋盘格、浅色、深色背景检查透明边缘，无需 CDN 或额外服务。
+- 播放器接入 API 及 CORS 要求见
+  [`player/README.md`](src/designtoolkit/chroma_keyer/player/README.md)。
+  旧 API 请求未指定 `output_format` 时继续导出 PNG；新格式使用
+  `output_format: "packed_alpha_mp4"`，本地可选 `output_path`。
+- PNG 序列导出显示逐帧进度；内容先写入临时目录，全部完成后原子发布
   `<视频名>_keyed_frames`。图片文件和视频目录均不覆盖已有输出
 - v1 不提供取消、批量抠像、参数关键帧或图片序列输入
 
@@ -234,5 +252,10 @@ uv run python -m compileall src tests
 ├── scripts/    # 本地自动化脚本
 ├── src/        # 应用源码
 │   └── designtoolkit/
+|       ├── chroma_keyer/ # 色键抠图工具
+|       ├── resize_media/ # 视频或图片尺寸修改工具
+|       └── video_to_frames/ # 视频转序列帧工具
+├── web/        # Web GUI 源码
+│   └── frontend/ # 前端源码
 └── tests/      # 自动化测试
 ```

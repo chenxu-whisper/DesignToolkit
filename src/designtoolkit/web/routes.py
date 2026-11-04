@@ -26,6 +26,7 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from PIL import Image
 from redis.exceptions import RedisError
+from starlette.requests import ClientDisconnect
 
 from designtoolkit.chroma_keyer.core import key_rgb
 from designtoolkit.chroma_keyer.image_io import (
@@ -66,6 +67,11 @@ from designtoolkit.web.hosted import (
     _safe_filename,
     parse_asset_reference,
 )
+from designtoolkit.web.local_imports import (
+    LocalImportError,
+    LocalImportStore,
+    local_import_filename,
+)
 from designtoolkit.web.local_paths import resolve_dropped_file_paths
 from designtoolkit.web.media_limits import (
     HostedMediaLimits,
@@ -77,6 +83,7 @@ from designtoolkit.web.native_picker import (
     LocalPathPickerError,
     TkinterLocalPathPicker,
 )
+from designtoolkit.web.packed_video import hosted_video_request
 from designtoolkit.web.redis_errors import (
     is_redis_unavailable,
     storage_unavailable_payload,
@@ -1015,6 +1022,11 @@ def create_router(
     picker_accepts_allowed_suffixes = _picker_accepts_allowed_suffixes(picker)
     decoder = video_decoder if video_decoder is not None else ImageioVideoDecoder()
     settings = hosted_settings or HostedSettings.from_env({})
+    local_imports = LocalImportStore(
+        Path.cwd() / ".temp" / "local-imports",
+        max_upload_bytes=settings.max_upload_bytes,
+        min_free_bytes=settings.min_free_bytes,
+    )
     storage = hosted_storage
     resources = resource_coordinator
     public_sanitizer = EventSanitizer(storage.root) if storage is not None else None
@@ -1552,12 +1564,7 @@ def create_router(
             allowed_media_types=frozenset({"video"}),
         )
         task_dir = storage.create_task_dir(http_request.state.session_id)
-        return payload.model_copy(
-            update={
-                "input_path": str(input_path),
-                "output_root": str(task_dir),
-            }
-        )
+        return hosted_video_request(payload, input_path, task_dir)
 
     def discard_failed_hosted_task_dir(
         http_request: Request,
@@ -1926,6 +1933,46 @@ def create_router(
                         "Failed to release asset deletion claim; TTL will expire it",
                         exc_info=True,
                     )
+        return Response(status_code=204)
+
+    @router.post("/local-paths/import-files", status_code=201)
+    async def import_local_file(http_request: Request) -> dict[str, str | int]:
+        if settings.enabled:
+            raise ApiError("api_not_found", "API route not found", 404)
+        import_id = http_request.headers.get("x-local-import-id")
+        if import_id is None or re.fullmatch(r"[a-fA-F0-9]{32}", import_id) is None:
+            raise ApiError(
+                "invalid_upload",
+                "X-Local-Import-Id must be 32 hexadecimal characters",
+                400,
+            )
+        import_id = import_id.lower()
+        length = _upload_content_length(http_request.headers.get("content-length"))
+        try:
+            filename = local_import_filename(
+                _upload_filename(http_request.headers.get("x-upload-filename"))
+            )
+            path = await local_imports.store_stream(
+                import_id, filename, length, http_request.stream()
+            )
+        except LocalImportError as exc:
+            raise ApiError("invalid_upload", str(exc), exc.status_code) from exc
+        except ClientDisconnect as exc:
+            raise ApiError("invalid_upload", "Upload client disconnected", 400) from exc
+        return {"path": str(path), "filename": filename, "size": length}
+
+    @router.delete("/local-paths/import-files/{import_id}", status_code=204)
+    async def delete_local_import(import_id: str) -> Response:
+        if settings.enabled:
+            raise ApiError("api_not_found", "API route not found", 404)
+        if re.fullmatch(r"[a-fA-F0-9]{32}", import_id) is None:
+            raise ApiError("api_not_found", "Local import not found", 404)
+        try:
+            await to_thread.run_sync(local_imports.delete, import_id.lower())
+        except OSError as exc:
+            raise ApiError(
+                "storage_unavailable", "Local import cleanup is unavailable", 503
+            ) from exc
         return Response(status_code=204)
 
     @router.post(

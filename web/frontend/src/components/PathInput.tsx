@@ -10,6 +10,7 @@ type PathInputProps = {
   disabled?: boolean
   error?: string
   id?: string
+  importDroppedFiles?: PathInputProps['uploadFiles']
   label: string
   multiline?: boolean
   onChange: (value: string) => void
@@ -34,6 +35,7 @@ export function PathInput({
   disabled = false,
   error,
   id,
+  importDroppedFiles,
   label,
   multiline = false,
   onChange,
@@ -65,6 +67,8 @@ export function PathInput({
   const currentValueRef = useRef(value)
   const latestIntentRef = useRef(0)
   const mountedRef = useRef(true)
+  const onChangeRef = useRef(onChange)
+  const onCommitRef = useRef(onCommit)
   const pickerPointerSequenceRef = useRef(0)
   const suppressPickerBlurRef = useRef(false)
   const skipNextBlurRef = useRef(false)
@@ -72,6 +76,8 @@ export function PathInput({
   const uploadInputRef = useRef<HTMLInputElement>(null)
   const uploadPendingChangeRef = useRef(onUploadPendingChange)
   currentValueRef.current = value
+  onChangeRef.current = onChange
+  onCommitRef.current = onCommit
   uploadPendingChangeRef.current = onUploadPendingChange
 
   useEffect(() => {
@@ -159,12 +165,12 @@ export function PathInput({
     skipNextBlurRef.current = false
     setDropError(null)
     setPickerError(null)
-    onChange(nextValue)
+    onChangeRef.current(nextValue)
   }
 
   const commitValue = (nextValue: string) => {
     updateValue(nextValue)
-    onCommit?.(nextValue)
+    onCommitRef.current?.(nextValue)
   }
 
   const commitManualValue = (nextValue: string) => {
@@ -172,7 +178,7 @@ export function PathInput({
       return
     }
     beginIntent()
-    onCommit?.(nextValue)
+    onCommitRef.current?.(nextValue)
   }
 
   const applyDraftPath = () => {
@@ -235,12 +241,15 @@ export function PathInput({
     }
   }
 
-  const handleUploads = async (files: readonly File[]) => {
+  const handleUploads = async (
+    files: readonly File[],
+    uploader = uploadFiles,
+  ) => {
     if (
       disabled
       || isPicking
       || uploadControllerRef.current
-      || !uploadFiles
+      || !uploader
       || files.length === 0
     ) {
       return
@@ -256,27 +265,30 @@ export function PathInput({
     setIsPicking(true)
     setUploadProgress(0)
     try {
-      const references = await uploadFiles(
+      const references = await uploader(
         files,
         (percentage) => {
-          if (isLatestIntent(intent) && !controller.signal.aborted) {
+          if (mountedRef.current && isLatestIntent(intent) && !controller.signal.aborted) {
             setUploadProgress(percentage)
           }
         },
         controller.signal,
       )
-      if (isLatestIntent(intent) && references.length > 0) {
+      if (mountedRef.current && isLatestIntent(intent) && !controller.signal.aborted && references.length > 0) {
         const previousValue = currentValueRef.current
-        const nextValue = valueWithDroppedPaths('', references, multiline)
+        const isHostedUpload = uploader === uploadFiles
+        const nextValue = valueWithDroppedPaths(isHostedUpload ? '' : previousValue, references, multiline)
         const retainedReferences = new Set(assetReferences(nextValue))
         const removedReferences = assetReferences(previousValue).filter(
           (reference) => !retainedReferences.has(reference),
         )
         commitValue(nextValue)
-        schedulePendingCleanup(removedReferences, cleanupOperation)
+        if (isHostedUpload) {
+          schedulePendingCleanup(removedReferences, cleanupOperation)
+        }
       }
     } catch (error) {
-      if (isLatestIntent(intent)) {
+      if (mountedRef.current && isLatestIntent(intent) && !controller.signal.aborted) {
         setPickerError(
           error instanceof Error && error.message
             ? error.message
@@ -326,6 +338,35 @@ export function PathInput({
     }
     const fileNames = droppedFileNames(event.dataTransfer.files)
     const paths = droppedPathsFromDataTransfer(event.dataTransfer)
+    if (importDroppedFiles && event.dataTransfer.files.length > 0) {
+      const files = Array.from(event.dataTransfer.files)
+      const selectedFiles = multiline ? files : files.slice(0, 1)
+      const explicitPaths = uniquePaths([
+        ...pathsFromText(event.dataTransfer.getData('text/uri-list')),
+        ...pathsFromText(event.dataTransfer.getData('text/plain')),
+      ]).filter(isAbsolutePath)
+      const filePaths = selectedFiles.map((file) => {
+        const filePath = (file as File & { path?: string }).path
+        if (filePath) return filePath
+        // Associate sender metadata only when both the file and path are unique.
+        const matchingPaths = explicitPaths.filter((path) => path.split(/[\\/]/).at(-1) === file.name)
+        return files.filter((candidate) => candidate.name === file.name).length === 1
+          && matchingPaths.length === 1 ? matchingPaths[0] : undefined
+      })
+      const pathlessFiles = selectedFiles.filter((_file, index) => !filePaths[index])
+      if (pathlessFiles.length === 0) {
+        commitValue(valueWithDroppedPaths(currentValueRef.current, filePaths as string[], multiline))
+      } else if (pathlessFiles.length === selectedFiles.length) {
+        await handleUploads(selectedFiles, importDroppedFiles)
+      } else {
+        await handleUploads(pathlessFiles, async (files, onProgress, signal) => {
+          const importedPaths = await importDroppedFiles(files, onProgress, signal)
+          let importedIndex = 0
+          return filePaths.map((path) => path || importedPaths[importedIndex++])
+        })
+      }
+      return
+    }
     if (paths.length === 0) {
       if (fileNames.length > 0 && resolveDroppedFilePaths) {
         const resolvedPaths = await resolveDroppedFilePaths(fileNames)
@@ -545,6 +586,10 @@ function pathsFromText(value: string): string[] {
     .map((line) => line.trim())
     .filter((line) => line.length > 0 && !line.startsWith('#'))
     .map((line) => fileUriToWindowsPath(line) ?? line)
+}
+
+function isAbsolutePath(value: string): boolean {
+  return /^(?:[A-Za-z]:[\\/]|\\\\|\/)/.test(value)
 }
 
 function fileUriToWindowsPath(value: string): string | null {

@@ -155,6 +155,271 @@ function ControlledCommittedPathInput({
 }
 
 describe('PathInput', () => {
+  it.each(['local import', 'hosted upload', 'native picker', 'drop resolution'] as const)(
+    'uses the latest callbacks when a pending %s completes',
+    async (operation) => {
+      const result = deferred<readonly string[]>()
+      const completePaths = vi.fn(() => result.promise)
+      const oldOnChange = vi.fn()
+      const oldOnCommit = vi.fn()
+      const newOnChange = vi.fn()
+      const newOnCommit = vi.fn()
+      const renderInput = (onChange: typeof oldOnChange, onCommit: typeof oldOnCommit) => (
+        <PathInput
+          importDroppedFiles={operation === 'local import' ? completePaths : undefined}
+          label="Media path"
+          onChange={onChange}
+          onCommit={onCommit}
+          pickPaths={operation === 'native picker' ? completePaths : undefined}
+          resolveDroppedFilePaths={operation === 'drop resolution' ? completePaths : undefined}
+          uploadFiles={operation === 'hosted upload' ? completePaths : undefined}
+          value=""
+        />
+      )
+      const { rerender } = render(renderInput(oldOnChange, oldOnCommit))
+
+      if (operation === 'native picker') {
+        fireEvent.click(screen.getByRole('button', { name: '指定Media path' }))
+      } else {
+        fireEvent.drop(screen.getByLabelText('Media path'), {
+          dataTransfer: { files: [new File(['media'], 'new.png')], getData: () => '' },
+        })
+      }
+      expect(completePaths).toHaveBeenCalledOnce()
+      expect(oldOnChange).not.toHaveBeenCalled()
+      expect(oldOnCommit).not.toHaveBeenCalled()
+
+      rerender(renderInput(newOnChange, newOnCommit))
+      const path = operation === 'hosted upload'
+        ? `asset:${'1'.repeat(32)}:new.png`
+        : 'E:\\imports\\new.png'
+      await act(async () => {
+        result.resolve([path])
+        await result.promise
+      })
+
+      expect(newOnChange).toHaveBeenCalledExactlyOnceWith(path)
+      expect(newOnCommit).toHaveBeenCalledExactlyOnceWith(path)
+      expect(oldOnChange).not.toHaveBeenCalled()
+      expect(oldOnCommit).not.toHaveBeenCalled()
+    },
+  )
+
+  it('imports a pathless browser File before resolving same-name project files and only imports the first single input', async () => {
+    const imported = deferred<readonly string[]>()
+    const importDroppedFiles = vi.fn(() => imported.promise)
+    const resolveDroppedFilePaths = vi.fn().mockResolvedValue(['C:\\wrong\\same.png'])
+    const onChange = vi.fn()
+    const onCommit = vi.fn()
+    const onUploadPendingChange = vi.fn()
+    const { container } = render(
+      <PathInput
+        importDroppedFiles={importDroppedFiles}
+        label="Local media"
+        onChange={onChange}
+        onCommit={onCommit}
+        onUploadPendingChange={onUploadPendingChange}
+        resolveDroppedFilePaths={resolveDroppedFilePaths}
+        value={'C:\\previous\\old.png'}
+      />,
+    )
+    const file = new File(['actual outside bytes'], 'same.png', { type: 'image/png' })
+    expect((file as File & { path?: string }).path).toBeUndefined()
+    const input = screen.getByLabelText('Local media')
+    fireEvent.drop(input, {
+      dataTransfer: { files: [file, new File(['other'], 'other.png')], getData: () => '' },
+    })
+    expect(importDroppedFiles).toHaveBeenCalledWith([file], expect.any(Function), expect.any(AbortSignal))
+    expect(resolveDroppedFilePaths).not.toHaveBeenCalled()
+    expect(onUploadPendingChange).toHaveBeenLastCalledWith(true)
+    fireEvent.blur(input)
+    fireEvent.keyDown(input, { key: 'Enter' })
+    expect(onCommit).not.toHaveBeenCalled()
+    expect(input).toHaveValue('C:\\previous\\old.png')
+    expect(input).not.toHaveAttribute('readonly')
+    expect(container.querySelector('input[type="file"]')).toBeNull()
+    await act(async () => imported.resolve(['E:\\imports\\same.png']))
+    expect(onChange).toHaveBeenCalledWith('E:\\imports\\same.png')
+    expect(onCommit).toHaveBeenCalledOnce()
+    expect(onCommit).toHaveBeenCalledWith('E:\\imports\\same.png')
+    expect(onUploadPendingChange.mock.calls).toEqual([[true], [false]])
+  })
+
+  it('merges imported paths with the latest multiline prop and leaves the native picker unchanged', async () => {
+    const imported = deferred<readonly string[]>()
+    const importDroppedFiles = vi.fn(() => imported.promise)
+    const pickPaths = vi.fn().mockResolvedValue(['C:\\native\\picked.mp4'])
+    const onChange = vi.fn()
+    const renderInput = (value: string) => (
+      <PathInput importDroppedFiles={importDroppedFiles} label="Local media" multiline
+        onChange={onChange} pickPaths={pickPaths} value={value} />
+    )
+    const { rerender } = render(renderInput('C:\\existing\\one.mp4'))
+    const files = [new File(['a'], 'a.mp4'), new File(['b'], 'b.mp4')]
+    fireEvent.drop(screen.getByLabelText('Local media'), {
+      dataTransfer: { files, getData: () => '' },
+    })
+    expect(importDroppedFiles).toHaveBeenCalledWith(files, expect.any(Function), expect.any(AbortSignal))
+    rerender(renderInput('C:\\existing\\one.mp4\nD:\\latest\\two.mp4'))
+    await act(async () => imported.resolve(['E:\\imports\\a.mp4', 'E:\\imports\\b.mp4']))
+    expect(onChange).toHaveBeenLastCalledWith(
+      'C:\\existing\\one.mp4\nD:\\latest\\two.mp4\nE:\\imports\\a.mp4\nE:\\imports\\b.mp4',
+    )
+    fireEvent.click(screen.getByRole('button', { name: '指定Local media' }))
+    await waitFor(() => expect(pickPaths).toHaveBeenCalledOnce())
+    expect(importDroppedFiles).toHaveBeenCalledOnce()
+  })
+
+  it.each(['file.path', 'file URI', 'absolute text'])('keeps a real %s drop direct even with a local importer', (kind) => {
+    const file = new File(['a'], 'same.png')
+    if (kind === 'file.path') Object.assign(file, { path: 'D:\\outside\\same.png' })
+    const importDroppedFiles = vi.fn()
+    const onChange = vi.fn()
+    render(<PathInput importDroppedFiles={importDroppedFiles} label="Local media" onChange={onChange} value="" />)
+    fireEvent.drop(screen.getByLabelText('Local media'), {
+      dataTransfer: {
+        files: [file],
+        getData: (type: string) => kind === 'file URI' && type === 'text/uri-list'
+          ? 'file:///D:/outside/same.png'
+          : kind === 'absolute text' && type === 'text/plain' ? 'D:\\outside\\same.png' : '',
+      },
+    })
+    expect(onChange).toHaveBeenCalledWith('D:\\outside\\same.png')
+    expect(importDroppedFiles).not.toHaveBeenCalled()
+  })
+
+  it('does not trust a bare filename text accompanying pathless File bytes', async () => {
+    const importDroppedFiles = vi.fn().mockResolvedValue(['E:\\imports\\same.png'])
+    const onChange = vi.fn()
+    render(<PathInput importDroppedFiles={importDroppedFiles} label="Local media" onChange={onChange} value="" />)
+    fireEvent.drop(screen.getByLabelText('Local media'), {
+      dataTransfer: { files: [new File(['actual'], 'same.png')], getData: () => 'same.png' },
+    })
+    await waitFor(() => expect(onChange).toHaveBeenCalledWith('E:\\imports\\same.png'))
+    expect(importDroppedFiles).toHaveBeenCalledOnce()
+  })
+
+  it('preserves previous input and never falls back to filename guessing when importing fails', async () => {
+    const importDroppedFiles = vi.fn().mockRejectedValue(new Error('Local import failed'))
+    const resolveDroppedFilePaths = vi.fn().mockResolvedValue(['C:\\wrong\\same.png'])
+    const onChange = vi.fn()
+    const pending = vi.fn()
+    render(<PathInput importDroppedFiles={importDroppedFiles} label="Local media" onChange={onChange}
+      onUploadPendingChange={pending} resolveDroppedFilePaths={resolveDroppedFilePaths} value={'C:\\old\\a.png'} />)
+    fireEvent.drop(screen.getByLabelText('Local media'), {
+      dataTransfer: { files: [new File(['a'], 'same.png')], getData: () => '' },
+    })
+    expect(await screen.findByText('Local import failed')).toBeInTheDocument()
+    expect(screen.getByLabelText('Local media')).toHaveValue('C:\\old\\a.png')
+    expect(onChange).not.toHaveBeenCalled()
+    expect(resolveDroppedFilePaths).not.toHaveBeenCalled()
+    expect(pending.mock.calls).toEqual([[true], [false]])
+  })
+
+  it('keeps a newer local import pending when an aborted import later reports progress, errors or paths', async () => {
+    const first = deferred<readonly string[]>()
+    const second = deferred<readonly string[]>()
+    const importDroppedFiles = vi.fn().mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise)
+    const onChange = vi.fn()
+    const pending = vi.fn()
+    const renderInput = (disabled: boolean) => (
+      <PathInput disabled={disabled} importDroppedFiles={importDroppedFiles} label="Local media"
+        onChange={onChange} onUploadPendingChange={pending} value="C:\\old\\a.png" />
+    )
+    const { rerender, unmount } = render(renderInput(false))
+    const drop = () => fireEvent.drop(screen.getByLabelText('Local media'), {
+      dataTransfer: { files: [new File(['a'], 'a.png')], getData: () => '' },
+    })
+    drop()
+    drop()
+    expect(importDroppedFiles).toHaveBeenCalledOnce()
+    const firstSignal = importDroppedFiles.mock.calls[0][2] as AbortSignal
+    rerender(renderInput(true))
+    expect(firstSignal.aborted).toBe(true)
+    rerender(renderInput(false))
+    drop()
+    act(() => importDroppedFiles.mock.calls[0][1](99))
+    await act(async () => first.reject(new Error('Stale import failed')))
+    expect(screen.getByLabelText('上传进度')).toHaveValue(0)
+    expect(screen.queryByText('Stale import failed')).not.toBeInTheDocument()
+    expect(pending.mock.calls).toEqual([[true], [false], [true]])
+    unmount()
+    expect((importDroppedFiles.mock.calls[1][2] as AbortSignal).aborted).toBe(true)
+    await act(async () => second.resolve(['E:\\stale\\b.png']))
+    expect(onChange).not.toHaveBeenCalled()
+    expect(pending.mock.calls).toEqual([[true], [false], [true], [false]])
+  })
+
+  it('imports pathless files in mixed drops while retaining real paths in file order', async () => {
+    const pathless = new File(['actual'], 'outside.png')
+    const real = Object.assign(new File(['real'], 'real.png'), { path: 'D:\\real\\real.png' })
+    const importDroppedFiles = vi.fn().mockResolvedValue(['E:\\imports\\outside.png'])
+    const onChange = vi.fn()
+    render(<PathInput importDroppedFiles={importDroppedFiles} label="Local media" multiline
+      onChange={onChange} value="" />)
+    fireEvent.drop(screen.getByLabelText('Local media'), {
+      dataTransfer: { files: [pathless, real], getData: () => '' },
+    })
+    await waitFor(() => expect(onChange).toHaveBeenCalledWith('E:\\imports\\outside.png\nD:\\real\\real.png'))
+    expect(importDroppedFiles).toHaveBeenCalledWith([pathless], expect.any(Function), expect.any(AbortSignal))
+  })
+
+  it('imports the first single-field file even when a later file exposes a real path', async () => {
+    const first = new File(['first'], 'first.png')
+    const second = Object.assign(new File(['second'], 'second.png'), { path: 'D:\\real\\second.png' })
+    const importDroppedFiles = vi.fn().mockResolvedValue(['E:\\imports\\first.png'])
+    const onChange = vi.fn()
+    render(<PathInput importDroppedFiles={importDroppedFiles} label="Local media" onChange={onChange} value="" />)
+    fireEvent.drop(screen.getByLabelText('Local media'), {
+      dataTransfer: { files: [first, second], getData: () => '' },
+    })
+    await waitFor(() => expect(onChange).toHaveBeenCalledWith('E:\\imports\\first.png'))
+    expect(importDroppedFiles).toHaveBeenCalledWith([first], expect.any(Function), expect.any(AbortSignal))
+  })
+
+  it.each([false, true])('reconciles a URI for only the second dropped file without skipping the first (multiline=%s)', async (multiline) => {
+    const first = new File(['first bytes'], 'first.png')
+    const second = new File(['second bytes'], 'second.png')
+    const importDroppedFiles = vi.fn().mockResolvedValue(['E:\\imports\\first.png'])
+    const onChange = vi.fn()
+    render(<PathInput importDroppedFiles={importDroppedFiles} label="Local media" multiline={multiline}
+      onChange={onChange} value="" />)
+    fireEvent.drop(screen.getByLabelText('Local media'), {
+      dataTransfer: {
+        files: [first, second],
+        getData: (type: string) => type === 'text/uri-list' ? 'file:///D:/real/second.png' : '',
+      },
+    })
+    await waitFor(() => expect(onChange).toHaveBeenCalledWith(
+      multiline ? 'E:\\imports\\first.png\nD:\\real\\second.png' : 'E:\\imports\\first.png',
+    ))
+    expect(importDroppedFiles).toHaveBeenCalledWith([first], expect.any(Function), expect.any(AbortSignal))
+  })
+
+  it('imports same-name files when a URI cannot be uniquely associated with a dropped File', async () => {
+    const files = [new File(['first bytes'], 'same.png'), new File(['second bytes'], 'same.png')]
+    const importDroppedFiles = vi.fn().mockResolvedValue(['E:\\imports\\first\\same.png', 'E:\\imports\\second\\same.png'])
+    const onChange = vi.fn()
+    render(<PathInput importDroppedFiles={importDroppedFiles} label="Local media" multiline onChange={onChange} value="" />)
+    fireEvent.drop(screen.getByLabelText('Local media'), {
+      dataTransfer: { files, getData: (type: string) => type === 'text/uri-list' ? 'file:///D:/real/same.png' : '' },
+    })
+    await waitFor(() => expect(onChange).toHaveBeenCalledWith('E:\\imports\\first\\same.png\nE:\\imports\\second\\same.png'))
+    expect(importDroppedFiles).toHaveBeenCalledWith(files, expect.any(Function), expect.any(AbortSignal))
+  })
+
+  it('imports a File when multiple explicit paths share its basename', async () => {
+    const file = new File(['actual bytes'], 'same.png')
+    const importDroppedFiles = vi.fn().mockResolvedValue(['E:\\imports\\same.png'])
+    const onChange = vi.fn()
+    render(<PathInput importDroppedFiles={importDroppedFiles} label="Local media" onChange={onChange} value="" />)
+    fireEvent.drop(screen.getByLabelText('Local media'), {
+      dataTransfer: { files: [file], getData: (type: string) => type === 'text/uri-list'
+        ? 'file:///D:/first/same.png\nfile:///D:/second/same.png' : '' },
+    })
+    await waitFor(() => expect(onChange).toHaveBeenCalledWith('E:\\imports\\same.png'))
+    expect(importDroppedFiles).toHaveBeenCalledWith([file], expect.any(Function), expect.any(AbortSignal))
+  })
   it('keeps an aria-disabled picker focusable and guards all activation', async () => {
     const user = userEvent.setup()
     const onChange = vi.fn()

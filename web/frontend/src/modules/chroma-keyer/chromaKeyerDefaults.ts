@@ -4,6 +4,7 @@ export function createChromaKeyerDefaultValues(): ChromaKeyerValues {
   return {
     inputPath: '',
     mediaKind: null,
+    outputFormat: 'packed_alpha_mp4',
     outputPath: '',
     outputRoot: '',
     samples: [],

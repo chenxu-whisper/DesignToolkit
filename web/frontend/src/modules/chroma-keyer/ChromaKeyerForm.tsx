@@ -5,12 +5,14 @@ import { FieldError } from '../../components/FieldError'
 import { PathInput } from '../../components/PathInput'
 import {
   deleteUploadedAsset,
+  importDroppedFiles,
   pickLocalDirectory,
   pickLocalFiles,
   pickLocalSaveFile,
   resolveDroppedFilePaths,
   uploadFiles,
 } from '../../services/apiClient'
+import type { ChromaVideoOutputFormat } from '../../services/apiClient'
 import type { ChromaKeyerErrors, ChromaKeyerValues } from './chromaKeyerValidation'
 
 type ChromaKeyerFormProps = {
@@ -84,6 +86,7 @@ export function ChromaKeyerForm({
           disabled={disabled}
           error={errors.inputPath}
           id="chroma-keyer-input-path"
+          importDroppedFiles={hostedMode ? undefined : importDroppedFiles}
           label={hostedMode ? '输入图片或视频' : '输入图片或视频路径'}
           onChange={(value) => updateValue('inputPath', value)}
           onCommit={onInputPathCommit}
@@ -193,10 +196,31 @@ export function ChromaKeyerForm({
         </fieldset>
       </div>
 
-      {hostedMode ? null : (
+      {!hostedMode || values.mediaKind === 'video' ? (
         <div className="chroma-form-section">
           <h2 className="chroma-section-title">输出</h2>
           {values.mediaKind === 'video' ? (
+            <div className="field">
+              <label className="field-label" htmlFor="chroma-keyer-output-format">输出格式</label>
+              <select
+                aria-describedby={values.outputFormat === 'packed_alpha_mp4' ? 'chroma-keyer-format-help' : undefined}
+                className="text-input"
+                disabled={disabled}
+                id="chroma-keyer-output-format"
+                onChange={(event) => updateValue('outputFormat', event.target.value as ChromaVideoOutputFormat)}
+                value={values.outputFormat}
+              >
+                <option value="packed_alpha_mp4">MP4（颜色 + 透明遮罩）</option>
+                <option value="png_sequence">PNG 序列</option>
+              </select>
+              {values.outputFormat === 'packed_alpha_mp4' ? (
+                <p className="chroma-format-help" id="chroma-keyer-format-help">
+                  需要配套播放器恢复透明效果。普通播放器会显示颜色与透明遮罩的左右拼接画面。
+                </p>
+              ) : null}
+            </div>
+          ) : null}
+          {hostedMode ? null : values.mediaKind === 'video' && values.outputFormat === 'png_sequence' ? (
             <PathInput
               disabled={disabled}
               error={errors.outputRoot}
@@ -209,6 +233,23 @@ export function ChromaKeyerForm({
               }}
               placeholder="留空时在视频旁创建序列目录"
               value={values.outputRoot}
+            />
+          ) : values.mediaKind === 'video' ? (
+            <PathInput
+              disabled={disabled}
+              error={errors.outputPath}
+              id="chroma-keyer-output-path"
+              label="MP4 输出路径（可选）"
+              onChange={(value) => updateValue('outputPath', value)}
+              pickPaths={async () => {
+                const response = await pickLocalSaveFile({
+                  fileKind: 'video',
+                  title: '选择 MP4 输出路径',
+                })
+                return response.paths
+              }}
+              placeholder="留空时自动生成 _keyed_packed.mp4"
+              value={values.outputPath}
             />
           ) : (
             <PathInput
@@ -229,14 +270,16 @@ export function ChromaKeyerForm({
             />
           )}
         </div>
-      )}
+      ) : null}
       <div className="chroma-inspector-footer">
         <button
           className="submit-button"
           disabled={disabled || isUploadPending || values.samples.length === 0}
           type="submit"
         >
-          {values.mediaKind === 'video' ? '导出 PNG 序列' : '导出 PNG'}
+          {values.mediaKind === 'video'
+            ? values.outputFormat === 'packed_alpha_mp4' ? '导出 MP4' : '导出 PNG 序列'
+            : '导出 PNG'}
         </button>
       </div>
     </form>

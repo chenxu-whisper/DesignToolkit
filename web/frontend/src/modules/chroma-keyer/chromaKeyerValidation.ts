@@ -1,8 +1,11 @@
+import type { ChromaVideoOutputFormat } from '../../services/apiClient'
+
 export type ChromaKeyerRgbSample = [red: number, green: number, blue: number]
 
 export type ChromaKeyerValues = {
   inputPath: string
   mediaKind: 'image' | 'video' | null
+  outputFormat: ChromaVideoOutputFormat
   outputPath: string
   outputRoot: string
   samples: ChromaKeyerRgbSample[]
@@ -30,20 +33,14 @@ export function isVideoPath(path: string): boolean {
   return VIDEO_SUFFIXES.some((suffix) => normalizedPath.endsWith(suffix))
 }
 
-export function validateChromaKeyerValues(values: ChromaKeyerValues): ChromaKeyerErrors {
+export function validateChromaKeyerPreviewValues(values: ChromaKeyerValues): ChromaKeyerErrors {
   const errors: ChromaKeyerErrors = {}
   const inputPath = values.inputPath.trim()
 
   if (!inputPath) {
     errors.inputPath = '请输入图片路径'
   }
-  if (values.mediaKind === 'image' && values.outputPath.trim() === inputPath && inputPath) {
-    errors.outputPath = '输出路径不能等于输入路径'
-  }
   if (values.mediaKind === 'video') {
-    if (values.outputRoot.trim() === inputPath && inputPath) {
-      errors.outputRoot = '输出目录不能等于输入路径'
-    }
     if (!Number.isFinite(values.timestampSeconds) || values.timestampSeconds < 0) {
       errors.timestampSeconds = '视频时间必须是大于或等于 0 的有限数值'
     }
@@ -82,6 +79,30 @@ export function validateChromaKeyerValues(values: ChromaKeyerValues): ChromaKeye
   }
   if (isUnitInterval(values.clipBlack) && isUnitInterval(values.clipWhite) && values.clipBlack >= values.clipWhite) {
     errors.clipBlack = 'Clip Black 必须小于 Clip White'
+  }
+
+  return errors
+}
+
+export function validateChromaKeyerValues(values: ChromaKeyerValues): ChromaKeyerErrors {
+  const errors = validateChromaKeyerPreviewValues(values)
+  const inputPath = values.inputPath.trim()
+
+  if (values.mediaKind === 'image' && values.outputPath.trim() === inputPath && inputPath) {
+    errors.outputPath = '输出路径不能等于输入路径'
+  }
+  if (values.mediaKind === 'video') {
+    const outputPath = values.outputPath.trim()
+    if (values.outputFormat === 'packed_alpha_mp4' && outputPath) {
+      if (outputPath === inputPath) {
+        errors.outputPath = '输出路径不能等于输入路径'
+      } else if (!outputPath.toLowerCase().endsWith('.mp4')) {
+        errors.outputPath = 'MP4 输出路径必须以 .mp4 结尾'
+      }
+    }
+    if (values.outputFormat === 'png_sequence' && values.outputRoot.trim() === inputPath && inputPath) {
+      errors.outputRoot = '输出目录不能等于输入路径'
+    }
   }
 
   return errors

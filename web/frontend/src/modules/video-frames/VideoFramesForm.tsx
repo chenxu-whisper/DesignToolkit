@@ -7,6 +7,7 @@ import { SubmitButton } from '../../components/SubmitButton'
 import { hostedMode } from '../../app/runtimeConfig'
 import {
   deleteUploadedAsset,
+  importDroppedFiles,
   pickLocalDirectory,
   pickLocalFiles,
   resolveDroppedFilePaths,
@@ -87,6 +88,7 @@ export function VideoFramesForm({ disabled, onSubmit }: VideoFramesFormProps) {
         disabled={formDisabled}
         error={errors.inputPath}
         id="video-frames-input-path"
+        importDroppedFiles={hostedMode ? undefined : importDroppedFiles}
         label={hostedMode ? '输入视频' : '输入视频路径'}
         multiline
         onChange={(value) => updateValue('inputPath', value)}

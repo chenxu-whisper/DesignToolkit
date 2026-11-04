@@ -61,6 +61,7 @@ const originalInnerHeight = window.innerHeight
 
 vi.mock('../services/apiClient', () => ({
   createMediaResizeTask: serviceMocks.createMediaResizeTask,
+  importDroppedFiles: vi.fn(),
   createVideoFramesTask: serviceMocks.createVideoFramesTask,
   getTask: serviceMocks.getTask,
 }))

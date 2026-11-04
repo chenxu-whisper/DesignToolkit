@@ -26,6 +26,7 @@ const pageMocks = vi.hoisted(() => {
 
 vi.mock('../../services/apiClient', () => ({
   createVideoFramesTask: pageMocks.createVideoFramesTask,
+  importDroppedFiles: vi.fn(),
 }))
 
 vi.mock('../../services/taskEvents', () => ({

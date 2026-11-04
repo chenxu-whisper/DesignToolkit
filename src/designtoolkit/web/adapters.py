@@ -63,6 +63,8 @@ def chroma_video_keyer_options_from_request(
         VideoKeyOptions(
             input_path=Path(request.input_path),
             output_root=Path(request.output_root) if request.output_root else None,
+            output_format=request.output_format,
+            output_path=Path(request.output_path) if request.output_path else None,
         ),
         screen_model_from_samples(request.samples),
         KeyerParams(
