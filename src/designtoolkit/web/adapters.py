@@ -57,7 +57,7 @@ def chroma_keyer_options_from_request(
 
 def chroma_video_keyer_options_from_request(
     request: ChromaVideoKeyerTaskRequest,
-) -> tuple[VideoKeyOptions, ScreenColorModel, KeyerParams]:
+) -> tuple[VideoKeyOptions, ScreenColorModel | None, KeyerParams]:
     params = request.params
     return (
         VideoKeyOptions(
@@ -65,8 +65,14 @@ def chroma_video_keyer_options_from_request(
             output_root=Path(request.output_root) if request.output_root else None,
             output_format=request.output_format,
             output_path=Path(request.output_path) if request.output_path else None,
+            alpha_source=request.alpha_source,
+            source_alpha_mode=request.source_alpha_mode,
         ),
-        screen_model_from_samples(request.samples),
+        (
+            None
+            if request.alpha_source == "source"
+            else screen_model_from_samples(request.samples)
+        ),
         KeyerParams(
             screen_gain=params.screen_gain,
             screen_balance=params.screen_balance,

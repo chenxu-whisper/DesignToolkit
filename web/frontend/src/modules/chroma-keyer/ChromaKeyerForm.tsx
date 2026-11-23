@@ -62,6 +62,7 @@ export function ChromaKeyerForm({
   onUploadPendingChange,
   values,
 }: ChromaKeyerFormProps) {
+  const isSourceAlpha = values.mediaKind === 'video' && values.alphaSource === 'source'
   const updateValue = <Key extends keyof ChromaKeyerValues>(key: Key, value: ChromaKeyerValues[Key]) => {
     onChange({ ...values, [key]: value })
   }
@@ -112,6 +113,54 @@ export function ChromaKeyerForm({
         />
       </div>
 
+      {values.mediaKind === 'video' ? (
+        <div className="chroma-form-section">
+          <h2 className="chroma-section-title">透明来源</h2>
+          <div className="field">
+            <label className="field-label" htmlFor="chroma-keyer-alpha-source">透明来源</label>
+            <select
+              className="text-input"
+              disabled={disabled}
+              id="chroma-keyer-alpha-source"
+              onChange={(event) => onChange({
+                ...values,
+                alphaSource: event.target.value as ChromaKeyerValues['alphaSource'],
+                ...(event.target.value === 'source' ? { outputFormat: 'packed_alpha_mp4' as const } : {}),
+              })}
+              value={values.alphaSource ?? 'chroma_key'}
+            >
+              <option value="chroma_key">色键抠图</option>
+              <option value="source">视频原始透明通道</option>
+            </select>
+          </div>
+          {isSourceAlpha ? (
+            <>
+              <div className="field">
+                <label className="field-label" htmlFor="chroma-keyer-source-alpha-mode">Alpha 解释</label>
+                <select
+                  aria-describedby="chroma-keyer-source-alpha-help"
+                  className="text-input"
+                  disabled={disabled}
+                  id="chroma-keyer-source-alpha-mode"
+                  onChange={(event) => updateValue('sourceAlphaMode', event.target.value as ChromaKeyerValues['sourceAlphaMode'])}
+                  value={values.sourceAlphaMode ?? 'straight'}
+                >
+                  <option value="straight">直通 Alpha</option>
+                  <option value="premultiplied">预乘 Alpha</option>
+                </select>
+              </div>
+              <p className="chroma-format-help" id="chroma-keyer-source-alpha-help">
+                保留视频原始透明通道，无需背景采样或抠像参数。请按素材选择直通或预乘 Alpha；无原生 Alpha 的视频无法转换。
+              </p>
+              <p className="chroma-format-help">
+                MP4 颜色与遮罩有损压缩，Alpha 转为 8 位；使用配套播放器恢复透明效果。
+              </p>
+            </>
+          ) : null}
+        </div>
+      ) : null}
+
+      {!isSourceAlpha ? (
       <div className="chroma-form-section">
         <h2 className="chroma-section-title">
           <SlidersHorizontal aria-hidden="true" size={17} />
@@ -168,6 +217,7 @@ export function ChromaKeyerForm({
           })}
         </div>
       </div>
+      ) : null}
 
       <div className="chroma-form-section">
         <h2 className="chroma-section-title">预览</h2>
@@ -205,7 +255,7 @@ export function ChromaKeyerForm({
               <select
                 aria-describedby={values.outputFormat === 'packed_alpha_mp4' ? 'chroma-keyer-format-help' : undefined}
                 className="text-input"
-                disabled={disabled}
+                disabled={disabled || isSourceAlpha}
                 id="chroma-keyer-output-format"
                 onChange={(event) => updateValue('outputFormat', event.target.value as ChromaVideoOutputFormat)}
                 value={values.outputFormat}
@@ -213,6 +263,7 @@ export function ChromaKeyerForm({
                 <option value="packed_alpha_mp4">MP4（颜色 + 透明遮罩）</option>
                 <option value="png_sequence">PNG 序列</option>
               </select>
+              <FieldError message={errors.outputFormat} />
               {values.outputFormat === 'packed_alpha_mp4' ? (
                 <p className="chroma-format-help" id="chroma-keyer-format-help">
                   需要配套播放器恢复透明效果。普通播放器会显示颜色与透明遮罩的左右拼接画面。
@@ -274,7 +325,7 @@ export function ChromaKeyerForm({
       <div className="chroma-inspector-footer">
         <button
           className="submit-button"
-          disabled={disabled || isUploadPending || values.samples.length === 0}
+          disabled={disabled || isUploadPending || (!isSourceAlpha && values.samples.length === 0)}
           type="submit"
         >
           {values.mediaKind === 'video'

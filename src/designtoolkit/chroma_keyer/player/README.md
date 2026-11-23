@@ -13,8 +13,9 @@ not guess paths or automatically read neighboring files.
 ## Format
 
 This is **not native MP4 transparency**. An ordinary video player displays both
-halves. One H.264/yuv420p video stores straight (non-premultiplied) RGB on the
-left and grayscale alpha on the right. Alpha 0 is transparent, 255 opaque.
+halves. New H.264/yuv420p exports store grayscale alpha on the left and straight
+(non-premultiplied) RGB on the right. Alpha 0 is transparent, 255 opaque.
+The player also accepts legacy color-left, alpha-right files by reading their JSON layout.
 H.264 is lossy, including the mask; small alpha and color errors are expected.
 
 Required JSON fields:
@@ -22,7 +23,7 @@ Required JSON fields:
 ```json
 {
   "version": 1,
-  "layout": "color_left_alpha_right",
+  "layout": "alpha_left_color_right",
   "alpha_mode": "straight",
   "original_width": 65,
   "original_height": 33,
@@ -34,8 +35,17 @@ Required JSON fields:
 `stored_width` and `stored_height` are the size **of each half**, padded upward
 to even. Decoded video dimensions must be `2 * stored_width` by `stored_height`.
 Original pixels occupy each half's top-left corner. Padding is not displayed;
-the output canvas has the original dimensions. Additional encoder fields are
+new exports extend RGB edge colors into padding to avoid compression darkening,
+while alpha padding stays zero.
+The output canvas has the original dimensions. Additional encoder fields are
 accepted but duration/seeking use decoded video timing.
+
+Exports also record `alpha_source` (`chroma_key` or `source`) and
+`source_alpha_mode` (`straight` or `premultiplied`). Native-alpha MOV exports
+use the same player and layout: the source mask bypasses chroma keying, and
+premultiplied source RGB is restored before packing. Output `alpha_mode`
+remains `straight` for both source interpretations. High-bit-depth source
+alpha is converted to 8 bits before lossy H.264 encoding.
 
 The shader clamps sampling to the original crop's pixel centers independently
 in each half. It uses the browser-decoded grayscale directly, without a second

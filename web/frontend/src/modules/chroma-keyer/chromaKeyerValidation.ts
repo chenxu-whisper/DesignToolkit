@@ -5,6 +5,8 @@ export type ChromaKeyerRgbSample = [red: number, green: number, blue: number]
 export type ChromaKeyerValues = {
   inputPath: string
   mediaKind: 'image' | 'video' | null
+  alphaSource?: 'chroma_key' | 'source'
+  sourceAlphaMode?: 'straight' | 'premultiplied'
   outputFormat: ChromaVideoOutputFormat
   outputPath: string
   outputRoot: string
@@ -44,6 +46,9 @@ export function validateChromaKeyerPreviewValues(values: ChromaKeyerValues): Chr
     if (!Number.isFinite(values.timestampSeconds) || values.timestampSeconds < 0) {
       errors.timestampSeconds = '视频时间必须是大于或等于 0 的有限数值'
     }
+  }
+  if (values.mediaKind === 'video' && values.alphaSource === 'source') {
+    return errors
   }
   if (values.samples.length === 0) {
     errors.samples = '请先在画布上吸取需要抠除的背景颜色'
@@ -92,6 +97,9 @@ export function validateChromaKeyerValues(values: ChromaKeyerValues): ChromaKeye
     errors.outputPath = '输出路径不能等于输入路径'
   }
   if (values.mediaKind === 'video') {
+    if (values.alphaSource === 'source' && values.outputFormat !== 'packed_alpha_mp4') {
+      errors.outputFormat = '视频原始透明通道仅支持 MP4 输出'
+    }
     const outputPath = values.outputPath.trim()
     if (values.outputFormat === 'packed_alpha_mp4' && outputPath) {
       if (outputPath === inputPath) {

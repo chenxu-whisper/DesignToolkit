@@ -146,7 +146,23 @@ export type ChromaVideoSampleResponse = ChromaImageSampleResponse & {
   timestamp_seconds: number
 }
 
-export type ChromaVideoPreviewPayload = Omit<ChromaKeyerPayload, 'outputPath'> & {
+export type ChromaAlphaSource = 'chroma_key' | 'source'
+export type SourceAlphaMode = 'straight' | 'premultiplied'
+
+export type ChromaVideoBasePayload =
+  | (Omit<ChromaKeyerPayload, 'outputPath'> & {
+      alphaSource?: 'chroma_key'
+      sourceAlphaMode?: SourceAlphaMode
+    })
+  | {
+      inputPath: string
+      alphaSource: 'source'
+      sourceAlphaMode?: SourceAlphaMode
+      samples?: readonly ChromaKeyerRgbSample[]
+      params?: ChromaKeyerParams
+    }
+
+export type ChromaVideoPreviewPayload = ChromaVideoBasePayload & {
   timestampSeconds: number
   viewMode: ChromaViewMode
 }
@@ -157,7 +173,7 @@ export type ChromaVideoPreviewResponse = ChromaPreviewResponse & {
 
 export type ChromaVideoOutputFormat = 'png_sequence' | 'packed_alpha_mp4'
 
-export type ChromaVideoKeyerPayload = Omit<ChromaKeyerPayload, 'outputPath'> & {
+export type ChromaVideoKeyerPayload = ChromaVideoBasePayload & {
   outputFormat?: ChromaVideoOutputFormat
   outputPath?: string
   outputRoot?: string
@@ -645,16 +661,29 @@ function chromaPreviewPayloadToWire(payload: ChromaPreviewPayload) {
 }
 
 function chromaVideoPreviewPayloadToWire(payload: ChromaVideoPreviewPayload) {
-  const { input_path, ...previewPayload } = chromaPreviewPayloadToWire(payload)
+  const { input_path, ...previewPayload } = chromaVideoBasePayloadToWire(payload)
   return {
     input_path,
     timestamp_seconds: payload.timestampSeconds,
     ...previewPayload,
+    view_mode: payload.viewMode,
   }
 }
 
+function chromaVideoBasePayloadToWire(payload: ChromaVideoBasePayload) {
+  if (payload.alphaSource === 'source') {
+    return {
+      input_path: payload.inputPath,
+      alpha_source: 'source',
+      source_alpha_mode: payload.sourceAlphaMode ?? 'straight',
+      samples: [],
+    }
+  }
+  return chromaBasePayloadToWire(payload)
+}
+
 function chromaVideoKeyerPayloadToWire(payload: ChromaVideoKeyerPayload) {
-  const { input_path, ...keyerPayload } = chromaBasePayloadToWire(payload)
+  const { input_path, ...keyerPayload } = chromaVideoBasePayloadToWire(payload)
   const outputRoot = payload.outputRoot?.trim()
   const outputPath = payload.outputPath?.trim()
   return {

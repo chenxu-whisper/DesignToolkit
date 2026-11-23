@@ -14,6 +14,7 @@ import {
   sampleChromaImage,
   sampleChromaVideo,
   type ChromaKeyerPayload,
+  type ChromaVideoBasePayload,
   type ChromaVideoKeyerPayload,
 } from '../../services/apiClient'
 import { FieldError } from '../../components/FieldError'
@@ -97,13 +98,29 @@ function toPayload(values: ChromaKeyerValues): ChromaKeyerPayload {
 
 function toVideoPayload(values: ChromaKeyerValues): ChromaVideoKeyerPayload {
   return {
-    ...toBasePayload(values),
+    ...toVideoBasePayload(values),
     outputFormat: values.outputFormat,
     ...(!hostedMode && values.outputFormat === 'packed_alpha_mp4' && values.outputPath.trim()
       ? { outputPath: values.outputPath.trim() } : {}),
     ...(!hostedMode && values.outputFormat === 'png_sequence' && values.outputRoot.trim()
       ? { outputRoot: values.outputRoot.trim() } : {}),
   }
+}
+
+function isSourceAlpha(values: ChromaKeyerValues): boolean {
+  return values.mediaKind === 'video' && values.alphaSource === 'source'
+}
+
+function toVideoBasePayload(values: ChromaKeyerValues): ChromaVideoBasePayload {
+  if (isSourceAlpha(values)) {
+    return {
+      inputPath: values.inputPath.trim(),
+      alphaSource: 'source',
+      sourceAlphaMode: values.sourceAlphaMode ?? 'straight',
+      samples: [],
+    }
+  }
+  return toBasePayload(values)
 }
 
 export function ChromaKeyerPage() {
@@ -126,6 +143,7 @@ export function ChromaKeyerPage() {
   const [sampleDetails, setSampleDetails] = useState<ChromaCanvasSample[]>([])
   const [exportError, setExportError] = useState<string | null>(null)
   const [isRequestPending, setIsRequestPending] = useState(false)
+  const [pendingPreviewSequence, setPendingPreviewSequence] = useState<number | null>(null)
   const [isUploadPending, setIsUploadPending] = useState(false)
   const [inspectorOpen, setInspectorOpen] = useState(false)
   const [renderedTimestampSeconds, setRenderedTimestampSeconds] = useState<number | null>(null)
@@ -139,12 +157,14 @@ export function ChromaKeyerPage() {
   const renderedTimestampRef = useRef<number | null>(null)
   const seekTimeoutRef = useRef<number | null>(null)
   const lastViewModeRef = useRef(values.viewMode)
+  const lastAlphaSettingsRef = useRef(`${values.alphaSource}:${values.sourceAlphaMode}`)
   const mediaRef = useRef(media)
   const valuesRef = useRef(values)
   mediaRef.current = media
   valuesRef.current = values
   const disabledByTask = status === 'queued' || status === 'running' || isCreating
   const disabled = disabledByTask || isRequestPending
+  const sourceAlpha = isSourceAlpha(values)
   const keyedVideoSeekInvalid = media?.kind === 'video'
     && values.samples.length > 0
     && !areKeyedPreviewInputsValid(values)
@@ -156,6 +176,7 @@ export function ChromaKeyerPage() {
   const canPlayVideo = Boolean(
     videoTransportAvailable
     && !disabled
+    && pendingPreviewSequence === null
     && inspectingPathRef.current === null
     && !keyedVideoSeekInvalid,
   )
@@ -176,6 +197,7 @@ export function ChromaKeyerPage() {
   const invalidateRequests = () => {
     requestSequenceRef.current += 1
     previewSequenceRef.current += 1
+    setPendingPreviewSequence(null)
   }
 
   const handleUploadPendingChange = (pending: boolean) => {
@@ -196,6 +218,7 @@ export function ChromaKeyerPage() {
         seekTimeoutRef.current = null
       }
       setMedia(null)
+      mediaRef.current = null
       setPreviewUrl(null)
       renderedTimestampRef.current = null
       setRenderedTimestampSeconds(null)
@@ -203,6 +226,8 @@ export function ChromaKeyerPage() {
       const resetValues = {
         ...nextValues,
         mediaKind: null,
+        alphaSource: 'chroma_key',
+        sourceAlphaMode: 'straight',
         outputFormat: 'packed_alpha_mp4',
         outputPath: '',
         outputRoot: '',
@@ -214,8 +239,11 @@ export function ChromaKeyerPage() {
       setErrors({})
       return
     }
+    const alphaSettingsChanged = nextValues.alphaSource !== currentValues.alphaSource
+      || nextValues.sourceAlphaMode !== currentValues.sourceAlphaMode
     const playbackInputChanged = (
-      nextValues.samples !== currentValues.samples
+      alphaSettingsChanged
+      || nextValues.samples !== currentValues.samples
       || nextValues.viewMode !== currentValues.viewMode
       || previewParameterFields.some(
         (field) => nextValues[field] !== currentValues[field],
@@ -225,14 +253,30 @@ export function ChromaKeyerPage() {
     if (playbackInputChanged) {
       stopVideoPlayback()
     }
+    if (alphaSettingsChanged || (isSourceAlpha(currentValues) && nextValues.viewMode !== currentValues.viewMode)) {
+      invalidateRequests()
+      if (seekTimeoutRef.current !== null) {
+        window.clearTimeout(seekTimeoutRef.current)
+        seekTimeoutRef.current = null
+      }
+      setIsRequestPending(false)
+      setErrors({})
+    }
+    const sourceSafeValues = isSourceAlpha(nextValues)
+      ? { ...nextValues, outputFormat: 'packed_alpha_mp4' as const }
+      : nextValues
     const resolvedNextValues = (
       wasPlaying
       && renderedTimestampRef.current !== null
     )
-      ? { ...nextValues, timestampSeconds: renderedTimestampRef.current }
-      : nextValues
+      ? { ...sourceSafeValues, timestampSeconds: renderedTimestampRef.current }
+      : sourceSafeValues
     valuesRef.current = resolvedNextValues
     setValues(resolvedNextValues)
+    if (isPreviewValid(currentValues) && !isPreviewValid(resolvedNextValues)) {
+      previewSequenceRef.current += 1
+      setPendingPreviewSequence(null)
+    }
     const validationErrors = validateChromaKeyerPreviewValues(resolvedNextValues)
     setErrors((current) => {
       const nextErrors = { ...current }
@@ -241,6 +285,14 @@ export function ChromaKeyerPage() {
       }
       return nextErrors
     })
+    if (
+      alphaSettingsChanged
+      && mediaRef.current?.kind === 'video'
+      && !isSourceAlpha(resolvedNextValues)
+      && resolvedNextValues.samples.length === 0
+    ) {
+      requestVideoTimestamp(resolvedNextValues.timestampSeconds, 0)
+    }
   }
 
   const setRenderedVideoTimestamp = (
@@ -287,9 +339,9 @@ export function ChromaKeyerPage() {
       throw new Error('视频未加载')
     }
 
-    const response = playbackValues.samples.length === 1
+    const response = isSourceAlpha(playbackValues) || playbackValues.samples.length === 1
       ? await createChromaVideoPreview({
-          ...toBasePayload(playbackValues),
+          ...toVideoBasePayload(playbackValues),
           timestampSeconds,
           viewMode: playbackValues.viewMode,
         })
@@ -326,7 +378,7 @@ export function ChromaKeyerPage() {
 
       setPreviewUrl(frame.previewUrl)
       setRenderedVideoTimestamp(playbackMedia, frame.timestampSeconds)
-      if (valuesRef.current.samples.length === 0) {
+      if (!isSourceAlpha(valuesRef.current) && valuesRef.current.samples.length === 0) {
         setMedia((current) => {
           if (!current || current.kind !== 'video' || current.inputPath !== playbackMedia.inputPath) {
             return current
@@ -374,11 +426,12 @@ export function ChromaKeyerPage() {
       return
     }
     const previewSequence = ++previewSequenceRef.current
+    setPendingPreviewSequence(previewSequence)
 
     try {
       const response = previewMedia.kind === 'video'
         ? await createChromaVideoPreview({
-            ...toBasePayload(previewValues),
+            ...toVideoBasePayload(previewValues),
             timestampSeconds: previewValues.timestampSeconds,
             viewMode: previewValues.viewMode,
           })
@@ -413,18 +466,25 @@ export function ChromaKeyerPage() {
           samples: error instanceof Error && error.message ? error.message : '无法生成预览',
         }))
       }
+    } finally {
+      if (mountedRef.current && previewSequence === previewSequenceRef.current) {
+        setPendingPreviewSequence(null)
+      }
     }
   }
 
   useEffect(() => {
     const isViewModeChange = lastViewModeRef.current !== values.viewMode
     lastViewModeRef.current = values.viewMode
+    const alphaSettings = `${values.alphaSource}:${values.sourceAlphaMode}`
+    const isAlphaSettingsChange = lastAlphaSettingsRef.current !== alphaSettings
+    lastAlphaSettingsRef.current = alphaSettings
     if (!media || !isPreviewValid(values)) {
       return
     }
 
     const actionSequence = requestSequenceRef.current
-    if (isViewModeChange) {
+    if (isViewModeChange || isAlphaSettingsChange) {
       void requestPreview(values, actionSequence)
       return
     }
@@ -445,6 +505,8 @@ export function ChromaKeyerPage() {
     values.feather,
     values.despillAmount,
     values.viewMode,
+    values.alphaSource,
+    values.sourceAlphaMode,
   ])
 
   const handleInspect = async (committedPath: string) => {
@@ -459,8 +521,11 @@ export function ChromaKeyerPage() {
 
     stopVideoPlayback()
     const mediaKind = isVideoPath(inputPath) ? 'video' : 'image'
+    const preserveSourceAlpha = mediaRef.current?.inputPath === inputPath
+      && isSourceAlpha(valuesRef.current)
     const requestSequence = ++requestSequenceRef.current
     previewSequenceRef.current += 1
+    setPendingPreviewSequence(null)
     inspectingPathRef.current = inputPath
     setIsRequestPending(true)
     setErrors({})
@@ -487,13 +552,17 @@ export function ChromaKeyerPage() {
         setViewportKey((current) => current + 1)
         mediaRef.current = inspectedVideo
         setMedia(inspectedVideo)
-        setPreviewUrl(response.preview_url)
+        if (!preserveSourceAlpha) {
+          setPreviewUrl(response.preview_url)
+        }
         renderedTimestampRef.current = renderedTimestamp
         setRenderedTimestampSeconds(renderedTimestamp)
         setValues((current) => {
           const nextValues = {
             ...current,
             mediaKind: 'video' as const,
+            alphaSource: preserveSourceAlpha ? current.alphaSource : 'chroma_key' as const,
+            sourceAlphaMode: preserveSourceAlpha ? current.sourceAlphaMode : 'straight' as const,
             samples: [],
             timestampSeconds: renderedTimestamp,
           }
@@ -523,6 +592,8 @@ export function ChromaKeyerPage() {
           const nextValues = {
             ...current,
             mediaKind: 'image' as const,
+            alphaSource: 'chroma_key' as const,
+            sourceAlphaMode: 'straight' as const,
             outputFormat: 'png_sequence' as const,
             outputRoot: '',
             samples: [],
@@ -590,6 +661,9 @@ export function ChromaKeyerPage() {
     const requestSequence = ++requestSequenceRef.current
     const previewSequence = ++previewSequenceRef.current
     const nextValues = { ...valuesRef.current, timestampSeconds: timestamp }
+    setPendingPreviewSequence(
+      isPreviewValid(nextValues) ? previewSequence : null,
+    )
     valuesRef.current = nextValues
     setValues(nextValues)
     setIsRequestPending(false)
@@ -607,18 +681,21 @@ export function ChromaKeyerPage() {
       const seekMedia = mediaRef.current
       const seekValues = valuesRef.current
       if (!seekMedia || seekMedia.kind !== 'video' || seekMedia.inputPath !== currentMedia.inputPath) {
+        if (previewSequence === previewSequenceRef.current) {
+          setPendingPreviewSequence(null)
+        }
         return
       }
 
       try {
-        const hasSample = seekValues.samples.length === 1
-        if (hasSample && !areKeyedPreviewInputsValid(seekValues)) {
+        const usesPreview = isSourceAlpha(seekValues) || seekValues.samples.length === 1
+        if (usesPreview && !areKeyedPreviewInputsValid(seekValues)) {
           rollbackRequestedTimestamp()
           return
         }
-        const response = hasSample
+        const response = usesPreview
           ? await createChromaVideoPreview({
-              ...toBasePayload(seekValues),
+              ...toVideoBasePayload(seekValues),
               timestampSeconds: timestamp,
               viewMode: seekValues.viewMode,
             })
@@ -636,7 +713,7 @@ export function ChromaKeyerPage() {
 
         setPreviewUrl(response.preview_url)
         synchronizeRenderedVideoTimestamp(seekMedia, response.timestamp_seconds)
-        if (!hasSample) {
+        if (!usesPreview) {
           setMedia((current) => {
             if (!current || current.kind !== 'video' || current.inputPath !== seekMedia.inputPath) {
               return current
@@ -657,6 +734,10 @@ export function ChromaKeyerPage() {
             ...current,
             timestampSeconds: error instanceof Error && error.message ? error.message : '无法加载视频帧',
           }))
+        }
+      } finally {
+        if (mountedRef.current && previewSequence === previewSequenceRef.current) {
+          setPendingPreviewSequence(null)
         }
       }
     }
@@ -711,7 +792,7 @@ export function ChromaKeyerPage() {
   }
 
   const handleSample = async (point: { x: number; y: number; previewWidth: number; previewHeight: number }) => {
-    if (!media || disabled || uploadPendingRef.current) {
+    if (!media || disabled || uploadPendingRef.current || isSourceAlpha(valuesRef.current)) {
       return
     }
     stopVideoPlayback()
@@ -727,6 +808,7 @@ export function ChromaKeyerPage() {
     const requestSequence = ++requestSequenceRef.current
     if (media.kind === 'video') {
       previewSequenceRef.current += 1
+      setPendingPreviewSequence(null)
     }
     setIsRequestPending(true)
     try {
@@ -789,6 +871,7 @@ export function ChromaKeyerPage() {
     const currentMedia = mediaRef.current
     const requestSequence = ++requestSequenceRef.current
     previewSequenceRef.current += 1
+    setPendingPreviewSequence(null)
     const timestampSeconds = currentMedia?.kind === 'video'
       ? renderedTimestampRef.current ?? valuesRef.current.timestampSeconds
       : valuesRef.current.timestampSeconds
@@ -932,6 +1015,7 @@ export function ChromaKeyerPage() {
             <ChromaKeyerCanvas
               disabled={
                 disabledByTask
+                || sourceAlpha
                 || isUploadPending
                 || playback.isPlaying
                 || videoPreviewOutOfDate
@@ -975,6 +1059,8 @@ export function ChromaKeyerPage() {
           ) : (
             <div className="chroma-empty-preview">加载本地图片或视频后，可在画面中吸取背景颜色。</div>
           )}
+          {!sourceAlpha ? (
+          <>
           <div className="chroma-sample-toolbar">
             <h2 className="chroma-section-title">采样颜色</h2>
             <button
@@ -988,7 +1074,6 @@ export function ChromaKeyerPage() {
               <Eraser aria-hidden="true" size={18} />
             </button>
           </div>
-          <FieldError message={errors.samples} />
           <ol className="chroma-sample-list">
             {sampleDetails.map((sample) => (
               <li className="chroma-sample-item" key={`${sample.sourceX}-${sample.sourceY}`}>
@@ -1010,6 +1095,9 @@ export function ChromaKeyerPage() {
               </li>
             ))}
           </ol>
+          </>
+          ) : null}
+          <FieldError message={errors.samples} />
         </div>
         <ChromaInspector
           compact={compactInspector}

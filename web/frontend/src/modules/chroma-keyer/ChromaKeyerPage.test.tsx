@@ -180,6 +180,329 @@ afterEach(() => {
 })
 
 describe('ChromaKeyerPage', () => {
+  const selectSource = () => fireEvent.change(screen.getByRole('combobox', { name: '透明来源' }), {
+    target: { value: 'source' },
+  })
+  const preview = () => screen.getByRole('button', { name: '抠像预览' })
+
+  it('blocks transport for the current source preview without blocking mode changes or superseding seeks', async () => {
+    const requests = Array.from({ length: 5 }, () =>
+      createDeferred<{ preview_url: string; timestamp_seconds: number }>())
+    for (const request of requests) {
+      pageMocks.createChromaVideoPreview.mockReturnValueOnce(request.promise)
+    }
+    render(<ChromaKeyerPage />)
+    await inspectVideo()
+    selectSource()
+    const play = screen.getByRole('button', { name: '播放' })
+    const timeline = screen.getByRole('slider', { name: '视频时间轴' })
+    expect(play).toBeDisabled()
+    expect(screen.getByRole('button', { name: '下一帧' })).toBeDisabled()
+    expect(timeline).toBeEnabled()
+    expect(screen.getByRole('combobox', { name: 'Alpha 解释' })).toBeEnabled()
+    fireEvent.click(play)
+    expect(pageMocks.createChromaVideoPreview).toHaveBeenCalledOnce()
+    fireEvent.change(screen.getByRole('combobox', { name: 'Alpha 解释' }), {
+      target: { value: 'premultiplied' },
+    })
+    expect(play).toBeDisabled()
+    await act(async () => requests[0].resolve({ preview_url: '/stale-straight.png', timestamp_seconds: 0 }))
+    expect(play).toBeDisabled()
+    fireEvent.click(screen.getByRole('radio', { name: 'Alpha' }))
+    await act(async () => requests[1].reject(new Error('stale interpretation failure')))
+    expect(play).toBeDisabled()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    vi.useFakeTimers()
+    fireEvent.change(timeline, { target: { value: '1' } })
+    await act(async () => { vi.advanceTimersByTime(100) })
+    expect(play).toBeDisabled()
+    expect(timeline).toBeEnabled()
+    fireEvent.change(timeline, { target: { value: '2' } })
+    await act(async () => { vi.advanceTimersByTime(100) })
+    await act(async () => requests[2].resolve({ preview_url: '/stale-alpha.png', timestamp_seconds: 0 }))
+    await act(async () => requests[3].resolve({ preview_url: '/stale-seek.png', timestamp_seconds: 1 }))
+    expect(play).toBeDisabled()
+    expect(timeline).toHaveValue('2')
+    expect(pageMocks.createChromaVideoPreview.mock.calls.map(([payload]) => payload)).toEqual([
+      { inputPath: 'E:\\media\\screen.mp4', alphaSource: 'source', sourceAlphaMode: 'straight', samples: [], timestampSeconds: 0, viewMode: 'final' },
+      { inputPath: 'E:\\media\\screen.mp4', alphaSource: 'source', sourceAlphaMode: 'premultiplied', samples: [], timestampSeconds: 0, viewMode: 'final' },
+      { inputPath: 'E:\\media\\screen.mp4', alphaSource: 'source', sourceAlphaMode: 'premultiplied', samples: [], timestampSeconds: 0, viewMode: 'alpha' },
+      { inputPath: 'E:\\media\\screen.mp4', alphaSource: 'source', sourceAlphaMode: 'premultiplied', samples: [], timestampSeconds: 1, viewMode: 'alpha' },
+      { inputPath: 'E:\\media\\screen.mp4', alphaSource: 'source', sourceAlphaMode: 'premultiplied', samples: [], timestampSeconds: 2, viewMode: 'alpha' },
+    ])
+    await act(async () => requests[4].resolve({ preview_url: '/latest-source.png', timestamp_seconds: 2 }))
+    expect(play).toBeEnabled()
+    expect(preview()).toHaveAttribute('src', '/latest-source.png')
+  })
+
+  it.each(['failure', 'chroma-without-sample', 'new-path'] as const)(
+    'releases current source preview pending state on %s',
+    async (transition) => {
+      const pending = createDeferred<{ preview_url: string; timestamp_seconds: number }>()
+      pageMocks.createChromaVideoPreview.mockReturnValueOnce(pending.promise)
+      render(<ChromaKeyerPage />)
+      await inspectVideo()
+      selectSource()
+      expect(screen.getByRole('button', { name: '播放' })).toBeDisabled()
+      if (transition === 'failure') {
+        await act(async () => pending.reject(new Error('native preview failed')))
+        expect(screen.getByRole('alert')).toHaveTextContent('native preview failed')
+      } else if (transition === 'chroma-without-sample') {
+        fireEvent.change(screen.getByRole('combobox', { name: '透明来源' }), {
+          target: { value: 'chroma_key' },
+        })
+        await waitFor(() => expect(preview()).toHaveAttribute('src', '/api/previews/video-frame.png'))
+        await act(async () => pending.resolve({ preview_url: '/stale-source.png', timestamp_seconds: 8 }))
+      } else {
+        const input = screen.getByLabelText('输入图片或视频路径')
+        fireEvent.change(input, { target: { value: 'E:\\media\\next.mov' } })
+        fireEvent.keyDown(input, { key: 'Enter' })
+        await screen.findByRole('slider', { name: '视频时间轴' })
+        await act(async () => pending.resolve({ preview_url: '/old-path.png', timestamp_seconds: 8 }))
+      }
+      expect(screen.getByRole('button', { name: '播放' })).toBeEnabled()
+      expect(preview()).not.toHaveAttribute('src', '/stale-source.png')
+      expect(preview()).not.toHaveAttribute('src', '/old-path.png')
+    },
+  )
+
+  it('releases invalidated keyed preview pending state when no valid preview can dispatch', async () => {
+    render(<ChromaKeyerPage />)
+    await inspectVideo()
+    await sampleImage()
+    await waitFor(() => expect(preview()).toHaveAttribute('src', '/api/previews/video-keyed.png'))
+    const pending = createDeferred<{ preview_url: string; timestamp_seconds: number }>()
+    pageMocks.createChromaVideoPreview.mockReturnValueOnce(pending.promise)
+    fireEvent.click(screen.getByRole('radio', { name: 'Alpha' }))
+    expect(screen.getByRole('button', { name: '播放' })).toBeDisabled()
+    fireEvent.change(screen.getByRole('spinbutton', { name: 'Screen Gain 数值' }), {
+      target: { value: '' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: '清除全部采样点' }))
+    await waitFor(() => expect(preview()).toHaveAttribute('src', '/api/previews/video-frame.png'))
+    expect(screen.getByRole('button', { name: '播放' })).toBeEnabled()
+    await act(async () => pending.resolve({ preview_url: '/invalid-keyed.png', timestamp_seconds: 8 }))
+    expect(preview()).toHaveAttribute('src', '/api/previews/video-frame.png')
+  })
+
+  it.each(['final', 'alpha'] as const)(
+    'refreshes the unchanged input path with premultiplied source %s instead of RGB',
+    async (viewMode) => {
+      pageMocks.createChromaVideoPreview.mockImplementation(async (payload) => ({
+        preview_url: `/api/previews/source-${payload.viewMode}.png`,
+        timestamp_seconds: payload.timestampSeconds,
+      }))
+      render(<ChromaKeyerPage />)
+      await inspectVideo()
+      selectSource()
+      fireEvent.change(screen.getByRole('combobox', { name: 'Alpha 解释' }), {
+        target: { value: 'premultiplied' },
+      })
+      if (viewMode === 'alpha') {
+        fireEvent.click(screen.getByRole('radio', { name: 'Alpha' }))
+      }
+      await waitFor(() => expect(preview()).toHaveAttribute('src', `/api/previews/source-${viewMode}.png`))
+      pageMocks.createChromaVideoPreview.mockClear()
+      const refreshed = createDeferred<{ preview_url: string; timestamp_seconds: number }>()
+      pageMocks.createChromaVideoPreview.mockReturnValueOnce(refreshed.promise)
+
+      fireEvent.keyDown(screen.getByLabelText('输入图片或视频路径'), { key: 'Enter' })
+
+      await waitFor(() => expect(pageMocks.inspectChromaVideo).toHaveBeenCalledTimes(2))
+      await waitFor(() => expect(screen.getByRole('combobox', { name: '透明来源' })).toHaveValue('source'))
+      expect(screen.getByRole('combobox', { name: 'Alpha 解释' })).toHaveValue('premultiplied')
+      await waitFor(() => expect(pageMocks.createChromaVideoPreview).toHaveBeenCalledExactlyOnceWith({
+        inputPath: 'E:\\media\\screen.mp4',
+        alphaSource: 'source',
+        sourceAlphaMode: 'premultiplied',
+        samples: [],
+        timestampSeconds: 0,
+        viewMode,
+      }))
+      expect(preview()).not.toHaveAttribute('src', videoInspectResponse.preview_url)
+      await act(async () => refreshed.resolve({
+        preview_url: `/api/previews/refreshed-source-${viewMode}.png`,
+        timestamp_seconds: 0,
+      }))
+      expect(preview()).toHaveAttribute('src', `/api/previews/refreshed-source-${viewMode}.png`)
+      expect(pageMocks.createChromaVideoFrame).not.toHaveBeenCalled()
+    },
+  )
+
+  it('previews and exports source alpha with no samples or retained invalid keyer parameters', async () => {
+    render(<ChromaKeyerPage />)
+    await inspectVideo()
+    fireEvent.change(screen.getByRole('spinbutton', { name: 'Screen Gain 数值' }), { target: { value: '' } })
+    selectSource()
+    await waitFor(() => expect(pageMocks.createChromaVideoPreview).toHaveBeenCalledWith({
+      inputPath: 'E:\\media\\screen.mp4',
+      alphaSource: 'source',
+      sourceAlphaMode: 'straight',
+      samples: [],
+      timestampSeconds: 0,
+      viewMode: 'final',
+    }))
+    expect(preview()).toHaveAttribute('aria-disabled', 'true')
+    fireEvent.click(preview(), { clientX: 10, clientY: 10 })
+    expect(pageMocks.sampleChromaVideo).not.toHaveBeenCalled()
+    expect(screen.queryByRole('button', { name: '清除全部采样点' })).not.toBeInTheDocument()
+    fireEvent.change(screen.getByLabelText('MP4 输出路径（可选）'), { target: { value: 'E:\\exports\\native.mp4' } })
+    fireEvent.click(screen.getByRole('button', { name: '导出 MP4' }))
+    await waitFor(() => expect(pageMocks.createChromaVideoKeyerTask).toHaveBeenCalledWith({
+      inputPath: 'E:\\media\\screen.mp4',
+      alphaSource: 'source',
+      sourceAlphaMode: 'straight',
+      samples: [],
+      outputFormat: 'packed_alpha_mp4',
+      outputPath: 'E:\\exports\\native.mp4',
+    }))
+    expect(useTaskStore.getState().currentTaskId).toBe('chroma-video-task-1')
+    expect(pageMocks.createChromaVideoFrame).not.toHaveBeenCalled()
+  })
+
+  it('uses source Alpha previews for channel switches, seeks, steps and playback', async () => {
+    pageMocks.createChromaVideoPreview.mockImplementation(async (payload) => ({
+      preview_url: `/api/previews/source-${payload.viewMode}.png`,
+      timestamp_seconds: payload.timestampSeconds,
+    }))
+    render(<ChromaKeyerPage />)
+    await inspectVideo()
+    selectSource()
+    await waitFor(() => expect(preview()).toHaveAttribute('src', '/api/previews/source-final.png'))
+    fireEvent.click(screen.getByRole('radio', { name: 'Alpha' }))
+    await waitFor(() => expect(preview()).toHaveAttribute('src', '/api/previews/source-alpha.png'))
+    fireEvent.change(screen.getByRole('slider', { name: '视频时间轴' }), { target: { value: '2' } })
+    await waitFor(() => expect(pageMocks.createChromaVideoPreview).toHaveBeenLastCalledWith(expect.objectContaining({
+      alphaSource: 'source', samples: [], viewMode: 'alpha', timestampSeconds: 2,
+    })))
+    await waitFor(() => expect(screen.getByRole('slider', { name: '视频时间轴' })).toHaveValue('2'))
+    fireEvent.click(screen.getByRole('button', { name: '下一帧' }))
+    await waitFor(() => expect(pageMocks.createChromaVideoPreview).toHaveBeenLastCalledWith(expect.objectContaining({
+      alphaSource: 'source', viewMode: 'alpha', timestampSeconds: 2 + 1 / 30,
+    })))
+    installPlaybackClock()
+    fireEvent.click(screen.getByRole('button', { name: '播放' }))
+    expect(pageMocks.createChromaVideoPreview).toHaveBeenLastCalledWith(expect.objectContaining({
+      alphaSource: 'source', samples: [], viewMode: 'alpha',
+    }))
+    await act(async () => {})
+    fireEvent.click(screen.getByRole('button', { name: '暂停' }))
+    expect(pageMocks.createChromaVideoFrame).not.toHaveBeenCalled()
+  })
+
+  it.each(['source-cycle', 'interpretation'] as const)(
+    'ignores an older source preview through a pending %s transition',
+    async (transition) => {
+      const older = createDeferred<{ preview_url: string; timestamp_seconds: number }>()
+      pageMocks.createChromaVideoPreview.mockReturnValueOnce(older.promise)
+      render(<ChromaKeyerPage />)
+      await inspectVideo()
+      selectSource()
+      await waitFor(() => expect(pageMocks.createChromaVideoPreview).toHaveBeenCalledOnce())
+      if (transition === 'source-cycle') {
+        fireEvent.change(screen.getByRole('combobox', { name: '透明来源' }), { target: { value: 'chroma_key' } })
+        expect(screen.getByRole('button', { name: '导出 MP4' })).toBeDisabled()
+        selectSource()
+      } else {
+        fireEvent.change(screen.getByRole('combobox', { name: 'Alpha 解释' }), { target: { value: 'premultiplied' } })
+      }
+      await waitFor(() => expect(pageMocks.createChromaVideoPreview).toHaveBeenCalledTimes(2))
+      await waitFor(() => expect(preview()).toHaveAttribute('src', '/api/previews/video-keyed.png'))
+      await act(async () => older.resolve({ preview_url: '/stale-source.png', timestamp_seconds: 5 }))
+      expect(preview()).toHaveAttribute('src', '/api/previews/video-keyed.png')
+      expect(screen.getByRole('slider', { name: '视频时间轴' })).toHaveValue('1.25')
+    },
+  )
+
+  it.each(['channel', 'interpretation', 'source'] as const)(
+    'pauses source playback on %s change and rejects its stale response',
+    async (change) => {
+      render(<ChromaKeyerPage />)
+      await inspectVideo()
+      selectSource()
+      await waitFor(() => expect(pageMocks.createChromaVideoPreview).toHaveBeenCalled())
+      const older = createDeferred<{ preview_url: string; timestamp_seconds: number }>()
+      pageMocks.createChromaVideoPreview.mockReturnValueOnce(older.promise)
+      installPlaybackClock()
+      fireEvent.click(screen.getByRole('button', { name: '播放' }))
+      expect(pageMocks.createChromaVideoPreview).toHaveBeenLastCalledWith(expect.objectContaining({ alphaSource: 'source' }))
+      if (change === 'channel') {
+        fireEvent.click(screen.getByRole('radio', { name: 'Alpha' }))
+      } else if (change === 'interpretation') {
+        fireEvent.change(screen.getByRole('combobox', { name: 'Alpha 解释' }), { target: { value: 'premultiplied' } })
+      } else {
+        fireEvent.change(screen.getByRole('combobox', { name: '透明来源' }), { target: { value: 'chroma_key' } })
+      }
+      expect(screen.getByRole('button', { name: '播放' })).toBeInTheDocument()
+      await act(async () => { vi.advanceTimersByTime(150) })
+      const currentUrl = preview().getAttribute('src')
+      await act(async () => older.resolve({ preview_url: '/stale-playback.png', timestamp_seconds: 5 }))
+      expect(preview()).toHaveAttribute('src', currentUrl)
+      expect(preview()).not.toHaveAttribute('src', '/stale-playback.png')
+      if (change === 'source') {
+        expect(pageMocks.createChromaVideoFrame).toHaveBeenCalled()
+        expect(screen.getByRole('button', { name: '导出 MP4' })).toBeDisabled()
+      } else {
+        expect(pageMocks.createChromaVideoFrame).not.toHaveBeenCalled()
+      }
+    },
+  )
+
+  it('resets source settings on new files and rejects the old source preview', async () => {
+    const older = createDeferred<{ preview_url: string; timestamp_seconds: number }>()
+    pageMocks.createChromaVideoPreview.mockReturnValueOnce(older.promise)
+    render(<ChromaKeyerPage />)
+    await inspectVideo()
+    selectSource()
+    await waitFor(() => expect(pageMocks.createChromaVideoPreview).toHaveBeenCalledOnce())
+    fireEvent.change(screen.getByRole('combobox', { name: 'Alpha 解释' }), { target: { value: 'premultiplied' } })
+    const input = screen.getByLabelText('输入图片或视频路径')
+    fireEvent.change(input, { target: { value: 'E:\\media\\next.mov' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    await waitFor(() => expect(screen.getByRole('combobox', { name: '透明来源' })).toHaveValue('chroma_key'))
+    expect(screen.getByRole('button', { name: '导出 MP4' })).toBeDisabled()
+    await act(async () => older.resolve({ preview_url: '/old-file-source.png', timestamp_seconds: 5 }))
+    expect(preview()).toHaveAttribute('src', '/api/previews/video-first.png')
+    selectSource()
+    await waitFor(() => expect(pageMocks.createChromaVideoPreview).toHaveBeenLastCalledWith(expect.objectContaining({
+      inputPath: 'E:\\media\\next.mov', alphaSource: 'source', sourceAlphaMode: 'straight',
+    })))
+  })
+
+  it('retains chroma samples and parameters across source mode and does not preview output path edits', async () => {
+    render(<ChromaKeyerPage />)
+    await inspectVideo()
+    await sampleImage()
+    await waitFor(() => expect(pageMocks.createChromaVideoPreview).toHaveBeenCalled())
+    fireEvent.change(screen.getByRole('spinbutton', { name: 'Screen Gain 数值' }), { target: { value: '1.7' } })
+    selectSource()
+    await waitFor(() => expect(pageMocks.createChromaVideoPreview).toHaveBeenLastCalledWith(expect.objectContaining({
+      alphaSource: 'source', samples: [],
+    })))
+    const calls = pageMocks.createChromaVideoPreview.mock.calls.length
+    vi.useFakeTimers()
+    fireEvent.change(screen.getByLabelText('MP4 输出路径（可选）'), { target: { value: 'result.mp4' } })
+    await act(async () => { vi.advanceTimersByTime(500) })
+    expect(pageMocks.createChromaVideoPreview).toHaveBeenCalledTimes(calls)
+    fireEvent.change(screen.getByRole('combobox', { name: '透明来源' }), { target: { value: 'chroma_key' } })
+    await act(async () => { vi.advanceTimersByTime(150) })
+    expect(screen.getByRole('spinbutton', { name: 'Screen Gain 数值' })).toHaveValue(1.7)
+    expect(screen.getByText('RGB(42, 180, 72)')).toBeInTheDocument()
+    expect(pageMocks.createChromaVideoPreview).toHaveBeenLastCalledWith(expect.objectContaining({
+      samples: [[42, 180, 72]], params: expect.objectContaining({ screenGain: 1.7 }),
+    }))
+    expect(pageMocks.createChromaVideoPreview.mock.lastCall?.[0]).not.toHaveProperty('alphaSource')
+  })
+
+  it('surfaces missing native Alpha as a preview error without an RGB fallback', async () => {
+    pageMocks.createChromaVideoPreview.mockRejectedValueOnce(new Error('视频没有原生 Alpha 通道'))
+    render(<ChromaKeyerPage />)
+    await inspectVideo()
+    selectSource()
+    expect(await screen.findByRole('alert')).toHaveTextContent('视频没有原生 Alpha 通道')
+    expect(pageMocks.createChromaVideoFrame).not.toHaveBeenCalled()
+  })
+
   it.each([
     ['packed_alpha_mp4', 'MP4 输出路径（可选）', 'E:\\exports\\result', '导出 MP4', 'MP4 输出路径必须以 .mp4 结尾'],
     ['png_sequence', '输出根目录（可选）', 'E:\\media\\screen.mp4', '导出 PNG 序列', '输出目录不能等于输入路径'],

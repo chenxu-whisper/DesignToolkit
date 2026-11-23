@@ -13,13 +13,15 @@
     uniform sampler2D frame;
     uniform vec2 originalSize;
     uniform vec2 storedSize;
+    uniform float colorHalf;
     varying vec2 uv;
     void main() {
       // Top-left crop, at texel centers. Clamp each crop before adding the half offset.
       vec2 pixel = clamp(vec2(uv.x, 1.0 - uv.y) * originalSize,
                          vec2(0.5), originalSize - vec2(0.5));
-      vec2 colorUV = pixel / vec2(storedSize.x * 2.0, storedSize.y);
-      vec2 alphaUV = (pixel + vec2(storedSize.x, 0.0)) /
+      vec2 colorUV = (pixel + vec2(storedSize.x * colorHalf, 0.0)) /
+                     vec2(storedSize.x * 2.0, storedSize.y);
+      vec2 alphaUV = (pixel + vec2(storedSize.x * (1.0 - colorHalf), 0.0)) /
                      vec2(storedSize.x * 2.0, storedSize.y);
       vec3 color = texture2D(frame, colorUV).rgb;
       float alpha = texture2D(frame, alphaUV).r;
@@ -27,9 +29,10 @@
     }`
 
   function validateMetadata(value) {
-    if (!value || value.version !== 1 || value.layout !== 'color_left_alpha_right' ||
+    if (!value || value.version !== 1 ||
+        !['alpha_left_color_right', 'color_left_alpha_right'].includes(value.layout) ||
         value.alpha_mode !== 'straight') {
-      throw new Error('Invalid metadata: expected version 1, color_left_alpha_right, straight alpha.')
+      throw new Error('Invalid metadata: expected version 1, supported packed layout, straight alpha.')
     }
     for (const key of ['original_width', 'original_height', 'stored_width', 'stored_height']) {
       if (!Number.isSafeInteger(value[key]) || value[key] < 1) {
@@ -166,6 +169,7 @@
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
         resources.original = gl.getUniformLocation(resources.program, 'originalSize')
         resources.stored = gl.getUniformLocation(resources.program, 'storedSize')
+        resources.colorHalf = gl.getUniformLocation(resources.program, 'colorHalf')
         resources.frame = gl.getUniformLocation(resources.program, 'frame')
         resources.position = gl.getAttribLocation(resources.program, 'position')
         gl.disable(gl.BLEND)
@@ -330,6 +334,7 @@
         gl.uniform1i(resources.frame, 0)
         gl.uniform2f(resources.original, value.original_width, value.original_height)
         gl.uniform2f(resources.stored, value.stored_width, value.stored_height)
+        gl.uniform1f(resources.colorHalf, value.layout === 'alpha_left_color_right' ? 1 : 0)
         gl.viewport(0, 0, this.canvas.width, this.canvas.height)
         gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4)
         const drawError = gl.getError()

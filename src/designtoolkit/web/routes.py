@@ -40,6 +40,10 @@ from designtoolkit.chroma_keyer.sampling import (
     map_preview_point,
     screen_model_from_samples,
 )
+from designtoolkit.chroma_keyer.source_alpha import (
+    read_source_preview,
+    split_source_rgba,
+)
 from designtoolkit.chroma_keyer.video_io import ImageioVideoDecoder
 from designtoolkit.chroma_keyer.video_models import (
     VideoDecoder,
@@ -708,6 +712,8 @@ def _chroma_preview_cache_key(
     params: dict[str, float | int] | None = None,
     view_mode: ChromaViewMode | None = None,
     timestamp_seconds: float | None = None,
+    alpha_source: str | None = None,
+    source_alpha_mode: str | None = None,
 ) -> str:
     request_state: dict[str, object] = {
         "preview_kind": preview_kind,
@@ -721,6 +727,10 @@ def _chroma_preview_cache_key(
         request_state["view_mode"] = view_mode.value
     if timestamp_seconds is not None:
         request_state["timestamp_seconds"] = timestamp_seconds
+    if alpha_source is not None:
+        request_state["alpha_source"] = alpha_source
+    if source_alpha_mode is not None:
+        request_state["source_alpha_mode"] = source_alpha_mode
     serialized_state = json.dumps(
         request_state,
         sort_keys=True,
@@ -825,6 +835,8 @@ def _get_stable_video_preview_entry(
     samples: list[list[int]] | None = None,
     params: dict[str, float | int] | None = None,
     view_mode: ChromaViewMode | None = None,
+    alpha_source: str | None = None,
+    source_alpha_mode: str | None = None,
 ) -> tuple[VideoMetadata, float, ChromaPreviewEntry]:
     for _ in range(_CHROMA_SNAPSHOT_READ_ATTEMPTS):
         source_snapshot = _video_source_snapshot(input_path)
@@ -841,6 +853,8 @@ def _get_stable_video_preview_entry(
                 params=params,
                 view_mode=view_mode,
                 timestamp_seconds=timestamp_seconds,
+                alpha_source=alpha_source,
+                source_alpha_mode=source_alpha_mode,
             )
             generated = False
 
@@ -2391,16 +2405,32 @@ def create_router(
                 payload.input_path,
                 media_type="video",
             ) as input_path:
-                model = screen_model_from_samples(payload.samples)
+                source_alpha = payload.alpha_source == "source"
+                model = (
+                    None if source_alpha else screen_model_from_samples(payload.samples)
+                )
                 params_data = payload.params.model_dump(mode="json")
 
                 def create_preview_png(rgb: np.ndarray) -> bytes:
-                    params = KeyerParams(**params_data)
-                    preview_rgb, alpha = key_rgb(rgb, model, params)
+                    if source_alpha:
+                        preview_rgb, alpha = split_source_rgba(rgb)
+                    else:
+                        params = KeyerParams(**params_data)
+                        preview_rgb, alpha = key_rgb(rgb, model, params)
                     if payload.view_mode is ChromaViewMode.FINAL:
                         return make_preview_png(preview_rgb, alpha=alpha)
                     alpha_rgb = np.repeat(alpha[..., np.newaxis], 3, axis=2)
                     return make_preview_png(alpha_rgb)
+
+                def read_source_frame(
+                    path: Path, timestamp: float, metadata: VideoMetadata
+                ) -> np.ndarray:
+                    rgb, alpha = read_source_preview(
+                        path, timestamp, payload.source_alpha_mode
+                    )
+                    if rgb.shape[:2] != (metadata.height, metadata.width):
+                        raise KeyerError("Video stream dimensions changed")
+                    return np.dstack((rgb, alpha))
 
                 _metadata, timestamp_seconds, preview_entry = (
                     _get_stable_video_preview_entry(
@@ -2409,7 +2439,7 @@ def create_router(
                         "video_generated",
                         payload.timestamp_seconds,
                         get_video_metadata,
-                        read_video_preview_frame,
+                        read_source_frame if source_alpha else read_video_preview_frame,
                         create_preview_png,
                         owner_id=(
                             http_request.state.session_id
@@ -2419,6 +2449,8 @@ def create_router(
                         samples=payload.samples,
                         params=params_data,
                         view_mode=payload.view_mode,
+                        alpha_source=payload.alpha_source,
+                        source_alpha_mode=payload.source_alpha_mode,
                     )
                 )
         except KeyerError as exc:

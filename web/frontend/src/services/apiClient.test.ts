@@ -37,6 +37,49 @@ afterEach(() => {
 })
 
 describe('apiClient', () => {
+  it.each(['straight', 'premultiplied'] as const)('sends source %s preview without chroma samples or params', async (sourceAlphaMode) => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ preview_url: '/source.png', timestamp_seconds: 2 })),
+    )
+    await createChromaVideoPreview({
+      inputPath: 'native.mov',
+      alphaSource: 'source',
+      sourceAlphaMode,
+      timestampSeconds: 2,
+      viewMode: 'alpha',
+      samples: [],
+    })
+    expect(JSON.parse(fetchMock.mock.calls[0][1]?.body as string)).toEqual({
+      input_path: 'native.mov',
+      alpha_source: 'source',
+      source_alpha_mode: sourceAlphaMode,
+      timestamp_seconds: 2,
+      view_mode: 'alpha',
+      samples: [],
+    })
+  })
+
+  it('sends source export fields with default straight interpretation and discards retained keyer inputs', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ task_id: 'native-task', status: 'queued' })),
+    )
+    await createChromaVideoKeyerTask({
+      inputPath: 'native.mov',
+      alphaSource: 'source',
+      outputFormat: 'packed_alpha_mp4',
+      outputPath: ' result.mp4 ',
+      samples: [[42, 180, 72]],
+      params: { screenGain: 2, screenBalance: 0.5, clipBlack: 0, clipWhite: 1, shrinkGrow: 0, feather: 0, despillAmount: 1 },
+    })
+    expect(JSON.parse(fetchMock.mock.calls[0][1]?.body as string)).toEqual({
+      input_path: 'native.mov',
+      alpha_source: 'source',
+      source_alpha_mode: 'straight',
+      output_format: 'packed_alpha_mp4',
+      output_path: 'result.mp4',
+      samples: [],
+    })
+  })
   it.each([
     ['packed_alpha_mp4', 'outputPath', 'output_path', ' result.mp4 '],
     ['png_sequence', 'outputRoot', 'output_root', ' E:\\exports '],
@@ -782,7 +825,8 @@ describe('apiClient', () => {
 
   it('models chroma payloads with exactly one RGB sample', () => {
     expectTypeOf<ChromaKeyerPayload['samples']>().toEqualTypeOf<readonly [ChromaKeyerRgbSample]>()
-    expectTypeOf<ChromaVideoKeyerPayload['samples']>().toEqualTypeOf<readonly [ChromaKeyerRgbSample]>()
+    expectTypeOf<Extract<ChromaVideoKeyerPayload, { alphaSource?: 'chroma_key' }>['samples']>()
+      .toEqualTypeOf<readonly [ChromaKeyerRgbSample]>()
     expectTypeOf<ChromaVideoKeyerPayload>().toMatchTypeOf<Parameters<typeof createChromaVideoKeyerTask>[0]>()
     expectTypeOf<ChromaVideoPreviewPayload['viewMode']>().toEqualTypeOf<'final' | 'alpha'>()
     expectTypeOf<Parameters<typeof inspectChromaVideo>[0]>().toEqualTypeOf<ChromaVideoInspectRequest>()

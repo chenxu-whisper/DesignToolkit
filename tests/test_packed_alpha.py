@@ -18,22 +18,24 @@ def test_pack_alpha_frame_preserves_rgb_and_pads_each_half():
     assert packed.shape == (4, 12, 3)
     assert packed.dtype == np.uint8
     assert packed.flags.c_contiguous
-    np.testing.assert_array_equal(packed[:3, :5], rgb)
+    np.testing.assert_array_equal(packed[:3, 6:11], rgb)
     np.testing.assert_array_equal(
-        packed[:3, 6:11],
+        packed[:3, :5],
         np.repeat(np.tile([0, 128, 255, 128, 0], (3, 1))[..., None], 3, 2),
     )
-    assert not packed[3].any()
+    assert not packed[3, :6].any()
     assert not packed[:, 5].any()
-    assert not packed[:, 11].any()
+    np.testing.assert_array_equal(packed[:3, 11], rgb[:, -1])
+    np.testing.assert_array_equal(packed[3, 6:11], rgb[-1])
+    np.testing.assert_array_equal(packed[3, 11], rgb[-1, -1])
 
 
 def test_pack_alpha_frame_accepts_core_byte_alpha_and_strided_rgb():
     rgb = np.full((2, 4, 3), 213, dtype=np.uint8)[:, ::2]
     alpha = np.array([[0, 128], [255, 16]], dtype=np.uint8)
     packed = pack(rgb, alpha)
-    np.testing.assert_array_equal(packed[:, :2], rgb)
-    np.testing.assert_array_equal(packed[:, 2:, 0], alpha)
+    np.testing.assert_array_equal(packed[:, 2:], rgb)
+    np.testing.assert_array_equal(packed[:, :2], np.repeat(alpha[..., None], 3, axis=2))
     assert packed.flags.c_contiguous
 
 

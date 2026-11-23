@@ -58,6 +58,7 @@ function near(actual: number[], expected: number[], tolerance = 8) {
 }
 
 test('local H.264 restores straight alpha, odd crop, orientation and seam pixel centers', async ({ page }, info) => {
+  expect(files.metadata.layout).toBe('alpha_left_color_right')
   await load(page)
   const evidence = await pixels(page)
   console.log('DECODED PIXELS', JSON.stringify(evidence))
@@ -114,6 +115,17 @@ test('actual production encoder and JSON cross-validate with decoded browser alp
   near(evidence.light[1], [216, 216, 216, 255])
 })
 
+test('legacy color-left alpha-right MP4 remains transparent with the updated player', async ({ page }) => {
+  const legacy = await fixture('color_left_alpha_right')
+  await load(page, legacy)
+  const evidence = await pixels(page)
+  near(evidence.transparent, [192, 192, 192, 0])
+  near(evidence.half, [192, 192, 192, 128])
+  near(evidence.opaque, [192, 192, 192, 255])
+  near(evidence.seam, [192, 192, 192, 255], 12)
+  near(evidence.bottom, [64, 64, 64, 255], 12)
+})
+
 test('controls play, pause, seek, mute and switch backgrounds on narrow screens', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 })
   await load(page)
@@ -139,7 +151,7 @@ test('rejects malformed metadata and mismatched dimensions, then recovers with v
   await page.getByLabel('MP4 video').setInputFiles(files.mp4)
   for (const metadata of [
     '{bad json', JSON.stringify({ ...files.metadata, version: 2 }),
-    JSON.stringify({ ...files.metadata, layout: 'alpha_left_color_right' }),
+    JSON.stringify({ ...files.metadata, layout: 'unknown_layout' }),
     JSON.stringify({ ...files.metadata, alpha_mode: 'premultiplied' }),
     JSON.stringify({ ...files.metadata, original_width: 67 }),
     JSON.stringify({ ...files.metadata, stored_width: 68 }),

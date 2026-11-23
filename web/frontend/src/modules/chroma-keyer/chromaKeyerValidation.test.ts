@@ -7,6 +7,8 @@ describe('chromaKeyerDefaultValues', () => {
     expect(chromaKeyerDefaultValues).toEqual({
       inputPath: '',
       mediaKind: null,
+      alphaSource: 'chroma_key',
+      sourceAlphaMode: 'straight',
       outputFormat: 'packed_alpha_mp4',
       outputPath: '',
       outputRoot: '',
@@ -52,6 +54,26 @@ describe('isVideoPath', () => {
 })
 
 describe('validateChromaKeyerPreviewValues', () => {
+  it('previews native video alpha without samples or valid chroma parameters', () => {
+    expect(validateChromaKeyerPreviewValues({
+      ...createChromaKeyerDefaultValues(),
+      inputPath: 'native.mov',
+      mediaKind: 'video',
+      alphaSource: 'source',
+      screenGain: Number.NaN,
+      clipBlack: 1,
+      clipWhite: 0,
+    })).toEqual({})
+  })
+
+  it('does not bypass image sampling for stale source values', () => {
+    expect(validateChromaKeyerPreviewValues({
+      ...createChromaKeyerDefaultValues(),
+      inputPath: 'image.png',
+      mediaKind: 'image',
+      alphaSource: 'source',
+    })).toHaveProperty('samples')
+  })
   it.each([
     ['image', 'packed_alpha_mp4', 'screen.png', 'screen.png', ''],
     ['video', 'packed_alpha_mp4', 'screen.mp4', 'E:\\exports\\result', ''],
@@ -100,6 +122,21 @@ describe('validateChromaKeyerPreviewValues', () => {
 })
 
 describe('validateChromaKeyerValues', () => {
+  it('exports source alpha without samples but rejects PNG sequence output', () => {
+    const values = {
+      ...createChromaKeyerDefaultValues(),
+      inputPath: 'native.mov',
+      mediaKind: 'video' as const,
+      alphaSource: 'source' as const,
+    }
+    expect(validateChromaKeyerValues(values)).toEqual({})
+    expect(validateChromaKeyerValues({ ...values, outputFormat: 'png_sequence' })).toEqual({
+      outputFormat: '视频原始透明通道仅支持 MP4 输出',
+    })
+    expect(validateChromaKeyerValues({ ...values, timestampSeconds: -1 })).toHaveProperty('timestampSeconds')
+    expect(validateChromaKeyerValues({ ...values, outputPath: 'bad.png' })).toHaveProperty('outputPath')
+    expect(validateChromaKeyerValues({ ...values, alphaSource: 'chroma_key' })).toHaveProperty('samples')
+  })
   it('requires a nonblank input path and one sampled background color', () => {
     expect(validateChromaKeyerValues(createChromaKeyerDefaultValues())).toEqual({
       inputPath: '请输入图片路径',

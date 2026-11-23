@@ -23,6 +23,7 @@ from . import core
 from .image_io import _resolved_path
 from .models import KeyerError, KeyerParams, ScreenColorModel
 from .packed_alpha import pack_alpha_frame
+from .source_alpha import split_source_rgba
 from .video_export import _remove_directory, _validate_screen_color_model
 from .video_io import ImageioVideoDecoder, _validate_input_path
 from .video_models import (
@@ -229,15 +230,19 @@ class _FfmpegProcess:
 class _RawFrameStream:
     """Packed-only passthrough decode, with an explicitly owned child process."""
 
-    def __init__(self, executable, path, metadata, monitor) -> None:
+    def __init__(
+        self, executable, path, metadata, monitor, *, source_alpha=False
+    ) -> None:
         self.metadata = metadata
-        self.frame_bytes = metadata.width * metadata.height * 3
+        self.channels = 4 if source_alpha else 3
+        self.frame_bytes = metadata.width * metadata.height * self.channels
         self.closed = False
         self.ffmpeg = _FfmpegProcess(
             [
                 executable, "-hide_banner", "-nostdin", "-loglevel", "error",
                 "-i", str(path), "-map", "0:v:0", "-an", "-sn", "-dn",
-                "-fps_mode", "passthrough", "-pix_fmt", "rgb24",
+                "-fps_mode", "passthrough", "-pix_fmt",
+                "rgba" if source_alpha else "rgb24",
                 "-f", "rawvideo", "pipe:1",
             ],
             monitor,
@@ -258,7 +263,7 @@ class _RawFrameStream:
                 raise StopIteration
             data.extend(chunk)
         return np.frombuffer(bytes(data), dtype=np.uint8).reshape(
-            self.metadata.height, self.metadata.width, 3
+            self.metadata.height, self.metadata.width, self.channels
         )
 
     def cancel(self):
@@ -444,7 +449,8 @@ class _SourceTiming:
 
 
 def _preflight(
-    executable: str, path: Path, metadata: VideoMetadata, monitor: _OutputMonitor
+    executable: str, path: Path, metadata: VideoMetadata, monitor: _OutputMonitor,
+    *, source_alpha: bool = False,
 ) -> _SourceTiming:
     timing = _SourceTiming(metadata)
     command = [
@@ -460,15 +466,20 @@ def _preflight(
         "0:v:0",
         "-an",
         "-vf",
-        "showinfo",
+        "showinfo,alphaextract" if source_alpha else "showinfo",
         "-fps_mode",
         "passthrough",
         "-f",
         "null",
         "-",
     ]
-    with _FfmpegProcess(command, monitor, observe_line=timing.observe) as process:
-        process.wait()
+    try:
+        with _FfmpegProcess(command, monitor, observe_line=timing.observe) as process:
+            process.wait()
+    except KeyerError as error:
+        if source_alpha and "Requested planes not available" in str(error):
+            raise KeyerError("Source video has no native alpha channel") from error
+        raise
     if timing.count == 0:
         raise KeyerError("Source contains no frames with verifiable timestamps")
     return timing
@@ -502,7 +513,7 @@ def _packed_metadata(
     return {
         "version": 1,
         "format": "packed_alpha_mp4",
-        "layout": "color_left_alpha_right",
+        "layout": "alpha_left_color_right",
         "original_width": metadata.width,
         "original_height": metadata.height,
         "stored_width": metadata.width + metadata.width % 2,
@@ -524,7 +535,7 @@ def _packed_metadata(
 def key_video_to_packed_mp4(
     options: VideoKeyOptions,
     decoder: VideoDecoder,
-    model: ScreenColorModel,
+    model: ScreenColorModel | None,
     params: KeyerParams,
     progress_callback: ProgressCallback | None = None,
     *,
@@ -536,7 +547,11 @@ def key_video_to_packed_mp4(
     published: list[tuple[Path, int, int]] = []
     success = False
     try:
-        _validate_screen_color_model(model)
+        source_alpha = options.alpha_source == "source"
+        if not source_alpha:
+            if model is None:
+                raise KeyerError("Chroma key export requires a ScreenColorModel")
+            _validate_screen_color_model(model)
         _validate_input_path(options.input_path)
         destination = _destination(options)
         metadata = decoder.probe(options.input_path)
@@ -553,7 +568,14 @@ def key_video_to_packed_mp4(
         with _OutputMonitor(output_check) as monitor:
             if stage_callback is not None:
                 stage_callback("validating")
-            timing = _preflight(executable, options.input_path, metadata, monitor)
+            timing = (
+                _preflight(
+                    executable, options.input_path, metadata, monitor,
+                    source_alpha=True,
+                )
+                if source_alpha
+                else _preflight(executable, options.input_path, metadata, monitor)
+            )
             metadata = replace(metadata, fps=float(timing.rate))
             temporary_dir = destination.parent / f".packed.{uuid4().hex}.tmp"
             temporary_dir.mkdir()
@@ -561,9 +583,10 @@ def key_video_to_packed_mp4(
             mux_path = temporary_dir / "packed.mp4"
             json_path = temporary_dir / "metadata.json"
             def open_stream():
-                if type(decoder) is ImageioVideoDecoder:
+                if source_alpha or type(decoder) is ImageioVideoDecoder:
                     return metadata, _RawFrameStream(
-                        executable, options.input_path, metadata, monitor
+                        executable, options.input_path, metadata, monitor,
+                        source_alpha=source_alpha,
                     )
                 return decoder.iter_frames(options.input_path)
 
@@ -614,9 +637,15 @@ def key_video_to_packed_mp4(
                             raise KeyerError(
                                 "Decoded video frame count does not match preflight"
                             )
-                        if frame.shape != (metadata.height, metadata.width, 3):
+                        channels = 4 if source_alpha else 3
+                        if frame.shape != (metadata.height, metadata.width, channels):
                             raise KeyerError("Decoded video frame dimensions changed")
-                        rgb, alpha = core.key_rgb(frame, model, params)
+                        if source_alpha:
+                            rgb, alpha = split_source_rgba(
+                                frame, options.source_alpha_mode
+                            )
+                        else:
+                            rgb, alpha = core.key_rgb(frame, model, params)
                         packed = pack_alpha_frame(rgb, alpha)
                         process.write(packed.tobytes())
                         count += 1
@@ -697,7 +726,13 @@ def key_video_to_packed_mp4(
                 )
             json_path.write_text(
                 json.dumps(
-                    _packed_metadata(result_metadata, count, timing.audio_present),
+                    {
+                        **_packed_metadata(
+                            result_metadata, count, timing.audio_present
+                        ),
+                        "alpha_source": options.alpha_source,
+                        "source_alpha_mode": options.source_alpha_mode,
+                    },
                     indent=2,
                 )
                 + "\n",

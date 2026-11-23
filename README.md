@@ -34,6 +34,8 @@ uv run designtoolkit web
 支持功能：
 
 - 视频转 PNG/JPG/JPEG 序列帧
+- 图片／视频色键抠图，支持 `Final` / `Alpha` 预览和透明素材导出
+- 保留 MOV 原生 Alpha，导出左侧黑白 Alpha、右侧 RGB 的拼接 MP4，以及同名 JSON 和配套透明播放器
 - 路径字段支持通过文件夹按钮唤起本机文件/目录选择器，并会记住上一次选择目录；不可用时会回退到内联编辑器手动填写本地路径
 - 本地图片和视频可直接拖入输入框。浏览器未提供真实路径时，按实际文件内容导入到
   `.temp/local-imports/` 并自动加载；原文件不变，多文件输入支持合并拖入。
@@ -96,7 +98,7 @@ uv run designtoolkit resize-media .\photo.png 800x600
 默认行为：
 
 - 输出路径：源文件同级目录下的 `{原文件名}_resized.{原扩展名}`
-- 输出尺寸：保持原始宽高比，并放入指定最大边界内z
+- 输出尺寸：保持原始宽高比，并放入指定最大边界内
 - 覆盖策略：默认不覆盖已有输出文件
 
 指定输出路径：
@@ -125,7 +127,8 @@ uv run designtoolkit resize-media .\photo.jpg 800x600 .\small.jpg
   预览、时间轴、帧率、源尺寸和估算帧数，连续 seek 只保留最新结果
 - 视频时间轴提供播放/暂停、回到开头、上一帧和下一帧控制，逐帧操作按源帧率
   步进并在首帧和末帧处停止
-- 未采样时播放原始视频帧；采样后播放当前 `Final` 或 `Alpha` 抠像预览
+- 色键模式未采样时播放原始视频帧；采样后播放当前 `Final` 或 `Alpha` 抠像预览。
+  原始透明通道模式无需采样，直接播放源 Alpha 对应的 `Final` / `Alpha` 预览。
 - 播放按真实时间推进且最多保留一个预览请求在途；解码慢于源帧率时丢弃中间
   预览帧，下一次请求追赶到最新帧时间
 - 当前预览播放不支持音频、循环、速度控制或入点/出点范围播放
@@ -139,12 +142,14 @@ uv run designtoolkit resize-media .\photo.jpg 800x600 .\small.jpg
 - PNG 序列输出目录包含 `manifest.json`，记录源路径、尺寸、帧率、时长、实际帧数、
   命名模式、Screen Color 和全部七项参数
 - 视频新增默认输出格式 `MP4（颜色 + 透明遮罩）`，仍可选择 `PNG 序列`。
-  MP4 左侧保存非预乘颜色，右侧保存灰度 Alpha；这是自定义布局，普通播放器
+  MP4 左侧保存黑白灰度 Alpha，右侧保存非预乘 RGB；这是自定义布局，普通播放器
   显示左右拼接画面，必须用配套播放器恢复透明效果。
+  JSON 布局为 `alpha_left_color_right`；配套播放器仍兼容旧的 `color_left_alpha_right` 文件。
 - MP4 使用 H.264/yuv420p，并默认保留第一条音轨为 AAC；无音轨也可导出。
   首版要求恒定帧率，变帧率素材会提示先转换；字幕、多音轨不保留。
 - 本地 MP4 默认生成 `<视频名>_keyed_packed.mp4`、同名 JSON 和配套
   `<输出名>_player` 目录。奇数尺寸通过补齐编码、按 JSON 裁切显示；
+  Alpha 补齐为零，RGB 补齐延续边缘颜色，以减少原始边缘像素的压缩暗边。
   压缩有损，包括透明遮罩。
 - 托管模式下载包包含一个 MP4、JSON 和播放器。解压后直接用浏览器打开
   播放器的 `index.html`，选择 MP4 和 JSON，再点击播放；播放器支持
@@ -156,6 +161,47 @@ uv run designtoolkit resize-media .\photo.jpg 800x600 .\small.jpg
 - PNG 序列导出显示逐帧进度；内容先写入临时目录，全部完成后原子发布
   `<视频名>_keyed_frames`。图片文件和视频目录均不覆盖已有输出
 - v1 不提供取消、批量抠像、参数关键帧或图片序列输入
+
+### 保留 MOV 自带透明信息
+
+在 Web GUI 中按以下步骤导出：
+
+1. 打开 `色键抠图`，选择或拖入带原生 Alpha 的 MOV。
+2. 将 `透明来源` 设为 `视频原始透明通道`，无需吸取背景色。
+3. 在 `Alpha 解释` 中选择 `直通 Alpha` 或 `预乘 Alpha`，用 `Final` / `Alpha` 检查结果。
+4. 点击 `导出 MP4`；打开结果目录中的 `<输出名>_player/index.html`，
+   选择输出 MP4 和同名 JSON，恢复透明显示。
+
+此模式固定导出 `MP4（颜色 + 透明遮罩）`：**左侧为黑白灰度 Alpha，右侧为 RGB 内容**，
+JSON 的 `layout` 为 `alpha_left_color_right`。不应用色键、羽化或去杂色参数。
+
+颜色解释默认使用 `直通`；若素材的 RGB 已乘以 Alpha，请选择 `预乘`，
+导出时会还原 RGB。应用不会自动猜测素材的颜色解释。
+支持 FFmpeg 可解码 Alpha 的 MOV，包括 QTRLE 和 ProRes 4444；
+普通 H.264 MOV 没有原生 Alpha，选择此模式会明确报错。
+
+结果包含 MP4、同名 JSON 和离线播放器，第一条音轨保留为 AAC。
+普通播放器显示左右拼接画面；配套播放器按 JSON 恢复透明显示，
+同时兼容旧的 `color_left_alpha_right` 文件。调整导出布局后，请重新导出新文件。
+H.264 压缩对颜色和透明遮罩均有损，高位深 Alpha 会转换为 8 位；
+本模式保持现有恒定帧率要求。
+API 示例：`POST /api/tasks/chroma-keyer-video`，可省略 `samples` 和 `params`。
+
+```json
+{
+  "input_path": "E:\\media\\native.mov",
+  "alpha_source": "source",
+  "source_alpha_mode": "straight",
+  "output_format": "packed_alpha_mp4",
+  "output_path": "E:\\exports\\native_packed.mp4"
+}
+```
+
+`source_alpha_mode` 可选 `"straight"`（默认）或 `"premultiplied"`。
+视频预览接口 `POST /api/chroma-keyer/videos/preview` 使用同样的来源字段，
+另传 `timestamp_seconds` 和 `view_mode: "final" | "alpha"`。
+使用步骤与真实素材验收见
+[`docs/source-alpha-mov-acceptance.md`](docs/source-alpha-mov-acceptance.md)。
 
 前端开发（热重载模式，端口 5173）：
 

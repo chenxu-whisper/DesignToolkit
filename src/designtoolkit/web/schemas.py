@@ -156,8 +156,10 @@ class ChromaVideoKeyerTaskRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     input_path: str
-    samples: list[list[RgbChannel]] = Field(min_length=1, max_length=1)
-    params: ChromaKeyerParams
+    samples: list[list[RgbChannel]] = Field(default_factory=list, max_length=1)
+    params: ChromaKeyerParams = Field(default_factory=ChromaKeyerParams)
+    alpha_source: Literal["chroma_key", "source"] = "chroma_key"
+    source_alpha_mode: Literal["straight", "premultiplied"] = "straight"
     output_root: str | None = None
     output_format: Literal["png_sequence", "packed_alpha_mp4"] = "png_sequence"
     output_path: str | None = None
@@ -178,6 +180,10 @@ class ChromaVideoKeyerTaskRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_video_output(self) -> ChromaVideoKeyerTaskRequest:
+        if self.alpha_source == "chroma_key" and len(self.samples) != 1:
+            raise ValueError("chroma_key requires exactly one sample")
+        if self.alpha_source == "source" and self.output_format != "packed_alpha_mp4":
+            raise ValueError("Source alpha requires packed_alpha_mp4")
         if self.output_path is not None:
             if self.output_format != "packed_alpha_mp4":
                 raise ValueError("output_path is only valid for packed_alpha_mp4")
@@ -255,6 +261,16 @@ class ChromaVideoSampleResponse(ChromaSampleResponse):
 
 class ChromaVideoPreviewRequest(ChromaPreviewRequest):
     timestamp_seconds: TimestampSeconds
+    samples: list[list[RgbChannel]] = Field(default_factory=list, max_length=1)
+    params: ChromaKeyerParams = Field(default_factory=ChromaKeyerParams)
+    alpha_source: Literal["chroma_key", "source"] = "chroma_key"
+    source_alpha_mode: Literal["straight", "premultiplied"] = "straight"
+
+    @model_validator(mode="after")
+    def validate_alpha_samples(self) -> ChromaVideoPreviewRequest:
+        if self.alpha_source == "chroma_key" and len(self.samples) != 1:
+            raise ValueError("chroma_key requires exactly one sample")
+        return self
 
 
 class ChromaVideoPreviewResponse(ChromaPreviewResponse):

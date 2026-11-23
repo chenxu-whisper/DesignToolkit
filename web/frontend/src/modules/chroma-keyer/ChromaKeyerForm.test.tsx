@@ -52,6 +52,45 @@ function ControlledForm({
 }
 
 describe('ChromaKeyerForm', () => {
+  it('selects source alpha, forces MP4, and exports without background sampling', () => {
+    render(<ControlledForm initialValues={{
+      ...createChromaKeyerDefaultValues(),
+      mediaKind: 'video',
+      outputFormat: 'png_sequence',
+      screenGain: 1.7,
+    }} />)
+    const source = screen.getByRole('combobox', { name: '透明来源' })
+    expect(source).toHaveValue('chroma_key')
+    fireEvent.change(source, { target: { value: 'source' } })
+    expect(screen.getByRole('combobox', { name: '输出格式' })).toHaveValue('packed_alpha_mp4')
+    expect(screen.getByRole('combobox', { name: '输出格式' })).toBeDisabled()
+    expect(screen.getByRole('combobox', { name: 'Alpha 解释' })).toHaveValue('straight')
+    expect(screen.getByRole('option', { name: '直通 Alpha' })).toBeInTheDocument()
+    expect(screen.getByRole('option', { name: '预乘 Alpha' })).toBeInTheDocument()
+    expect(screen.queryByRole('slider', { name: 'Screen Gain' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '导出 MP4' })).toBeEnabled()
+    expect(screen.getByText(/无需.*采样/)).toBeInTheDocument()
+    expect(screen.getByText(/8 位/)).toBeInTheDocument()
+    fireEvent.change(screen.getByRole('combobox', { name: 'Alpha 解释' }), { target: { value: 'premultiplied' } })
+    expect(screen.getByRole('combobox', { name: 'Alpha 解释' })).toHaveValue('premultiplied')
+    fireEvent.change(source, { target: { value: 'chroma_key' } })
+    expect(screen.getByRole('spinbutton', { name: 'Screen Gain 数值' })).toHaveValue(1.7)
+    expect(screen.getByRole('button', { name: '导出 MP4' })).toBeDisabled()
+    expect(screen.queryByRole('combobox', { name: 'Alpha 解释' })).not.toBeInTheDocument()
+  })
+
+  it('keeps source selection video-only and respects disabled source controls', () => {
+    const values = { ...createChromaKeyerDefaultValues(), mediaKind: 'video' as const, alphaSource: 'source' as const }
+    const { rerender } = render(<ChromaKeyerForm disabled errors={{}} onChange={vi.fn()}
+      onInputPathCommit={vi.fn()} onSubmit={vi.fn()} values={values} />)
+    expect(screen.getByRole('combobox', { name: '透明来源' })).toBeDisabled()
+    expect(screen.getByRole('combobox', { name: 'Alpha 解释' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: '导出 MP4' })).toBeDisabled()
+    rerender(<ChromaKeyerForm disabled={false} errors={{}} onChange={vi.fn()}
+      onInputPathCommit={vi.fn()} onSubmit={vi.fn()} values={{ ...values, mediaKind: 'image' }} />)
+    expect(screen.queryByRole('combobox', { name: '透明来源' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '导出 PNG' })).toBeDisabled()
+  })
   it('preserves Screen Gain edits when a pending local import completes', async () => {
     let resolveImport!: (paths: readonly string[]) => void
     const importResult = new Promise<readonly string[]>((resolve) => {

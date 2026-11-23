@@ -11,7 +11,20 @@
 .chroma-module-header {
   align-items: center;
   flex-direction: row;
+  flex-wrap: wrap;
   justify-content: space-between;
+}
+
+.chroma-module-header h1,
+.chroma-module-header .chroma-inspector-trigger {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+.chroma-module-header .task-result {
+  flex-basis: 100%;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .chroma-inspector-trigger {

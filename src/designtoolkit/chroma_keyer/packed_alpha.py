@@ -5,7 +5,7 @@ from .models import KeyerError
 
 
 def pack_alpha_frame(rgb: np.ndarray, alpha: np.ndarray) -> np.ndarray:
-    """Pack straight RGB and grayscale Alpha into independently padded halves."""
+    """Pack grayscale Alpha on the left and straight RGB on the right."""
     rgb = _validate_rgb(rgb)
     if (
         not isinstance(alpha, np.ndarray)
@@ -25,6 +25,9 @@ def pack_alpha_frame(rgb: np.ndarray, alpha: np.ndarray) -> np.ndarray:
     stored_width = width + width % 2
     stored_height = height + height % 2
     packed = np.zeros((stored_height, 2 * stored_width, 3), dtype=np.uint8)
-    packed[:height, :width] = rgb
-    packed[:height, stored_width : stored_width + width] = alpha_bytes[..., None]
+    packed[:height, :width] = alpha_bytes[..., None]
+    # Extend color edges into padding so H.264 does not darken original edge pixels.
+    packed[:, stored_width:] = np.pad(
+        rgb, ((0, height % 2), (0, width % 2), (0, 0)), mode="edge"
+    )
     return packed

@@ -23,31 +23,36 @@ export async function productionFixture() {
   return result
 }
 
-export async function fixture() {
+export async function fixture(layout = 'alpha_left_color_right') {
   await mkdir(artifacts, { recursive: true })
   const python = pythonExecutable()
   const discovery = spawnSync(python, ['-c',
     'import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())'], { encoding: 'utf8' })
   if (discovery.status !== 0) throw new Error(discovery.stderr || discovery.error?.message)
   const metadata = {
-    version: 1, layout: 'color_left_alpha_right', alpha_mode: 'straight',
+    version: 1, layout, alpha_mode: 'straight',
     original_width: 65, original_height: 33, stored_width: 66, stored_height: 34,
     fps: 20, frame_count: 40, duration_seconds: 2,
   }
   const frames = Buffer.alloc(132 * 34 * 3 * 40)
   for (let frame = 0; frame < 40; frame++) {
-    for (let y = 0; y < 33; y++) {
-      for (let x = 0; x < 65; x++) {
+    for (let y = 0; y < 34; y++) {
+      for (let x = 0; x < 66; x++) {
+        const original = y < 33 && x < 65
+        if (!original && layout === 'color_left_alpha_right') continue
         const color = y < 16 ? (frame < 20 ? 192 : 96) : (frame < 20 ? 64 : 32)
-        const alpha = x < 20 ? 0 : x < 44 ? 128 : 255
+        const alpha = !original || x < 20 ? 0 : x < 44 ? 128 : 255
         const offset = ((frame * 34 + y) * 132 + x) * 3
-        frames.fill(color, offset, offset + 3)
-        frames.fill(alpha, offset + 66 * 3, offset + 66 * 3 + 3)
+        const colorOffset = layout === 'color_left_alpha_right' ? offset : offset + 66 * 3
+        const alphaOffset = layout === 'color_left_alpha_right' ? offset + 66 * 3 : offset
+        frames.fill(color, colorOffset, colorOffset + 3)
+        frames.fill(alpha, alphaOffset, alphaOffset + 3)
       }
     }
   }
-  const mp4 = join(artifacts, 'odd-packed.mp4')
-  const json = join(artifacts, 'odd-packed.json')
+  const suffix = layout === 'color_left_alpha_right' ? '-legacy' : ''
+  const mp4 = join(artifacts, `odd-packed${suffix}.mp4`)
+  const json = join(artifacts, `odd-packed${suffix}.json`)
   const encoded = spawnSync(discovery.stdout.trim(), [
     '-hide_banner', '-loglevel', 'error', '-y', '-f', 'rawvideo',
     '-pixel_format', 'rgb24', '-video_size', '132x34', '-framerate', '20',

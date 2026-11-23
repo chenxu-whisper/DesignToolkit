@@ -75,6 +75,16 @@ class VideoKeyOptions:
     output_root: Path | None = None
     output_format: str = "png_sequence"
     output_path: Path | None = None
+    alpha_source: str = "chroma_key"
+    source_alpha_mode: str = "straight"
+
+    def __post_init__(self) -> None:
+        if self.alpha_source not in ("chroma_key", "source"):
+            raise KeyerError("alpha_source must be chroma_key or source")
+        if self.source_alpha_mode not in ("straight", "premultiplied"):
+            raise KeyerError("source alpha mode must be straight or premultiplied")
+        if self.alpha_source == "source" and self.output_format != "packed_alpha_mp4":
+            raise KeyerError("Source alpha requires packed_alpha_mp4")
 
 
 @dataclass(frozen=True)

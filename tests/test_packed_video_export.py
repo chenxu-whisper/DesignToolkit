@@ -142,7 +142,7 @@ def test_real_encode_decode_odd_dimensions_and_alpha(tmp_path, monkeypatch):
     assert all(entry[2] == result.output_path for entry in progress)
     data = json.loads(result.metadata_path.read_text())
     assert data["version"] == 1
-    assert data["layout"] == "color_left_alpha_right"
+    assert data["layout"] == "alpha_left_color_right"
     assert data["alpha_mode"] == "straight"
     assert (data["original_width"], data["original_height"]) == (65, 33)
     assert (data["stored_width"], data["stored_height"]) == (66, 34)
@@ -159,9 +159,9 @@ def test_real_encode_decode_odd_dimensions_and_alpha(tmp_path, monkeypatch):
     for frame in decoded:
         # Sample interiors; lossy ringing at alpha transitions is not pixel-exact.
         for x, expected in [(10, 0), (32, 128), (54, 255)]:
-            assert abs(int(frame[16, 66 + x, 0]) - expected) <= 4
-            assert np.ptp(frame[16, 66 + x].astype(int)) <= 2
-        assert abs(int(frame[16, 10, 0]) - 200) <= 4
+            assert abs(int(frame[16, x, 0]) - expected) <= 4
+            assert np.ptp(frame[16, x].astype(int)) <= 2
+        assert abs(int(frame[16, 76, 0]) - 200) <= 4
     encoded = result.output_path.read_bytes()
     assert encoded.index(b"moov") < encoded.index(b"mdat")
     assert not list(tmp_path.glob(".packed.*"))

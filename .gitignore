@@ -19,6 +19,7 @@ venv/
 env/
 .worktrees/
 .superpowers/
+.screenshots/
 
 # Caches
 .cache/
